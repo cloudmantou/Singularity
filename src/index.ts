@@ -23,6 +23,7 @@ import {
   overlayProviderEnvFromSettings,
   saveStoredModelSettings,
 } from "./settings/store";
+import { importEntries, parseImportPayload, type ImportMode } from "./import-entries";
 
 export interface Env {
   DB: D1Database;
@@ -2294,6 +2295,53 @@ const defaultHandler = {
       ).first() as Record<string, any> | null;
 
       return json({ processed, failed, remaining: (remaining?.count as number) ?? 0 });
+    }
+
+    // POST /import — Cloudflare / dashboard JSON export → entries (vector_ids cleared)
+    if (url.pathname === "/import" && request.method === "POST") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      let body: unknown;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON" }, 400);
+      }
+
+      let entries: unknown[];
+      try {
+        // Body may be raw array, { entries }, or { entries, mode, extraTags }
+        if (body && typeof body === "object" && !Array.isArray(body) && "entries" in (body as object)) {
+          entries = parseImportPayload(body);
+        } else {
+          entries = parseImportPayload(body);
+        }
+      } catch (e) {
+        return json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 400);
+      }
+
+      const opts = (body && typeof body === "object" && !Array.isArray(body)
+        ? (body as Record<string, unknown>)
+        : {}) as {
+        mode?: ImportMode;
+        extraTags?: string[];
+      };
+
+      const result = await importEntries(env.DB, entries, {
+        mode: opts.mode === "overwrite" ? "overwrite" : "skip",
+        extraTags: Array.isArray(opts.extraTags)
+          ? opts.extraTags.map(String)
+          : ["cf-import"],
+      });
+
+      return json({
+        ...result,
+        next:
+          result.pendingVectorize.length > 0
+            ? "Run POST /vectorize-pending to embed imported memories with the current embedding provider."
+            : undefined,
+      });
     }
 
     // ── Control plane: model settings ───────────────────────────────────────

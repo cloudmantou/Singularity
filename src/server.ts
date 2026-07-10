@@ -140,6 +140,7 @@ async function main() {
         urlPath.startsWith("/forget") ||
         urlPath.startsWith("/tags") ||
         urlPath.startsWith("/settings") ||
+        urlPath.startsWith("/import") ||
         urlPath.startsWith("/.well-known");
 
       if (!isApi) {

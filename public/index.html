@@ -2678,6 +2678,8 @@
         </button>
         <button class="menu-item" onclick="exportMemories('json')"><i class="ti ti-download"></i> Export as JSON</button>
         <button class="menu-item" onclick="exportMemories('markdown')"><i class="ti ti-markdown"></i> Export as Markdown</button>
+        <button class="menu-item" onclick="triggerImportJson()"><i class="ti ti-upload"></i> Import JSON</button>
+        <input type="file" id="import-json-file" accept="application/json,.json" style="display: none" onchange="handleImportJsonFile(event)" />
         <button class="menu-item danger" onclick="logout()"><i class="ti ti-logout"></i> Disconnect</button>
       </div>
     </div>
@@ -3752,6 +3754,72 @@
             btn.innerHTML = 'Classify now →'
             btn.style.color = ''
           }, 3000)
+        }
+      }
+
+      function triggerImportJson() {
+        closeMenu()
+        const input = document.getElementById('import-json-file')
+        if (input) {
+          input.value = ''
+          input.click()
+        }
+      }
+
+      async function handleImportJsonFile(event) {
+        const file = event.target?.files?.[0]
+        if (!file) return
+        try {
+          const text = await file.text()
+          const parsed = JSON.parse(text)
+          const entries = Array.isArray(parsed) ? parsed : parsed.entries || parsed.memories || parsed.data
+          if (!Array.isArray(entries) || !entries.length) {
+            throw new Error('JSON must be a non-empty array (or { entries: [...] })')
+          }
+          const mode = confirm(
+            `Import ${entries.length} memories?\n\nOK = skip existing IDs\nCancel = abort\n\n(Use overwrite via API if you need to replace.)`
+          )
+          if (!mode) return
+
+          const res = await fetch(`${WORKER_URL}/import`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${AUTH_TOKEN}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              entries,
+              mode: 'skip',
+              extraTags: ['cf-import'],
+            }),
+          })
+          const data = await res.json()
+          if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText)
+
+          let msg = `Import done: +${data.inserted} new, ${data.skipped} skipped, ${data.updated || 0} updated, ${data.failed} failed.`
+          if (data.pendingVectorize?.length) {
+            msg += `\n\n${data.pendingVectorize.length} need re-embedding. Run Vectorize pending from stats, or:\nPOST /vectorize-pending`
+            if (confirm(msg + '\n\nTry vectorize-pending now?')) {
+              const v = await fetch(`${WORKER_URL}/vectorize-pending`, {
+                method: 'POST',
+                headers: {
+                  Authorization: `Bearer ${AUTH_TOKEN}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ limit: 500 }),
+              })
+              const vd = await v.json().catch(() => ({}))
+              alert('vectorize-pending: ' + JSON.stringify(vd).slice(0, 400))
+            } else {
+              alert(msg)
+            }
+          } else {
+            alert(msg)
+          }
+          loadRecent()
+          updateStatus()
+        } catch (e) {
+          alert('Import failed: ' + (e.message || e))
         }
       }
 

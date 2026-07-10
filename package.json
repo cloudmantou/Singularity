@@ -16,7 +16,8 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "typecheck": "tsc --noEmit",
-    "test:ai": "tsx scripts/test-ai.ts"
+    "test:ai": "tsx scripts/test-ai.ts",
+    "import:json": "node --require ./src/selfhost/register-cf-shim.cjs --import tsx scripts/import-json.ts"
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "^0.7.0",
