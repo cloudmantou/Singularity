@@ -47,67 +47,170 @@ export interface PublicModelSettings {
     devEmbeddingWarning: boolean;
   };
   presets: {
-    llm: { id: string; label: string; baseURL: string; model: string }[];
-    embedding: { id: string; label: string; baseURL: string; model: string; dimensions: number }[];
+    llm: ProviderPresetPublic[];
+    embedding: EmbeddingPresetPublic[];
   };
 }
 
-export const LLM_PRESETS = [
+/** Card UI metadata for OpenAI-compatible chat providers. */
+export interface ProviderPresetPublic {
+  id: string;
+  label: string;
+  baseURL: string;
+  model: string;
+  /** Short badge letter/emoji for cards */
+  badge: string;
+  /** One-line Chinese hint under the card label */
+  hint?: string;
+  /** Optional alternate models for the advanced <select> */
+  models?: string[];
+}
+
+export interface EmbeddingPresetPublic {
+  id: string;
+  label: string;
+  baseURL: string;
+  model: string;
+  dimensions: number;
+  badge: string;
+  hint?: string;
+  models?: string[];
+}
+
+/**
+ * First-party / common OpenAI-compatible chat providers.
+ * Intentionally not a full gateway catalog — prefer “自定义” for obscure relays.
+ */
+export const LLM_PRESETS: readonly ProviderPresetPublic[] = [
   {
     id: "deepseek",
-    label: "DeepSeek V4 Flash",
+    label: "DeepSeek",
     baseURL: "https://api.deepseek.com/v1",
     model: "deepseek-v4-flash",
+    badge: "DS",
+    hint: "推荐 · 分类/摘要便宜稳定",
+    models: ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat"],
   },
   {
     id: "minimax",
-    label: "MiniMax M3",
+    label: "MiniMax",
     baseURL: "https://api.minimax.io/v1",
     model: "MiniMax-M3",
-  },
-  {
-    id: "mimo",
-    label: "MiMo (OpenAI-compatible)",
-    baseURL: "",
-    model: "",
+    badge: "MM",
+    hint: "M3 · 已默认关 thinking",
+    models: ["MiniMax-M3", "MiniMax-M2.5", "MiniMax-Text-01"],
   },
   {
     id: "openai",
     label: "OpenAI",
     baseURL: "https://api.openai.com/v1",
     model: "gpt-4o-mini",
+    badge: "OA",
+    hint: "官方 API",
+    models: ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"],
+  },
+  {
+    id: "siliconflow",
+    label: "硅基流动",
+    baseURL: "https://api.siliconflow.cn/v1",
+    model: "deepseek-ai/DeepSeek-V3",
+    badge: "硅",
+    hint: "国内常用中转/模型聚合",
+    models: [
+      "deepseek-ai/DeepSeek-V3",
+      "Qwen/Qwen2.5-7B-Instruct",
+      "THUDM/glm-4-9b-chat",
+    ],
+  },
+  {
+    id: "zhipu",
+    label: "智谱 GLM",
+    baseURL: "https://open.bigmodel.cn/api/paas/v4",
+    model: "glm-4-flash",
+    badge: "智",
+    hint: "OpenAI 兼容接口",
+    models: ["glm-4-flash", "glm-4-air", "glm-4"],
+  },
+  {
+    id: "kimi",
+    label: "Kimi / 月之暗面",
+    baseURL: "https://api.moonshot.cn/v1",
+    model: "moonshot-v1-8k",
+    badge: "K",
+    hint: "Moonshot OpenAI 兼容",
+    models: ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
+  },
+  {
+    id: "openrouter",
+    label: "OpenRouter",
+    baseURL: "https://openrouter.ai/api/v1",
+    model: "openai/gpt-4o-mini",
+    badge: "OR",
+    hint: "统一网关 · 模型名含厂商前缀",
+    models: ["openai/gpt-4o-mini", "deepseek/deepseek-chat", "anthropic/claude-3.5-sonnet"],
+  },
+  {
+    id: "mimo",
+    label: "MiMo",
+    baseURL: "",
+    model: "",
+    badge: "M",
+    hint: "填你的兼容端点",
+    models: [],
   },
   {
     id: "custom",
-    label: "Custom OpenAI-compatible",
+    label: "自定义配置",
     baseURL: "",
     model: "",
+    badge: "＋",
+    hint: "任意 OpenAI 兼容 Base URL",
+    models: [],
   },
-] as const;
+];
 
-export const EMBEDDING_PRESETS = [
+export const EMBEDDING_PRESETS: readonly EmbeddingPresetPublic[] = [
   {
     id: "openai",
-    label: "OpenAI text-embedding-3-small (384 via dimensions)",
+    label: "OpenAI",
     baseURL: "https://api.openai.com/v1",
     model: "text-embedding-3-small",
     dimensions: 384,
+    badge: "OA",
+    hint: "推荐 · dimensions=384 对齐索引",
+    models: ["text-embedding-3-small", "text-embedding-3-large"],
+  },
+  {
+    id: "siliconflow",
+    label: "硅基流动",
+    baseURL: "https://api.siliconflow.cn/v1",
+    model: "BAAI/bge-large-zh-v1.5",
+    dimensions: 1024,
+    badge: "硅",
+    hint: "中文向量常见；维度须与库一致",
+    models: ["BAAI/bge-large-zh-v1.5", "BAAI/bge-m3", "netease-youdao/bce-embedding-base_v1"],
   },
   {
     id: "custom",
-    label: "Custom OpenAI-compatible",
+    label: "自定义",
     baseURL: "",
     model: "",
     dimensions: 384,
+    badge: "＋",
+    hint: "自建 TEI / 兼容 /embeddings",
+    models: [],
   },
   {
     id: "local-hash-dev",
-    label: "Local hash (DEV ONLY — not for production memory)",
+    label: "本地哈希 (仅开发)",
     baseURL: "",
     model: "local-hash",
     dimensions: 384,
+    badge: "⚠",
+    hint: "需 ALLOW_DEV_EMBEDDING · 勿用于正式记忆",
+    models: [],
   },
-] as const;
+];
 
 export function emptyModelSettings(): ModelSettings {
   return {
@@ -290,8 +393,25 @@ export function toPublicModelSettings(
       devEmbeddingWarning: embDev,
     },
     presets: {
-      llm: LLM_PRESETS.map((p) => ({ ...p })),
-      embedding: EMBEDDING_PRESETS.map((p) => ({ ...p })),
+      llm: LLM_PRESETS.map((p) => ({
+        id: p.id,
+        label: p.label,
+        baseURL: p.baseURL,
+        model: p.model,
+        badge: p.badge,
+        hint: p.hint,
+        models: p.models ? [...p.models] : undefined,
+      })),
+      embedding: EMBEDDING_PRESETS.map((p) => ({
+        id: p.id,
+        label: p.label,
+        baseURL: p.baseURL,
+        model: p.model,
+        dimensions: p.dimensions,
+        badge: p.badge,
+        hint: p.hint,
+        models: p.models ? [...p.models] : undefined,
+      })),
     },
   };
 }

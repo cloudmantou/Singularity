@@ -1841,7 +1841,7 @@
         box-shadow: var(--shadow-card);
       }
 
-      /* ============ MODELS CONTROL PLANE ============ */
+      /* ============ MODELS CONTROL PLANE (provider cards) ============ */
       #models-sheet {
         position: fixed;
         inset: 0;
@@ -1862,12 +1862,12 @@
 
       .models-inner {
         width: 100%;
-        max-width: 480px;
-        max-height: min(92vh, 780px);
+        max-width: 520px;
+        max-height: min(94vh, 860px);
         overflow: auto;
         background: var(--bg-card);
         border-radius: 22px 22px 0 0;
-        padding: 22px 20px 28px;
+        padding: 20px 18px 28px;
         box-shadow: var(--shadow-sheet);
         transform: translateY(24px);
         transition: transform 0.28s var(--ease);
@@ -1887,15 +1887,43 @@
       .models-sub {
         font-size: 13px;
         color: var(--text-secondary);
-        margin-bottom: 16px;
+        margin-bottom: 12px;
         line-height: 1.45;
+      }
+
+      .models-tabs {
+        display: flex;
+        gap: 6px;
+        background: var(--surface-2);
+        border-radius: var(--radius-pill);
+        padding: 4px;
+        margin-bottom: 14px;
+      }
+
+      .models-tabs button {
+        flex: 1;
+        border: none;
+        background: transparent;
+        border-radius: var(--radius-pill);
+        padding: 10px 12px;
+        font-family: var(--font-sans);
+        font-size: 13.5px;
+        font-weight: 500;
+        color: var(--text-secondary);
+        cursor: pointer;
+      }
+
+      .models-tabs button.active {
+        background: var(--bg-card);
+        color: var(--accent-ink);
+        box-shadow: var(--shadow-card);
       }
 
       .models-status {
         display: flex;
         flex-wrap: wrap;
         gap: 8px;
-        margin-bottom: 16px;
+        margin-bottom: 14px;
       }
 
       .models-pill {
@@ -1916,19 +1944,95 @@
         color: var(--accent-ink);
       }
 
-      .models-section {
-        border-top: 0.5px solid var(--border);
-        padding: 14px 0 6px;
-        margin-top: 4px;
+      .models-panel {
+        display: none;
       }
 
-      .models-section h4 {
-        font-size: 13px;
+      .models-panel.active {
+        display: block;
+      }
+
+      .models-section-label {
+        font-size: 12px;
         font-weight: 600;
-        letter-spacing: 0.02em;
+        letter-spacing: 0.04em;
         text-transform: uppercase;
         color: var(--text-tertiary);
-        margin-bottom: 12px;
+        margin: 4px 0 10px;
+      }
+
+      .provider-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+        margin-bottom: 14px;
+      }
+
+      @media (min-width: 480px) {
+        .provider-grid {
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+        }
+      }
+
+      .provider-card {
+        position: relative;
+        border: 1px solid var(--border-input);
+        background: var(--bg);
+        border-radius: 14px;
+        padding: 12px 10px 10px;
+        text-align: left;
+        cursor: pointer;
+        font-family: var(--font-sans);
+        transition:
+          border-color 0.15s,
+          background 0.15s,
+          box-shadow 0.15s;
+        min-height: 72px;
+      }
+
+      .provider-card:hover {
+        border-color: rgba(178, 102, 65, 0.35);
+      }
+
+      .provider-card.active {
+        border-color: var(--accent);
+        background: var(--accent-soft);
+        box-shadow: 0 0 0 1px var(--accent);
+      }
+
+      .provider-card .pc-badge {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 28px;
+        height: 22px;
+        padding: 0 6px;
+        border-radius: 8px;
+        background: var(--surface-2);
+        color: var(--accent-ink);
+        font-size: 11px;
+        font-weight: 700;
+        margin-bottom: 6px;
+      }
+
+      .provider-card.active .pc-badge {
+        background: var(--bg-card);
+      }
+
+      .provider-card .pc-name {
+        display: block;
+        font-size: 13.5px;
+        font-weight: 600;
+        color: var(--text-primary);
+        line-height: 1.25;
+      }
+
+      .provider-card .pc-hint {
+        display: block;
+        margin-top: 3px;
+        font-size: 11px;
+        color: var(--text-tertiary);
+        line-height: 1.3;
       }
 
       .models-field {
@@ -1940,6 +2044,23 @@
         font-size: 12.5px;
         color: var(--text-secondary);
         margin-bottom: 5px;
+      }
+
+      .models-field .label-row {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 5px;
+      }
+
+      .models-field .label-row label {
+        margin-bottom: 0;
+      }
+
+      .models-field .label-hint {
+        font-size: 11px;
+        color: var(--text-tertiary);
       }
 
       .models-field input,
@@ -1958,6 +2079,35 @@
       .models-field input:focus,
       .models-field select:focus {
         border-color: var(--accent);
+      }
+
+      .models-field input[readonly] {
+        opacity: 0.85;
+      }
+
+      .models-advanced {
+        margin: 4px 0 10px;
+        border-radius: 12px;
+        border: 1px dashed var(--border);
+        padding: 0 12px;
+      }
+
+      .models-advanced summary {
+        cursor: pointer;
+        list-style: none;
+        font-size: 13px;
+        color: var(--text-secondary);
+        padding: 11px 0;
+        user-select: none;
+      }
+
+      .models-advanced summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .models-advanced[open] summary {
+        border-bottom: 0.5px solid var(--border);
+        margin-bottom: 10px;
       }
 
       .models-actions {
@@ -2665,7 +2815,7 @@
           </div>
         </div>
         <button class="menu-item" onclick="openModelsSettings()">
-          <i class="ti ti-cpu"></i> Models &amp; API
+          <i class="ti ti-cpu"></i> 模型与 API
         </button>
         <button
           class="menu-item"
@@ -2686,66 +2836,93 @@
 
     <div id="models-sheet" onclick="if(event.target===this)closeModelsSettings()">
       <div class="models-inner" onclick="event.stopPropagation()">
-        <h3>Models &amp; API</h3>
+        <h3>模型与 API</h3>
         <p class="models-sub">
-          Configure chat and embedding providers from the control plane. Changes apply immediately — no restart.
-          API keys are stored in your local database; protect the DB file and AUTH_TOKEN.
+          点选供应商后自动填入接口地址与推荐模型，一般只需填写 API Key。保存后立即生效，无需重启。
+          Key 存在本机数据库，请保护好数据库文件与登录令牌。
         </p>
         <div class="models-status" id="models-status"></div>
 
-        <div class="models-section">
-          <h4>Chat LLM</h4>
+        <div class="models-tabs" role="tablist">
+          <button type="button" class="active" id="models-tab-llm" onclick="switchModelsTab('llm')">对话模型</button>
+          <button type="button" id="models-tab-emb" onclick="switchModelsTab('emb')">向量模型</button>
+        </div>
+
+        <!-- Chat -->
+        <div class="models-panel active" id="models-panel-llm">
+          <div class="models-section-label">预设供应商</div>
+          <div class="provider-grid" id="llm-provider-grid"></div>
+          <input type="hidden" id="llm-provider" value="custom" />
+
           <div class="models-field">
-            <label for="llm-provider">Provider preset</label>
-            <select id="llm-provider" onchange="onLlmPresetChange()"></select>
+            <div class="label-row">
+              <label for="llm-key">API Key</label>
+              <span class="label-hint" id="llm-key-hint">必填（已保存可留空）</span>
+            </div>
+            <input id="llm-key" type="password" placeholder="粘贴你的 API Key" autocomplete="new-password" />
           </div>
-          <div class="models-field">
-            <label for="llm-base">Base URL</label>
-            <input id="llm-base" type="url" placeholder="https://api.deepseek.com/v1" autocomplete="off" />
-          </div>
-          <div class="models-field">
-            <label for="llm-model">Model</label>
-            <input id="llm-model" type="text" placeholder="deepseek-chat" autocomplete="off" />
-          </div>
-          <div class="models-field">
-            <label for="llm-key">API Key</label>
-            <input id="llm-key" type="password" placeholder="Leave blank to keep current" autocomplete="new-password" />
-          </div>
+
+          <details class="models-advanced" id="llm-advanced">
+            <summary>高级选项 · 接口地址 / 模型</summary>
+            <div class="models-field">
+              <label for="llm-base">接口地址 (Base URL)</label>
+              <input id="llm-base" type="url" placeholder="https://api.deepseek.com/v1" autocomplete="off" />
+            </div>
+            <div class="models-field">
+              <label for="llm-model">模型 ID</label>
+              <select id="llm-model-select" style="display: none; margin-bottom: 8px" onchange="onLlmModelSelectChange()"></select>
+              <input id="llm-model" type="text" placeholder="deepseek-v4-flash" autocomplete="off" />
+            </div>
+          </details>
+
           <div class="models-actions">
-            <button type="button" class="models-btn" id="llm-test-btn" onclick="testModelSettings('llm')">Test chat</button>
+            <button type="button" class="models-btn" id="llm-test-btn" onclick="testModelSettings('llm')">测试对话</button>
           </div>
         </div>
 
-        <div class="models-section">
-          <h4>Embedding</h4>
-          <div class="models-field">
-            <label for="emb-provider">Provider</label>
-            <select id="emb-provider" onchange="onEmbPresetChange()"></select>
-          </div>
-          <div class="models-field" id="emb-base-wrap">
-            <label for="emb-base">Base URL</label>
-            <input id="emb-base" type="url" placeholder="https://api.openai.com/v1" autocomplete="off" />
-          </div>
-          <div class="models-field" id="emb-model-wrap">
-            <label for="emb-model">Model</label>
-            <input id="emb-model" type="text" placeholder="text-embedding-3-small" autocomplete="off" />
-          </div>
+        <!-- Embedding -->
+        <div class="models-panel" id="models-panel-emb">
+          <div class="models-section-label">预设供应商</div>
+          <div class="provider-grid" id="emb-provider-grid"></div>
+          <input type="hidden" id="emb-provider" value="custom" />
+
           <div class="models-field" id="emb-key-wrap">
-            <label for="emb-key">API Key</label>
-            <input id="emb-key" type="password" placeholder="Leave blank to keep current" autocomplete="new-password" />
+            <div class="label-row">
+              <label for="emb-key">API Key</label>
+              <span class="label-hint" id="emb-key-hint">与对话可共用不同 Key</span>
+            </div>
+            <input id="emb-key" type="password" placeholder="粘贴 Embedding API Key" autocomplete="new-password" />
           </div>
+
           <div class="models-field">
-            <label for="emb-dim">Dimensions</label>
+            <div class="label-row">
+              <label for="emb-dim">向量维度</label>
+              <span class="label-hint">须与索引一致 · 常用 384</span>
+            </div>
             <input id="emb-dim" type="number" min="1" step="1" placeholder="384" />
           </div>
+
+          <details class="models-advanced" id="emb-advanced">
+            <summary>高级选项 · 接口地址 / 模型</summary>
+            <div class="models-field" id="emb-base-wrap">
+              <label for="emb-base">接口地址 (Base URL)</label>
+              <input id="emb-base" type="url" placeholder="https://api.openai.com/v1" autocomplete="off" />
+            </div>
+            <div class="models-field" id="emb-model-wrap">
+              <label for="emb-model">模型 ID</label>
+              <select id="emb-model-select" style="display: none; margin-bottom: 8px" onchange="onEmbModelSelectChange()"></select>
+              <input id="emb-model" type="text" placeholder="text-embedding-3-small" autocomplete="off" />
+            </div>
+          </details>
+
           <div class="models-actions">
-            <button type="button" class="models-btn" id="emb-test-btn" onclick="testModelSettings('embedding')">Test embedding</button>
+            <button type="button" class="models-btn" id="emb-test-btn" onclick="testModelSettings('embedding')">测试向量</button>
           </div>
         </div>
 
         <div class="models-actions" style="margin-top: 18px">
-          <button type="button" class="models-btn primary" id="models-save-btn" onclick="saveModelSettings()">Save</button>
-          <button type="button" class="models-btn" onclick="closeModelsSettings()">Close</button>
+          <button type="button" class="models-btn primary" id="models-save-btn" onclick="saveModelSettings()">保存</button>
+          <button type="button" class="models-btn" onclick="closeModelsSettings()">关闭</button>
         </div>
         <div class="models-msg" id="models-msg"></div>
       </div>
@@ -3374,8 +3551,9 @@
         document.getElementById('menu-sheet').classList.remove('open')
       }
 
-      // ── Models control plane ──────────────────────────────────────────────
+      // ── Models control plane (provider cards) ────────────────────────────
       let _modelPresets = { llm: [], embedding: [] }
+      let _modelsTab = 'llm'
 
       function setModelsMsg(text, kind) {
         const el = document.getElementById('models-msg')
@@ -3384,69 +3562,120 @@
         el.className = 'models-msg' + (kind ? ' ' + kind : '')
       }
 
-      function fillSelect(sel, items, selected) {
-        sel.innerHTML = ''
-        items.forEach((p) => {
-          const opt = document.createElement('option')
-          opt.value = p.id
-          opt.textContent = p.label
-          if (p.id === selected) opt.selected = true
-          sel.appendChild(opt)
+      function switchModelsTab(tab) {
+        _modelsTab = tab
+        document.getElementById('models-tab-llm').classList.toggle('active', tab === 'llm')
+        document.getElementById('models-tab-emb').classList.toggle('active', tab === 'emb')
+        document.getElementById('models-panel-llm').classList.toggle('active', tab === 'llm')
+        document.getElementById('models-panel-emb').classList.toggle('active', tab === 'emb')
+      }
+
+      function renderProviderGrid(kind, selectedId) {
+        const presets = kind === 'llm' ? _modelPresets.llm : _modelPresets.embedding
+        const grid = document.getElementById(kind === 'llm' ? 'llm-provider-grid' : 'emb-provider-grid')
+        if (!grid) return
+        grid.innerHTML = ''
+        presets.forEach((p) => {
+          const btn = document.createElement('button')
+          btn.type = 'button'
+          btn.className = 'provider-card' + (p.id === selectedId ? ' active' : '')
+          btn.dataset.id = p.id
+          btn.innerHTML =
+            `<span class="pc-badge">${escHtml(p.badge || p.id.slice(0, 2).toUpperCase())}</span>` +
+            `<span class="pc-name">${escHtml(p.label || p.id)}</span>` +
+            (p.hint ? `<span class="pc-hint">${escHtml(p.hint)}</span>` : '')
+          btn.onclick = () => selectProvider(kind, p.id, true)
+          grid.appendChild(btn)
         })
-        if (!items.find((p) => p.id === selected) && selected) {
-          const opt = document.createElement('option')
-          opt.value = selected
-          opt.textContent = selected
-          opt.selected = true
-          sel.appendChild(opt)
+      }
+
+      function fillModelSelect(selectEl, models, current) {
+        if (!selectEl) return
+        const list = Array.isArray(models) ? models.filter(Boolean) : []
+        if (!list.length) {
+          selectEl.style.display = 'none'
+          selectEl.innerHTML = ''
+          return
         }
-      }
-
-      function onLlmPresetChange() {
-        const id = document.getElementById('llm-provider').value
-        const p = _modelPresets.llm.find((x) => x.id === id)
-        if (!p) return
-        if (p.baseURL) document.getElementById('llm-base').value = p.baseURL
-        if (p.model) document.getElementById('llm-model').value = p.model
-      }
-
-      function onEmbPresetChange() {
-        const id = document.getElementById('emb-provider').value
-        const local = id === 'local' || id === 'local-hash' || id === 'local-hash-dev'
-        ;['emb-base-wrap', 'emb-model-wrap', 'emb-key-wrap'].forEach((wid) => {
-          const el = document.getElementById(wid)
-          if (el) el.style.display = local ? 'none' : ''
+        selectEl.style.display = 'block'
+        selectEl.innerHTML = ''
+        const uniq = [...new Set(list.concat(current ? [current] : []).filter(Boolean))]
+        uniq.forEach((m) => {
+          const opt = document.createElement('option')
+          opt.value = m
+          opt.textContent = m
+          if (m === current) opt.selected = true
+          selectEl.appendChild(opt)
         })
-        const p = _modelPresets.embedding.find((x) => x.id === id)
-        if (!p) return
-        if (local) {
-          document.getElementById('emb-base').value = ''
-          document.getElementById('emb-model').value = p.model || 'local-hash'
-          document.getElementById('emb-dim').value = p.dimensions || 384
+      }
+
+      function selectProvider(kind, id, applyDefaults) {
+        const presets = kind === 'llm' ? _modelPresets.llm : _modelPresets.embedding
+        const p = presets.find((x) => x.id === id) || { id, label: id, baseURL: '', model: '', dimensions: 384 }
+        document.getElementById(kind === 'llm' ? 'llm-provider' : 'emb-provider').value = id
+        renderProviderGrid(kind, id)
+
+        if (kind === 'llm') {
+          if (applyDefaults) {
+            if (p.baseURL != null) document.getElementById('llm-base').value = p.baseURL || ''
+            if (p.model) document.getElementById('llm-model').value = p.model
+          }
+          fillModelSelect(document.getElementById('llm-model-select'), p.models, document.getElementById('llm-model').value)
+          const isCustom = id === 'custom' || id === 'mimo'
+          document.getElementById('llm-advanced').open = isCustom || !p.baseURL
         } else {
-          if (p.baseURL) document.getElementById('emb-base').value = p.baseURL
-          if (p.model) document.getElementById('emb-model').value = p.model
-          if (p.dimensions) document.getElementById('emb-dim').value = p.dimensions
+          const local = id === 'local' || id === 'local-hash' || id === 'local-hash-dev'
+          ;['emb-base-wrap', 'emb-model-wrap', 'emb-key-wrap'].forEach((wid) => {
+            const el = document.getElementById(wid)
+            if (el) el.style.display = local ? 'none' : ''
+          })
+          if (applyDefaults) {
+            if (local) {
+              document.getElementById('emb-base').value = ''
+              document.getElementById('emb-model').value = p.model || 'local-hash'
+              document.getElementById('emb-dim').value = p.dimensions || 384
+            } else {
+              if (p.baseURL != null) document.getElementById('emb-base').value = p.baseURL || ''
+              if (p.model) document.getElementById('emb-model').value = p.model
+              if (p.dimensions) document.getElementById('emb-dim').value = p.dimensions
+            }
+          }
+          fillModelSelect(document.getElementById('emb-model-select'), p.models, document.getElementById('emb-model').value)
+          document.getElementById('emb-advanced').open = id === 'custom' || local
         }
+      }
+
+      function onLlmModelSelectChange() {
+        const v = document.getElementById('llm-model-select').value
+        if (v) document.getElementById('llm-model').value = v
+      }
+
+      function onEmbModelSelectChange() {
+        const v = document.getElementById('emb-model-select').value
+        if (v) document.getElementById('emb-model').value = v
       }
 
       function renderModelsStatus(data) {
         const box = document.getElementById('models-status')
         if (!box) return
-        const llm = data.status?.llm || 'unconfigured'
-        const emb = data.status?.embedding || 'unconfigured'
-        const src = data.status?.source || 'default'
+        const llmOk = data.status?.llm === 'openai-compatible' || data.status?.llm === 'workers-ai'
+        const embOk = data.status?.embedding === 'openai-compatible' || data.status?.embedding === 'workers-ai'
         const pill = (label, ok) =>
-          `<span class="models-pill ${ok ? 'ok' : label.includes('unconfigured') || label.includes('DEV') || label.includes('reindex') ? 'warn' : ''}">${label}</span>`
-        let html =
-          pill('LLM: ' + llm, llm === 'openai-compatible' || llm === 'workers-ai') +
-          pill('Embed: ' + emb, emb === 'openai-compatible' || emb === 'workers-ai') +
-          pill('Source: ' + src, src === 'control-plane' || src === 'mixed')
+          `<span class="models-pill ${ok ? 'ok' : 'warn'}">${escHtml(label)}</span>`
+
+        const llmLabel = data.llm?.model
+          ? `对话：${data.llm.provider || '—'} · ${data.llm.model}`
+          : `对话：${data.status?.llm === 'unconfigured' ? '未配置' : data.status?.llm || '—'}`
+        const embLabel = data.embedding?.model
+          ? `向量：${data.embedding.provider || '—'} · ${data.embedding.model} · ${data.embedding.dimensions || '?'}维`
+          : `向量：${data.status?.embedding === 'unconfigured' ? '未配置' : data.status?.embedding || '—'}`
+
+        let html = pill(llmLabel, llmOk) + pill(embLabel, embOk)
         if (data.status?.devEmbeddingWarning) {
-          html += pill('DEV hash vectors — not for production', false)
+          html += pill('开发用哈希向量 · 勿用于正式记忆', false)
         }
         if (data.status?.reindexRequired) {
-          html += pill('reindex required', false)
+          html += pill('需重建向量索引', false)
         }
         box.innerHTML = html
       }
@@ -3454,7 +3683,8 @@
       async function openModelsSettings() {
         closeMenu()
         document.getElementById('models-sheet').classList.add('open')
-        setModelsMsg('Loading…')
+        switchModelsTab('llm')
+        setModelsMsg('加载中…')
         try {
           const res = await fetch(`${WORKER_URL}/settings/models`, {
             headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
@@ -3465,29 +3695,36 @@
           }
           const data = await res.json()
           _modelPresets = data.presets || { llm: [], embedding: [] }
-          if (!_modelPresets.llm.find((p) => p.id === 'custom')) {
-            _modelPresets.llm.push({ id: 'custom', label: 'Custom', baseURL: '', model: '' })
-          }
-          fillSelect(document.getElementById('llm-provider'), _modelPresets.llm, data.llm?.provider || 'custom')
-          fillSelect(
-            document.getElementById('emb-provider'),
-            _modelPresets.embedding,
-            data.embedding?.provider || 'local'
-          )
+
+          const llmId = data.llm?.provider && data.llm.provider !== 'none' ? data.llm.provider : 'custom'
+          const embId =
+            data.embedding?.provider && data.embedding.provider !== 'none'
+              ? data.embedding.provider
+              : 'openai'
+
           document.getElementById('llm-base').value = data.llm?.baseURL || ''
           document.getElementById('llm-model').value = data.llm?.model || ''
           document.getElementById('llm-key').value = ''
           document.getElementById('llm-key').placeholder = data.llm?.hasApiKey
-            ? 'Saved · enter new key to replace'
-            : 'API key'
+            ? '已保存 · 留空保持不变'
+            : '粘贴你的 API Key'
+          document.getElementById('llm-key-hint').textContent = data.llm?.hasApiKey ? '已保存' : '必填'
+
           document.getElementById('emb-base').value = data.embedding?.baseURL || ''
           document.getElementById('emb-model').value = data.embedding?.model || ''
           document.getElementById('emb-dim').value = data.embedding?.dimensions || 384
           document.getElementById('emb-key').value = ''
           document.getElementById('emb-key').placeholder = data.embedding?.hasApiKey
-            ? 'Saved · enter new key to replace'
-            : 'API key'
-          onEmbPresetChange()
+            ? '已保存 · 留空保持不变'
+            : '粘贴 Embedding API Key'
+          document.getElementById('emb-key-hint').textContent = data.embedding?.hasApiKey ? '已保存' : '与对话可不同'
+
+          selectProvider('llm', llmId, false)
+          selectProvider('emb', embId, false)
+          // Ensure hidden ids match even if preset missing
+          document.getElementById('llm-provider').value = llmId
+          document.getElementById('emb-provider').value = embId
+
           renderModelsStatus(data)
           setModelsMsg('')
         } catch (e) {
@@ -3500,7 +3737,7 @@
       }
 
       async function saveModelSettings() {
-        setModelsMsg('Saving…')
+        setModelsMsg('保存中…')
         const saveBtn = document.getElementById('models-save-btn')
         saveBtn.disabled = true
         try {
@@ -3517,20 +3754,20 @@
             body: JSON.stringify(body),
           })
           const data = await res.json()
-          if (!res.ok || !data.ok) throw new Error(data.error || 'Save failed')
+          if (!res.ok || !data.ok) throw new Error(data.error || '保存失败')
           document.getElementById('llm-key').value = ''
           document.getElementById('emb-key').value = ''
           document.getElementById('llm-key').placeholder = data.settings?.llm?.hasApiKey
-            ? 'Saved · enter new key to replace'
-            : 'API key'
+            ? '已保存 · 留空保持不变'
+            : '粘贴你的 API Key'
           document.getElementById('emb-key').placeholder = data.settings?.embedding?.hasApiKey
-            ? 'Saved · enter new key to replace'
-            : 'API key'
+            ? '已保存 · 留空保持不变'
+            : '粘贴 Embedding API Key'
           if (data.settings) renderModelsStatus(data.settings)
-          let msg = 'Saved. New requests use this config.'
+          let msg = '已保存，新请求立即使用此配置。'
           if (data.warning) msg += ' ' + data.warning
           if (data.embeddingFingerprintChanged) {
-            msg += ' Tip: POST /settings/models/reindex then re-vectorize.'
+            msg += ' 如更换了向量模型/维度，请执行重建索引后再 vectorize-pending。'
           }
           setModelsMsg(msg, data.warning ? 'error' : 'ok')
           return true
@@ -3561,8 +3798,7 @@
       }
 
       async function testModelSettings(target) {
-        // Probe candidate config only — does NOT save (avoid locking in bad keys).
-        setModelsMsg('Testing ' + target + ' (not saved)…')
+        setModelsMsg((target === 'embedding' ? '测试向量' : '测试对话') + '中（不会保存）…')
         const btn = document.getElementById(target === 'embedding' ? 'emb-test-btn' : 'llm-test-btn')
         btn.disabled = true
         try {
@@ -3575,11 +3811,11 @@
             body: JSON.stringify({ target, ...collectModelFormBody() }),
           })
           const data = await res.json()
-          if (!data.ok) throw new Error(data.error || 'Test failed')
+          if (!data.ok) throw new Error(data.error || '测试失败')
           if (target === 'embedding') {
-            setModelsMsg('Embedding OK · dim=' + data.dimensions + ' · not saved yet', 'ok')
+            setModelsMsg('向量测试通过 · 维度=' + data.dimensions + ' · 尚未保存', 'ok')
           } else {
-            setModelsMsg('Chat OK · reply=' + JSON.stringify(data.reply) + ' · not saved yet', 'ok')
+            setModelsMsg('对话测试通过 · 回复=' + JSON.stringify(data.reply) + ' · 尚未保存', 'ok')
           }
         } catch (e) {
           setModelsMsg(String(e.message || e), 'error')
