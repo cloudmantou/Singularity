@@ -24,9 +24,29 @@ const HOP_BY_HOP = new Set([
 ]);
 
 function buildRequestUrl(req: FastifyRequest): string {
-  const host = req.headers.host || "127.0.0.1";
+  // Prefer explicit public origin (ChatGPT OAuth issuer must be https://domain)
+  const configured = (process.env.PUBLIC_URL || process.env.PUBLIC_BASE_URL || "").trim();
+  if (configured) {
+    try {
+      const origin = new URL(configured).origin;
+      return `${origin}${req.url}`;
+    } catch {
+      /* fall through */
+    }
+  }
+
+  const xfHost = req.headers["x-forwarded-host"];
+  const hostRaw =
+    (Array.isArray(xfHost) ? xfHost[0] : xfHost) || req.headers.host || "127.0.0.1";
+  let host = String(hostRaw).split(",")[0].trim();
+  host = host.replace(/:443$/i, "").replace(/:80$/i, "");
+
   const protoHeader = req.headers["x-forwarded-proto"];
-  const proto = (Array.isArray(protoHeader) ? protoHeader[0] : protoHeader) || "http";
+  let proto =
+    (Array.isArray(protoHeader) ? protoHeader[0] : protoHeader) || "http";
+  proto = String(proto).split(",")[0].trim().toLowerCase();
+  if (String(hostRaw).includes(":443") && proto === "http") proto = "https";
+
   return `${proto}://${host}${req.url}`;
 }
 

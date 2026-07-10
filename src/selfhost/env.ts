@@ -65,6 +65,8 @@ export function createSelfhostEnv(options: SelfhostOptions = {}): {
     SELFHOST: "1",
     ALLOW_DEV_EMBEDDING: process.env.ALLOW_DEV_EMBEDDING,
     VECTORIZE_GRACE_MS: process.env.VECTORIZE_GRACE_MS,
+    PUBLIC_URL: process.env.PUBLIC_URL || process.env.PUBLIC_BASE_URL,
+    PUBLIC_BASE_URL: process.env.PUBLIC_BASE_URL || process.env.PUBLIC_URL,
     LLM_BASE_URL: process.env.LLM_BASE_URL,
     LLM_API_KEY: process.env.LLM_API_KEY,
     LLM_MODEL: process.env.LLM_MODEL,

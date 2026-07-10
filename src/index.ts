@@ -44,6 +44,18 @@ import {
   DEFAULT_TELEMETRY_CONFIG,
   type TelemetryConfig,
 } from "./telemetry";
+import {
+  buildAuthorizationServerMetadata,
+  buildProtectedResourceMetadata,
+  isOAuthAuthorizationServerWellKnown,
+  isOAuthProtectedResourceWellKnown,
+  jsonResponse as oauthJson,
+  resourcePathFromProtectedWellKnown,
+} from "./oauth/metadata";
+import {
+  resolvePublicOrigin,
+  rewriteRequestPublicOrigin,
+} from "./oauth/public-origin";
 
 export interface Env {
   DB: D1Database;
@@ -60,6 +72,12 @@ export interface Env {
   SELFHOST?: string;
   /** Required with EMBEDDING_PROVIDER=local-hash-dev for smoke tests only. */
   ALLOW_DEV_EMBEDDING?: string;
+  /**
+   * Public site origin for OAuth metadata (e.g. https://agent.mtzs.cloud).
+   * Required behind reverse proxies so ChatGPT sees https issuer, not http://host:443.
+   */
+  PUBLIC_URL?: string;
+  PUBLIC_BASE_URL?: string;
   /** OpenAI-compatible chat API (DeepSeek / MiniMax / MiMo / OpenAI). */
   LLM_BASE_URL?: string;
   LLM_API_KEY?: string;
@@ -3205,6 +3223,12 @@ function mergeFromEnvOnly(env: Env) {
 // Wrap both handlers in OAuthProvider. It auto-serves the OAuth metadata,
 // /oauth/token, and /oauth/register (RFC 7591) endpoints, and gates /mcp.
 // The scheduled handler runs the nightly compression cron alongside the fetch handler.
+//
+// We intercept OAuth discovery ourselves so ChatGPT / MCP clients always get a
+// correct HTTPS issuer even when the reverse proxy mangles request.url
+// (common: http://host:443). Endpoints stay at the site root:
+//   GET /.well-known/oauth-authorization-server
+//   GET /.well-known/oauth-protected-resource[/mcp]
 
 const oauthProvider = new OAuthProvider({
   apiRoute: "/mcp",
@@ -3222,9 +3246,54 @@ const oauthProvider = new OAuthProvider({
   },
 });
 
+async function handleOAuthDiscovery(
+  request: Request,
+  env: Env
+): Promise<Response | null> {
+  const url = new URL(request.url);
+  const path = url.pathname;
+
+  if (request.method === "OPTIONS") {
+    if (
+      isOAuthAuthorizationServerWellKnown(path) ||
+      isOAuthProtectedResourceWellKnown(path)
+    ) {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, OPTIONS",
+          "Access-Control-Allow-Headers": "Authorization, Content-Type, *",
+          "Access-Control-Max-Age": "86400",
+        },
+      });
+    }
+  }
+
+  if (request.method !== "GET" && request.method !== "HEAD") return null;
+
+  const origin = resolvePublicOrigin(request, env as Env & { PUBLIC_URL?: string });
+
+  if (isOAuthAuthorizationServerWellKnown(path)) {
+    return oauthJson(buildAuthorizationServerMetadata(origin));
+  }
+  if (isOAuthProtectedResourceWellKnown(path)) {
+    const resourcePath = resourcePathFromProtectedWellKnown(path);
+    return oauthJson(buildProtectedResourceMetadata(origin, resourcePath));
+  }
+  return null;
+}
+
 export default {
-  fetch: (req: Request, env: Env, ctx: ExecutionContext) =>
-    oauthProvider.fetch(req, env as any, ctx),
+  fetch: async (req: Request, env: Env, ctx: ExecutionContext) => {
+    // 1) Discovery must work before OAuthProvider / static routing
+    const discovery = await handleOAuthDiscovery(req, env);
+    if (discovery) return discovery;
+
+    // 2) Normalize origin so token WWW-Authenticate + redirects use public HTTPS
+    const normalized = rewriteRequestPublicOrigin(req, env as Env & { PUBLIC_URL?: string });
+    return oauthProvider.fetch(normalized, env as any, ctx);
+  },
   scheduled: async (_event: ScheduledEvent, env: Env, ctx: ExecutionContext) => {
     ctx.waitUntil(runScheduledMaintenance(env, ctx));
   },

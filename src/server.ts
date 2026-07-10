@@ -171,9 +171,21 @@ async function main() {
 
   await app.listen({ port: PORT, host: HOST });
   const displayHost = HOST === "0.0.0.0" ? "127.0.0.1" : HOST;
+  const publicUrl = process.env.PUBLIC_URL || process.env.PUBLIC_BASE_URL || "";
   console.log(`Second Brain self-host listening on http://${displayHost}:${PORT}`);
   console.log(`  database: ${databasePath}`);
   console.log(`  MCP:      http://${displayHost}:${PORT}/mcp`);
+  if (publicUrl) {
+    console.log(`  public:   ${publicUrl.replace(/\/+$/, "")}`);
+    console.log(
+      `  OAuth:    ${publicUrl.replace(/\/+$/, "")}/.well-known/oauth-authorization-server`
+    );
+  } else {
+    console.warn(
+      "[warn] PUBLIC_URL is not set. ChatGPT/MCP OAuth discovery may advertise http://host:443. " +
+        "Set PUBLIC_URL=https://your.domain in .env"
+    );
+  }
   console.log(
     `  LLM:      ${effective.llm.baseURL || env.LLM_BASE_URL || "(configure in Settings → Models)"}`
   );
