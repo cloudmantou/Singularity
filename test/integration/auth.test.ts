@@ -34,4 +34,13 @@ describe("Auth", () => {
       expect(res.status).toBe(401);
     });
   }
+
+  it("does not accept the owner token in the URL query string", async () => {
+    const res = await worker.fetch(
+      new Request("http://localhost/count?token=test-token"),
+      env,
+      ctx
+    );
+    expect(res.status).toBe(401);
+  });
 });

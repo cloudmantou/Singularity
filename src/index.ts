@@ -41,6 +41,7 @@ import {
   normalizeTelemetryConfig,
   routeToOperation,
   runWithTelemetryAsync,
+  shouldSuppressRequestBodyTelemetry,
   DEFAULT_TELEMETRY_CONFIG,
   type TelemetryConfig,
 } from "./telemetry";
@@ -75,14 +76,13 @@ export interface Env {
   /** Required with EMBEDDING_PROVIDER=local-hash-dev for smoke tests only. */
   ALLOW_DEV_EMBEDDING?: string;
   /**
-   * Public site origin from .env (PUBLIC_URL / PUBLIC_BASE_URL / SITE_URL / BASE_URL).
+   * Public site origin from .env (PUBLIC_URL / PUBLIC_BASE_URL / SITE_URL).
    * Example: https://your.domain — no trailing slash.
    * Required behind reverse proxies so OAuth issuer is https, not http://host:443.
    */
   PUBLIC_URL?: string;
   PUBLIC_BASE_URL?: string;
   SITE_URL?: string;
-  BASE_URL?: string;
   /** OpenAI-compatible chat API (DeepSeek / MiniMax / MiMo / OpenAI). */
   LLM_BASE_URL?: string;
   LLM_API_KEY?: string;
@@ -225,8 +225,7 @@ export function ensureDatabase(env: Env): Promise<void> {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function isAuthorized(request: Request, env: Env): boolean {
-  if (request.headers.get("Authorization") === `Bearer ${env.AUTH_TOKEN}`) return true;
-  return new URL(request.url).searchParams.get("token") === env.AUTH_TOKEN;
+  return request.headers.get("Authorization") === `Bearer ${env.AUTH_TOKEN}`;
 }
 
 function json(data: unknown, status = 200): Response {
@@ -1948,7 +1947,14 @@ const apiHandler = {
     return withRequestTelemetry(request, env, ctx, async () => {
       await ensureDatabase(env);
       const server = buildMcpServer(env, ctx);
-      return createMcpHandler(server)(request, env, ctx);
+      // Prefer a complete JSON-RPC response for POST requests. This is still
+      // MCP Streamable HTTP, but avoids reverse proxies buffering or dropping
+      // the first short-lived SSE frame during initialize/tools/list.
+      return createMcpHandler(server, { enableJsonResponse: true })(
+        request,
+        env,
+        ctx
+      );
     });
   },
 };
@@ -1970,15 +1976,17 @@ async function withRequestTelemetry(
   let reqPreview: string | null = null;
   let reqHash: string | null = null;
   let requestBytes = 0;
-  try {
-    const clone = request.clone();
-    const text = await clone.text().catch(() => "");
-    requestBytes = new TextEncoder().encode(text).length;
-    const p = previewText(text, config.contentLogging, config.previewMaxChars);
-    reqPreview = p.preview;
-    reqHash = p.hash;
-  } catch {
-    /* ignore */
+  if (!shouldSuppressRequestBodyTelemetry(url.pathname)) {
+    try {
+      const clone = request.clone();
+      const text = await clone.text().catch(() => "");
+      requestBytes = new TextEncoder().encode(text).length;
+      const p = previewText(text, config.contentLogging, config.previewMaxChars);
+      reqPreview = p.preview;
+      reqHash = p.hash;
+    } catch {
+      /* ignore */
+    }
   }
 
   const source =
@@ -2127,7 +2135,7 @@ const defaultHandler = {
         ok: true,
         ...cfg,
         // hint for operators
-        envKeys: ["PUBLIC_URL", "PUBLIC_BASE_URL", "SITE_URL", "BASE_URL"],
+        envKeys: ["PUBLIC_URL", "PUBLIC_BASE_URL", "SITE_URL"],
       });
     }
 
@@ -3285,9 +3293,12 @@ const oauthProvider = new OAuthProvider({
   // Public clients (token_endpoint_auth_method=none) are allowed for PKCE
   accessTokenTTL: 3600,
   // Accept the static AUTH_TOKEN for Claude Desktop + mcp-remote (no browser flow).
-  resolveExternalToken: async ({ token, env }) => {
+  resolveExternalToken: async ({ token, env, request }) => {
     if (token === (env as Env).AUTH_TOKEN) {
-      return { props: { userId: "owner" } };
+      return {
+        props: { userId: "owner" },
+        audience: `${new URL(request.url).origin}/mcp`,
+      };
     }
     return null;
   },

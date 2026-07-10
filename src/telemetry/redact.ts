@@ -37,6 +37,20 @@ export function previewText(
   return { preview: clipped, hash, length };
 }
 
+/**
+ * Credential exchange and MCP bodies may contain the owner token, OAuth codes,
+ * or private memories. Never preview or hash them, regardless of telemetry mode.
+ */
+export function shouldSuppressRequestBodyTelemetry(pathname: string): boolean {
+  const p = pathname.replace(/\/+$/, "") || "/";
+  return (
+    p === "/oauth" ||
+    p.startsWith("/oauth/") ||
+    p === "/mcp" ||
+    p.startsWith("/mcp/")
+  );
+}
+
 function simpleHash(s: string): string {
   let h = 2166136261;
   for (let i = 0; i < s.length; i++) {

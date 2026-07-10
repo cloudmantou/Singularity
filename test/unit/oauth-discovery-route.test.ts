@@ -29,6 +29,9 @@ describe("OAuth discovery routes", () => {
       "https://agent.mtzs.cloud/oauth/register"
     );
     expect(data.scopes_supported).toEqual(["mcp"]);
+    expect(data.revocation_endpoint).toBe(
+      "https://agent.mtzs.cloud/oauth/token"
+    );
   });
 
   it("GET /.well-known/oauth-protected-resource/mcp", async () => {

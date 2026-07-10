@@ -2,7 +2,7 @@
  * Resolve the public HTTPS origin for OAuth metadata and redirects.
  *
  * Behind Nginx, Request.url is often wrong (`http://host:443`). Prefer:
- * 1. PUBLIC_URL / PUBLIC_BASE_URL / SITE_URL / BASE_URL env (global site config)
+ * 1. PUBLIC_URL / PUBLIC_BASE_URL / SITE_URL env (global site config)
  * 2. X-Forwarded-Proto + X-Forwarded-Host / Host (strip default ports)
  */
 

@@ -73,14 +73,11 @@ Set up your Second Brain in three steps.
 
 Your `AUTH_TOKEN` is the password used to access your Second Brain.
 
-Use either:
+Use a randomly generated token rather than a memorable password:
 
-* A memorable phrase, such as `coffee-lover-2026`
-* A randomly generated token:
-
-  ```bash
-  openssl rand -base64 32
-  ```
+```bash
+openssl rand -base64 32
+```
 
 Save this token somewhere secure. You will need it when authorizing clients and testing your deployment.
 
@@ -205,7 +202,7 @@ This means your authentication token does not need to be placed in the client co
 PUBLIC_URL=https://YOUR-DOMAIN
 ```
 
-Aliases (first non-empty wins): `PUBLIC_URL` | `PUBLIC_BASE_URL` | `SITE_URL` | `BASE_URL`.  
+Aliases (first non-empty wins): `PUBLIC_URL` | `PUBLIC_BASE_URL` | `SITE_URL`.
 Inspect runtime config: `GET /config` (public, no secrets).
 
 **Behind Nginx:** proxy **all** of these paths to the Node process (do not reserve `/.well-known` only for ACME):

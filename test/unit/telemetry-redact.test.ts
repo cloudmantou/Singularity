@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { previewText, redactSecrets, routeToOperation } from "../../src/telemetry/redact";
+import {
+  previewText,
+  redactSecrets,
+  routeToOperation,
+  shouldSuppressRequestBodyTelemetry,
+} from "../../src/telemetry/redact";
 
 describe("telemetry redact", () => {
   it("redacts bearer and sk- keys", () => {
@@ -22,5 +27,14 @@ describe("telemetry redact", () => {
     expect(routeToOperation("GET", "/recall")).toBe("memory.recall");
     expect(routeToOperation("POST", "/import")).toBe("memory.import");
     expect(routeToOperation("PUT", "/settings/telemetry")).toBe("settings.telemetry");
+  });
+
+  it("never previews or hashes OAuth credentials and private MCP payloads", () => {
+    expect(shouldSuppressRequestBodyTelemetry("/oauth/authorize")).toBe(true);
+    expect(shouldSuppressRequestBodyTelemetry("/oauth/token")).toBe(true);
+    expect(shouldSuppressRequestBodyTelemetry("/oauth/register")).toBe(true);
+    expect(shouldSuppressRequestBodyTelemetry("/mcp")).toBe(true);
+    expect(shouldSuppressRequestBodyTelemetry("/mcp/session")).toBe(true);
+    expect(shouldSuppressRequestBodyTelemetry("/capture")).toBe(false);
   });
 });

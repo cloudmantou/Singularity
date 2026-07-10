@@ -12,7 +12,6 @@ export const PUBLIC_URL_ENV_KEYS = [
   "PUBLIC_URL",
   "PUBLIC_BASE_URL",
   "SITE_URL",
-  "BASE_URL",
 ] as const;
 
 export type PublicUrlEnv = Partial<
@@ -21,7 +20,6 @@ export type PublicUrlEnv = Partial<
   PUBLIC_URL?: string;
   PUBLIC_BASE_URL?: string;
   SITE_URL?: string;
-  BASE_URL?: string;
 };
 
 /** Strip trailing slashes; return empty string if unset/invalid. */
@@ -45,7 +43,7 @@ export function normalizePublicUrl(raw: string | undefined | null): string {
 
 /**
  * Read public site origin from env-like object (process.env or Worker Env).
- * Priority: PUBLIC_URL → PUBLIC_BASE_URL → SITE_URL → BASE_URL
+ * Priority: PUBLIC_URL → PUBLIC_BASE_URL → SITE_URL
  */
 export function readPublicUrl(env: PublicUrlEnv = {}): string {
   for (const key of PUBLIC_URL_ENV_KEYS) {

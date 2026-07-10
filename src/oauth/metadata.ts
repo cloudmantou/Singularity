@@ -24,7 +24,7 @@ export function buildAuthorizationServerMetadata(origin: string): Record<string,
       "none",
     ],
     code_challenge_methods_supported: ["S256"],
-    // Helpful for clients that probe revocation
+    // workers-oauth-provider implements RFC 7009 revocation on the token path.
     revocation_endpoint: `${base}/oauth/token`,
   };
 }

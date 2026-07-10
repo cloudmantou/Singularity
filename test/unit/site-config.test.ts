@@ -14,11 +14,14 @@ describe("site config PUBLIC_URL", () => {
   });
 
   it("reads first available env alias", () => {
-    expect(readPublicUrl({ BASE_URL: "https://a.example" })).toBe("https://a.example");
+    const unrelatedBaseUrl = {
+      BASE_URL: "https://wrong.example",
+    } as unknown as Parameters<typeof readPublicUrl>[0];
+    expect(readPublicUrl(unrelatedBaseUrl)).toBe("");
     expect(
       readPublicUrl({
         PUBLIC_URL: "https://primary.example",
-        BASE_URL: "https://secondary.example",
+        PUBLIC_BASE_URL: "https://secondary.example",
       })
     ).toBe("https://primary.example");
     expect(readPublicUrl({ SITE_URL: "https://site.example/" })).toBe(

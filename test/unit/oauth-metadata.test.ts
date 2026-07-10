@@ -24,6 +24,7 @@ describe("OAuth metadata", () => {
     );
     expect(m.scopes_supported).toEqual(["mcp"]);
     expect(m.code_challenge_methods_supported).toContain("S256");
+    expect(m.revocation_endpoint).toBe("https://agent.mtzs.cloud/oauth/token");
   });
 
   it("builds protected resource metadata for /mcp", () => {
