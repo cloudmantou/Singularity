@@ -25,6 +25,25 @@ const HOP_BY_HOP = new Set([
   "upgrade",
 ]);
 
+/** Client aborted / proxy cut the socket mid-stream — never crash the process. */
+export function isBenignStreamClose(err: unknown): boolean {
+  if (err == null || typeof err !== "object") return false;
+  const e = err as NodeJS.ErrnoException & { name?: string };
+  const code = e.code || "";
+  if (
+    code === "ERR_STREAM_PREMATURE_CLOSE" ||
+    code === "ECONNRESET" ||
+    code === "EPIPE" ||
+    code === "ECANCELED" ||
+    code === "ABORT_ERR"
+  ) {
+    return true;
+  }
+  if (e.name === "AbortError") return true;
+  const msg = String(e.message || "");
+  return /premature close|aborted|socket hang up/i.test(msg);
+}
+
 function buildRequestUrl(req: FastifyRequest): string {
   // Prefer PUBLIC_URL from .env — single global site domain for OAuth issuer
   const configured = readPublicUrlFromProcess();
@@ -45,6 +64,67 @@ function buildRequestUrl(req: FastifyRequest): string {
   if (String(hostRaw).includes(":443") && proto === "http") proto = "https";
 
   return `${proto}://${host}${req.url}`;
+}
+
+/**
+ * Pipe Fetch SSE body → HTTP ServerResponse without crashing when the browser
+ * tab closes mid-stream (ERR_STREAM_PREMATURE_CLOSE).
+ */
+async function pipeSseToResponse(
+  webBody: ReadableStream,
+  req: FastifyRequest,
+  reply: FastifyReply,
+  status: number,
+  responseHeaders: Array<[string, string]>
+): Promise<void> {
+  // Hijack so Fastify does not end the response when the route handler returns.
+  reply.hijack();
+  reply.raw.statusCode = status;
+  for (const [key, value] of responseHeaders) {
+    reply.raw.setHeader(key, value);
+  }
+  reply.raw.setHeader("cache-control", "no-cache, no-transform");
+  reply.raw.setHeader("x-accel-buffering", "no");
+  if (!reply.raw.headersSent) {
+    reply.raw.flushHeaders();
+  }
+
+  const nodeStream = Readable.fromWeb(
+    webBody as unknown as import("stream/web").ReadableStream
+  );
+
+  // Swallow async stream errors so they never become uncaughtException
+  // after pipeline() has already settled (common on client disconnect).
+  const quiet = (err: unknown) => {
+    if (!isBenignStreamClose(err)) {
+      console.error("[sse] stream error:", err);
+    }
+  };
+  nodeStream.on("error", quiet);
+  reply.raw.on("error", quiet);
+
+  const abortUpstream = () => {
+    if (!nodeStream.destroyed) {
+      nodeStream.destroy();
+    }
+  };
+  // Client closed the socket (refresh, navigate away, proxy timeout)
+  req.raw.on("close", abortUpstream);
+  reply.raw.on("close", abortUpstream);
+
+  try {
+    await pipeline(nodeStream, reply.raw);
+  } catch (error) {
+    if (!isBenignStreamClose(error)) {
+      console.error("[sse] pipeline failed:", error);
+    }
+    // Always ensure source is torn down; destination may already be closed.
+    abortUpstream();
+  } finally {
+    req.raw.off("close", abortUpstream);
+    reply.raw.off("close", abortUpstream);
+    if (!nodeStream.destroyed) nodeStream.destroy();
+  }
 }
 
 export async function handleWithWorker(
@@ -106,29 +186,13 @@ export async function handleWithWorker(
 
   // Only stream true SSE; buffer everything else so JSON APIs never return empty bodies.
   if (contentType.includes("text/event-stream")) {
-    // Fastify considers an async handler complete as soon as it returns. Sending a
-    // Web/Node stream and returning immediately can therefore close the self-host
-    // response before the first delayed model token arrives. Hijack the raw response
-    // and await the pipeline so its lifetime matches the upstream SSE stream.
-    reply.hijack();
-    reply.raw.statusCode = response.status;
-    for (const [key, value] of responseHeaders) {
-      reply.raw.setHeader(key, value);
-    }
-    reply.raw.setHeader("cache-control", "no-cache, no-transform");
-    reply.raw.setHeader("x-accel-buffering", "no");
-    reply.raw.flushHeaders();
-
-    const nodeStream = Readable.fromWeb(
-      response.body as unknown as import("stream/web").ReadableStream
+    await pipeSseToResponse(
+      response.body,
+      req,
+      reply,
+      response.status,
+      responseHeaders
     );
-    try {
-      await pipeline(nodeStream, reply.raw);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ERR_STREAM_PREMATURE_CLOSE") {
-        throw error;
-      }
-    }
     return;
   }
 

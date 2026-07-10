@@ -18,7 +18,7 @@ import {
   createExecutionContext,
   createSelfhostEnv,
 } from "./selfhost/env";
-import { handleWithWorker } from "./selfhost/fetch-adapter";
+import { handleWithWorker, isBenignStreamClose } from "./selfhost/fetch-adapter";
 import { getEffectiveModelSettings } from "./settings/store";
 import { isDevLocalProvider } from "./settings/model-settings";
 import { flushTelemetry } from "./telemetry";
@@ -248,6 +248,7 @@ async function main() {
         urlPath.startsWith("/oauth") ||
         urlPath.startsWith("/capture") ||
         urlPath.startsWith("/recall") ||
+        urlPath.startsWith("/relations") ||
         urlPath.startsWith("/list") ||
         urlPath.startsWith("/count") ||
         urlPath.startsWith("/stats") ||
@@ -319,6 +320,24 @@ async function shutdown() {
 }
 process.on("SIGINT", () => void shutdown());
 process.on("SIGTERM", () => void shutdown());
+
+// Client disconnect mid-SSE must never kill the process (Node 20+/24 pipeline).
+process.on("uncaughtException", (err) => {
+  if (isBenignStreamClose(err)) {
+    console.warn("[stream] ignored premature close (client disconnected)");
+    return;
+  }
+  console.error("[fatal] uncaughtException:", err);
+  process.exit(1);
+});
+process.on("unhandledRejection", (reason) => {
+  if (isBenignStreamClose(reason)) {
+    console.warn("[stream] ignored premature close rejection (client disconnected)");
+    return;
+  }
+  console.error("[fatal] unhandledRejection:", reason);
+  process.exit(1);
+});
 
 main().catch((err) => {
   console.error(err);
