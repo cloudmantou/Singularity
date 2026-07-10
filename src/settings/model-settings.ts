@@ -4,7 +4,6 @@
  */
 
 export interface LlmSettings {
-  /** Preset id: deepseek | minimax | mimo | openai | custom | workers | none */
   provider: string;
   baseURL: string;
   apiKey: string;
@@ -12,20 +11,23 @@ export interface LlmSettings {
 }
 
 export interface EmbeddingSettings {
-  /** local-hash-dev | openai | custom | workers | none */
   provider: string;
   baseURL: string;
   apiKey: string;
   model: string;
   dimensions: number;
+  /** When true, send `dimensions` in embeddings API body (OpenAI / some Qwen). */
+  supportsDimensionsParameter?: boolean;
 }
 
 export interface ModelSettings {
   llm: LlmSettings;
   embedding: EmbeddingSettings;
   updatedAt?: number;
-  /** Fingerprint of last embedding config used for vectors (provider|model|dim|base). */
+  /** Fingerprint of vectors currently in the index. */
   embeddingFingerprint?: string;
+  /** Fingerprint of saved config waiting for full reindex. */
+  pendingEmbeddingFingerprint?: string;
 }
 
 export interface PublicModelSettings {
@@ -36,9 +38,11 @@ export interface PublicModelSettings {
   embedding: Omit<EmbeddingSettings, "apiKey"> & {
     apiKey: string;
     hasApiKey: boolean;
+    supportsDimensionsParameter?: boolean;
   };
   updatedAt?: number;
   embeddingFingerprint?: string;
+  pendingEmbeddingFingerprint?: string;
   status: {
     llm: "openai-compatible" | "workers-ai" | "unconfigured";
     embedding: "openai-compatible" | "local-dev" | "workers-ai" | "unconfigured";
@@ -52,17 +56,13 @@ export interface PublicModelSettings {
   };
 }
 
-/** Card UI metadata for OpenAI-compatible chat providers. */
 export interface ProviderPresetPublic {
   id: string;
   label: string;
   baseURL: string;
   model: string;
-  /** Short badge letter/emoji for cards */
   badge: string;
-  /** One-line Chinese hint under the card label */
   hint?: string;
-  /** Optional alternate models for the advanced <select> */
   models?: string[];
 }
 
@@ -75,21 +75,20 @@ export interface EmbeddingPresetPublic {
   badge: string;
   hint?: string;
   models?: string[];
+  supportsDimensionsParameter: boolean;
+  fixedDimensions?: number;
+  allowedDimensions?: number[];
 }
 
-/**
- * First-party / common OpenAI-compatible chat providers.
- * Intentionally not a full gateway catalog — prefer “自定义” for obscure relays.
- */
 export const LLM_PRESETS: readonly ProviderPresetPublic[] = [
   {
     id: "deepseek",
     label: "DeepSeek",
-    baseURL: "https://api.deepseek.com/v1",
+    baseURL: "https://api.deepseek.com",
     model: "deepseek-v4-flash",
     badge: "DS",
-    hint: "推荐 · 分类/摘要便宜稳定",
-    models: ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat"],
+    hint: "推荐 · 分类/摘要",
+    models: ["deepseek-v4-flash", "deepseek-v4-pro"],
   },
   {
     id: "minimax",
@@ -97,7 +96,7 @@ export const LLM_PRESETS: readonly ProviderPresetPublic[] = [
     baseURL: "https://api.minimax.io/v1",
     model: "MiniMax-M3",
     badge: "MM",
-    hint: "M3 · 已默认关 thinking",
+    hint: "M3 可关 thinking",
     models: ["MiniMax-M3", "MiniMax-M2.5", "MiniMax-Text-01"],
   },
   {
@@ -115,7 +114,7 @@ export const LLM_PRESETS: readonly ProviderPresetPublic[] = [
     baseURL: "https://api.siliconflow.cn/v1",
     model: "deepseek-ai/DeepSeek-V3",
     badge: "硅",
-    hint: "国内常用中转/模型聚合",
+    hint: "国内聚合",
     models: [
       "deepseek-ai/DeepSeek-V3",
       "Qwen/Qwen2.5-7B-Instruct",
@@ -128,17 +127,17 @@ export const LLM_PRESETS: readonly ProviderPresetPublic[] = [
     baseURL: "https://open.bigmodel.cn/api/paas/v4",
     model: "glm-4-flash",
     badge: "智",
-    hint: "OpenAI 兼容接口",
+    hint: "OpenAI 兼容",
     models: ["glm-4-flash", "glm-4-air", "glm-4"],
   },
   {
     id: "kimi",
-    label: "Kimi / 月之暗面",
-    baseURL: "https://api.moonshot.cn/v1",
-    model: "moonshot-v1-8k",
+    label: "Kimi",
+    baseURL: "https://api.moonshot.ai/v1",
+    model: "kimi-k2.6",
     badge: "K",
-    hint: "Moonshot OpenAI 兼容",
-    models: ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
+    hint: "通用推荐 k2.6",
+    models: ["kimi-k2.6", "kimi-k2.7-code", "kimi-k2.7-code-highspeed"],
   },
   {
     id: "openrouter",
@@ -146,16 +145,16 @@ export const LLM_PRESETS: readonly ProviderPresetPublic[] = [
     baseURL: "https://openrouter.ai/api/v1",
     model: "openai/gpt-4o-mini",
     badge: "OR",
-    hint: "统一网关 · 模型名含厂商前缀",
+    hint: "统一网关",
     models: ["openai/gpt-4o-mini", "deepseek/deepseek-chat", "anthropic/claude-3.5-sonnet"],
   },
   {
     id: "mimo",
-    label: "MiMo",
+    label: "MiMo / 自定义网关",
     baseURL: "",
     model: "",
     badge: "M",
-    hint: "填你的兼容端点",
+    hint: "需填高级配置",
     models: [],
   },
   {
@@ -164,7 +163,7 @@ export const LLM_PRESETS: readonly ProviderPresetPublic[] = [
     baseURL: "",
     model: "",
     badge: "＋",
-    hint: "任意 OpenAI 兼容 Base URL",
+    hint: "任意 OpenAI 兼容",
     models: [],
   },
 ];
@@ -177,18 +176,22 @@ export const EMBEDDING_PRESETS: readonly EmbeddingPresetPublic[] = [
     model: "text-embedding-3-small",
     dimensions: 384,
     badge: "OA",
-    hint: "推荐 · dimensions=384 对齐索引",
+    hint: "推荐 384 维",
     models: ["text-embedding-3-small", "text-embedding-3-large"],
+    supportsDimensionsParameter: true,
+    allowedDimensions: [384, 512, 768, 1536],
   },
   {
     id: "siliconflow",
-    label: "硅基流动",
+    label: "硅基流动 BGE",
     baseURL: "https://api.siliconflow.cn/v1",
     model: "BAAI/bge-large-zh-v1.5",
     dimensions: 1024,
     badge: "硅",
-    hint: "中文向量常见；维度须与库一致",
-    models: ["BAAI/bge-large-zh-v1.5", "BAAI/bge-m3", "netease-youdao/bce-embedding-base_v1"],
+    hint: "BGE 固定 1024 · 不传 dimensions",
+    models: ["BAAI/bge-large-zh-v1.5", "BAAI/bge-m3"],
+    supportsDimensionsParameter: false,
+    fixedDimensions: 1024,
   },
   {
     id: "custom",
@@ -197,8 +200,9 @@ export const EMBEDDING_PRESETS: readonly EmbeddingPresetPublic[] = [
     model: "",
     dimensions: 384,
     badge: "＋",
-    hint: "自建 TEI / 兼容 /embeddings",
+    hint: "自建 TEI / 兼容接口",
     models: [],
+    supportsDimensionsParameter: true,
   },
   {
     id: "local-hash-dev",
@@ -207,8 +211,10 @@ export const EMBEDDING_PRESETS: readonly EmbeddingPresetPublic[] = [
     model: "local-hash",
     dimensions: 384,
     badge: "⚠",
-    hint: "需 ALLOW_DEV_EMBEDDING · 勿用于正式记忆",
+    hint: "需 ALLOW_DEV_EMBEDDING",
     models: [],
+    supportsDimensionsParameter: false,
+    fixedDimensions: 384,
   },
 ];
 
@@ -221,6 +227,7 @@ export function emptyModelSettings(): ModelSettings {
       apiKey: "",
       model: "",
       dimensions: 384,
+      supportsDimensionsParameter: true,
     },
   };
 }
@@ -250,7 +257,6 @@ export function isMaskedSecret(value: string | undefined): boolean {
   return Boolean(value && value.includes("••"));
 }
 
-/** Env surface used when resolving effective provider config. */
 export interface SettingsEnvInput {
   SELFHOST?: string;
   ALLOW_DEV_EMBEDDING?: string;
@@ -269,11 +275,6 @@ function allowDevEmbedding(env: SettingsEnvInput): boolean {
   return env.ALLOW_DEV_EMBEDDING === "1" || env.ALLOW_DEV_EMBEDDING === "true";
 }
 
-/**
- * Merge stored control-plane settings with env fallbacks.
- * Stored non-empty fields win; empty stored apiKey falls back to env.
- * Self-host does NOT auto-enable local hash without ALLOW_DEV_EMBEDDING.
- */
 export function mergeModelSettings(
   stored: ModelSettings | null | undefined,
   env: SettingsEnvInput
@@ -301,13 +302,11 @@ export function mergeModelSettings(
             ? "workers"
             : "none";
 
-  // Refuse silent local without allow flag even if stored as local
-  if (isDevLocalProvider(embProvider) && !allowDevEmbedding(env)) {
-    if (!(env.EMBEDDING_BASE_URL && env.EMBEDDING_API_KEY) && !(env.AI && !isSelfhost)) {
-      embProvider = isDevLocalProvider(s.embedding.provider) ? s.embedding.provider : "none";
-      // Keep stored local id for UI, but createEmbedding will still reject without ALLOW_DEV_EMBEDDING
-    }
-  }
+  const preset = EMBEDDING_PRESETS.find((p) => p.id === embProvider);
+  const supportsDim =
+    s.embedding.supportsDimensionsParameter ??
+    preset?.supportsDimensionsParameter ??
+    true;
 
   return {
     llm: {
@@ -325,9 +324,11 @@ export function mergeModelSettings(
         s.embedding.dimensions ||
         parseInt(env.EMBEDDING_DIM || "384", 10) ||
         384,
+      supportsDimensionsParameter: supportsDim,
     },
     updatedAt: s.updatedAt,
     embeddingFingerprint: s.embeddingFingerprint,
+    pendingEmbeddingFingerprint: s.pendingEmbeddingFingerprint,
   };
 }
 
@@ -362,9 +363,11 @@ export function toPublicModelSettings(
         : "unconfigured";
 
   const currentFp = embeddingFingerprintOf(effective.embedding);
+  const active = effective.embeddingFingerprint;
+  const pending = effective.pendingEmbeddingFingerprint;
   const reindexRequired = Boolean(
-    effective.embeddingFingerprint &&
-      effective.embeddingFingerprint !== currentFp
+    (pending && pending !== active) ||
+      (active && active !== currentFp && !pending)
   );
 
   return {
@@ -382,9 +385,11 @@ export function toPublicModelSettings(
       dimensions: effective.embedding.dimensions,
       apiKey: maskSecret(effective.embedding.apiKey),
       hasApiKey: Boolean(effective.embedding.apiKey),
+      supportsDimensionsParameter: effective.embedding.supportsDimensionsParameter,
     },
     updatedAt: effective.updatedAt,
     embeddingFingerprint: effective.embeddingFingerprint,
+    pendingEmbeddingFingerprint: effective.pendingEmbeddingFingerprint,
     status: {
       llm: llmStatus,
       embedding: embStatus,
@@ -393,24 +398,11 @@ export function toPublicModelSettings(
       devEmbeddingWarning: embDev,
     },
     presets: {
-      llm: LLM_PRESETS.map((p) => ({
-        id: p.id,
-        label: p.label,
-        baseURL: p.baseURL,
-        model: p.model,
-        badge: p.badge,
-        hint: p.hint,
-        models: p.models ? [...p.models] : undefined,
-      })),
+      llm: LLM_PRESETS.map((p) => ({ ...p, models: p.models ? [...p.models] : undefined })),
       embedding: EMBEDDING_PRESETS.map((p) => ({
-        id: p.id,
-        label: p.label,
-        baseURL: p.baseURL,
-        model: p.model,
-        dimensions: p.dimensions,
-        badge: p.badge,
-        hint: p.hint,
+        ...p,
         models: p.models ? [...p.models] : undefined,
+        allowedDimensions: p.allowedDimensions ? [...p.allowedDimensions] : undefined,
       })),
     },
   };
@@ -419,14 +411,10 @@ export function toPublicModelSettings(
 export type ModelSettingsPatchBody = {
   llm?: Partial<LlmSettings> & { clearApiKey?: boolean };
   embedding?: Partial<EmbeddingSettings> & { clearApiKey?: boolean };
-  /** When true, update embeddingFingerprint to match the new embedding config. */
+  /** @deprecated Do not set active fingerprint on ordinary save. */
   acceptEmbeddingFingerprint?: boolean;
 };
 
-/**
- * Apply a partial PUT body onto previous stored settings.
- * Masked or empty apiKey keeps the previous key unless clearApiKey is true.
- */
 export function applyModelSettingsPatch(
   previous: ModelSettings,
   body: ModelSettingsPatchBody
@@ -469,22 +457,35 @@ export function applyModelSettingsPatch(
     }
     const preset = EMBEDDING_PRESETS.find((p) => p.id === next.embedding.provider);
     if (preset) {
+      next.embedding.supportsDimensionsParameter = preset.supportsDimensionsParameter;
       if (isDevLocalProvider(next.embedding.provider)) {
         next.embedding.baseURL = "";
         next.embedding.model = preset.model;
-        next.embedding.dimensions = preset.dimensions;
+        next.embedding.dimensions = preset.fixedDimensions ?? preset.dimensions;
       } else {
         if (!next.embedding.baseURL && preset.baseURL) next.embedding.baseURL = preset.baseURL;
         if (!next.embedding.model && preset.model) next.embedding.model = preset.model;
-        if (!next.embedding.dimensions) next.embedding.dimensions = preset.dimensions;
+        if (preset.fixedDimensions != null) {
+          next.embedding.dimensions = preset.fixedDimensions;
+        } else if (!next.embedding.dimensions) {
+          next.embedding.dimensions = preset.dimensions;
+        }
       }
     }
   }
 
-  if (body.acceptEmbeddingFingerprint) {
+  next.updatedAt = Date.now();
+  return next;
+}
+
+/** After successful full reindex, promote pending → active. */
+export function promoteEmbeddingFingerprint(settings: ModelSettings): ModelSettings {
+  const next = structuredClone(settings);
+  if (next.pendingEmbeddingFingerprint) {
+    next.embeddingFingerprint = next.pendingEmbeddingFingerprint;
+    next.pendingEmbeddingFingerprint = undefined;
+  } else {
     next.embeddingFingerprint = embeddingFingerprintOf(next.embedding);
   }
-
-  next.updatedAt = Date.now();
   return next;
 }

@@ -121,11 +121,13 @@ export async function resolveProviderEnv<T extends SettingsEnvInput & { DB?: D1D
         ? effective.embedding.provider
         : env.EMBEDDING_PROVIDER,
     EMBEDDING_DIM: String(effective.embedding.dimensions || 384),
+    EMBEDDING_SEND_DIMENSIONS:
+      effective.embedding.supportsDimensionsParameter === false ? "0" : "1",
     ALLOW_DEV_EMBEDDING: embLocal
       ? env.ALLOW_DEV_EMBEDDING || "true"
       : env.ALLOW_DEV_EMBEDDING,
     SELFHOST: env.SELFHOST,
-  };
+  } as T;
 }
 
 /** Build a one-off env overlay from a candidate config without writing to DB. */
@@ -144,6 +146,8 @@ export function overlayProviderEnvFromSettings<T extends SettingsEnvInput>(
     EMBEDDING_MODEL: embLocal ? undefined : candidate.embedding.model || undefined,
     EMBEDDING_PROVIDER: embLocal ? "local-hash-dev" : candidate.embedding.provider,
     EMBEDDING_DIM: String(candidate.embedding.dimensions || 384),
+    EMBEDDING_SEND_DIMENSIONS:
+      candidate.embedding.supportsDimensionsParameter === false ? "0" : "1",
     ALLOW_DEV_EMBEDDING: embLocal ? "true" : env.ALLOW_DEV_EMBEDDING,
   };
 }

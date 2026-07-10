@@ -15,8 +15,10 @@ export interface OpenAICompatibleConfig {
 }
 
 export interface OpenAICompatibleEmbeddingConfig extends OpenAICompatibleConfig {
-  /** Expected output dimensions; sent when the provider supports it and validated on response. */
+  /** Expected output dimensions; validated on response. */
   dimensions?: number;
+  /** Only send body.dimensions when the provider supports it (e.g. OpenAI, not SiliconFlow BGE). */
+  sendDimensionsParameter?: boolean;
 }
 
 function normalizeBaseURL(baseURL: string): string {
@@ -103,12 +105,14 @@ export class OpenAICompatibleEmbedding implements EmbeddingProvider {
   private apiKey: string;
   private model: string;
   private dimensions?: number;
+  private sendDimensionsParameter: boolean;
 
   constructor(config: OpenAICompatibleEmbeddingConfig) {
     this.baseURL = normalizeBaseURL(config.baseURL);
     this.apiKey = config.apiKey;
     this.model = config.model;
     this.dimensions = config.dimensions;
+    this.sendDimensionsParameter = config.sendDimensionsParameter !== false;
   }
 
   async embed(text: string): Promise<number[]> {
@@ -116,8 +120,12 @@ export class OpenAICompatibleEmbedding implements EmbeddingProvider {
       model: this.model,
       input: text,
     };
-    // OpenAI text-embedding-3-* supports dimensions; other providers may ignore or error.
-    if (this.dimensions != null && this.dimensions > 0) {
+    // Only OpenAI / some Qwen models support dimensions — SiliconFlow BGE rejects it.
+    if (
+      this.sendDimensionsParameter &&
+      this.dimensions != null &&
+      this.dimensions > 0
+    ) {
       body.dimensions = this.dimensions;
     }
 

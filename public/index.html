@@ -3554,6 +3554,8 @@
       // ── Models control plane (provider cards) ────────────────────────────
       let _modelPresets = { llm: [], embedding: [] }
       let _modelsTab = 'llm'
+      let _loadedLlmProvider = ''
+      let _loadedEmbProvider = ''
 
       /** Safe JSON parse of fetch Response — avoids cryptic "Unexpected end of JSON input". */
       async function readJsonResponse(res) {
@@ -3626,14 +3628,24 @@
 
       function selectProvider(kind, id, applyDefaults) {
         const presets = kind === 'llm' ? _modelPresets.llm : _modelPresets.embedding
-        const p = presets.find((x) => x.id === id) || { id, label: id, baseURL: '', model: '', dimensions: 384 }
+        const p = presets.find((x) => x.id === id) || {
+          id,
+          label: id,
+          baseURL: '',
+          model: '',
+          dimensions: 384,
+          supportsDimensionsParameter: true,
+        }
         document.getElementById(kind === 'llm' ? 'llm-provider' : 'emb-provider').value = id
         renderProviderGrid(kind, id)
 
         if (kind === 'llm') {
           if (applyDefaults) {
-            if (p.baseURL != null) document.getElementById('llm-base').value = p.baseURL || ''
-            if (p.model) document.getElementById('llm-model').value = p.model
+            // Always reset URL/model when switching cards (no leftover from previous provider)
+            document.getElementById('llm-base').value = p.baseURL ?? ''
+            document.getElementById('llm-model').value = p.model ?? ''
+            document.getElementById('llm-key').value = ''
+            document.getElementById('llm-key').placeholder = '粘贴你的 API Key'
           }
           fillModelSelect(document.getElementById('llm-model-select'), p.models, document.getElementById('llm-model').value)
           const isCustom = id === 'custom' || id === 'mimo'
@@ -3645,15 +3657,13 @@
             if (el) el.style.display = local ? 'none' : ''
           })
           if (applyDefaults) {
-            if (local) {
-              document.getElementById('emb-base').value = ''
-              document.getElementById('emb-model').value = p.model || 'local-hash'
-              document.getElementById('emb-dim').value = p.dimensions || 384
-            } else {
-              if (p.baseURL != null) document.getElementById('emb-base').value = p.baseURL || ''
-              if (p.model) document.getElementById('emb-model').value = p.model
-              if (p.dimensions) document.getElementById('emb-dim').value = p.dimensions
-            }
+            document.getElementById('emb-base').value = local ? '' : p.baseURL ?? ''
+            document.getElementById('emb-model').value = p.model ?? (local ? 'local-hash' : '')
+            document.getElementById('emb-dim').value = p.fixedDimensions ?? p.dimensions ?? 384
+            document.getElementById('emb-key').value = ''
+            document.getElementById('emb-key').placeholder = local ? '' : '粘贴 Embedding API Key'
+            const dimInput = document.getElementById('emb-dim')
+            dimInput.readOnly = p.supportsDimensionsParameter === false || p.fixedDimensions != null
           }
           fillModelSelect(document.getElementById('emb-model-select'), p.models, document.getElementById('emb-model').value)
           document.getElementById('emb-advanced').open = id === 'custom' || local
@@ -3735,12 +3745,17 @@
 
           selectProvider('llm', llmId, false)
           selectProvider('emb', embId, false)
-          // Ensure hidden ids match even if preset missing
           document.getElementById('llm-provider').value = llmId
           document.getElementById('emb-provider').value = embId
+          _loadedLlmProvider = llmId
+          _loadedEmbProvider = embId
 
           renderModelsStatus(data)
-          setModelsMsg('')
+          setModelsMsg(
+            data.status?.reindexRequired
+              ? '向量配置已变更，请在保存后使用「开始重建」或设置页提示完成向量重建。'
+              : ''
+          )
         } catch (e) {
           setModelsMsg(String(e.message || e), 'error')
         }
@@ -3755,10 +3770,24 @@
         const saveBtn = document.getElementById('models-save-btn')
         saveBtn.disabled = true
         try {
-          const body = {
-            ...collectModelFormBody(),
-            acceptEmbeddingFingerprint: true,
+          const body = collectModelFormBody()
+          // Switching provider without a new key is not allowed
+          if (
+            body.llm.provider !== _loadedLlmProvider &&
+            body.llm.provider !== 'none' &&
+            !String(body.llm.apiKey || '').trim()
+          ) {
+            throw new Error('切换对话供应商后必须重新填写 API Key')
           }
+          if (
+            body.embedding.provider !== _loadedEmbProvider &&
+            body.embedding.provider !== 'none' &&
+            body.embedding.provider !== 'local-hash-dev' &&
+            !String(body.embedding.apiKey || '').trim()
+          ) {
+            throw new Error('切换向量供应商后必须重新填写 API Key')
+          }
+          // Do NOT send acceptEmbeddingFingerprint — active FP only after reindex completes
           const res = await fetch(`${WORKER_URL}/settings/models`, {
             method: 'PUT',
             headers: {
@@ -3777,11 +3806,15 @@
           document.getElementById('emb-key').placeholder = data.settings?.embedding?.hasApiKey
             ? '已保存 · 留空保持不变'
             : '粘贴 Embedding API Key'
+          _loadedLlmProvider = body.llm.provider
+          _loadedEmbProvider = body.embedding.provider
           if (data.settings) renderModelsStatus(data.settings)
           let msg = '已保存，新请求立即使用此配置。'
           if (data.warning) msg += ' ' + data.warning
-          if (data.embeddingFingerprintChanged) {
-            msg += ' 如更换了向量模型/维度，请执行重建索引后再 vectorize-pending。'
+          if (data.reindexRequired || data.embeddingFingerprintChanged) {
+            if (confirm((data.warning || msg) + '\n\n是否立即开始重建向量索引？')) {
+              await startFullReindex()
+            }
           }
           setModelsMsg(msg, data.warning ? 'error' : 'ok')
           return true
@@ -3809,6 +3842,61 @@
             apiKey: document.getElementById('emb-key').value,
           },
         }
+      }
+
+      async function startFullReindex() {
+        setModelsMsg('正在清空旧向量…')
+        const r = await fetch(`${WORKER_URL}/settings/models/reindex`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+        })
+        const data = await readJsonResponse(r)
+        if (!r.ok || !data.ok) throw new Error(data.error || 'reindex 失败')
+        setModelsMsg(`已重置 ${data.entriesReset || 0} 条，开始批量向量化…`)
+        await runVectorizeLoop({ limit: 100, includeRecent: true })
+      }
+
+      /** Loop vectorize-pending until remaining=0 or stuck. */
+      async function runVectorizeLoop(opts = {}) {
+        const limit = opts.limit || 100
+        const includeRecent = opts.includeRecent !== false
+        let remaining = 1
+        let totalProcessed = 0
+        let totalFailed = 0
+        let stagnant = 0
+        while (remaining > 0) {
+          const res = await fetch(`${WORKER_URL}/vectorize-pending`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${AUTH_TOKEN}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ limit, includeRecent }),
+          })
+          const data = await readJsonResponse(res)
+          if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+          const processed = data.processed ?? 0
+          const failed = data.failed ?? 0
+          remaining = data.remaining ?? 0
+          totalProcessed += processed
+          totalFailed += failed
+          setModelsMsg(
+            `重建向量中：本批 +${processed}，累计 ${totalProcessed}，失败 ${totalFailed}，剩余 ${remaining}`
+          )
+          if (processed === 0 && remaining > 0) {
+            stagnant++
+            if (stagnant >= 2) {
+              throw new Error(`向量化停滞（剩余 ${remaining}，连续失败）。请检查 Embedding 配置。`)
+            }
+          } else {
+            stagnant = 0
+          }
+        }
+        setModelsMsg(
+          `向量重建完成：成功 ${totalProcessed}，失败 ${totalFailed}`,
+          totalFailed ? 'error' : 'ok'
+        )
+        return { totalProcessed, totalFailed }
       }
 
       async function testModelSettings(target) {
@@ -3929,21 +4017,9 @@
         btn.classList.add('digest-btn--loading')
         btn.innerHTML = '<i class="ti ti-loader-2"></i> Working…'
         try {
-          let remaining = 1
-          let totalProcessed = 0
-          while (remaining > 0) {
-            const res = await fetch(`${WORKER_URL}/vectorize-pending`, {
-              method: 'POST',
-              headers: { Authorization: `Bearer ${AUTH_TOKEN}` }
-            })
-            if (!res.ok) throw new Error(`Server error: ${res.status}`)
-            const data = await res.json()
-            remaining = data.remaining ?? 0
-            totalProcessed += data.processed ?? 0
-            if ((data.processed ?? 0) === 0 && remaining > 0) break
-          }
+          const r = await runVectorizeLoop({ limit: 100, includeRecent: true })
           btn.classList.remove('digest-btn--loading')
-          btn.innerHTML = `<i class="ti ti-check"></i> Done — ${totalProcessed} re-indexed`
+          btn.innerHTML = `<i class="ti ti-check"></i> Done — ${r.totalProcessed} re-indexed`
           btn.style.color = 'var(--good)'
           await loadMenuStats()
           loadRecent()
@@ -4046,20 +4122,17 @@
           const data = await readJsonResponse(res)
           if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText || `HTTP ${res.status}`)
 
+          const pending = data.pendingVectorizeCount ?? data.pendingVectorize?.length ?? 0
           let msg = `导入完成：新增 ${data.inserted}，跳过 ${data.skipped}，更新 ${data.updated || 0}，失败 ${data.failed}。`
-          if (data.pendingVectorize?.length) {
-            msg += `\n\n${data.pendingVectorize.length} 条需重新向量化。`
-            if (confirm(msg + '\n\n现在执行 vectorize-pending？')) {
-              const v = await fetch(`${WORKER_URL}/vectorize-pending`, {
-                method: 'POST',
-                headers: {
-                  Authorization: `Bearer ${AUTH_TOKEN}`,
-                  'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({ limit: 500 }),
-              })
-              const vd = await readJsonResponse(v).catch(() => ({}))
-              alert('vectorize-pending: ' + JSON.stringify(vd).slice(0, 400))
+          if (pending > 0) {
+            msg += `\n\n${pending} 条需重新向量化。`
+            if (confirm(msg + '\n\n现在循环执行 vectorize-pending？')) {
+              try {
+                const r = await runVectorizeLoop({ limit: 100, includeRecent: true })
+                alert(`向量化完成：成功 ${r.totalProcessed}，失败 ${r.totalFailed}`)
+              } catch (ve) {
+                alert('向量化中断: ' + (ve.message || ve))
+              }
             } else {
               alert(msg)
             }
@@ -4073,22 +4146,53 @@
         }
       }
 
+      /** Full export via paginated GET /export (not capped at list n=100). */
+      async function fetchAllExportEntries() {
+        const all = []
+        let cursor = null
+        let total = null
+        do {
+          const q = new URLSearchParams({ limit: '500' })
+          if (cursor) q.set('cursor', cursor)
+          const res = await fetch(`${WORKER_URL}/export?${q}`, {
+            headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+          })
+          const data = await readJsonResponse(res)
+          if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+          if (total == null) total = data.total
+          const batch = data.entries || []
+          all.push(...batch)
+          cursor = data.nextCursor || null
+        } while (cursor)
+        if (total != null && all.length !== total) {
+          throw new Error(`导出数量不一致：count=${total} 实际=${all.length}`)
+        }
+        return all
+      }
+
       async function exportMemories(format) {
         closeMenu()
         try {
-          const res = await fetch(`${WORKER_URL}/list?n=9999`, { headers: { Authorization: `Bearer ${AUTH_TOKEN}` } })
-          if (!res.ok) throw new Error(`Server error: ${res.status}`)
-          const entries = await res.json()
+          const entries = await fetchAllExportEntries()
 
           let content, filename, mime
           const ts = new Date().toISOString().slice(0, 10)
 
           if (format === 'json') {
-            content = JSON.stringify(entries, null, 2)
+            content = JSON.stringify(
+              {
+                schemaVersion: 2,
+                exportedAt: new Date().toISOString(),
+                total: entries.length,
+                entries,
+              },
+              null,
+              2
+            )
             filename = `second-brain-export-${ts}.json`
             mime = 'application/json'
           } else {
-            const lines = [`# Second Brain Export`, `Exported: ${ts}`, '']
+            const lines = [`# Second Brain Export`, `Exported: ${ts}`, `Total: ${entries.length}`, '']
             entries.forEach((e, i) => {
               let tags = []
               try {
@@ -4117,8 +4221,9 @@
           a.download = filename
           a.click()
           URL.revokeObjectURL(url)
+          alert(`导出完成：${entries.length} 条`)
         } catch (e) {
-          alert('Export failed: ' + e.message)
+          alert('导出失败: ' + e.message)
         }
       }
 

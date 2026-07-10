@@ -13,6 +13,8 @@ import {
   embeddingFingerprintOf,
   emptyModelSettings,
   isDevLocalProvider,
+  isMaskedSecret,
+  promoteEmbeddingFingerprint,
   toPublicModelSettings,
   type ModelSettingsPatchBody,
 } from "./settings/model-settings";
@@ -2097,6 +2099,68 @@ const defaultHandler = {
       return json(results);
     }
 
+    // GET /export — paginated full backup (not capped at list's 100)
+    // Query: limit (1–500, default 200), cursor = `${created_at}:${id}` of last row
+    if (url.pathname === "/export" && request.method === "GET") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      const limit = Math.min(
+        Math.max(parseInt(url.searchParams.get("limit") ?? "200", 10) || 200, 1),
+        500
+      );
+      const cursor = url.searchParams.get("cursor")?.trim() || "";
+
+      const countRow = await env.DB.prepare(`SELECT COUNT(*) as count FROM entries`).first() as {
+        count: number;
+      } | null;
+      const total = Number(countRow?.count ?? 0);
+
+      let results: Record<string, any>[];
+      if (cursor) {
+        const [cAtRaw, ...idParts] = cursor.split(":");
+        const cAt = parseInt(cAtRaw, 10);
+        const cId = idParts.join(":");
+        if (!Number.isFinite(cAt) || !cId) {
+          return json({ ok: false, error: "Invalid cursor" }, 400);
+        }
+        const q = await env.DB.prepare(
+          `SELECT id, content, tags, source, created_at, vector_ids,
+                  recall_count, importance_score, contradiction_wins, contradiction_losses
+           FROM entries
+           WHERE created_at < ? OR (created_at = ? AND id < ?)
+           ORDER BY created_at DESC, id DESC
+           LIMIT ?`
+        ).bind(cAt, cAt, cId, limit).all();
+        results = (q.results || []) as Record<string, any>[];
+      } else {
+        const q = await env.DB.prepare(
+          `SELECT id, content, tags, source, created_at, vector_ids,
+                  recall_count, importance_score, contradiction_wins, contradiction_losses
+           FROM entries
+           ORDER BY created_at DESC, id DESC
+           LIMIT ?`
+        ).bind(limit).all();
+        results = (q.results || []) as Record<string, any>[];
+      }
+
+      const last = results[results.length - 1];
+      const nextCursor =
+        results.length === limit && last
+          ? `${last.created_at}:${last.id}`
+          : null;
+
+      return json({
+        schemaVersion: 2,
+        exportedAt: new Date().toISOString(),
+        source: env.SELFHOST === "1" ? "selfhost" : "cloudflare",
+        total,
+        count: results.length,
+        nextCursor,
+        entries: results,
+      });
+    }
+
     // GET /recall — semantic search, mirrors the MCP `recall` tool
     if (url.pathname === "/recall" && request.method === "GET") {
       const authErr = requireAuth(request, env);
@@ -2221,13 +2285,23 @@ const defaultHandler = {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
 
-      const graceCutoff = Date.now() - graceMs(env);
+      let body: { limit?: number; includeRecent?: boolean } = {};
+      try {
+        body = await request.json();
+      } catch {
+        /* empty body OK */
+      }
+      const limit = Math.min(Math.max(Number(body.limit) || 25, 1), 200);
+      // includeRecent: skip grace window (imports / full reindex)
+      const graceCutoff = body.includeRecent
+        ? Date.now() + 86_400_000
+        : Date.now() - graceMs(env);
 
       const { results: toProcess } = await env.DB.prepare(
         `SELECT id, content, tags, source, created_at FROM entries
          WHERE vector_ids = '[]' AND created_at < ?
-         ORDER BY created_at DESC LIMIT 25`
-      ).bind(graceCutoff).all();
+         ORDER BY created_at DESC LIMIT ?`
+      ).bind(graceCutoff, limit).all();
 
       let processed = 0;
       let failed = 0;
@@ -2252,8 +2326,26 @@ const defaultHandler = {
       const remaining = await env.DB.prepare(
         `SELECT COUNT(*) as count FROM entries WHERE vector_ids = '[]' AND created_at < ?`
       ).bind(graceCutoff).first() as Record<string, any> | null;
+      const remainingN = (remaining?.count as number) ?? 0;
 
-      return json({ processed, failed, remaining: (remaining?.count as number) ?? 0 });
+      // Promote pending embedding fingerprint when full reindex completes cleanly
+      if (remainingN === 0 && failed === 0) {
+        try {
+          const stored = await loadStoredModelSettings(env.DB);
+          if (stored?.pendingEmbeddingFingerprint) {
+            await saveStoredModelSettings(env.DB, promoteEmbeddingFingerprint(stored));
+          }
+        } catch (e) {
+          console.error("Fingerprint promote failed:", e);
+        }
+      }
+
+      return json({
+        processed,
+        failed,
+        remaining: remainingN,
+        limit,
+      });
     }
 
     // POST /classify-pending
@@ -2337,9 +2429,11 @@ const defaultHandler = {
 
       return json({
         ...result,
+        // Back-compat for older UI that expected pendingVectorize[]
+        pendingVectorize: result.pendingVectorizeSample,
         next:
-          result.pendingVectorize.length > 0
-            ? "Run POST /vectorize-pending to embed imported memories with the current embedding provider."
+          result.pendingVectorizeCount > 0
+            ? "Run POST /vectorize-pending with { limit, includeRecent: true } in a loop until remaining=0."
             : undefined,
       });
     }
@@ -2376,6 +2470,44 @@ const defaultHandler = {
 
       const previous =
         (await loadStoredModelSettings(env.DB)) ?? mergeFromEnvOnly(env);
+
+      // Switching provider without a new key is not allowed (prevents wrong-key reuse)
+      if (
+        body.llm?.provider &&
+        body.llm.provider !== previous.llm.provider &&
+        body.llm.provider !== "none" &&
+        !body.llm.clearApiKey
+      ) {
+        const k = body.llm.apiKey != null ? String(body.llm.apiKey) : "";
+        if (!k || isMaskedSecret(k)) {
+          return json(
+            {
+              ok: false,
+              error: "切换对话供应商后必须填写新的 API Key",
+            },
+            400
+          );
+        }
+      }
+      if (
+        body.embedding?.provider &&
+        body.embedding.provider !== previous.embedding.provider &&
+        body.embedding.provider !== "none" &&
+        !isDevLocalProvider(String(body.embedding.provider)) &&
+        !body.embedding.clearApiKey
+      ) {
+        const k = body.embedding.apiKey != null ? String(body.embedding.apiKey) : "";
+        if (!k || isMaskedSecret(k)) {
+          return json(
+            {
+              ok: false,
+              error: "切换向量供应商后必须填写新的 API Key",
+            },
+            400
+          );
+        }
+      }
+
       const next = applyModelSettingsPatch(previous, body);
 
       if (
@@ -2393,25 +2525,40 @@ const defaultHandler = {
         );
       }
 
-      const prevFp = previous.embeddingFingerprint || embeddingFingerprintOf(previous.embedding);
       const nextFp = embeddingFingerprintOf(next.embedding);
-      const fingerprintChanged = prevFp !== nextFp && Boolean(previous.embeddingFingerprint || previous.embedding.model);
+      const activeFp = previous.embeddingFingerprint;
+      const embConfigChanged =
+        nextFp !== embeddingFingerprintOf(previous.embedding) ||
+        nextFp !== activeFp;
 
-      // First save of a real embedding config: stamp fingerprint
-      if (!next.embeddingFingerprint && !isDevLocalProvider(next.embedding.provider)) {
-        next.embeddingFingerprint = nextFp;
-      } else if (body.acceptEmbeddingFingerprint) {
-        next.embeddingFingerprint = nextFp;
+      // Never stamp active fingerprint on ordinary save — only pending when changed
+      if (!activeFp && !isDevLocalProvider(next.embedding.provider)) {
+        // First-time embed config: mark as pending until first reindex/vectorize completes
+        next.pendingEmbeddingFingerprint = nextFp;
+        if (!next.embeddingFingerprint) {
+          // No existing vectors assumed — activate immediately
+          next.embeddingFingerprint = nextFp;
+          next.pendingEmbeddingFingerprint = undefined;
+        }
+      } else if (embConfigChanged) {
+        next.pendingEmbeddingFingerprint = nextFp;
+        // keep previous embeddingFingerprint (active) until reindex finishes
+        next.embeddingFingerprint = previous.embeddingFingerprint;
       }
 
       await saveStoredModelSettings(env.DB, next);
 
       const { effective, stored } = await getEffectiveModelSettings(env);
+      const reindexRequired = Boolean(
+        effective.pendingEmbeddingFingerprint &&
+          effective.pendingEmbeddingFingerprint !== effective.embeddingFingerprint
+      );
       return json({
         ok: true,
-        embeddingFingerprintChanged: fingerprintChanged,
-        warning: fingerprintChanged
-          ? "Embedding provider/model/dimensions changed. Existing vectors are incompatible until reindex. POST /settings/models/reindex then vectorize-pending."
+        embeddingFingerprintChanged: reindexRequired,
+        reindexRequired,
+        warning: reindexRequired
+          ? "向量配置已变更。请点击「开始重建」或 POST /settings/models/reindex，再循环调用 vectorize-pending，完成前语义检索可能不准确。"
           : undefined,
         settings: toPublicModelSettings(effective, {
           hasStored: Boolean(stored),
@@ -2482,18 +2629,19 @@ const defaultHandler = {
       }
     }
 
-    // POST /settings/models/reindex — clear vectors + reset vector_ids for full re-embed
+    // POST /settings/models/reindex — clear vectors + reset vector_ids; fingerprint stays pending until vectorize completes
     if (url.pathname === "/settings/models/reindex" && request.method === "POST") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
 
       const { effective, stored } = await getEffectiveModelSettings(env);
       if (stored) {
-        stored.embeddingFingerprint = embeddingFingerprintOf(effective.embedding);
+        const pending = embeddingFingerprintOf(effective.embedding);
+        stored.pendingEmbeddingFingerprint = pending;
+        // Do NOT promote active fingerprint here — wait until remaining=0
         await saveStoredModelSettings(env.DB, stored);
       }
 
-      // Clear local vector table when self-host adapter is present
       let clearedVectors = 0;
       try {
         const clear = (env.VECTORIZE as any).clearAll;
@@ -2513,8 +2661,10 @@ const defaultHandler = {
         ok: true,
         clearedVectors,
         entriesReset: rows,
-        next: "Call POST /vectorize-pending (or wait for capture re-embed) to rebuild vectors with the current embedding config.",
-        fingerprint: stored?.embeddingFingerprint ?? embeddingFingerprintOf(effective.embedding),
+        reindexRequired: true,
+        pendingFingerprint:
+          stored?.pendingEmbeddingFingerprint ?? embeddingFingerprintOf(effective.embedding),
+        next: "Loop POST /vectorize-pending {\"limit\":100,\"includeRecent\":true} until remaining=0. Active fingerprint promotes only when finished with failed=0.",
       });
     }
 

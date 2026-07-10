@@ -41,7 +41,8 @@ describe("POST /import", () => {
     const data = (await res.json()) as any;
     expect(data.ok).toBe(true);
     expect(data.inserted).toBe(1);
-    expect(data.pendingVectorize).toContain("imp-1");
+    expect(data.pendingVectorizeCount).toBe(1);
+    expect(data.pendingVectorizeSample).toContain("imp-1");
     expect(db.entries[0].vector_ids).toBe("[]");
   });
 

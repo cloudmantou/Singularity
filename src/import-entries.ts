@@ -1,16 +1,11 @@
 /**
  * Import Cloudflare / dashboard JSON exports into the entries table.
- *
- * - Preserves id, content, source, created_at, tags when present
- * - Always clears vector_ids (re-embed with current embedding provider)
- * - tags may be a JSON string or string[]
  */
 
 export type ImportMode = "skip" | "overwrite";
 
 export interface ImportOptions {
   mode?: ImportMode;
-  /** Extra tags appended to every imported row (e.g. cf-import). */
   extraTags?: string[];
 }
 
@@ -22,8 +17,9 @@ export interface ImportResult {
   skipped: number;
   failed: number;
   errors: { index: number; id?: string; error: string }[];
-  /** IDs that need re-embedding (inserted + overwritten). */
-  pendingVectorize: string[];
+  /** Sample of IDs needing re-embed (not full list when huge). */
+  pendingVectorizeSample: string[];
+  pendingVectorizeCount: number;
 }
 
 function normalizeTags(raw: unknown, extra: string[]): string[] {
@@ -54,11 +50,29 @@ function asNonEmptyString(v: unknown): string | null {
   return s || null;
 }
 
-function asCreatedAt(v: unknown): number {
-  if (typeof v === "number" && Number.isFinite(v) && v > 0) return Math.floor(v);
+function asSafeInt(v: unknown, fallback = 0): number {
+  if (typeof v === "number" && Number.isFinite(v)) return Math.max(0, Math.floor(v));
   if (typeof v === "string" && v.trim()) {
     const n = Number(v);
-    if (Number.isFinite(n) && n > 0) return Math.floor(n);
+    if (Number.isFinite(n)) return Math.max(0, Math.floor(n));
+  }
+  return fallback;
+}
+
+/** Unix seconds → ms; already-ms values left alone. */
+export function normalizeTimestamp(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) return Date.now();
+  // Real unix-seconds for modern dates: ~1e9–2e10; ms stamps are >= 1e12.
+  // Do not multiply small fixture values (e.g. created_at: 99 in tests).
+  if (value >= 1_000_000_000 && value < 1_000_000_000_000) return Math.floor(value * 1000);
+  return Math.floor(value);
+}
+
+function asCreatedAt(v: unknown): number {
+  if (typeof v === "number" && Number.isFinite(v) && v > 0) return normalizeTimestamp(v);
+  if (typeof v === "string" && v.trim()) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n > 0) return normalizeTimestamp(n);
     const d = Date.parse(v);
     if (!Number.isNaN(d)) return d;
   }
@@ -76,10 +90,6 @@ export function parseImportPayload(body: unknown): unknown[] {
   throw new Error("Import body must be a JSON array or { entries: [...] }");
 }
 
-/**
- * Insert/overwrite rows from an export. Does not call embedding/Vectorize.
- * Caller should run POST /vectorize-pending after import when ready.
- */
 export async function importEntries(
   db: D1Database,
   rawEntries: unknown[],
@@ -96,8 +106,11 @@ export async function importEntries(
     skipped: 0,
     failed: 0,
     errors: [],
-    pendingVectorize: [],
+    pendingVectorizeSample: [],
+    pendingVectorizeCount: 0,
   };
+
+  const pendingIds: string[] = [];
 
   for (let i = 0; i < rawEntries.length; i++) {
     const row = rawEntries[i];
@@ -119,7 +132,11 @@ export async function importEntries(
       const source = asNonEmptyString(r.source) || "import";
       const created_at = asCreatedAt(r.created_at);
       const tagsJson = JSON.stringify(tags);
-      const vectorIds = "[]"; // never reuse Cloudflare Vectorize IDs
+      const vectorIds = "[]";
+      const recall_count = asSafeInt(r.recall_count, 0);
+      const importance_score = asSafeInt(r.importance_score, 0);
+      const contradiction_wins = asSafeInt(r.contradiction_wins, 0);
+      const contradiction_losses = asSafeInt(r.contradiction_losses, 0);
 
       const existing = await db
         .prepare(`SELECT id FROM entries WHERE id = ?`)
@@ -133,21 +150,47 @@ export async function importEntries(
         }
         await db
           .prepare(
-            `UPDATE entries SET content = ?, tags = ?, source = ?, created_at = ?, vector_ids = ? WHERE id = ?`
+            `UPDATE entries SET content = ?, tags = ?, source = ?, created_at = ?, vector_ids = ?,
+             recall_count = ?, importance_score = ?, contradiction_wins = ?, contradiction_losses = ?
+             WHERE id = ?`
           )
-          .bind(content, tagsJson, source, created_at, vectorIds, id)
+          .bind(
+            content,
+            tagsJson,
+            source,
+            created_at,
+            vectorIds,
+            recall_count,
+            importance_score,
+            contradiction_wins,
+            contradiction_losses,
+            id
+          )
           .run();
         result.updated++;
-        result.pendingVectorize.push(id);
+        pendingIds.push(id);
       } else {
         await db
           .prepare(
-            `INSERT INTO entries (id, content, tags, source, created_at, vector_ids) VALUES (?, ?, ?, ?, ?, ?)`
+            `INSERT INTO entries (id, content, tags, source, created_at, vector_ids,
+             recall_count, importance_score, contradiction_wins, contradiction_losses)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           )
-          .bind(id, content, tagsJson, source, created_at, vectorIds)
+          .bind(
+            id,
+            content,
+            tagsJson,
+            source,
+            created_at,
+            vectorIds,
+            recall_count,
+            importance_score,
+            contradiction_wins,
+            contradiction_losses
+          )
           .run();
         result.inserted++;
-        result.pendingVectorize.push(id);
+        pendingIds.push(id);
       }
     } catch (e) {
       result.failed++;
@@ -162,5 +205,7 @@ export async function importEntries(
     }
   }
 
+  result.pendingVectorizeCount = pendingIds.length;
+  result.pendingVectorizeSample = pendingIds.slice(0, 5);
   return result;
 }

@@ -52,6 +52,8 @@ export interface ProviderEnv {
    */
   EMBEDDING_PROVIDER?: string;
   EMBEDDING_DIM?: string;
+  /** "0"/"false" = do not send dimensions in embedding request body. */
+  EMBEDDING_SEND_DIMENSIONS?: string;
 }
 
 function parseExtraBody(raw?: string): Record<string, unknown> | undefined {
@@ -64,17 +66,15 @@ function parseExtraBody(raw?: string): Record<string, unknown> | undefined {
   }
 }
 
-/** Providers that enable thinking by default — disable for short JSON tasks. */
+/** Disable thinking only where the API honors it (DeepSeek V4, MiniMax-M3). */
 function defaultThinkingBody(model: string, baseURL: string): Record<string, unknown> | undefined {
   const m = model.toLowerCase();
   const u = baseURL.toLowerCase();
-  if (
-    m.includes("deepseek-v4") ||
-    m.includes("minimax-m") ||
-    u.includes("deepseek.com") ||
-    u.includes("minimax.io") ||
-    u.includes("minimax.chat")
-  ) {
+  if (m.includes("deepseek-v4") || u.includes("deepseek.com")) {
+    return thinkingDisabledBody();
+  }
+  // MiniMax M2.x still thinks even with disabled — only send for M3.
+  if (m === "minimax-m3" || (u.includes("minimax") && m.includes("m3") && !m.includes("m2"))) {
     return thinkingDisabledBody();
   }
   return undefined;
@@ -115,11 +115,15 @@ function isDevLocalEmbedding(env: ProviderEnv): boolean {
 function buildEmbedding(env: ProviderEnv): EmbeddingProvider {
   if (env.EMBEDDING_BASE_URL && env.EMBEDDING_API_KEY) {
     const dimensions = parseInt(env.EMBEDDING_DIM || "384", 10) || 384;
+    const sendDimensions =
+      env.EMBEDDING_SEND_DIMENSIONS !== "0" &&
+      env.EMBEDDING_SEND_DIMENSIONS !== "false";
     return new OpenAICompatibleEmbedding({
       baseURL: env.EMBEDDING_BASE_URL,
       apiKey: env.EMBEDDING_API_KEY,
       model: env.EMBEDDING_MODEL || "text-embedding-3-small",
       dimensions,
+      sendDimensionsParameter: sendDimensions,
     });
   }
 

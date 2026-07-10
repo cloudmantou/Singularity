@@ -45,7 +45,34 @@ describe("importEntries", () => {
     const tags = JSON.parse(db.entries[0].tags);
     expect(tags).toContain("work");
     expect(tags).toContain("cf-import");
-    expect(result.pendingVectorize).toEqual(["9a9b28ed-ce21-4858-85f9-feb7ddc2d0fc"]);
+    expect(result.pendingVectorizeCount).toBe(1);
+    expect(result.pendingVectorizeSample).toEqual(["9a9b28ed-ce21-4858-85f9-feb7ddc2d0fc"]);
+  });
+
+  it("normalizes unix-seconds timestamps to ms", async () => {
+    const { normalizeTimestamp } = await import("../../src/import-entries");
+    expect(normalizeTimestamp(1_712_345_678)).toBe(1_712_345_678_000);
+    expect(normalizeTimestamp(1_712_345_678_000)).toBe(1_712_345_678_000);
+    expect(normalizeTimestamp(99)).toBe(99);
+  });
+
+  it("preserves recall_count and importance on import", async () => {
+    await importEntries(db as unknown as D1Database, [
+      {
+        id: "stats-1",
+        content: "with stats",
+        tags: "[]",
+        source: "api",
+        created_at: 1_700_000_000_000,
+        recall_count: 5,
+        importance_score: 4,
+        contradiction_wins: 1,
+        contradiction_losses: 2,
+      },
+    ], { extraTags: [] });
+    expect(db.entries[0].recall_count).toBe(5);
+    expect(db.entries[0].importance_score).toBe(4);
+    expect(db.entries[0].contradiction_wins).toBe(1);
   });
 
   it("skips existing ids in skip mode", async () => {

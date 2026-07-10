@@ -10,8 +10,13 @@ export class D1Mock {
     const makeStmt = (args: any[]) => ({
       async run() {
         if (s.startsWith("INSERT INTO entries")) {
-          const [id, content, tags, source, created_at, vector_ids] = args;
-          db.entries.push({ id, content, tags, source, created_at, vector_ids, recall_count: 0, importance_score: 0, contradiction_wins: 0, contradiction_losses: 0 });
+          if (args.length >= 10) {
+            const [id, content, tags, source, created_at, vector_ids, recall_count, importance_score, contradiction_wins, contradiction_losses] = args;
+            db.entries.push({ id, content, tags, source, created_at, vector_ids, recall_count, importance_score, contradiction_wins, contradiction_losses });
+          } else {
+            const [id, content, tags, source, created_at, vector_ids] = args;
+            db.entries.push({ id, content, tags, source, created_at, vector_ids, recall_count: 0, importance_score: 0, contradiction_wins: 0, contradiction_losses: 0 });
+          }
           return { meta: { changes: 1 } };
         }
         if (s.startsWith("UPDATE entries SET content = ?, vector_ids")) {
@@ -36,6 +41,14 @@ export class D1Mock {
           const [tags, id] = args;
           const row = db.entries.find((e: any) => e.id === id);
           if (row) row.tags = tags;
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.includes("UPDATE entries SET content = ?, tags = ?, source = ?, created_at = ?, vector_ids = ?,") && s.includes("recall_count")) {
+          const [content, tags, source, created_at, vector_ids, recall_count, importance_score, contradiction_wins, contradiction_losses, id] = args;
+          const row = db.entries.find((e: any) => e.id === id);
+          if (row) {
+            Object.assign(row, { content, tags, source, created_at, vector_ids, recall_count, importance_score, contradiction_wins, contradiction_losses });
+          }
           return { meta: { changes: row ? 1 : 0 } };
         }
         if (s.startsWith("UPDATE entries SET content = ?, tags = ?, source = ?, created_at = ?, vector_ids")) {
@@ -168,6 +181,28 @@ export class D1Mock {
         return null;
       },
       async all() {
+        // export (cursor + id) and vectorize-pending — avoid matching compress/list queries
+        if (
+          s.includes("FROM entries") &&
+          s.includes("LIMIT") &&
+          (s.includes("ORDER BY created_at DESC, id DESC") ||
+            (s.includes("vector_ids = '[]'") && s.includes("ORDER BY created_at DESC")))
+        ) {
+          const limit = Number(args[args.length - 1]);
+          let rows = [...db.entries];
+          if (s.includes("vector_ids = '[]'")) {
+            const cutoff = Number(args[0]);
+            rows = rows.filter((e: any) => e.vector_ids === "[]" && e.created_at < cutoff);
+          } else if (s.includes("created_at = ? AND id < ?") && args.length >= 4) {
+            const cAt = Number(args[0]);
+            const cId = String(args[2]);
+            rows = rows.filter(
+              (e: any) => e.created_at < cAt || (e.created_at === cAt && e.id < cId)
+            );
+          }
+          rows.sort((a: any, b: any) => b.created_at - a.created_at || (b.id < a.id ? 1 : -1));
+          return { results: rows.slice(0, limit) };
+        }
         if (
           s === "SELECT id FROM entries WHERE tags LIKE ?" ||
           s === "SELECT id, vector_ids FROM entries WHERE tags LIKE ?" ||
