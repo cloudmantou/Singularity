@@ -19,9 +19,11 @@ function makeDigestAI(digestText = "Work on the API redesign is progressing well
     run: vi.fn().mockImplementation(async (_model: string, opts: any) => {
       if (_model === "@cf/baai/bge-small-en-v1.5")
         return { data: [new Array(384).fill(0.1)] };
+      // Streaming path (e.g. chatAsCfSse) still returns CF SSE.
       if (opts?.stream)
         return makeSseStream(digestText);
-      return { response: "3" };
+      // Non-stream llm.chat() — used by synthesizeDigest / classify after provider abstraction.
+      return { response: digestText };
     }),
   } as unknown as Ai;
 }

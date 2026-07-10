@@ -7,17 +7,25 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpHandler } from "agents/mcp";
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { z } from "zod";
+import { createEmbedding, createLLM } from "./providers";
 
 export interface Env {
   DB: D1Database;
   VECTORIZE: VectorizeIndex;
+  /** Workers AI binding — used when external LLM/embedding env vars are not set. */
   AI: Ai;
   AUTH_TOKEN: string;
   OAUTH_KV: KVNamespace;
   VECTORIZE_GRACE_MS?: string;
+  /** OpenAI-compatible chat API (DeepSeek / MiniMax / MiMo / OpenAI). */
+  LLM_BASE_URL?: string;
+  LLM_API_KEY?: string;
+  LLM_MODEL?: string;
+  /** OpenAI-compatible embeddings API (or TEI). Independent of LLM. */
+  EMBEDDING_BASE_URL?: string;
+  EMBEDDING_API_KEY?: string;
+  EMBEDDING_MODEL?: string;
 }
-
-const LLM_MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct";
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 
@@ -59,10 +67,6 @@ export function compressionEligibilitySql(columnPrefix = ""): string {
       AND (${p}recall_count = 0 OR (${p}recall_count < ${COMPRESSION_MIN_RECALL} AND ${p}created_at < ?))
       AND (${p}contradiction_wins IS NULL OR ${p}contradiction_wins = 0)`;
 }
-
-// ─── Model constants ──────────────────────────────────────────────────────────
-
-const EMBEDDING_MODEL = "@cf/baai/bge-small-en-v1.5";
 
 // ─── Chunking constants ───────────────────────────────────────────────────────
 
@@ -143,23 +147,6 @@ let dbReady = false;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-async function readStreamText(stream: ReadableStream): Promise<string> {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let text = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    decoder.decode(value).split("\n").forEach(line => {
-      if (line.startsWith("data: ") && !line.includes("[DONE]")) {
-        try { const d = JSON.parse(line.slice(6)); if (d.response) text += d.response; } catch { }
-      }
-    });
-  }
-  reader.releaseLock();
-  return text;
-}
-
 function isAuthorized(request: Request, env: Env): boolean {
   if (request.headers.get("Authorization") === `Bearer ${env.AUTH_TOKEN}`) return true;
   return new URL(request.url).searchParams.get("token") === env.AUTH_TOKEN;
@@ -236,9 +223,7 @@ function loginHtml(error?: string): string {
 }
 
 async function embed(text: string, env: Env): Promise<number[]> {
-  // Workers AI requires `as any` here — the SDK types don't cover all models
-  const result = (await env.AI.run(EMBEDDING_MODEL as any, { text: [text] })) as any;
-  return result.data[0] as number[];
+  return createEmbedding(env).embed(text);
 }
 
 // ─── Database initialization ──────────────────────────────────────────────────
@@ -359,12 +344,10 @@ Respond with JSON only. No text outside the JSON.
 {"action":"keep_both"} OR {"action":"contradiction","conflicting_id":"<id>","reason":"<10 words max>"} OR {"action":"replace","target_id":"<id>"} OR {"action":"merge","target_id":"<id>","merged_content":"<text>"}`;
 
           try {
-            const stream = await (env.AI as any).run(LLM_MODEL as any, {
-              messages: [{ role: "user", content: prompt }],
-              max_tokens: SMART_MERGE_MAX_TOKENS,
-              stream: true,
-            });
-            const text = await readStreamText(stream as ReadableStream);
+            const text = await createLLM(env).chat(
+              [{ role: "user", content: prompt }],
+              { max_tokens: SMART_MERGE_MAX_TOKENS }
+            );
             const jsonMatch = text.match(/\{[\s\S]*\}/);
             if (jsonMatch) {
               const parsed = JSON.parse(jsonMatch[0]);
@@ -407,12 +390,10 @@ Respond with JSON only. No text outside the JSON object.
 {"contradicts": false} OR {"contradicts": true, "conflicting_id": "<exact_id>", "reason": "<10 words max>"}`;
 
           try {
-            const stream = await (env.AI as any).run(LLM_MODEL as any, {
-              messages: [{ role: "user", content: prompt }],
-              max_tokens: CONTRADICTION_MAX_TOKENS,
-              stream: true,
-            });
-            const text = await readStreamText(stream as ReadableStream);
+            const text = await createLLM(env).chat(
+              [{ role: "user", content: prompt }],
+              { max_tokens: CONTRADICTION_MAX_TOKENS }
+            );
             const jsonMatch = text.match(/\{[\s\S]*\}/);
             if (jsonMatch) {
               const parsed = JSON.parse(jsonMatch[0]);
@@ -630,19 +611,19 @@ function parseClassification(text: string): { importance: number; canonical: boo
 export async function classifyEntry(content: string, env: Env): Promise<{ importance: number; canonical: boolean; kind: MemoryKind | null }> {
   let text: string;
   try {
-    const stream = await env.AI.run(LLM_MODEL as any, {
-      messages: [{ role: "user", content:
-        `Classify this memory. Respond with ONLY one JSON object and nothing else — no prose, no markdown, no code fences.\n` +
-        `{"importance": <1-5>, "canonical": <true|false>, "kind": "episodic"|"semantic"}\n` +
-        `importance: 1=trivial, 3=useful context, 5=critical decision or goal.\n` +
-        `canonical: true ONLY for a confirmed decision, durable fact, or stated permanent preference that should be authoritative (be conservative; false for anything tentative, one-off, or event-like).\n` +
-        `kind: "episodic" for a specific event/decision/milestone that happened at a point in time; "semantic" for a general fact, preference, or piece of knowledge.\n\n` +
-        `Memory: ${content.slice(0, 500)}`,
+    text = await createLLM(env).chat(
+      [{
+        role: "user",
+        content:
+          `Classify this memory. Respond with ONLY one JSON object and nothing else — no prose, no markdown, no code fences.\n` +
+          `{"importance": <1-5>, "canonical": <true|false>, "kind": "episodic"|"semantic"}\n` +
+          `importance: 1=trivial, 3=useful context, 5=critical decision or goal.\n` +
+          `canonical: true ONLY for a confirmed decision, durable fact, or stated permanent preference that should be authoritative (be conservative; false for anything tentative, one-off, or event-like).\n` +
+          `kind: "episodic" for a specific event/decision/milestone that happened at a point in time; "semantic" for a general fact, preference, or piece of knowledge.\n\n` +
+          `Memory: ${content.slice(0, 500)}`,
       }],
-      max_tokens: CLASSIFY_MAX_TOKENS,
-      stream: true,
-    });
-    text = await readStreamText(stream as ReadableStream);
+      { max_tokens: CLASSIFY_MAX_TOKENS }
+    );
   } catch {
     return { importance: 0, canonical: false, kind: null };
   }
@@ -678,15 +659,13 @@ export async function inferQueryTags(query: string, env: Env): Promise<string[]>
   if (!knownTags.length) return [];
 
   try {
-    const stream = await env.AI.run(LLM_MODEL as any, {
-      messages: [{
+    const text = await createLLM(env).chat(
+      [{
         role: "user",
         content: `From this list of tags: ${knownTags.slice(0, 50).join(", ")}\n\nWhich tags best match this query? Reply with only a comma-separated list of matching tag names from the list, or nothing if none apply.\n\nQuery: ${query.slice(0, 300)}`,
       }],
-      max_tokens: 100,
-      stream: true,
-    });
-    const text = await readStreamText(stream as ReadableStream);
+      { max_tokens: 100 }
+    );
     const knownSet = new Set(knownTags);
     return text.split(",").map(t => t.trim().toLowerCase()).filter(t => t && knownSet.has(t));
   } catch {
@@ -889,12 +868,10 @@ Write a brief insight (2-4 sentences).`;
 
   let insight = "";
   try {
-    const stream = await (env.AI as any).run(LLM_MODEL as any, {
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: INSIGHT_MAX_TOKENS,
-      stream: true,
-    });
-    insight = await readStreamText(stream as ReadableStream);
+    insight = await createLLM(env).chat(
+      [{ role: "user", content: prompt }],
+      { max_tokens: INSIGHT_MAX_TOKENS }
+    );
   } catch (e) {
     console.error("synthesizeInsight LLM call failed (non-fatal):", e);
   }
@@ -934,15 +911,11 @@ If you find a genuine cross-memory pattern, respond with exactly ONE sentence st
 If no genuine pattern exists across 3+ memories, respond with exactly: NONE`;
 
   try {
-    const response = await (env.AI as any).run(LLM_MODEL as any, {
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: PATTERN_MAX_TOKENS,
-    }) as any;
-
     const trimmed = (
-      response?.choices?.[0]?.message?.content ??
-      response?.response ??
-      ""
+      await createLLM(env).chat(
+        [{ role: "user", content: prompt }],
+        { max_tokens: PATTERN_MAX_TOKENS }
+      )
     ).trim();
 
     if (!trimmed || trimmed === "NONE") return;
@@ -978,12 +951,10 @@ State of "${tag}":`;
 
   let digest = "";
   try {
-    const stream = await (env.AI as any).run(LLM_MODEL as any, {
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: DIGEST_MAX_TOKENS,
-      stream: true,
-    });
-    digest = await readStreamText(stream as ReadableStream);
+    digest = await createLLM(env).chat(
+      [{ role: "user", content: prompt }],
+      { max_tokens: DIGEST_MAX_TOKENS }
+    );
   } catch (e) {
     console.error("synthesizeDigest LLM call failed (non-fatal):", e);
   }
@@ -2192,16 +2163,14 @@ const defaultHandler = {
 
       const userMessage = `Question: ${body.query}\n\nRelevant memories:\n${body.memories}`;
 
-      // Workers AI requires `as any` here — the SDK types don't cover all models
-      const stream = await env.AI.run(LLM_MODEL as any, {
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userMessage }
-        ],
-        stream: true,
-      });
+      // CF-compatible SSE (`data: {"response":...}`) so the existing dashboard parser works
+      // for both Workers AI and OpenAI-compatible providers.
+      const stream = await createLLM(env).chatAsCfSse([
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userMessage },
+      ]);
 
-      return new Response(stream as ReadableStream, {
+      return new Response(stream, {
         headers: { "Content-Type": "text/event-stream", ...CORS_HEADERS },
       });
     }

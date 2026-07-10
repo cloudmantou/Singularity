@@ -1,1 +1,14 @@
-AUTH_TOKEN=your_memorable_token_here
+# Copy to .dev.vars for local wrangler dev with external APIs.
+# If unset, Workers AI bindings are used (default CF behavior).
+
+AUTH_TOKEN=change-me
+
+# LLM — OpenAI-compatible (DeepSeek / MiniMax / MiMo / OpenAI)
+# LLM_BASE_URL=https://api.deepseek.com/v1
+# LLM_API_KEY=sk-...
+# LLM_MODEL=deepseek-chat
+
+# Embedding — independent of LLM (keep 384-dim if matching CF Vectorize)
+# EMBEDDING_BASE_URL=https://api.openai.com/v1
+# EMBEDDING_API_KEY=sk-...
+# EMBEDDING_MODEL=text-embedding-3-small
