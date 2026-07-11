@@ -1114,6 +1114,44 @@
         line-height: 1.4;
       }
 
+      .recall-explain {
+        margin-top: 9px;
+        border-top: 0.5px solid var(--border);
+        padding-top: 8px;
+      }
+
+      .recall-explain summary {
+        cursor: pointer;
+        list-style: none;
+        color: var(--text-secondary);
+        font-size: 12px;
+        font-weight: 600;
+        user-select: none;
+      }
+
+      .recall-explain summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .recall-signal-grid {
+        display: grid;
+        grid-template-columns: minmax(70px, 0.8fr) minmax(0, 1.2fr);
+        gap: 5px 10px;
+        margin-top: 8px;
+        color: var(--text-tertiary);
+        font-size: 11.5px;
+        line-height: 1.35;
+      }
+
+      .recall-signal-name {
+        color: var(--text-secondary);
+      }
+
+      .recall-signal-value {
+        min-width: 0;
+        overflow-wrap: anywhere;
+      }
+
       .card-footer {
         display: flex;
         align-items: center;
@@ -4604,6 +4642,17 @@
         msgs.scrollTop = msgs.scrollHeight
       }
 
+      function formatRecallSignal(value) {
+        const number = Number(value)
+        if (!Number.isFinite(number) || number <= 0) return null
+        return `${Math.round(Math.max(0, Math.min(1, number)) * 100)}%`
+      }
+
+      function makeRecallExplainLine(label, value) {
+        if (!value) return ''
+        return `<div class="recall-signal-name">${escHtml(label)}</div><div class="recall-signal-value">${escHtml(value)}</div>`
+      }
+
       function makeRecallCard(entry) {
         const card = document.createElement('div')
         const isSynthesized = entry.tags.includes('synthesized')
@@ -4634,11 +4683,28 @@
         const graphMetaLine = graphMetaParts.length
           ? `<div class="card-meta">${graphMetaParts.map(escHtml).join(' · ')}</div>`
           : ''
+        const scoreDetails = entry.scoreDetails || {}
+        const explainRows = [
+          makeRecallExplainLine('Semantic', formatRecallSignal(scoreDetails.semantic)),
+          makeRecallExplainLine('Keyword', formatRecallSignal(scoreDetails.keyword)),
+          makeRecallExplainLine('Entity', matchedEntities.length ? matchedEntities.join(', ') : formatRecallSignal(scoreDetails.entity)),
+          makeRecallExplainLine('Time', formatRecallSignal(scoreDetails.temporal)),
+          makeRecallExplainLine('Relation', graphFacts.length ? graphFacts.join(' · ') : formatRecallSignal(scoreDetails.relation)),
+          makeRecallExplainLine('Importance', formatRecallSignal(scoreDetails.importance)),
+          makeRecallExplainLine('Confidence', formatRecallSignal(scoreDetails.confidence)),
+        ].filter(Boolean).join('')
+        const explainBlock = explainRows
+          ? `<details class="recall-explain">
+              <summary>Why recalled</summary>
+              <div class="recall-signal-grid">${explainRows}</div>
+            </details>`
+          : ''
         card.className = 'memory-card' + (isSynthesized ? ' card--synthesized' : '') + (isRolledUp ? ' card--rolled-up' : '')
         card.innerHTML = `
     ${matchLine}
     <div class="card-content" style="cursor: pointer;">${escHtml(entry.content)}</div>
     ${graphMetaLine}
+    ${explainBlock}
     <div class="card-footer">
       <div class="card-tags">${entry.tags.map((tag) => `<span class="tag-chip${tag === 'synthesized' ? ' tag-chip--synthesized' : ''}">${escHtml(tag)}</span>`).join('')}</div>
       <div class="card-actions">

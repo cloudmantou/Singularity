@@ -37,5 +37,9 @@ describe("web memory mutation API contract", () => {
     expect(html).toContain("Matched entities:");
     expect(html).toContain("Current graph facts:");
     expect(html).toContain("const graphContext = [");
+    expect(html).toContain("class=\"recall-explain\"");
+    expect(html).toContain("<summary>Why recalled</summary>");
+    expect(html).toContain("recall-signal-grid");
+    expect(html).toContain("formatRecallSignal(scoreDetails.temporal)");
   });
 });

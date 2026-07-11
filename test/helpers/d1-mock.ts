@@ -1036,6 +1036,19 @@ export class D1Mock {
           const row = db.entities.find((e: any) => e.name_normalized === key);
           return row ?? null;
         }
+        if (s.includes("SELECT id FROM sb_entity_relations") && s.includes("from_entity_id = ?")) {
+          const [fromEntityId, toEntityId, relationType, memoryId, factKey] = args.map(String);
+          const row = db.entityRelations.find((relation: any) =>
+            String(relation.from_entity_id) === fromEntityId &&
+            String(relation.to_entity_id) === toEntityId &&
+            String(relation.relation_type) === relationType &&
+            String(relation.memory_id ?? "") === memoryId &&
+            String(relation.fact ?? "").trim().toLowerCase() === factKey &&
+            relation.invalid_at == null &&
+            relation.expired_at == null
+          );
+          return row ? { id: row.id } : null;
+        }
         if (s.includes("FROM sb_memories") && s.includes("entry_id = ? OR content_hash = ?")) {
           const entryId = String(args[0]);
           const contentHash = String(args[1]);
@@ -1181,15 +1194,22 @@ export class D1Mock {
         }
         if (
           s.includes("FROM sb_entities") &&
-          s.includes("instr(?, name_normalized)") &&
           s.includes("ORDER BY length(name_normalized)")
         ) {
           const normalizedQuery = String(args[0] ?? "");
+          const aliasPatterns = args
+            .slice(1, -1)
+            .map((arg: any) => String(arg ?? "").replace(/^%/, "").replace(/%$/, "").toLowerCase())
+            .filter(Boolean);
           const limit = Number(args[args.length - 1] ?? 8);
           const results = [...db.entities]
             .filter((entity: any) => {
               const name = String(entity.name_normalized ?? "");
-              return name.length >= 2 && normalizedQuery.includes(name);
+              const aliases = String(entity.aliases_json ?? "[]").toLowerCase();
+              return name.length >= 2 && (
+                normalizedQuery.includes(name) ||
+                aliasPatterns.some((pattern: string) => aliases.includes(pattern))
+              );
             })
             .sort((a: any, b: any) =>
               String(b.name_normalized ?? "").length - String(a.name_normalized ?? "").length ||
@@ -1202,7 +1222,9 @@ export class D1Mock {
               name: entity.name,
               name_normalized: entity.name_normalized,
               entity_type: entity.entity_type ?? null,
+              aliases_json: entity.aliases_json ?? "[]",
               mention_count: entity.mention_count ?? 0,
+              updated_at: entity.updated_at ?? 0,
             }));
           return { results };
         }
@@ -1246,6 +1268,7 @@ export class D1Mock {
               expired_at: memory.expired_at ?? null,
               importance: memory.importance ?? null,
               confidence: memory.confidence ?? null,
+              entity_id: link.entity_id,
               entity_score: link.score ?? null,
               entity_name: entity?.name ?? null,
             }));
@@ -1292,6 +1315,8 @@ export class D1Mock {
               entry_id: memory.entry_id,
               memory_created_at: memory.created_at,
               memory_id: relation.memory_id,
+              from_entity_id: relation.from_entity_id,
+              to_entity_id: relation.to_entity_id,
               relation_type: relation.relation_type,
               fact: relation.fact ?? null,
               score: relation.score ?? null,

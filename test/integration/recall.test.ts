@@ -785,8 +785,130 @@ describe("GET /recall", () => {
     expect(data.results[0].id).toBe("singularity-entry");
     expect(data.results[0].matched_entities).toContain("Singularity");
     expect(data.results[0].score_details.entity).toBeGreaterThan(0);
-    expect(data.results[0].score_details.temporal).toBe(1);
+    expect(data.results[0].score_details.temporal).toBe(0.6);
     expect(data.results[0].score_details.semantic).toBeGreaterThan(0);
+  });
+
+  it("does not match short Latin entities inside longer words", async () => {
+    const now = Date.now();
+    db.entries.push({
+      id: "ai-entry",
+      content: "Artificial intelligence architecture note.",
+      tags: "[]",
+      source: "api",
+      created_at: now,
+      vector_ids: "[]",
+      recall_count: 0,
+      importance_score: 0,
+    });
+    db.memories.push({
+      id: "memory-ai",
+      entry_id: "ai-entry",
+      content: "Artificial intelligence architecture note.",
+      kind: "semantic",
+      memory_class: "fact",
+      importance: 3,
+      confidence: 0.8,
+      valid_from: null,
+      valid_to: null,
+      invalid_at: null,
+      expired_at: null,
+      created_at: now,
+    });
+    db.entities.push({
+      id: "entity-ai",
+      name: "AI",
+      name_normalized: "ai",
+      entity_type: "concept",
+      mention_count: 1,
+      updated_at: now,
+    });
+    db.memoryEntities.push({
+      id: "me-ai",
+      memory_id: "memory-ai",
+      entity_id: "entity-ai",
+      role: "mentions",
+      score: 0.9,
+      created_at: now,
+    });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({ matches: [] }),
+      }),
+    });
+
+    const res = await worker.fetch(
+      req("GET", `/recall?query=${encodeURIComponent("mail training plan")}`),
+      env,
+      ctx
+    );
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.results).toEqual([]);
+  });
+
+  it("matches entity aliases and scores explicit temporal coverage highest", async () => {
+    const now = Date.now();
+    db.entries.push({
+      id: "alias-entry",
+      content: "The project currently uses SQLite.",
+      tags: "[]",
+      source: "api",
+      created_at: now,
+      vector_ids: "[]",
+      recall_count: 0,
+      importance_score: 0,
+    });
+    db.memories.push({
+      id: "memory-alias",
+      entry_id: "alias-entry",
+      content: "The project currently uses SQLite.",
+      kind: "semantic",
+      memory_class: "fact",
+      importance: 4,
+      confidence: 0.9,
+      valid_from: now - 1_000,
+      valid_to: now + 60_000,
+      invalid_at: null,
+      expired_at: null,
+      created_at: now,
+    });
+    db.entities.push({
+      id: "entity-singularity",
+      name: "Singularity",
+      name_normalized: "singularity",
+      entity_type: "project",
+      aliases_json: '["奇点"]',
+      mention_count: 1,
+      updated_at: now,
+    });
+    db.memoryEntities.push({
+      id: "me-alias",
+      memory_id: "memory-alias",
+      entity_id: "entity-singularity",
+      role: "mentions",
+      score: 0.93,
+      created_at: now,
+    });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({ matches: [] }),
+      }),
+    });
+
+    const res = await worker.fetch(
+      req("GET", `/recall?query=${encodeURIComponent("奇点 当前方案")}`),
+      env,
+      ctx
+    );
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.results).toHaveLength(1);
+    expect(data.results[0].id).toBe("alias-entry");
+    expect(data.results[0].matched_entities).toContain("Singularity");
+    expect(data.results[0].score_details.temporal).toBe(1);
   });
 
   it("surfaces graph-only current fact candidates when dense and keyword recall miss", async () => {
@@ -862,6 +984,7 @@ describe("GET /recall", () => {
     expect(data.results[0].score_details.semantic).toBe(0);
     expect(data.results[0].score_details.entity).toBeGreaterThan(0);
     expect(data.results[0].score_details.relation).toBeGreaterThan(0);
+    expect(data.results[0].score_details.temporal).toBe(0.6);
     expect(data.results[0].graph_facts).toContain("Singularity uses SQLite");
   });
 
@@ -926,7 +1049,7 @@ describe("GET /recall", () => {
     expect(res.status).toBe(200);
     expect(data.results).toHaveLength(1);
     expect(data.results[0].id).toBe("historical-graph-entry");
-    expect(data.results[0].score_details.temporal).toBe(1);
+    expect(data.results[0].score_details.temporal).toBe(0.8);
     expect(data.results[0].matched_entities).toContain("Singularity");
   });
 
@@ -1000,6 +1123,8 @@ describe("GET /recall", () => {
     expect(data.results[0].id).toBe("embedding-fallback-entry");
     expect(data.results[0].score_details.semantic).toBe(0);
     expect(data.results[0].score_details.entity).toBeGreaterThan(0);
+    expect(data.degraded_mode).toBe(true);
+    expect(data.degraded_reason).toBe("embedding_failed");
     expect(vectorQuery).not.toHaveBeenCalled();
   });
 

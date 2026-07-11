@@ -42,6 +42,14 @@ export function normalizeEntityName(name: string): string {
     .toLowerCase();
 }
 
+export function normalizeEntityFactKey(fact: string | null | undefined): string {
+  return (fact ?? "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase()
+    .slice(0, 500);
+}
+
 export function normalizeEntityType(raw: unknown): EntityType | null {
   if (typeof raw !== "string") return null;
   const v = raw.trim().toLowerCase().replace(/\s+/g, "_");
@@ -293,6 +301,29 @@ export async function insertEntityRelation(
     createdAt: number;
   }
 ): Promise<string> {
+  const factKey = normalizeEntityFactKey(input.fact);
+  const existing = await db
+    .prepare(
+      `SELECT id FROM sb_entity_relations
+       WHERE from_entity_id = ?
+         AND to_entity_id = ?
+         AND relation_type = ?
+         AND COALESCE(memory_id, '') = ?
+         AND lower(trim(COALESCE(fact, ''))) = ?
+         AND invalid_at IS NULL
+         AND expired_at IS NULL
+       LIMIT 1`
+    )
+    .bind(
+      input.fromEntityId,
+      input.toEntityId,
+      input.relationType,
+      input.memoryId ?? "",
+      factKey
+    )
+    .first<{ id: string }>();
+  if (existing?.id) return existing.id;
+
   const id = crypto.randomUUID();
   await db
     .prepare(
@@ -308,7 +339,7 @@ export async function insertEntityRelation(
       input.fromEntityId,
       input.toEntityId,
       input.relationType,
-      input.fact ?? null,
+      input.fact?.trim() || null,
       input.memoryId ?? null,
       input.observationId ?? null,
       input.score ?? null,

@@ -107,6 +107,7 @@ import {
   getEntityGraph,
   listActiveEntityRelations,
   listEntities,
+  normalizeEntityFactKey,
   normalizeEntityName,
 } from "./memory/entities";
 
@@ -2043,6 +2044,8 @@ export interface RecallMatch {
 export interface RecallSearchResult {
   matches: RecallMatch[];
   insight: string;
+  degraded?: boolean;
+  degradedReason?: string;
 }
 
 // ─── Hybrid recall: keyword search + Reciprocal Rank Fusion ────────────────────
@@ -2069,9 +2072,11 @@ interface GraphRecallSignal {
   relation: number;
   entityNames: string[];
   facts: string[];
+  signalKeys: Set<string>;
 }
 
 const GRAPH_ENTITY_MATCH_LIMIT = 8;
+const GRAPH_ENTITY_MATCH_CANDIDATE_LIMIT = 80;
 const GRAPH_DIRECT_MEMORY_LIMIT = 100;
 const GRAPH_RELATION_MEMORY_LIMIT = 100;
 const GRAPH_DIRECT_BASE_BOOST = 0.026;
@@ -2115,10 +2120,75 @@ function activeAt(row: { valid_from?: unknown; valid_to?: unknown; invalid_at?: 
   return (validFrom == null || validFrom <= asOf) && (validTo == null || validTo > asOf);
 }
 
+function temporalScoreAt(
+  row: { valid_from?: unknown; valid_to?: unknown; invalid_at?: unknown; expired_at?: unknown },
+  asOf: number
+): number {
+  if (!activeAt(row, asOf)) return 0;
+  const hasFrom = row.valid_from != null && Number.isFinite(Number(row.valid_from));
+  const hasTo = row.valid_to != null && Number.isFinite(Number(row.valid_to));
+  if (hasFrom && hasTo) return 1;
+  if (hasFrom || hasTo) return 0.8;
+  return 0.6;
+}
+
+function parseEntityAliases(raw: unknown): string[] {
+  if (typeof raw !== "string" || !raw.trim()) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (item && typeof item === "object") return String((item as any).name ?? (item as any).text ?? "");
+        return "";
+      })
+      .map(normalizeEntityName)
+      .filter((alias) => alias.length >= 2);
+  } catch {
+    return [];
+  }
+}
+
+function hasHanScript(text: string): boolean {
+  return /[\p{Script=Han}]/u.test(text);
+}
+
+function isAsciiWordChar(char: string | undefined): boolean {
+  return !!char && /[A-Za-z0-9_]/.test(char);
+}
+
+export function entityNameMatchesQuery(normalizedQuery: string, normalizedName: string): boolean {
+  if (normalizedName.length < 2) return false;
+  if (!normalizedQuery.includes(normalizedName)) return false;
+  if (hasHanScript(normalizedName)) return true;
+
+  let index = normalizedQuery.indexOf(normalizedName);
+  while (index >= 0) {
+    const before = normalizedQuery[index - 1];
+    const after = normalizedQuery[index + normalizedName.length];
+    if (!isAsciiWordChar(before) && !isAsciiWordChar(after)) return true;
+    index = normalizedQuery.indexOf(normalizedName, index + 1);
+  }
+  return false;
+}
+
+function graphFactSignalKey(row: Record<string, unknown>): string {
+  return [
+    "relation",
+    String(row.entry_id ?? ""),
+    String(row.from_entity_id ?? ""),
+    String(row.to_entity_id ?? ""),
+    String(row.relation_type ?? ""),
+    normalizeEntityFactKey(typeof row.fact === "string" ? row.fact : null),
+  ].join(":");
+}
+
 function addGraphSignal(
   signals: Map<string, GraphRecallSignal>,
   input: {
     parentId: string;
+    signalKey: string;
     boost: number;
     createdAt: number;
     entity?: number;
@@ -2138,11 +2208,16 @@ function addGraphSignal(
     relation: 0,
     entityNames: [],
     facts: [],
+    signalKeys: new Set<string>(),
   };
-  current.boost = Math.min(
-    GRAPH_TOTAL_BOOST_MAX,
-    Math.max(current.boost, 0) + Math.max(0, input.boost)
-  );
+  const isNewSignal = !current.signalKeys.has(input.signalKey);
+  current.signalKeys.add(input.signalKey);
+  if (isNewSignal) {
+    current.boost = Math.min(
+      GRAPH_TOTAL_BOOST_MAX,
+      Math.max(current.boost, 0) + Math.max(0, input.boost)
+    );
+  }
   current.createdAt = Math.max(current.createdAt, input.createdAt || 0);
   current.entity = Math.max(current.entity, input.entity ?? 0);
   current.temporal = Math.max(current.temporal, input.temporal ?? 0);
@@ -2212,22 +2287,48 @@ async function buildGraphRecallSignals(
   const normalizedQuery = normalizeEntityName(query);
   if (normalizedQuery.length < 2) return new Map();
 
-  const { results: entityRows } = await env.DB.prepare(
-    `SELECT id, name, name_normalized, entity_type, mention_count
+  const aliasTokens = [...new Set(
+    [normalizedQuery, ...tokenizeQuery(query).map(normalizeEntityName)]
+      .filter((token) => token.length >= 2)
+      .slice(0, 12)
+  )];
+  const aliasWhere = aliasTokens.map(() => "aliases_json LIKE ?").join(" OR ");
+  const { results: entityCandidateRows } = await env.DB.prepare(
+    `SELECT id, name, name_normalized, entity_type, aliases_json, mention_count, updated_at
      FROM sb_entities
      WHERE length(name_normalized) >= 2
-       AND instr(?, name_normalized) > 0
+       AND (instr(?, name_normalized) > 0${aliasWhere ? ` OR ${aliasWhere}` : ""})
      ORDER BY length(name_normalized) DESC, mention_count DESC, updated_at DESC
      LIMIT ?`
-  ).bind(normalizedQuery, GRAPH_ENTITY_MATCH_LIMIT).all() as {
+  ).bind(
+    normalizedQuery,
+    ...aliasTokens.map((token) => `%${token}%`),
+    GRAPH_ENTITY_MATCH_CANDIDATE_LIMIT
+  ).all() as {
     results: Array<{
       id: string;
       name: string;
       name_normalized: string;
       entity_type: string | null;
+      aliases_json?: string | null;
       mention_count: number;
+      updated_at: number;
     }>;
   };
+
+  const entityRows = (entityCandidateRows ?? [])
+    .map((row) => {
+      const names = [row.name_normalized, ...parseEntityAliases(row.aliases_json)];
+      const matchedName = names.find((name) => entityNameMatchesQuery(normalizedQuery, name));
+      return matchedName ? { ...row, matchedName } : null;
+    })
+    .filter((row): row is NonNullable<typeof row> => row !== null)
+    .sort((a, b) =>
+      String(b.matchedName ?? "").length - String(a.matchedName ?? "").length ||
+      Number(b.mention_count ?? 0) - Number(a.mention_count ?? 0) ||
+      Number(b.updated_at ?? 0) - Number(a.updated_at ?? 0)
+    )
+    .slice(0, GRAPH_ENTITY_MATCH_LIMIT);
 
   const entityIds = [...new Set((entityRows ?? []).map((row) => row.id).filter(Boolean))];
   if (!entityIds.length) return new Map();
@@ -2238,7 +2339,7 @@ async function buildGraphRecallSignals(
   const { results: directRows } = await env.DB.prepare(
     `SELECT m.entry_id, m.id AS memory_id, m.created_at, m.valid_from, m.valid_to,
             m.invalid_at, m.expired_at, m.importance, m.confidence,
-            me.score AS entity_score, e.name AS entity_name
+            me.entity_id, me.score AS entity_score, e.name AS entity_name
      FROM sb_memory_entities me
      JOIN sb_memories m ON m.id = me.memory_id
      JOIN sb_entities e ON e.id = me.entity_id
@@ -2259,9 +2360,10 @@ async function buildGraphRecallSignals(
     const parentId = String(row.entry_id ?? "");
     if (!parentId) continue;
     const entityScore = clamp01(row.entity_score ?? 0.75);
-    const temporal = 1;
+    const temporal = temporalScoreAt(row, asOf);
     addGraphSignal(signals, {
       parentId,
+      signalKey: ["entity", parentId, String(row.memory_id ?? ""), String(row.entity_id ?? "")].join(":"),
       boost: GRAPH_DIRECT_BASE_BOOST * Math.max(0.65, entityScore) + GRAPH_TEMPORAL_BASE_BOOST,
       createdAt: Number(row.created_at ?? 0),
       entity: entityScore || 0.75,
@@ -2273,7 +2375,7 @@ async function buildGraphRecallSignals(
   const relationWhere = entityIds.map(() => "?").join(", ");
   const { results: relationRows } = await env.DB.prepare(
     `SELECT m.entry_id, m.created_at AS memory_created_at,
-            r.memory_id, r.relation_type, r.fact, r.score,
+            r.memory_id, r.from_entity_id, r.to_entity_id, r.relation_type, r.fact, r.score,
             r.valid_from, r.valid_to, r.invalid_at, r.expired_at,
             fe.name AS from_name, te.name AS to_name
      FROM sb_entity_relations r
@@ -2299,12 +2401,14 @@ async function buildGraphRecallSignals(
     const parentId = String(row.entry_id ?? "");
     if (!parentId) continue;
     const relationScore = clamp01(row.score ?? 0.6);
+    const temporal = temporalScoreAt(row, asOf);
     addGraphSignal(signals, {
       parentId,
+      signalKey: graphFactSignalKey(row),
       boost: GRAPH_RELATION_BASE_BOOST * Math.max(0.5, relationScore) + GRAPH_TEMPORAL_BASE_BOOST,
       createdAt: Number(row.memory_created_at ?? 0),
       relation: relationScore || 0.6,
-      temporal: 1,
+      temporal,
       entityNames: [String(row.from_name ?? ""), String(row.to_name ?? "")].filter(Boolean),
       fact: typeof row.fact === "string" ? row.fact.slice(0, 300) : null,
     });
@@ -2472,8 +2576,10 @@ export async function recallEntries(
   }
 
   const tokens = tokenizeQuery(embedQuery);
+  let embeddingFailed = false;
   const [values, queryTags, graphSignals] = await Promise.all([
     embed(embedQuery, env, "query").catch((error) => {
+      embeddingFailed = true;
       console.error("Recall embedding failed; continuing with keyword/graph recall:", error);
       return null;
     }),
@@ -2501,7 +2607,12 @@ export async function recallEntries(
          AND tags NOT LIKE '%"status:deprecated"%'
          AND tags NOT LIKE '%"auto-pattern"%'`
     ).bind(`%"${tag}"%`).all();
-    if (!tagRows.length) return { matches: [], insight: "" };
+    if (!tagRows.length) return {
+      matches: [],
+      insight: "",
+      degraded: embeddingFailed,
+      degradedReason: embeddingFailed ? "embedding_failed" : undefined,
+    };
     keywordRows = tagRows as unknown as KeywordRow[];
 
     if (!values) {
@@ -2510,7 +2621,12 @@ export async function recallEntries(
       const vectorIds = [...new Set(
         (tagRows as any[]).flatMap(r => JSON.parse((r.vector_ids as string) ?? "[]") as string[])
       )];
-      if (!vectorIds.length) return { matches: [], insight: "" };
+      if (!vectorIds.length) return {
+        matches: [],
+        insight: "",
+        degraded: embeddingFailed,
+        degradedReason: embeddingFailed ? "embedding_failed" : undefined,
+      };
 
       const vectors: VectorizeVector[] = [];
       for (let i = 0; i < vectorIds.length; i += VECTORIZE_GET_BY_IDS_BATCH) {
@@ -2560,7 +2676,12 @@ export async function recallEntries(
   // also surface exact-identifier matches the dense top-K missed entirely.
   let fusedMatches = fuseDenseAndKeyword(results.matches as VectorizeMatch[], keywordRows, tokens, !tag);
   fusedMatches = applyGraphRecallSignals(fusedMatches, graphSignals, !tag);
-  if (!fusedMatches.length) return { matches: [], insight: "" };
+  if (!fusedMatches.length) return {
+    matches: [],
+    insight: "",
+    degraded: embeddingFailed,
+    degradedReason: embeddingFailed ? "embedding_failed" : undefined,
+  };
 
   // Fetch recall_count and importance_score for all candidates to use in scoring.
   // The tag path can produce far more than 100 candidates, so chunk the IN query
@@ -2621,7 +2742,12 @@ export async function recallEntries(
     return true;
   }).slice(0, topK);
 
-  if (!deduped.length) return { matches: [], insight: "" };
+  if (!deduped.length) return {
+    matches: [],
+    insight: "",
+    degraded: embeddingFailed,
+    degradedReason: embeddingFailed ? "embedding_failed" : undefined,
+  };
 
   // Fetch full content from D1 for all matched parent IDs. Entry-level time filters are
   // applied after hydration so graph-temporal facts can be judged by fact validity rather
@@ -2703,6 +2829,13 @@ export async function recallEntries(
       query: query.slice(0, 200),
       score: m.score,
       rank: i + 1,
+      graph: {
+        entities: m.matchedEntities ?? [],
+        facts: m.graphFacts ?? [],
+        entity_score: m.scoreDetails?.entity ?? 0,
+        temporal_score: m.scoreDetails?.temporal ?? 0,
+        relation_score: m.scoreDetails?.relation ?? 0,
+      },
     }, "recall");
   }
 
@@ -2717,7 +2850,12 @@ export async function recallEntries(
     );
   }
 
-  return { matches, insight };
+  return {
+    matches,
+    insight,
+    degraded: embeddingFailed,
+    degradedReason: embeddingFailed ? "embedding_failed" : undefined,
+  };
 }
 
 // ─── Shared write path ────────────────────────────────────────────────────────
@@ -4387,10 +4525,11 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
       },
     },
     async ({ query, topK, tag, after, before, kind }) => {
-      const { matches, insight } = await recallEntries({ query, topK, tag, after, before, kind: kind as MemoryKind | undefined }, env, ctx);
+      const { matches, insight, degraded, degradedReason } = await recallEntries({ query, topK, tag, after, before, kind: kind as MemoryKind | undefined }, env, ctx);
 
       if (!matches.length) {
-        return { content: [{ type: "text", text: "Nothing found matching that query." }] };
+        const degradedText = degraded ? ` (${degradedReason ?? "degraded"})` : "";
+        return { content: [{ type: "text", text: `Nothing found matching that query.${degradedText}` }] };
       }
 
       const text = matches.map((m, i) => {
@@ -4402,7 +4541,8 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
         return `${i + 1}. [${date}${src}${tagList}] (${relevance})${updateLabel}\n${m.content}`;
       }).join("\n\n");
 
-      const finalText = insight ? `**Insight:** ${insight}\n\n---\n\n${text}` : text;
+      const degradedText = degraded ? `**Recall degraded:** ${degradedReason ?? "partial recall"}\n\n---\n\n` : "";
+      const finalText = degradedText + (insight ? `**Insight:** ${insight}\n\n---\n\n${text}` : text);
       return { content: [{ type: "text", text: finalText }] };
     }
   );
@@ -5188,15 +5328,23 @@ const defaultHandler = {
 
       const topK = Math.min(Math.max(parseInt(url.searchParams.get("topK") ?? "5", 10), 1), 20);
 
-      const { matches, insight } = await recallEntries({ query, topK, tag, after, before, kind }, env, ctx);
+      const { matches, insight, degraded, degradedReason } = await recallEntries({ query, topK, tag, after, before, kind }, env, ctx);
 
       if (!matches.length) {
-        return json({ ok: true, results: [], message: "Nothing found matching that query." });
+        return json({
+          ok: true,
+          results: [],
+          message: "Nothing found matching that query.",
+          degraded_mode: Boolean(degraded),
+          degraded_reason: degradedReason ?? null,
+        });
       }
 
       return json({
         ok: true,
         mode: "semantic",
+        degraded_mode: Boolean(degraded),
+        degraded_reason: degradedReason ?? null,
         results: matches.map(m => ({
           id: m.id,
           content: m.content,

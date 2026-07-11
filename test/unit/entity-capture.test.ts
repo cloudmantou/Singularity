@@ -72,6 +72,12 @@ describe("entity dual-write from capture", () => {
                 type: "uses",
                 fact: "Singularity uses SQLite",
               },
+              {
+                from: "Singularity",
+                to: "SQLite",
+                type: "uses",
+                fact: " singularity uses sqlite ",
+              },
             ],
           },
         ],
@@ -93,6 +99,7 @@ describe("entity dual-write from capture", () => {
     expect(db.memoryEntities.length).toBeGreaterThanOrEqual(2);
     expect(db.entityRelations.some((r) => r.relation_type === "uses")).toBe(true);
     const uses = db.entityRelations.find((r) => r.relation_type === "uses");
+    expect(db.entityRelations.filter((r) => r.relation_type === "uses")).toHaveLength(1);
     expect(uses.valid_from).toBe(1_700_000_000_000);
     expect(uses.reference_time).toBe(1_700_000_000_000);
     expect(db.memories[0].reference_time).toBeTruthy();
