@@ -111,6 +111,44 @@ describe("POST /append", () => {
     );
   });
 
+  it("returns a warning when append succeeds but atomic sync fails", async () => {
+    db.entries.push({
+      id: "entry-1",
+      content: "Original content",
+      tags: "[]",
+      source: "api",
+      created_at: Date.now(),
+      vector_ids: "[]",
+    });
+    const originalBatch = db.batch.bind(db);
+    db.batch = vi.fn(async (statements: any[]) => {
+      const looksLikeAtomicReplacement =
+        statements.length === 5 &&
+        db.entries[0]?.content.includes("New info") &&
+        db.revisions.some((revision: any) => revision.event_type === "APPEND");
+      if (looksLikeAtomicReplacement) {
+        throw new Error("atomic replacement failed");
+      }
+      return originalBatch(statements);
+    }) as any;
+
+    const res = await worker.fetch(
+      req("POST", "/append", { body: { id: "entry-1", addition: "New info" } }),
+      env,
+      ctx
+    );
+
+    expect(res.status).toBe(200);
+    const data = await res.json() as any;
+    expect(data).toMatchObject({
+      ok: true,
+      id: "entry-1",
+      warning: "atomic_sync_failed",
+    });
+    expect(db.entries[0].content).toContain("New info");
+    expect(db.memories).toHaveLength(0);
+  });
+
   // ── Short append: append-only path (≤ CHUNK_MAX_CHARS) ──────────────────────
 
   it("short append: uses a unique update generation and does not delete old vectors", async () => {

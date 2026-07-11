@@ -97,6 +97,12 @@ import {
   type ObservationExtractionStatus,
 } from "./memory/atomic";
 import {
+  exportMemoryBackup,
+  importMemoryBackup,
+  isMemoryBackupPayload,
+  memoryBackupRowCount,
+} from "./memory/backup";
+import {
   attachEntitiesToMemory,
   getEntityGraph,
   listActiveEntityRelations,
@@ -4524,6 +4530,7 @@ const defaultHandler = {
         console.error("Append failed:", e);
         return json({ ok: false, error: "Append failed. Retry later." }, 500);
       }
+      let atomicSyncWarning: string | undefined;
       try {
         await replaceEntryAtomicMemory(env.DB, {
           entryId: id,
@@ -4535,6 +4542,7 @@ const defaultHandler = {
         });
       } catch (e) {
         console.error("Atomic memory append sync failed (non-fatal):", e);
+        atomicSyncWarning = "atomic_sync_failed";
       }
       scheduleClassifyAndTag(id, appendedContent, env, ctx);
 
@@ -4542,6 +4550,10 @@ const defaultHandler = {
         ok: true,
         id,
         message: "Update appended successfully with timestamp",
+        warning: atomicSyncWarning,
+        warning_message: atomicSyncWarning
+          ? "Append succeeded, but atomic memory sync failed. Run extraction repair from Observatory."
+          : undefined,
       });
     }
 
@@ -4591,6 +4603,7 @@ const defaultHandler = {
           error: "Update could not be indexed. Previous content remains active; retry later.",
         }, 503);
       }
+      let atomicSyncWarning: string | undefined;
       try {
         await replaceEntryAtomicMemory(env.DB, {
           entryId: id,
@@ -4602,10 +4615,19 @@ const defaultHandler = {
         });
       } catch (e) {
         console.error("Atomic memory update sync failed (non-fatal):", e);
+        atomicSyncWarning = "atomic_sync_failed";
       }
       scheduleClassifyAndTag(id, finalContent, env, ctx);
 
-      return json({ ok: true, id, vectors: newVectorIds.length });
+      return json({
+        ok: true,
+        id,
+        vectors: newVectorIds.length,
+        warning: atomicSyncWarning,
+        warning_message: atomicSyncWarning
+          ? "Update succeeded, but atomic memory sync failed. Run extraction repair from Observatory."
+          : undefined,
+      });
     }
 
     // GET /count
@@ -4698,6 +4720,16 @@ const defaultHandler = {
     if (url.pathname === "/export" && request.method === "GET") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+
+      const fullExport =
+        url.searchParams.get("full") === "1" ||
+        url.searchParams.get("full") === "true" ||
+        url.searchParams.get("schemaVersion") === "4";
+      if (fullExport) {
+        return json(await exportMemoryBackup(env.DB, {
+          source: env.SELFHOST === "1" ? "selfhost" : "cloudflare",
+        }));
+      }
 
       const limit = Math.min(
         Math.max(parseInt(url.searchParams.get("limit") ?? "200", 10) || 200, 1),
@@ -5162,6 +5194,38 @@ const defaultHandler = {
 
       let entries: unknown[];
       try {
+        if (isMemoryBackupPayload(body)) {
+          const totalRows = memoryBackupRowCount(body);
+          if (env.SELFHOST !== "1" && totalRows > CLOUDFLARE_IMPORT_MAX_ROWS) {
+            return json({
+              ok: false,
+              error: "Full graph backup import is too large for one Cloudflare D1 invocation. Import on self-host or split to an entries-only batch.",
+              maxRows: CLOUDFLARE_IMPORT_MAX_ROWS,
+              totalRows,
+            }, 413);
+          }
+          const opts = (body && typeof body === "object" && !Array.isArray(body)
+            ? (body as Record<string, unknown>)
+            : {}) as {
+            mode?: ImportMode;
+            extraTags?: string[];
+          };
+          const result = await importMemoryBackup(env.DB, body as Record<string, unknown>, {
+            mode: opts.mode === "overwrite" ? "overwrite" : "skip",
+            extraTags: Array.isArray(opts.extraTags)
+              ? opts.extraTags.map(String)
+              : [],
+          });
+          return json({
+            ...result,
+            pendingVectorize: result.pendingVectorizeSample,
+            next:
+              result.pendingVectorizeCount > 0
+                ? "Run POST /vectorize-pending with { limit, includeRecent: true } in a loop until remaining=0."
+                : undefined,
+          });
+        }
+
         // Body may be raw array, { entries }, or { entries, mode, extraTags }
         if (body && typeof body === "object" && !Array.isArray(body) && "entries" in (body as object)) {
           entries = parseImportPayload(body);

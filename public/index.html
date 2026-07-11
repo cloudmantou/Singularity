@@ -5687,6 +5687,43 @@ ${metaLine}
         try {
           const text = await file.text()
           const parsed = JSON.parse(text)
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Number(parsed.schemaVersion) >= 4) {
+            const totalRows = Object.entries(parsed).reduce((sum, [, value]) => {
+              return sum + (Array.isArray(value) ? value.length : 0)
+            }, 0)
+            if (!confirm(`Import full Singularity backup (${totalRows} rows across memory tables)?\n\nOK = skip existing IDs\nCancel = abort`)) return
+            const res = await fetch(`${WORKER_URL}/import`, {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${AUTH_TOKEN}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({ ...parsed, mode: 'skip' }),
+            })
+            const data = await readJsonResponse(res)
+            if (!res.ok || data.ok === false) {
+              throw new Error(data.error || res.statusText || `HTTP ${res.status}`)
+            }
+            const pending = data.pendingVectorizeCount ?? data.pendingVectorize?.length ?? 0
+            const graph = data.graph || {}
+            const graphImported = Object.values(graph).reduce((sum, item) => sum + Number(item?.imported || 0), 0)
+            let msg = `完整导入完成：新增 ${data.inserted}，跳过 ${data.skipped}，更新 ${data.updated || 0}，图数据 ${graphImported}，失败 ${data.failed}。`
+            if (data.integrity && data.integrity.ok === false) msg += '\n\n完整性检查发现孤立引用，请在观测台查看健康指标。'
+            if (pending > 0) {
+              msg += `\n\n${pending} 条需重新向量化。`
+              if (confirm(msg + '\n\n现在循环执行 vectorize-pending？')) {
+                const r = await runVectorizeLoop({ limit: 100, includeRecent: true })
+                alert(`向量化完成：成功 ${r.totalProcessed}，失败 ${r.totalFailed}`)
+              } else {
+                alert(msg)
+              }
+            } else {
+              alert(msg)
+            }
+            loadRecent()
+            updateStatus()
+            return
+          }
           const entries = Array.isArray(parsed) ? parsed : parsed.entries || parsed.memories || parsed.data
           if (!Array.isArray(entries) || !entries.length) {
             throw new Error('JSON must be a non-empty array (or { entries: [...] })')
@@ -5743,49 +5780,27 @@ ${metaLine}
         }
       }
 
-      /** Full export via paginated GET /export (not capped at list n=100). */
-      async function fetchAllExportEntries() {
-        const all = []
-        let cursor = null
-        let total = null
-        do {
-          const q = new URLSearchParams({ limit: '500' })
-          if (cursor) q.set('cursor', cursor)
-          const res = await fetch(`${WORKER_URL}/export?${q}`, {
-            headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
-          })
-          const data = await readJsonResponse(res)
-          if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
-          if (total == null) total = data.total
-          const batch = data.entries || []
-          all.push(...batch)
-          cursor = data.nextCursor || null
-        } while (cursor)
-        if (total != null && all.length !== total) {
-          throw new Error(`导出数量不一致：count=${total} 实际=${all.length}`)
-        }
-        return all
+      /** Full graph export. The backend owns schemaVersion so UI cannot drop tables. */
+      async function fetchFullExportPayload() {
+        const res = await fetch(`${WORKER_URL}/export?full=true`, {
+          headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+        })
+        const data = await readJsonResponse(res)
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+        return data
       }
 
       async function exportMemories(format) {
         closeMenu()
         try {
-          const entries = await fetchAllExportEntries()
+          const payload = await fetchFullExportPayload()
+          const entries = payload.entries || []
 
           let content, filename, mime
           const ts = new Date().toISOString().slice(0, 10)
 
           if (format === 'json') {
-            content = JSON.stringify(
-              {
-                schemaVersion: 3,
-                exportedAt: new Date().toISOString(),
-                total: entries.length,
-                entries,
-              },
-              null,
-              2
-            )
+            content = JSON.stringify(payload, null, 2)
             filename = `singularity-export-${ts}.json`
             mime = 'application/json'
           } else {
