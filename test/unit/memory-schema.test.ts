@@ -50,6 +50,126 @@ describe("memory data model", () => {
     );
   });
 
+  it("migrates legacy observations to the extraction queue schema", async () => {
+    const db = new SqliteD1Database(raw) as unknown as D1Database;
+    await db.exec(`
+      CREATE TABLE sb_observations (
+        id TEXT PRIMARY KEY,
+        content TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'api',
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at INTEGER NOT NULL
+      )
+    `);
+    await db.batch([
+      db.prepare(
+        `INSERT INTO sb_observations (id, content, source, metadata_json, created_at)
+         VALUES (?, ?, ?, ?, ?)`
+      ).bind("obs-pending", "legacy observation", "api", "{}", 1),
+      db.prepare(
+        `INSERT INTO sb_observations (id, content, source, metadata_json, created_at)
+         VALUES (?, ?, ?, ?, ?)`
+      ).bind("obs-reprocess", "legacy fallback", "api", '{"needs_reprocess":true}', 2),
+    ]);
+
+    await ensureMemoryDataModel(db);
+
+    const columns = raw
+      .prepare(`PRAGMA table_info('sb_observations')`)
+      .all() as Array<{ name: string }>;
+    expect(columns.map((column) => column.name)).toEqual(
+      expect.arrayContaining([
+        "content_hash",
+        "extraction_status",
+        "extraction_version",
+        "extraction_attempts",
+        "extraction_error",
+        "next_attempt_at",
+        "processing_started_at",
+        "processed_at",
+        "needs_reprocess",
+      ])
+    );
+
+    const rows = raw
+      .prepare(
+        `SELECT id, extraction_status, extraction_attempts, needs_reprocess
+         FROM sb_observations
+         ORDER BY id`
+      )
+      .all() as Array<{
+        id: string;
+        extraction_status: string;
+        extraction_attempts: number;
+        needs_reprocess: number;
+      }>;
+    expect(rows).toEqual([
+      {
+        id: "obs-pending",
+        extraction_status: "pending",
+        extraction_attempts: 0,
+        needs_reprocess: 0,
+      },
+      {
+        id: "obs-reprocess",
+        extraction_status: "fallback",
+        extraction_attempts: 0,
+        needs_reprocess: 1,
+      },
+    ]);
+  });
+
+  it("migrates legacy atomic memories and fact edges with expired_at", async () => {
+    const db = new SqliteD1Database(raw) as unknown as D1Database;
+    await db.exec(`
+      CREATE TABLE sb_memories (
+        id TEXT PRIMARY KEY,
+        content TEXT NOT NULL,
+        kind TEXT,
+        memory_class TEXT,
+        importance REAL,
+        confidence REAL,
+        entry_id TEXT,
+        content_hash TEXT,
+        observed_at INTEGER,
+        valid_from INTEGER,
+        valid_to INTEGER,
+        reference_time INTEGER,
+        invalid_at INTEGER,
+        entities_json TEXT NOT NULL DEFAULT '[]',
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE sb_entity_relations (
+        id TEXT PRIMARY KEY,
+        from_entity_id TEXT NOT NULL,
+        to_entity_id TEXT NOT NULL,
+        relation_type TEXT NOT NULL,
+        fact TEXT,
+        memory_id TEXT,
+        observation_id TEXT,
+        score REAL,
+        valid_from INTEGER,
+        valid_to INTEGER,
+        invalid_at INTEGER,
+        reference_time INTEGER,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at INTEGER NOT NULL
+      )
+    `);
+
+    await ensureMemoryDataModel(db);
+
+    const memoryColumns = raw
+      .prepare(`PRAGMA table_info('sb_memories')`)
+      .all() as Array<{ name: string }>;
+    expect(memoryColumns.map((column) => column.name)).toContain("expired_at");
+
+    const relationColumns = raw
+      .prepare(`PRAGMA table_info('sb_entity_relations')`)
+      .all() as Array<{ name: string }>;
+    expect(relationColumns.map((column) => column.name)).toContain("expired_at");
+  });
+
   it("rejects invalid relation endpoints, types, and scores before SQL", () => {
     expect(() => buildMemoryRelation({
       fromMemoryId: "same",
@@ -102,6 +222,73 @@ describe("memory data model", () => {
         relationType: "digest_of",
       },
     ]);
+    await db.batch([
+      db.prepare(
+        `INSERT INTO sb_observations (id, content, source, metadata_json, created_at)
+         VALUES (?, ?, ?, ?, ?)`
+      ).bind("obs-deleted", "private fact", "api", "{}", 1),
+      db.prepare(
+        `INSERT INTO sb_observations (id, content, source, metadata_json, created_at)
+         VALUES (?, ?, ?, ?, ?)`
+      ).bind("obs-surviving", "other fact", "api", "{}", 3),
+      db.prepare(
+        `INSERT INTO sb_memories (
+           id, content, kind, memory_class, importance, confidence,
+           entry_id, content_hash, observed_at, valid_from, valid_to,
+           reference_time, invalid_at, entities_json, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind("atomic-source", "private fact", null, null, null, null, "source", "hash-source", 1, null, null, 1, null, "[]", 1),
+      db.prepare(
+        `INSERT INTO sb_memories (
+           id, content, kind, memory_class, importance, confidence,
+           entry_id, content_hash, observed_at, valid_from, valid_to,
+           reference_time, invalid_at, entities_json, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind("atomic-digest", "digest of private fact", null, null, null, null, "digest", "hash-digest", 2, null, null, 2, null, "[]", 2),
+      db.prepare(
+        `INSERT INTO sb_memories (
+           id, content, kind, memory_class, importance, confidence,
+           entry_id, content_hash, observed_at, valid_from, valid_to,
+           reference_time, invalid_at, entities_json, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind("atomic-other", "other fact", null, null, null, null, "other", "hash-other", 3, null, null, 3, null, "[]", 3),
+      db.prepare(
+        `INSERT INTO sb_memory_sources (id, memory_id, observation_id, role, score, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind("src-source", "atomic-source", "obs-deleted", "derived_from", null, 1),
+      db.prepare(
+        `INSERT INTO sb_memory_sources (id, memory_id, observation_id, role, score, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind("src-digest", "atomic-digest", "obs-deleted", "derived_from", null, 2),
+      db.prepare(
+        `INSERT INTO sb_memory_sources (id, memory_id, observation_id, role, score, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind("src-other", "atomic-other", "obs-surviving", "derived_from", null, 3),
+      db.prepare(
+        `INSERT INTO sb_memory_entities (id, memory_id, entity_id, role, score, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind("mention-source", "atomic-source", "entity-source", "mentions", null, 1),
+      db.prepare(
+        `INSERT INTO sb_memory_entities (id, memory_id, entity_id, role, score, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind("mention-other", "atomic-other", "entity-other", "mentions", null, 3),
+      db.prepare(
+        `INSERT INTO sb_entity_relations (
+           id, from_entity_id, to_entity_id, relation_type, fact,
+           memory_id, observation_id, score,
+           valid_from, valid_to, invalid_at, reference_time,
+           metadata_json, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind("fact-source", "entity-source", "entity-other", "related_to", null, "atomic-source", "obs-deleted", null, null, null, null, 1, "{}", 1),
+      db.prepare(
+        `INSERT INTO sb_entity_relations (
+           id, from_entity_id, to_entity_id, relation_type, fact,
+           memory_id, observation_id, score,
+           valid_from, valid_to, invalid_at, reference_time,
+           metadata_json, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind("fact-other", "entity-other", "entity-source", "related_to", null, "atomic-other", "obs-surviving", null, null, null, null, 3, "{}", 3),
+    ]);
 
     const relations = await listMemoryRelations(db, "source");
     expect(relations).toEqual([
@@ -132,6 +319,22 @@ describe("memory data model", () => {
       .bind("other")
       .first<{ event_type: string }>();
     expect(unroll?.event_type).toBe("UNROLL");
+    const { results: atomicMemories } = await db
+      .prepare(`SELECT id FROM sb_memories ORDER BY id`)
+      .all<{ id: string }>();
+    expect(atomicMemories.map(row => row.id)).toEqual(["atomic-other"]);
+    const { results: observations } = await db
+      .prepare(`SELECT id FROM sb_observations ORDER BY id`)
+      .all<{ id: string }>();
+    expect(observations.map(row => row.id)).toEqual(["obs-surviving"]);
+    const { results: memoryEntities } = await db
+      .prepare(`SELECT memory_id FROM sb_memory_entities ORDER BY memory_id`)
+      .all<{ memory_id: string }>();
+    expect(memoryEntities.map(row => row.memory_id)).toEqual(["atomic-other"]);
+    const { results: factEdges } = await db
+      .prepare(`SELECT memory_id FROM sb_entity_relations ORDER BY memory_id`)
+      .all<{ memory_id: string }>();
+    expect(factEdges.map(row => row.memory_id)).toEqual(["atomic-other"]);
   });
 
   it("records a revision only when the guarded vector generation becomes active", async () => {

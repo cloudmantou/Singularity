@@ -61,6 +61,41 @@ describe("POST /capture", () => {
     expect(res.status).toBe(400);
   });
 
+  it("dry-runs extraction backlog without invoking the LLM", async () => {
+    const run = vi.fn().mockImplementation(async (model: string) => {
+      if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
+      throw new Error("LLM should not be called during dry-run");
+    });
+    env = makeTestEnv(db, { AI: { run } as unknown as Ai });
+    db.observations.push({
+      id: "orphan-pending",
+      content: "legacy orphan",
+      source: "api",
+      metadata_json: "{}",
+      extraction_status: "pending",
+      extraction_attempts: 0,
+      next_attempt_at: null,
+      processing_started_at: null,
+      extraction_version: 1,
+      needs_reprocess: 0,
+      created_at: 1,
+    });
+
+    const { ctx } = makeCtx();
+    const res = await worker.fetch(req("GET", "/extract-pending?dryRun=true&limit=3"), env, ctx);
+    const body = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(body).toMatchObject({
+      dryRun: true,
+      limit: 3,
+      due: 1,
+      orphanPending: 1,
+    });
+    expect(db.observations[0].extraction_status).toBe("pending");
+    expect(run).not.toHaveBeenCalled();
+  });
+
   it("stores valid entry and returns id", async () => {
     const { ctx } = makeCtx();
     const res = await worker.fetch(req("POST", "/capture", { body: { content: "Test note" } }), env, ctx);
@@ -191,8 +226,14 @@ describe("POST /capture", () => {
     );
     const data = await response.json() as any;
 
-    expect(data.duplicate).toBe(true);
-    expect(data.matchId).toBe("existing");
+    expect(data).toMatchObject({
+      ok: true,
+      duplicate: true,
+      action: "source_linked",
+      id: "existing",
+    });
+    expect(db.observations).toHaveLength(1);
+    expect(db.memorySources).toHaveLength(1);
     expect(queryMock).not.toHaveBeenCalled();
   });
 

@@ -68,6 +68,23 @@ describe("checkDuplicateAndContradiction()", () => {
     expect(contradiction.reason).toBe("different city");
   });
 
+  it("maps masked numeric contradiction refs back to real IDs without exposing IDs in the prompt", async () => {
+    const env = makeEnv(
+      '{"contradicts": true, "conflicting_id": "1", "reason": "different city"}',
+      [match("abc123", 0.72)],
+      [entry("abc123", "I live in NYC")]
+    );
+    const { contradiction } = await checkDuplicateAndContradiction("I moved to LA last year", env);
+    expect(contradiction.detected).toBe(true);
+    expect(contradiction.conflicting_id).toBe("abc123");
+
+    const llmCall = (env.AI.run as any).mock.calls.find(
+      ([model]: [string]) => model !== "@cf/baai/bge-small-en-v1.5"
+    );
+    expect(JSON.stringify(llmCall?.[1] ?? "")).not.toContain("abc123");
+    expect(JSON.stringify(llmCall?.[1] ?? "")).toContain("[1]");
+  });
+
   it("ignores a hallucinated ID not in the candidate results", async () => {
     const env = makeEnv(
       '{"contradicts": true, "conflicting_id": "made-up-id", "reason": "different city"}',
@@ -142,6 +159,22 @@ describe("checkDuplicateAndContradiction()", () => {
     );
     const { mergeAction } = await checkDuplicateAndContradiction("I switched to Cursor", env);
     expect(mergeAction).toEqual({ action: "replace", target_id: "near" });
+  });
+
+  it("maps masked numeric merge targets back to real IDs without exposing IDs in the prompt", async () => {
+    const env = makeEnv(
+      '{"action":"replace","target_id":"1"}',
+      [match("near", 0.88)],
+      [entry("near", "I use VSCode")]
+    );
+    const { mergeAction } = await checkDuplicateAndContradiction("I switched to Cursor", env);
+    expect(mergeAction).toEqual({ action: "replace", target_id: "near" });
+
+    const llmCall = (env.AI.run as any).mock.calls.find(
+      ([model]: [string]) => model !== "@cf/baai/bge-small-en-v1.5"
+    );
+    expect(JSON.stringify(llmCall?.[1] ?? "")).not.toContain("near");
+    expect(JSON.stringify(llmCall?.[1] ?? "")).toContain("[1]");
   });
 
   it("returns mergeAction=merge with a validated target_id without generating rewritten content", async () => {

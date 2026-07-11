@@ -171,6 +171,7 @@ export const ENTITY_SCHEMA_STATEMENTS = [
     valid_from INTEGER,
     valid_to INTEGER,
     invalid_at INTEGER,
+    expired_at INTEGER,
     reference_time INTEGER,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     created_at INTEGER NOT NULL
@@ -191,6 +192,8 @@ export async function ensureEntityDataModel(db: D1Database): Promise<void> {
   for (const alter of [
     `ALTER TABLE sb_memories ADD COLUMN reference_time INTEGER`,
     `ALTER TABLE sb_memories ADD COLUMN invalid_at INTEGER`,
+    `ALTER TABLE sb_memories ADD COLUMN expired_at INTEGER`,
+    `ALTER TABLE sb_entity_relations ADD COLUMN expired_at INTEGER`,
   ]) {
     try {
       await db.exec(alter);
@@ -284,6 +287,7 @@ export async function insertEntityRelation(
     validFrom?: number | null;
     validTo?: number | null;
     invalidAt?: number | null;
+    expiredAt?: number | null;
     referenceTime?: number | null;
     metadata?: Record<string, unknown>;
     createdAt: number;
@@ -295,9 +299,9 @@ export async function insertEntityRelation(
       `INSERT INTO sb_entity_relations (
          id, from_entity_id, to_entity_id, relation_type, fact,
          memory_id, observation_id, score,
-         valid_from, valid_to, invalid_at, reference_time,
+         valid_from, valid_to, invalid_at, expired_at, reference_time,
          metadata_json, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       id,
@@ -311,6 +315,7 @@ export async function insertEntityRelation(
       input.validFrom ?? null,
       input.validTo ?? null,
       input.invalidAt ?? null,
+      input.expiredAt ?? null,
       input.referenceTime ?? null,
       JSON.stringify(input.metadata ?? {}),
       input.createdAt
@@ -483,8 +488,8 @@ export async function getEntityGraph(
   const { results: relations } = await db
     .prepare(
       `SELECT r.id, r.from_entity_id, r.to_entity_id, r.relation_type, r.fact, r.memory_id,
-              r.observation_id, r.score, r.valid_from, r.valid_to, r.invalid_at, r.reference_time,
-              r.created_at,
+              r.observation_id, r.score, r.valid_from, r.valid_to, r.invalid_at,
+              r.expired_at, r.reference_time, r.created_at,
               fe.name AS from_name, te.name AS to_name
        FROM sb_entity_relations r
        JOIN sb_entities fe ON fe.id = r.from_entity_id
@@ -500,7 +505,7 @@ export async function getEntityGraph(
     .prepare(
       `SELECT m.id, m.content, m.kind, m.memory_class, m.importance, m.confidence,
               m.entry_id, m.observed_at, m.valid_from, m.valid_to, m.reference_time,
-              m.invalid_at, m.created_at, me.role
+              m.invalid_at, m.expired_at, m.created_at, me.role
        FROM sb_memory_entities me
        JOIN sb_memories m ON m.id = me.memory_id
        WHERE me.entity_id = ?
@@ -517,7 +522,7 @@ export async function getEntityGraph(
   };
 }
 
-/** Active facts: invalid_at IS NULL and (valid_to IS NULL OR valid_to > asOf). */
+/** Active facts: not invalid/expired and (valid_to IS NULL OR valid_to > asOf). */
 export async function listActiveEntityRelations(
   db: D1Database,
   opts: { entityId?: string; asOf?: number; limit?: number } = {}
@@ -533,6 +538,7 @@ export async function listActiveEntityRelations(
          JOIN sb_entities te ON te.id = r.to_entity_id
          WHERE (r.from_entity_id = ? OR r.to_entity_id = ?)
            AND r.invalid_at IS NULL
+           AND r.expired_at IS NULL
            AND (r.valid_from IS NULL OR r.valid_from <= ?)
            AND (r.valid_to IS NULL OR r.valid_to > ?)
          ORDER BY r.created_at DESC
@@ -549,6 +555,7 @@ export async function listActiveEntityRelations(
        JOIN sb_entities fe ON fe.id = r.from_entity_id
        JOIN sb_entities te ON te.id = r.to_entity_id
        WHERE r.invalid_at IS NULL
+         AND r.expired_at IS NULL
          AND (r.valid_from IS NULL OR r.valid_from <= ?)
          AND (r.valid_to IS NULL OR r.valid_to > ?)
        ORDER BY r.created_at DESC

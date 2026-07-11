@@ -92,7 +92,7 @@ describe("captureEntry()", () => {
 
   // ── Duplicate: exact content hash only ──────────────────────────────────────
 
-  it("returns status=blocked for exact content fingerprint match", async () => {
+  it("links exact content fingerprint matches as new sources without adding entries", async () => {
     const { contentFingerprint } = await import("../../src/index");
     const content = "Exact same fact";
     db.entries.push({
@@ -115,11 +115,13 @@ describe("captureEntry()", () => {
     });
     const { ctx } = makeCtx();
     const result = await captureEntry(content, [], "api", env, ctx);
-    expect(result.status).toBe("blocked");
-    if (result.status !== "blocked") return;
-    expect(result.matchId).toBe("existing");
-    expect(result.score).toBe(1);
+    expect(result.status).toBe("sourced");
+    if (result.status !== "sourced") return;
+    expect(result.id).toBe("existing");
     expect(db.entries).toHaveLength(1);
+    expect(db.observations).toHaveLength(1);
+    expect(db.memories).toHaveLength(1);
+    expect(db.memorySources).toHaveLength(1);
   });
 
   it("does not hard-block high vector similarity — still ADD + link", async () => {

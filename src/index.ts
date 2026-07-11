@@ -84,12 +84,17 @@ import {
 } from "./memory/revisions";
 import {
   buildAtomicExtractionPrompt,
+  deprecateEntryAtomicMemory,
+  linkObservationToAtomicMemory,
   parseAtomicExtraction,
   prepareAtomicMemoryInsert,
   prepareMemorySourceInsert,
   prepareObservationInsert,
+  replaceEntryAtomicMemory,
   ATOMIC_EXTRACTION_MAX_TOKENS,
+  ATOMIC_EXTRACTION_VERSION,
   type AtomicFactDraft,
+  type ObservationExtractionStatus,
 } from "./memory/atomic";
 import {
   attachEntitiesToMemory,
@@ -757,8 +762,22 @@ export async function checkDuplicateAndContradiction(content: string, env: Env):
       ).bind(...parentIds).all() as { results: { id: string; content: string }[] };
 
       if (rows.length) {
-        const existingList = rows
-          .map((r, i) => `[${i + 1}] ID: ${r.id}\n${r.content}`)
+        const candidateRefs = rows.map((row, index) => ({
+          ref: String(index + 1),
+          id: row.id,
+          content: row.content,
+        }));
+        const resolveCandidateId = (raw: unknown): string | null => {
+          if (raw == null) return null;
+          const value = String(raw).trim().replace(/^\[(\d+)\]$/, "$1");
+          const byRef = candidateRefs.find(candidate => candidate.ref === value);
+          if (byRef) return byRef.id;
+          // Backward compatibility: older tests/models may still return a real ID.
+          const byId = candidateRefs.find(candidate => candidate.id === value);
+          return byId?.id ?? null;
+        };
+        const existingList = candidateRefs
+          .map((candidate) => `[${candidate.ref}]\n${candidate.content}`)
           .join("\n\n");
 
         if (duplicate.status === "flagged") {
@@ -777,8 +796,9 @@ Choose exactly one action. Prioritise in this order:
 3. "merge" — the new memory is complementary or continues an existing one. Include target_id. Do not rewrite either memory.
 4. "keep_both" — memories are different enough to coexist, or you are uncertain. This is the safe default.
 
+Use only the bracketed candidate number, not any database ID, for conflicting_id or target_id.
 Respond with JSON only. No text outside the JSON.
-{"action":"keep_both"} OR {"action":"contradiction","conflicting_id":"<id>","reason":"<10 words max>"} OR {"action":"replace","target_id":"<id>"} OR {"action":"merge","target_id":"<id>"}`;
+{"action":"keep_both"} OR {"action":"contradiction","conflicting_id":"<number>","reason":"<10 words max>"} OR {"action":"replace","target_id":"<number>"} OR {"action":"merge","target_id":"<number>"}`;
 
           try {
             const text = await (await createLLM(env)).chat(
@@ -791,14 +811,14 @@ Respond with JSON only. No text outside the JSON.
               const action = parsed.action as string;
 
               if (action === "contradiction" && parsed.conflicting_id) {
-                const validId = parentIds.find(id => id === parsed.conflicting_id);
+                const validId = resolveCandidateId(parsed.conflicting_id);
                 if (validId) contradiction = { detected: true, conflicting_id: validId, reason: parsed.reason };
                 // mergeAction stays null — contradiction path handles cleanup
               } else if (action === "replace" && parsed.target_id) {
-                const validId = parentIds.find(id => id === parsed.target_id);
+                const validId = resolveCandidateId(parsed.target_id);
                 mergeAction = validId ? { action: "replace", target_id: validId } : { action: "keep_both" };
               } else if (action === "merge" && parsed.target_id) {
-                const validId = parentIds.find(id => id === parsed.target_id);
+                const validId = resolveCandidateId(parsed.target_id);
                 mergeAction = validId
                   ? { action: "merge", target_id: validId }
                   : { action: "keep_both" };
@@ -823,8 +843,9 @@ ${existingList}
 
 A contradiction means the new memory states something that DIRECTLY CONFLICTS with an existing memory — a different current location, reversed preference, changed decision, or updated fact. Partial overlaps, additions, or elaborations are NOT contradictions.
 
+Use only the bracketed candidate number, not any database ID, for conflicting_id.
 Respond with JSON only. No text outside the JSON object.
-{"contradicts": false} OR {"contradicts": true, "conflicting_id": "<exact_id>", "reason": "<10 words max>"}`;
+{"contradicts": false} OR {"contradicts": true, "conflicting_id": "<number>", "reason": "<10 words max>"}`;
 
           try {
             const text = await (await createLLM(env)).chat(
@@ -835,7 +856,7 @@ Respond with JSON only. No text outside the JSON object.
             if (jsonMatch) {
               const parsed = JSON.parse(jsonMatch[0]);
               if (parsed.contradicts && parsed.conflicting_id) {
-                const validId = parentIds.find(id => id === parsed.conflicting_id);
+                const validId = resolveCandidateId(parsed.conflicting_id);
                 if (validId) contradiction = { detected: true, conflicting_id: validId, reason: parsed.reason };
               }
             }
@@ -2608,6 +2629,7 @@ function scheduleClassifyAndTag(
 
 export type CaptureSingleResult =
   | { status: "blocked"; matchId: string; score: number }
+  | { status: "sourced"; id: string; observationId: string; memoryId: string }
   | { status: "stored"; id: string }
   | { status: "flagged"; id: string; matchId: string; score: number }
   | { status: "linked"; id: string; linkedId: string; relation: MemoryRelationType; score: number }
@@ -2633,7 +2655,7 @@ export interface CaptureOptions {
 
 export function captureResultEntryIds(result: CaptureResult): string[] {
   if (result.status === "batch") {
-    return result.results.flatMap((item) => ("id" in item ? [item.id] : []));
+    return [...new Set(result.results.flatMap((item) => ("id" in item ? [item.id] : [])))];
   }
   if ("id" in result) return [result.id];
   return [];
@@ -2648,10 +2670,23 @@ export function formatCaptureResultMessage(result: CaptureResult): string {
     if (!ids.length) {
       return `Observation ${result.observationId} produced no new memories (all exact duplicates).`;
     }
+    const sourced = result.results.filter((item) => item.status === "sourced").length;
+    const created = result.results.filter(
+      (item) => item.status !== "blocked" && item.status !== "sourced"
+    ).length;
+    if (sourced && !created) {
+      return `Observation ${result.observationId} linked ${sourced} duplicate facts as new sources.`;
+    }
+    if (sourced) {
+      return `Stored ${created} atomic memories and linked ${sourced} duplicate facts as new sources from observation ${result.observationId}.`;
+    }
     return (
       `Stored ${ids.length} atomic memories from observation ${result.observationId}.\n` +
       ids.map((id, i) => `${i + 1}. ${id}`).join("\n")
     );
+  }
+  if (result.status === "sourced") {
+    return `Exact duplicate observed again — linked observation ${result.observationId} as a new source for memory ${result.id}.`;
   }
   if (result.status === "contradiction") {
     return `Stored as a new memory. ID: ${result.id} — linked as contradicting entry ${result.conflictId}; both original observations were preserved${result.reason ? `: ${result.reason}` : ""}.`;
@@ -2748,6 +2783,496 @@ export async function extractAtomicFacts(content: string, env: Env): Promise<Ato
   return parseAtomicExtraction(text);
 }
 
+const ATOMIC_EXTRACTION_MAX_ATTEMPTS = 3;
+const ATOMIC_EXTRACTION_LEASE_MS = 5 * 60_000;
+const ATOMIC_EXTRACTION_BASE_BACKOFF_MS = 60_000;
+const ATOMIC_EXTRACTION_DEFAULT_LIMIT = 10;
+const ATOMIC_EXTRACTION_SELFHOST_LIMIT = 50;
+const ATOMIC_EXTRACTION_CLOUDFLARE_LIMIT = 10;
+
+interface ObservationExtractionRow {
+  id: string;
+  content: string;
+  source: string;
+  metadata_json: string;
+  created_at: number;
+  content_hash: string | null;
+  extraction_status: ObservationExtractionStatus;
+  extraction_version: number;
+  extraction_attempts: number;
+  extraction_error: string | null;
+  next_attempt_at: number | null;
+  processing_started_at: number | null;
+  processed_at: number | null;
+  needs_reprocess: number;
+}
+
+type ObservationExtractionProcessResult =
+  | { status: "succeeded"; observationId: string; result: CaptureResult }
+  | { status: "fallback"; observationId: string; result: CaptureResult; error: string }
+  | { status: "failed"; observationId: string; error: string; final: boolean }
+  | { status: "skipped"; observationId: string };
+
+export interface ExtractionQueueDryRunResult {
+  dryRun: true;
+  limit: number;
+  due: number;
+  deferred: number;
+  exhausted: number;
+  orphanPending: number;
+  fallbackReprocess: number;
+  retryableDue: number;
+  staleProcessing: number;
+}
+
+function atomicExtractionErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500);
+}
+
+function atomicExtractionBackoffMs(attempts: number): number {
+  const power = Math.max(0, attempts - 1);
+  return Math.min(15 * 60_000, ATOMIC_EXTRACTION_BASE_BACKOFF_MS * 2 ** power);
+}
+
+function tagsFromObservationMetadata(metadataJson: string | null | undefined): string[] {
+  try {
+    const metadata = JSON.parse(metadataJson || "{}") as Record<string, unknown>;
+    if (!Array.isArray(metadata.tags)) return [];
+    return [...new Set(
+      metadata.tags
+        .map((tag) => String(tag).toLowerCase())
+        .filter(isD1SafeTag)
+    )];
+  } catch {
+    return [];
+  }
+}
+
+function fallbackAtomicDraft(content: string, observedAt: number): AtomicFactDraft {
+  return {
+    content,
+    kind: null,
+    memoryClass: null,
+    importance: null,
+    confidence: null,
+    observedAt,
+    validFrom: null,
+    validTo: null,
+    referenceTime: observedAt,
+    entities: [],
+    relations: [],
+  };
+}
+
+async function leaseObservationForExtraction(
+  env: Env,
+  row: Pick<ObservationExtractionRow, "id">,
+  now: number
+): Promise<boolean> {
+  const leaseCutoff = now - ATOMIC_EXTRACTION_LEASE_MS;
+  const result = await env.DB.prepare(
+    `UPDATE sb_observations
+     SET extraction_status = 'processing',
+         extraction_attempts = CASE
+           WHEN COALESCE(extraction_version, 0) < ? THEN 1
+           ELSE COALESCE(extraction_attempts, 0) + 1
+         END,
+         extraction_error = NULL,
+         next_attempt_at = NULL,
+         processing_started_at = ?,
+         extraction_version = ?
+     WHERE id = ?
+       AND COALESCE(extraction_attempts, 0) < ?
+       AND (
+         extraction_status = 'pending'
+         OR (extraction_status = 'retryable_error' AND COALESCE(next_attempt_at, 0) <= ?)
+         OR (extraction_status = 'processing' AND COALESCE(processing_started_at, 0) <= ?)
+         OR (extraction_status = 'fallback' AND COALESCE(needs_reprocess, 0) = 1)
+         OR COALESCE(extraction_version, 0) < ?
+       )`
+  )
+    .bind(
+      ATOMIC_EXTRACTION_VERSION,
+      now,
+      ATOMIC_EXTRACTION_VERSION,
+      row.id,
+      ATOMIC_EXTRACTION_MAX_ATTEMPTS,
+      now,
+      leaseCutoff,
+      ATOMIC_EXTRACTION_VERSION
+    )
+    .run();
+  return Number(result.meta?.changes ?? 0) > 0;
+}
+
+async function readObservationLease(
+  env: Env,
+  id: string
+): Promise<{ attempts: number; startedAt: number | null } | null> {
+  const row = await env.DB.prepare(
+    `SELECT extraction_attempts, processing_started_at
+     FROM sb_observations
+     WHERE id = ?`
+  )
+    .bind(id)
+    .first<{ extraction_attempts: number; processing_started_at: number | null }>();
+  if (!row) return null;
+  return {
+    attempts: Number(row.extraction_attempts ?? 0),
+    startedAt: row.processing_started_at == null ? null : Number(row.processing_started_at),
+  };
+}
+
+async function markObservationExtractionSucceeded(
+  env: Env,
+  input: { id: string; startedAt: number | null; processedAt: number }
+): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE sb_observations
+     SET extraction_status = 'succeeded',
+         extraction_error = NULL,
+         next_attempt_at = NULL,
+         processing_started_at = NULL,
+         processed_at = ?,
+         needs_reprocess = 0,
+         extraction_version = ?
+     WHERE id = ?
+       AND (processing_started_at = ? OR ? IS NULL)`
+  )
+    .bind(
+      input.processedAt,
+      ATOMIC_EXTRACTION_VERSION,
+      input.id,
+      input.startedAt,
+      input.startedAt
+    )
+    .run();
+}
+
+async function markObservationExtractionFailure(
+  env: Env,
+  input: {
+    id: string;
+    startedAt: number | null;
+    status: Exclude<ObservationExtractionStatus, "pending" | "processing" | "succeeded">;
+    error: string;
+    nextAttemptAt: number | null;
+    processedAt: number | null;
+    needsReprocess: boolean;
+  }
+): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE sb_observations
+     SET extraction_status = ?,
+         extraction_error = ?,
+         next_attempt_at = ?,
+         processing_started_at = NULL,
+         processed_at = ?,
+         needs_reprocess = ?,
+         extraction_version = ?
+     WHERE id = ?
+       AND (processing_started_at = ? OR ? IS NULL)`
+  )
+    .bind(
+      input.status,
+      input.error,
+      input.nextAttemptAt,
+      input.processedAt,
+      input.needsReprocess ? 1 : 0,
+      ATOMIC_EXTRACTION_VERSION,
+      input.id,
+      input.startedAt,
+      input.startedAt
+    )
+    .run();
+}
+
+async function captureExtractedFactsFromObservation(
+  row: Pick<ObservationExtractionRow, "id" | "content" | "source" | "metadata_json" | "created_at">,
+  facts: AtomicFactDraft[],
+  env: Env,
+  ctx: ExecutionContext
+): Promise<CaptureResult> {
+  const baseTags = tagsFromObservationMetadata(row.metadata_json);
+  if (facts.length <= 1) {
+    const draft = facts[0] ?? fallbackAtomicDraft(row.content, row.created_at);
+    return captureSingleFact(draft.content || row.content, baseTags, row.source, env, ctx, {
+      skipExtract: true,
+      observationId: row.id,
+      atomic: draft,
+    });
+  }
+
+  const results: CaptureSingleResult[] = [];
+  for (const draft of facts) {
+    const result = await captureSingleFact(draft.content, baseTags, row.source, env, ctx, {
+      skipExtract: true,
+      observationId: row.id,
+      atomic: draft,
+    });
+    results.push(result);
+  }
+
+  if (results.length && results.every((result) => result.status === "blocked")) {
+    const first = results[0];
+    if (first.status === "blocked") return first;
+  }
+
+  return { status: "batch", observationId: row.id, results };
+}
+
+async function processObservationExtraction(
+  row: ObservationExtractionRow,
+  env: Env,
+  ctx: ExecutionContext,
+  options: { fallbackOnError?: boolean } = {}
+): Promise<ObservationExtractionProcessResult> {
+  const startedAt = Date.now();
+  const leased = await leaseObservationForExtraction(env, row, startedAt);
+  if (!leased) return { status: "skipped", observationId: row.id };
+
+  const lease = await readObservationLease(env, row.id);
+  const attempts = lease?.attempts ?? Number(row.extraction_attempts ?? 0) + 1;
+  const processingStartedAt = lease?.startedAt ?? startedAt;
+
+  let facts: AtomicFactDraft[];
+  try {
+    facts = await extractAtomicFacts(row.content, env);
+  } catch (error) {
+    const message = atomicExtractionErrorMessage(error);
+    const now = Date.now();
+    if (options.fallbackOnError) {
+      const result = await captureExtractedFactsFromObservation(
+        row,
+        [fallbackAtomicDraft(row.content, row.created_at)],
+        env,
+        ctx
+      );
+      await markObservationExtractionFailure(env, {
+        id: row.id,
+        startedAt: processingStartedAt,
+        status: "fallback",
+        error: message,
+        nextAttemptAt: null,
+        processedAt: now,
+        needsReprocess: true,
+      });
+      return { status: "fallback", observationId: row.id, result, error: message };
+    }
+
+    const final = attempts >= ATOMIC_EXTRACTION_MAX_ATTEMPTS;
+    await markObservationExtractionFailure(env, {
+      id: row.id,
+      startedAt: processingStartedAt,
+      status: final ? "terminal_error" : "retryable_error",
+      error: message,
+      nextAttemptAt: final ? null : now + atomicExtractionBackoffMs(attempts),
+      processedAt: final ? now : null,
+      needsReprocess: Boolean(row.needs_reprocess),
+    });
+    return { status: "failed", observationId: row.id, error: message, final };
+  }
+
+  const result = await captureExtractedFactsFromObservation(row, facts, env, ctx);
+  await markObservationExtractionSucceeded(env, {
+    id: row.id,
+    startedAt: processingStartedAt,
+    processedAt: Date.now(),
+  });
+  return { status: "succeeded", observationId: row.id, result };
+}
+
+export async function processExtractionQueue(
+  env: Env,
+  ctx: ExecutionContext,
+  limit = ATOMIC_EXTRACTION_DEFAULT_LIMIT
+): Promise<{
+  processed: number;
+  failed: number;
+  skipped: number;
+  fallback: number;
+  remaining: number;
+  deferred: number;
+  exhausted: number;
+}> {
+  const now = Date.now();
+  const leaseCutoff = now - ATOMIC_EXTRACTION_LEASE_MS;
+  const boundedLimit = boundedExtractionLimit(env, limit);
+
+  const { results } = await env.DB.prepare(
+    `SELECT id, content, source, metadata_json, created_at, content_hash,
+            extraction_status, extraction_version, extraction_attempts,
+            extraction_error, next_attempt_at, processing_started_at,
+            processed_at, needs_reprocess
+     FROM sb_observations
+     WHERE COALESCE(extraction_attempts, 0) < ?
+       AND (
+         extraction_status = 'pending'
+         OR (extraction_status = 'retryable_error' AND COALESCE(next_attempt_at, 0) <= ?)
+         OR (extraction_status = 'processing' AND COALESCE(processing_started_at, 0) <= ?)
+         OR (extraction_status = 'fallback' AND COALESCE(needs_reprocess, 0) = 1)
+         OR COALESCE(extraction_version, 0) < ?
+       )
+     ORDER BY created_at ASC
+     LIMIT ?`
+  )
+    .bind(
+      ATOMIC_EXTRACTION_MAX_ATTEMPTS,
+      now,
+      leaseCutoff,
+      ATOMIC_EXTRACTION_VERSION,
+      boundedLimit
+    )
+    .all<ObservationExtractionRow>();
+
+  let processed = 0;
+  let failed = 0;
+  let skipped = 0;
+  let fallback = 0;
+
+  for (const row of results) {
+    const result = await processObservationExtraction(row, env, ctx);
+    if (result.status === "succeeded") processed += 1;
+    else if (result.status === "failed") failed += 1;
+    else if (result.status === "fallback") fallback += 1;
+    else skipped += 1;
+  }
+
+  const remaining = await env.DB.prepare(
+    `SELECT COUNT(*) as count FROM sb_observations
+     WHERE COALESCE(extraction_attempts, 0) < ?
+       AND (
+         extraction_status = 'pending'
+         OR (extraction_status = 'retryable_error' AND COALESCE(next_attempt_at, 0) <= ?)
+         OR (extraction_status = 'processing' AND COALESCE(processing_started_at, 0) <= ?)
+         OR (extraction_status = 'fallback' AND COALESCE(needs_reprocess, 0) = 1)
+         OR COALESCE(extraction_version, 0) < ?
+       )`
+  )
+    .bind(ATOMIC_EXTRACTION_MAX_ATTEMPTS, now, leaseCutoff, ATOMIC_EXTRACTION_VERSION)
+    .first<{ count: number }>();
+
+  const deferred = await env.DB.prepare(
+    `SELECT COUNT(*) as count FROM sb_observations
+     WHERE extraction_status = 'retryable_error'
+       AND COALESCE(extraction_attempts, 0) < ?
+       AND COALESCE(next_attempt_at, 0) > ?`
+  )
+    .bind(ATOMIC_EXTRACTION_MAX_ATTEMPTS, now)
+    .first<{ count: number }>();
+
+  const exhausted = await env.DB.prepare(
+    `SELECT COUNT(*) as count FROM sb_observations
+     WHERE extraction_status = 'terminal_error'`
+  )
+    .first<{ count: number }>();
+
+  return {
+    processed,
+    failed,
+    skipped,
+    fallback,
+    remaining: Number(remaining?.count ?? 0),
+    deferred: Number(deferred?.count ?? 0),
+    exhausted: Number(exhausted?.count ?? 0),
+  };
+}
+
+function boundedExtractionLimit(env: Env, limit: unknown): number {
+  return Math.min(
+    Math.max(Number(limit) || ATOMIC_EXTRACTION_DEFAULT_LIMIT, 1),
+    env.SELFHOST === "1" ? ATOMIC_EXTRACTION_SELFHOST_LIMIT : ATOMIC_EXTRACTION_CLOUDFLARE_LIMIT
+  );
+}
+
+export async function inspectExtractionQueue(
+  env: Env,
+  limit = ATOMIC_EXTRACTION_DEFAULT_LIMIT
+): Promise<ExtractionQueueDryRunResult> {
+  const now = Date.now();
+  const leaseCutoff = now - ATOMIC_EXTRACTION_LEASE_MS;
+  const boundedLimit = boundedExtractionLimit(env, limit);
+
+  const due = await env.DB.prepare(
+    `SELECT COUNT(*) as count FROM sb_observations
+     WHERE COALESCE(extraction_attempts, 0) < ?
+       AND (
+         extraction_status = 'pending'
+         OR (extraction_status = 'retryable_error' AND COALESCE(next_attempt_at, 0) <= ?)
+         OR (extraction_status = 'processing' AND COALESCE(processing_started_at, 0) <= ?)
+         OR (extraction_status = 'fallback' AND COALESCE(needs_reprocess, 0) = 1)
+         OR COALESCE(extraction_version, 0) < ?
+       )`
+  )
+    .bind(ATOMIC_EXTRACTION_MAX_ATTEMPTS, now, leaseCutoff, ATOMIC_EXTRACTION_VERSION)
+    .first<{ count: number }>();
+
+  const deferred = await env.DB.prepare(
+    `SELECT COUNT(*) as count FROM sb_observations
+     WHERE extraction_status = 'retryable_error'
+       AND COALESCE(extraction_attempts, 0) < ?
+       AND COALESCE(next_attempt_at, 0) > ?`
+  )
+    .bind(ATOMIC_EXTRACTION_MAX_ATTEMPTS, now)
+    .first<{ count: number }>();
+
+  const exhausted = await env.DB.prepare(
+    `SELECT COUNT(*) as count FROM sb_observations
+     WHERE extraction_status = 'terminal_error'`
+  )
+    .first<{ count: number }>();
+
+  const orphanPending = await env.DB.prepare(
+    `SELECT COUNT(*) as count FROM sb_observations
+     WHERE extraction_status = 'pending'
+       AND COALESCE(extraction_attempts, 0) = 0
+       AND NOT EXISTS (
+         SELECT 1 FROM sb_memory_sources
+         WHERE sb_memory_sources.observation_id = sb_observations.id
+       )`
+  )
+    .first<{ count: number }>();
+
+  const fallbackReprocess = await env.DB.prepare(
+    `SELECT COUNT(*) as count FROM sb_observations
+     WHERE extraction_status = 'fallback'
+       AND COALESCE(needs_reprocess, 0) = 1
+       AND COALESCE(extraction_attempts, 0) < ?`
+  )
+    .bind(ATOMIC_EXTRACTION_MAX_ATTEMPTS)
+    .first<{ count: number }>();
+
+  const retryableDue = await env.DB.prepare(
+    `SELECT COUNT(*) as count FROM sb_observations
+     WHERE extraction_status = 'retryable_error'
+       AND COALESCE(extraction_attempts, 0) < ?
+       AND COALESCE(next_attempt_at, 0) <= ?`
+  )
+    .bind(ATOMIC_EXTRACTION_MAX_ATTEMPTS, now)
+    .first<{ count: number }>();
+
+  const staleProcessing = await env.DB.prepare(
+    `SELECT COUNT(*) as count FROM sb_observations
+     WHERE extraction_status = 'processing'
+       AND COALESCE(extraction_attempts, 0) < ?
+       AND COALESCE(processing_started_at, 0) <= ?`
+  )
+    .bind(ATOMIC_EXTRACTION_MAX_ATTEMPTS, leaseCutoff)
+    .first<{ count: number }>();
+
+  return {
+    dryRun: true,
+    limit: boundedLimit,
+    due: Number(due?.count ?? 0),
+    deferred: Number(deferred?.count ?? 0),
+    exhausted: Number(exhausted?.count ?? 0),
+    orphanPending: Number(orphanPending?.count ?? 0),
+    fallbackReprocess: Number(fallbackReprocess?.count ?? 0),
+    retryableDue: Number(retryableDue?.count ?? 0),
+    staleProcessing: Number(staleProcessing?.count ?? 0),
+  };
+}
+
 function atomicTagsFromDraft(baseTags: string[], draft: AtomicFactDraft | undefined): string[] {
   let tags = [...baseTags];
   if (draft?.kind) tags = withKind(tags, draft.kind);
@@ -2839,6 +3364,26 @@ async function captureSingleFact(
   const contentHash = await contentFingerprint(c);
   const exactId = await findExactDuplicateId(env, c, contentHash);
   if (exactId) {
+    if (options.observationId) {
+      try {
+        const linked = await linkObservationToAtomicMemory(env.DB, {
+          entryId: exactId,
+          content: c,
+          contentHash,
+          observationId: options.observationId,
+          atomic: options.atomic,
+          createdAt: Date.now(),
+        });
+        return {
+          status: "sourced",
+          id: exactId,
+          observationId: options.observationId,
+          memoryId: linked.memoryId,
+        };
+      } catch (e) {
+        console.error("Duplicate source link failed; preserving legacy duplicate block:", e);
+      }
+    }
     return { status: "blocked", matchId: exactId, score: 1 };
   }
 
@@ -3062,12 +3607,46 @@ export async function captureEntry(
     baseTags.includes("synthesized") ||
     baseTags.includes("auto-pattern");
   const shouldExtract = !options.skipExtract && !systemLike && c.length >= 8;
+  let wholeHash: string | null = null;
 
-  // Exact whole-input fingerprint check before spending an extraction LLM call.
+  // Exact whole-input duplicates do not need LLM extraction, but they are still
+  // observations. Preserve the new source evidence against the existing atomic
+  // memory instead of dropping the capture before the four-layer path sees it.
   if (!options.skipExtract) {
-    const wholeHash = await contentFingerprint(c);
+    wholeHash = await contentFingerprint(c);
     const exactId = await findExactDuplicateId(env, c, wholeHash);
     if (exactId) {
+      if (shouldExtract) {
+        const observationId = crypto.randomUUID();
+        const observedAt = Date.now();
+        try {
+          await prepareObservationInsert(env.DB, {
+            id: observationId,
+            content: c,
+            source,
+            metadata: { tags: baseTags, duplicate_of: exactId },
+            contentHash: wholeHash,
+            extractionStatus: "succeeded",
+            processedAt: observedAt,
+            createdAt: observedAt,
+          }).run();
+          const linked = await linkObservationToAtomicMemory(env.DB, {
+            entryId: exactId,
+            content: c,
+            contentHash: wholeHash,
+            observationId,
+            createdAt: observedAt,
+          });
+          return {
+            status: "sourced",
+            id: exactId,
+            observationId,
+            memoryId: linked.memoryId,
+          };
+        } catch (e) {
+          console.error("Duplicate observation source link failed; preserving legacy duplicate block:", e);
+        }
+      }
       return { status: "blocked", matchId: exactId, score: 1 };
     }
   }
@@ -3081,12 +3660,15 @@ export async function captureEntry(
 
   const observationId = crypto.randomUUID();
   const observedAt = Date.now();
+  const observationHash = wholeHash ?? await contentFingerprint(c);
   try {
     await prepareObservationInsert(env.DB, {
       id: observationId,
       content: c,
       source,
       metadata: { tags: baseTags },
+      contentHash: observationHash,
+      extractionStatus: "pending",
       createdAt: observedAt,
     }).run();
   } catch (e) {
@@ -3094,65 +3676,35 @@ export async function captureEntry(
     return captureSingleFact(c, baseTags, source, env, ctx, { skipExtract: true });
   }
 
-  let facts: AtomicFactDraft[];
-  try {
-    facts = await extractAtomicFacts(c, env);
-  } catch (e) {
-    console.error("Atomic extraction failed (fallback to whole input):", e);
-    facts = [{
+  const processed = await processObservationExtraction(
+    {
+      id: observationId,
       content: c,
-      kind: null,
-      memoryClass: null,
-      importance: null,
-      confidence: null,
-      observedAt,
-      validFrom: null,
-      validTo: null,
-      referenceTime: observedAt,
-      entities: [],
-      relations: [],
-    }];
+      source,
+      metadata_json: JSON.stringify({ tags: baseTags }),
+      created_at: observedAt,
+      content_hash: observationHash,
+      extraction_status: "pending",
+      extraction_version: ATOMIC_EXTRACTION_VERSION,
+      extraction_attempts: 0,
+      extraction_error: null,
+      next_attempt_at: null,
+      processing_started_at: null,
+      processed_at: null,
+      needs_reprocess: 0,
+    },
+    env,
+    ctx,
+    { fallbackOnError: true }
+  );
+  if (processed.status === "succeeded" || processed.status === "fallback") {
+    return processed.result;
   }
 
-  // Single-fact path: one dual-written entry linked to the observation.
-  if (facts.length <= 1) {
-    const draft = facts[0] ?? {
-      content: c,
-      kind: null,
-      memoryClass: null,
-      importance: null,
-      confidence: null,
-      observedAt,
-      validFrom: null,
-      validTo: null,
-      referenceTime: observedAt,
-      entities: [],
-      relations: [],
-    };
-    return captureSingleFact(draft.content || c, baseTags, source, env, ctx, {
-      skipExtract: true,
-      observationId,
-      atomic: draft,
-    });
-  }
-
-  const results: CaptureSingleResult[] = [];
-  for (const draft of facts) {
-    const result = await captureSingleFact(draft.content, baseTags, source, env, ctx, {
-      skipExtract: true,
-      observationId,
-      atomic: draft,
-    });
-    results.push(result);
-  }
-
-  // If every fact was an exact duplicate, surface a single blocked outcome.
-  if (results.length && results.every(r => r.status === "blocked")) {
-    const first = results[0];
-    if (first.status === "blocked") return first;
-  }
-
-  return { status: "batch", observationId, results };
+  return captureSingleFact(c, baseTags, source, env, ctx, {
+    skipExtract: true,
+    observationId,
+  });
 }
 
 // ─── Shared delete path ───────────────────────────────────────────────────────
@@ -3181,6 +3733,7 @@ export async function deprecateEntry(
   const tags: string[] = JSON.parse(row.tags ?? "[]");
   const nextTags = withStatus(tags, "deprecated");
   const vectorIds: string[] = JSON.parse(row.vector_ids ?? "[]");
+  const now = Date.now();
 
   const deprecateRevision = prepareMemoryRevision(env.DB, {
     memoryId: id,
@@ -3191,12 +3744,14 @@ export async function deprecateEntry(
     newMetadata: { tags: nextTags, source: row.source, vectorIds: [] },
     reason,
     actor,
+    createdAt: now,
   });
   await env.DB.batch([
     env.DB.prepare(`UPDATE entries SET tags = ?, vector_ids = ? WHERE id = ?`)
       .bind(JSON.stringify(nextTags), "[]", id),
     deprecateRevision.statement,
   ]);
+  await deprecateEntryAtomicMemory(env.DB, { entryId: id, invalidAt: now });
 
   try {
     if (vectorIds.length) await env.VECTORIZE.deleteByIds(vectorIds);
@@ -3801,6 +4356,17 @@ const defaultHandler = {
           message: formatCaptureResultMessage(result),
         });
       }
+      if (result.status === "sourced") {
+        return json({
+          ok: true,
+          id: result.id,
+          duplicate: true,
+          action: "source_linked",
+          observation_id: result.observationId,
+          memory_id: result.memoryId,
+          message: formatCaptureResultMessage(result),
+        });
+      }
       if (result.status === "contradiction") {
         return json({
           ok: true,
@@ -3879,6 +4445,18 @@ const defaultHandler = {
         console.error("Append failed:", e);
         return json({ ok: false, error: "Append failed. Retry later." }, 500);
       }
+      try {
+        await replaceEntryAtomicMemory(env.DB, {
+          entryId: id,
+          content: appendedContent,
+          contentHash: await contentFingerprint(appendedContent),
+          source,
+          eventType: "append",
+          createdAt: Date.now(),
+        });
+      } catch (e) {
+        console.error("Atomic memory append sync failed (non-fatal):", e);
+      }
       scheduleClassifyAndTag(id, appendedContent, env, ctx);
 
       return json({
@@ -3933,6 +4511,18 @@ const defaultHandler = {
           ok: false,
           error: "Update could not be indexed. Previous content remains active; retry later.",
         }, 503);
+      }
+      try {
+        await replaceEntryAtomicMemory(env.DB, {
+          entryId: id,
+          content: finalContent,
+          contentHash: await contentFingerprint(finalContent),
+          source,
+          eventType: "update",
+          createdAt: Date.now(),
+        });
+      } catch (e) {
+        console.error("Atomic memory update sync failed (non-fatal):", e);
       }
       scheduleClassifyAndTag(id, finalContent, env, ctx);
 
@@ -4357,6 +4947,36 @@ const defaultHandler = {
       }
 
       return json({ tag, synthesis: result.text, entry_id: result.synthesizedId, source_count: result.entriesUsed });
+    }
+
+    // GET/POST /extract-pending
+    // Bounded, resumable atomic extraction worker. Capture still processes the
+    // current observation inline for compatibility; this endpoint repairs
+    // retryable and fallback observations without re-capturing raw input.
+    // Use dryRun=true to inspect upgrade/backlog risk without invoking the LLM.
+    if (
+      url.pathname === "/extract-pending" &&
+      (request.method === "POST" || request.method === "GET")
+    ) {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      let body: { limit?: number; dryRun?: boolean } = {};
+      if (request.method === "POST") {
+        try {
+          body = await request.json();
+        } catch {
+          /* empty body OK */
+        }
+      }
+      const queryLimit = Number(url.searchParams.get("limit"));
+      const limit = body.limit ?? (Number.isFinite(queryLimit) && queryLimit > 0 ? queryLimit : undefined);
+      const dryRun =
+        body.dryRun === true ||
+        url.searchParams.get("dryRun") === "1" ||
+        url.searchParams.get("dryRun") === "true";
+      if (dryRun) return json(await inspectExtractionQueue(env, limit));
+      return json(await processExtractionQueue(env, ctx, limit));
     }
 
     // POST /vectorize-pending

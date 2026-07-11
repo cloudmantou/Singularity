@@ -67,10 +67,23 @@ CREATE TABLE IF NOT EXISTS sb_observations (
   content TEXT NOT NULL,
   source TEXT NOT NULL DEFAULT 'api',
   metadata_json TEXT NOT NULL DEFAULT '{}',
+  content_hash TEXT,
+  extraction_status TEXT NOT NULL DEFAULT 'pending',
+  extraction_version INTEGER NOT NULL DEFAULT 1,
+  extraction_attempts INTEGER NOT NULL DEFAULT 0,
+  extraction_error TEXT,
+  next_attempt_at INTEGER,
+  processing_started_at INTEGER,
+  processed_at INTEGER,
+  needs_reprocess INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sb_observations_created
   ON sb_observations(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sb_observations_hash
+  ON sb_observations(content_hash);
+CREATE INDEX IF NOT EXISTS idx_sb_observations_extraction_queue
+  ON sb_observations(extraction_status, next_attempt_at, created_at);
 
 CREATE TABLE IF NOT EXISTS sb_memories (
   id TEXT PRIMARY KEY,
@@ -86,6 +99,7 @@ CREATE TABLE IF NOT EXISTS sb_memories (
   valid_to INTEGER,
   reference_time INTEGER,
   invalid_at INTEGER,
+  expired_at INTEGER,
   entities_json TEXT NOT NULL DEFAULT '[]',
   created_at INTEGER NOT NULL
 );
@@ -145,6 +159,7 @@ CREATE TABLE IF NOT EXISTS sb_entity_relations (
   valid_from INTEGER,
   valid_to INTEGER,
   invalid_at INTEGER,
+  expired_at INTEGER,
   reference_time INTEGER,
   metadata_json TEXT NOT NULL DEFAULT '{}',
   created_at INTEGER NOT NULL

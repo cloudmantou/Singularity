@@ -97,6 +97,21 @@ describe("POST /update", () => {
 
   it("updates D1 content and returns ok:true with id", async () => {
     seedEntry(db);
+    db.memories.push({
+      id: "atomic-old",
+      content: "Original content",
+      entry_id: "entry-abc",
+      content_hash: "old-hash",
+      valid_to: null,
+      invalid_at: null,
+      created_at: Date.now(),
+    });
+    db.entityRelations.push({
+      id: "fact-old",
+      memory_id: "atomic-old",
+      valid_to: null,
+      invalid_at: null,
+    });
     const res = await worker.fetch(
       req("POST", "/update", { body: { id: "entry-abc", content: "Updated content" } }),
       env, ctx
@@ -114,6 +129,26 @@ describe("POST /update", () => {
         event_type: "UPDATE",
         old_content: "Original content",
         new_content: "Updated content",
+      })
+    );
+    expect(db.memories).toHaveLength(2);
+    const oldAtomic = db.memories.find((memory: any) => memory.id === "atomic-old");
+    const newAtomic = db.memories.find((memory: any) => memory.id !== "atomic-old");
+    expect(oldAtomic.invalid_at).toEqual(expect.any(Number));
+    expect(oldAtomic.expired_at).toBe(oldAtomic.invalid_at);
+    expect(oldAtomic.valid_to).toBe(oldAtomic.invalid_at);
+    expect(db.entityRelations[0].invalid_at).toBe(oldAtomic.invalid_at);
+    expect(db.entityRelations[0].expired_at).toBe(oldAtomic.invalid_at);
+    expect(newAtomic).toMatchObject({
+      entry_id: "entry-abc",
+      content: "Updated content",
+      invalid_at: null,
+      expired_at: null,
+    });
+    expect(db.memorySources).toContainEqual(
+      expect.objectContaining({
+        memory_id: newAtomic.id,
+        observation_id: db.observations[0].id,
       })
     );
   });

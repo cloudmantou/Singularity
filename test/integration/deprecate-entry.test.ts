@@ -27,6 +27,21 @@ describe("deprecateEntry()", () => {
       created_at: Date.now(),
       vector_ids: JSON.stringify(["v1", "v2"]),
     });
+    db.memories.push({
+      id: "atomic-1",
+      content: "Some important work content",
+      entry_id: "entry-1",
+      content_hash: "hash",
+      valid_to: null,
+      invalid_at: null,
+      created_at: Date.now(),
+    });
+    db.entityRelations.push({
+      id: "fact-1",
+      memory_id: "atomic-1",
+      valid_to: null,
+      invalid_at: null,
+    });
 
     const result = await deprecateEntry("entry-1", env);
 
@@ -46,6 +61,12 @@ describe("deprecateEntry()", () => {
 
     // Vectorize deleteByIds must have been called with the original vector IDs
     expect(deleteByIdsMock).toHaveBeenCalledWith(["v1", "v2"]);
+    expect(db.memories[0].invalid_at).toEqual(expect.any(Number));
+    expect(db.memories[0].expired_at ?? null).toBeNull();
+    expect(db.memories[0].valid_to).toBe(db.memories[0].invalid_at);
+    expect(db.entityRelations[0].invalid_at).toBe(db.memories[0].invalid_at);
+    expect(db.entityRelations[0].expired_at ?? null).toBeNull();
+    expect(db.entityRelations[0].valid_to).toBe(db.memories[0].invalid_at);
     expect(db.revisions).toContainEqual(
       expect.objectContaining({
         memory_id: "entry-1",

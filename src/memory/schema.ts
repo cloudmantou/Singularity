@@ -1,4 +1,9 @@
-import { ATOMIC_SCHEMA_STATEMENTS } from "./atomic";
+import {
+  ATOMIC_SCHEMA_BACKFILL_STATEMENTS,
+  ATOMIC_OBSERVATION_MIGRATIONS,
+  ATOMIC_POST_MIGRATION_INDEX_STATEMENTS,
+  ATOMIC_SCHEMA_STATEMENTS,
+} from "./atomic";
 import { ensureEntityDataModel } from "./entities";
 
 const MEMORY_SCHEMA_STATEMENTS = [
@@ -35,6 +40,31 @@ const MEMORY_SCHEMA_STATEMENTS = [
 
 export async function ensureMemoryDataModel(db: D1Database): Promise<void> {
   for (const statement of MEMORY_SCHEMA_STATEMENTS) {
+    await db.exec(statement);
+  }
+  let observationColumns: Set<string> | null = null;
+  try {
+    const { results } = await db
+      .prepare(`PRAGMA table_info(sb_observations)`)
+      .all<{ name: string }>();
+    observationColumns = new Set(results.map((row) => row.name));
+  } catch {
+    observationColumns = null;
+  }
+
+  for (const migration of ATOMIC_OBSERVATION_MIGRATIONS) {
+    if (observationColumns?.has(migration.column)) continue;
+    try {
+      await db.exec(migration.statement);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/duplicate column name|already exists/i.test(message)) throw error;
+    }
+  }
+  for (const statement of ATOMIC_POST_MIGRATION_INDEX_STATEMENTS) {
+    await db.exec(statement);
+  }
+  for (const statement of ATOMIC_SCHEMA_BACKFILL_STATEMENTS) {
     await db.exec(statement);
   }
   await ensureEntityDataModel(db);

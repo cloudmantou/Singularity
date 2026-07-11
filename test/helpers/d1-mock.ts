@@ -35,29 +35,238 @@ export class D1Mock {
         db.statementCount += 1;
         
         if (s.startsWith("INSERT INTO sb_observations")) {
-          const [id, content, source, metadata_json, created_at] = args;
-          db.observations.push({ id, content, source, metadata_json, created_at });
+          if (args.length >= 14) {
+            const [
+              id, content, source, metadata_json, content_hash,
+              extraction_status, extraction_version, extraction_attempts,
+              extraction_error, next_attempt_at, processing_started_at,
+              processed_at, needs_reprocess, created_at,
+            ] = args;
+            db.observations.push({
+              id, content, source, metadata_json, content_hash,
+              extraction_status, extraction_version, extraction_attempts,
+              extraction_error, next_attempt_at, processing_started_at,
+              processed_at, needs_reprocess,
+              created_at,
+            });
+          } else {
+            const [id, content, source, metadata_json, created_at] = args;
+            db.observations.push({
+              id, content, source, metadata_json,
+              content_hash: null,
+              extraction_status: "pending",
+              extraction_version: 1,
+              extraction_attempts: 0,
+              extraction_error: null,
+              next_attempt_at: null,
+              processing_started_at: null,
+              processed_at: null,
+              needs_reprocess: 0,
+              created_at,
+            });
+          }
           return { meta: { changes: 1 } };
         }
-        if (s.startsWith("INSERT INTO sb_memories")) {
+        if (s.startsWith("UPDATE sb_observations SET extraction_status = 'processing'")) {
           const [
-            id, content, kind, memory_class, importance, confidence,
-            entry_id, content_hash, observed_at, valid_from, valid_to,
-            reference_time, invalid_at, entities_json, created_at,
-          ] = args.length >= 15
-            ? args
-            : [...args.slice(0, 11), null, null, args[11], args[12]];
+            currentVersion,
+            processing_started_at,
+            nextVersion,
+            id,
+            maxAttempts,
+            now,
+            leaseCutoff,
+            whereVersion,
+          ] = args;
+          const row = db.observations.find((observation: any) => {
+            if (observation.id !== id) return false;
+            if (Number(observation.extraction_attempts ?? 0) >= Number(maxAttempts)) return false;
+            const status = observation.extraction_status ?? "pending";
+            const staleVersion = Number(observation.extraction_version ?? 0) < Number(whereVersion);
+            return staleVersion ||
+              status === "pending" ||
+              (
+                status === "retryable_error" &&
+                Number(observation.next_attempt_at ?? 0) <= Number(now)
+              ) ||
+              (
+                status === "processing" &&
+                Number(observation.processing_started_at ?? 0) <= Number(leaseCutoff)
+              ) ||
+              (
+                status === "fallback" &&
+                Number(observation.needs_reprocess ?? 0) === 1
+              );
+          });
+          if (row) {
+            const staleVersion = Number(row.extraction_version ?? 0) < Number(currentVersion);
+            row.extraction_status = "processing";
+            row.extraction_attempts = staleVersion
+              ? 1
+              : Number(row.extraction_attempts ?? 0) + 1;
+            row.extraction_error = null;
+            row.next_attempt_at = null;
+            row.processing_started_at = processing_started_at;
+            row.extraction_version = nextVersion;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE sb_observations SET extraction_status = 'succeeded'")) {
+          const [processed_at, extraction_version, id, started_at] = args;
+          const row = db.observations.find((observation: any) =>
+            observation.id === id &&
+            (observation.processing_started_at === started_at || started_at == null)
+          );
+          if (row) {
+            row.extraction_status = "succeeded";
+            row.extraction_error = null;
+            row.next_attempt_at = null;
+            row.processing_started_at = null;
+            row.processed_at = processed_at;
+            row.needs_reprocess = 0;
+            row.extraction_version = extraction_version;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE sb_observations SET extraction_status = ?")) {
+          const [
+            extraction_status,
+            extraction_error,
+            next_attempt_at,
+            processed_at,
+            needs_reprocess,
+            extraction_version,
+            id,
+            started_at,
+          ] = args;
+          const row = db.observations.find((observation: any) =>
+            observation.id === id &&
+            (observation.processing_started_at === started_at || started_at == null)
+          );
+          if (row) {
+            row.extraction_status = extraction_status;
+            row.extraction_error = extraction_error;
+            row.next_attempt_at = next_attempt_at;
+            row.processing_started_at = null;
+            row.processed_at = processed_at;
+            row.needs_reprocess = needs_reprocess;
+            row.extraction_version = extraction_version;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("INSERT INTO sb_memories")) {
+          let id: any;
+          let content: any;
+          let kind: any;
+          let memory_class: any;
+          let importance: any;
+          let confidence: any;
+          let entry_id: any;
+          let content_hash: any;
+          let observed_at: any;
+          let valid_from: any;
+          let valid_to: any;
+          let reference_time: any;
+          let invalid_at: any;
+          let expired_at: any;
+          let entities_json: any;
+          let created_at: any;
+          if (args.length >= 16) {
+            [
+              id, content, kind, memory_class, importance, confidence,
+              entry_id, content_hash, observed_at, valid_from, valid_to,
+              reference_time, invalid_at, expired_at, entities_json, created_at,
+            ] = args;
+          } else if (args.length >= 15) {
+            [
+              id, content, kind, memory_class, importance, confidence,
+              entry_id, content_hash, observed_at, valid_from, valid_to,
+              reference_time, invalid_at, entities_json, created_at,
+            ] = args;
+            expired_at = null;
+          } else {
+            [
+              id, content, kind, memory_class, importance, confidence,
+              entry_id, content_hash, observed_at, valid_from, valid_to,
+              reference_time, invalid_at, expired_at, entities_json, created_at,
+            ] = [...args.slice(0, 11), null, null, null, args[11], args[12]];
+          }
           db.memories.push({
             id, content, kind, memory_class, importance, confidence,
             entry_id, content_hash, observed_at, valid_from, valid_to,
-            reference_time, invalid_at, entities_json, created_at,
+            reference_time, invalid_at, expired_at, entities_json, created_at,
           });
           return { meta: { changes: 1 } };
         }
         if (s.startsWith("INSERT INTO sb_memory_sources")) {
           const [id, memory_id, observation_id, role, score, created_at] = args;
-          db.memorySources.push({ id, memory_id, observation_id, role, score, created_at });
+          const existing = db.memorySources.find(
+            (row: any) =>
+              row.memory_id === memory_id &&
+              row.observation_id === observation_id &&
+              row.role === role
+          );
+          if (existing) {
+            if (score != null) existing.score = score;
+          } else {
+            db.memorySources.push({ id, memory_id, observation_id, role, score, created_at });
+          }
           return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("UPDATE sb_memories SET confidence = CASE")) {
+          const [score, , , id] = args;
+          const row = db.memories.find((memory: any) => memory.id === id);
+          if (row && (row.confidence == null || Number(row.confidence) < Number(score))) {
+            row.confidence = score;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE sb_entity_relations SET invalid_at")) {
+          const hasExpiredAt = s.startsWith("UPDATE sb_entity_relations SET invalid_at = ?, expired_at = ?");
+          const [invalid_at, maybe_expired_at, maybe_valid_to, maybe_entry_id] = args;
+          const expired_at = hasExpiredAt ? maybe_expired_at : null;
+          const valid_to = hasExpiredAt ? maybe_valid_to : maybe_expired_at;
+          const entry_id = hasExpiredAt ? maybe_entry_id : maybe_valid_to;
+          const activeMemoryIds = new Set(
+            db.memories
+              .filter((memory: any) =>
+                memory.entry_id === entry_id &&
+                memory.invalid_at == null &&
+                memory.expired_at == null
+              )
+              .map((memory: any) => memory.id)
+          );
+          let changes = 0;
+          for (const relation of db.entityRelations) {
+            if (
+              relation.invalid_at == null &&
+              relation.expired_at == null &&
+              activeMemoryIds.has(relation.memory_id)
+            ) {
+              relation.invalid_at = invalid_at;
+              if (hasExpiredAt) relation.expired_at = expired_at;
+              if (relation.valid_to == null) relation.valid_to = valid_to;
+              changes += 1;
+            }
+          }
+          return { meta: { changes } };
+        }
+        if (s.startsWith("UPDATE sb_memories SET invalid_at")) {
+          const hasExpiredAt = s.startsWith("UPDATE sb_memories SET invalid_at = ?, expired_at = ?");
+          const [invalid_at, maybe_expired_at, maybe_valid_to, maybe_entry_id] = args;
+          const expired_at = hasExpiredAt ? maybe_expired_at : null;
+          const valid_to = hasExpiredAt ? maybe_valid_to : maybe_expired_at;
+          const entry_id = hasExpiredAt ? maybe_entry_id : maybe_valid_to;
+          let changes = 0;
+          for (const memory of db.memories) {
+            if (memory.entry_id === entry_id && memory.invalid_at == null && memory.expired_at == null) {
+              memory.invalid_at = invalid_at;
+              if (hasExpiredAt) memory.expired_at = expired_at;
+              if (memory.valid_to == null) memory.valid_to = valid_to;
+              changes += 1;
+            }
+          }
+          return { meta: { changes } };
         }
         if (s.startsWith("UPDATE sb_entities")) {
           const [entity_type, updated_at, id] = args;
@@ -91,16 +300,41 @@ export class D1Mock {
           return { meta: { changes: 1 } };
         }
         if (s.startsWith("INSERT INTO sb_entity_relations")) {
-          const [
-            id, from_entity_id, to_entity_id, relation_type, fact,
-            memory_id, observation_id, score,
-            valid_from, valid_to, invalid_at, reference_time,
-            metadata_json, created_at,
-          ] = args;
+          let id: any;
+          let from_entity_id: any;
+          let to_entity_id: any;
+          let relation_type: any;
+          let fact: any;
+          let memory_id: any;
+          let observation_id: any;
+          let score: any;
+          let valid_from: any;
+          let valid_to: any;
+          let invalid_at: any;
+          let expired_at: any;
+          let reference_time: any;
+          let metadata_json: any;
+          let created_at: any;
+          if (args.length >= 15) {
+            [
+              id, from_entity_id, to_entity_id, relation_type, fact,
+              memory_id, observation_id, score,
+              valid_from, valid_to, invalid_at, expired_at, reference_time,
+              metadata_json, created_at,
+            ] = args;
+          } else {
+            [
+              id, from_entity_id, to_entity_id, relation_type, fact,
+              memory_id, observation_id, score,
+              valid_from, valid_to, invalid_at, reference_time,
+              metadata_json, created_at,
+            ] = args;
+            expired_at = null;
+          }
           db.entityRelations.push({
             id, from_entity_id, to_entity_id, relation_type, fact,
             memory_id, observation_id, score,
-            valid_from, valid_to, invalid_at, reference_time,
+            valid_from, valid_to, invalid_at, expired_at, reference_time,
             metadata_json, created_at,
           });
           return { meta: { changes: 1 } };
@@ -164,6 +398,50 @@ export class D1Mock {
             (revision: any) => !memoryIds.has(String(revision.memory_id))
           );
           return { meta: { changes: before - db.revisions.length } };
+        }
+        if (s.startsWith("DELETE FROM sb_entity_relations WHERE memory_id IN")) {
+          const memoryIds = new Set(args.map(String));
+          const before = db.entityRelations.length;
+          db.entityRelations = db.entityRelations.filter(
+            (relation: any) => !memoryIds.has(String(relation.memory_id))
+          );
+          return { meta: { changes: before - db.entityRelations.length } };
+        }
+        if (s.startsWith("DELETE FROM sb_memory_entities WHERE memory_id IN")) {
+          const memoryIds = new Set(args.map(String));
+          const before = db.memoryEntities.length;
+          db.memoryEntities = db.memoryEntities.filter(
+            (link: any) => !memoryIds.has(String(link.memory_id))
+          );
+          return { meta: { changes: before - db.memoryEntities.length } };
+        }
+        if (s.startsWith("DELETE FROM sb_memory_sources WHERE memory_id IN")) {
+          const memoryIds = new Set(args.map(String));
+          const before = db.memorySources.length;
+          db.memorySources = db.memorySources.filter(
+            (source: any) => !memoryIds.has(String(source.memory_id))
+          );
+          return { meta: { changes: before - db.memorySources.length } };
+        }
+        if (s.startsWith("DELETE FROM sb_memories WHERE id IN")) {
+          const memoryIds = new Set(args.map(String));
+          const before = db.memories.length;
+          db.memories = db.memories.filter(
+            (memory: any) => !memoryIds.has(String(memory.id))
+          );
+          return { meta: { changes: before - db.memories.length } };
+        }
+        if (s.startsWith("DELETE FROM sb_observations")) {
+          const observationIds = new Set(args.map(String));
+          const before = db.observations.length;
+          db.observations = db.observations.filter(
+            (observation: any) =>
+              !observationIds.has(String(observation.id)) ||
+              db.memorySources.some(
+                (source: any) => source.observation_id === observation.id
+              )
+          );
+          return { meta: { changes: before - db.observations.length } };
         }
         if (s.startsWith("INSERT INTO entries")) {
           if (s.includes("classification_confidence")) {
@@ -597,6 +875,97 @@ export class D1Mock {
           const count = db.entries.filter((e: any) => e.classification_status === "terminal_error").length;
           return { count };
         }
+        if (s.includes("COUNT(*) as count") && s.includes("FROM sb_observations")) {
+          const maxAttempts = Number(args[0] ?? 3);
+          const now = Number(args[1] ?? Date.now());
+          const leaseCutoff = Number(args[2] ?? 0);
+          const currentVersion = Number(args[3] ?? 1);
+          let rows = [...db.observations];
+          if (s.includes("OR COALESCE(extraction_version, 0) < ?")) {
+            rows = rows.filter((observation: any) => {
+              if (Number(observation.extraction_attempts ?? 0) >= maxAttempts) return false;
+              const status = observation.extraction_status ?? "pending";
+              return status === "pending" ||
+                (
+                  status === "retryable_error" &&
+                  Number(observation.next_attempt_at ?? 0) <= now
+                ) ||
+                (
+                  status === "processing" &&
+                  Number(observation.processing_started_at ?? 0) <= leaseCutoff
+                ) ||
+                (
+                  status === "fallback" &&
+                  Number(observation.needs_reprocess ?? 0) === 1
+                ) ||
+                Number(observation.extraction_version ?? 0) < currentVersion;
+            });
+          } else if (s.includes("extraction_status = 'pending'") && s.includes("NOT EXISTS")) {
+            rows = rows.filter((observation: any) =>
+              (observation.extraction_status ?? "pending") === "pending" &&
+              Number(observation.extraction_attempts ?? 0) === 0 &&
+              !db.memorySources.some((source: any) => source.observation_id === observation.id)
+            );
+          } else if (
+            s.includes("extraction_status = 'fallback'") &&
+            s.includes("needs_reprocess")
+          ) {
+            rows = rows.filter((observation: any) =>
+              observation.extraction_status === "fallback" &&
+              Number(observation.needs_reprocess ?? 0) === 1 &&
+              Number(observation.extraction_attempts ?? 0) < maxAttempts
+            );
+          } else if (
+            s.includes("extraction_status = 'retryable_error'") &&
+            s.includes("next_attempt_at, 0) <=")
+          ) {
+            rows = rows.filter((observation: any) =>
+              observation.extraction_status === "retryable_error" &&
+              Number(observation.extraction_attempts ?? 0) < maxAttempts &&
+              Number(observation.next_attempt_at ?? 0) <= now
+            );
+          } else if (
+            s.includes("extraction_status = 'processing'") &&
+            s.includes("processing_started_at, 0) <=")
+          ) {
+            rows = rows.filter((observation: any) =>
+              observation.extraction_status === "processing" &&
+              Number(observation.extraction_attempts ?? 0) < maxAttempts &&
+              Number(observation.processing_started_at ?? 0) <= Number(args[1] ?? leaseCutoff)
+            );
+          } else if (s.includes("extraction_status = 'terminal_error'")) {
+            rows = rows.filter((observation: any) => observation.extraction_status === "terminal_error");
+          } else if (
+            s.includes("extraction_status = 'retryable_error'") &&
+            s.includes("next_attempt_at, 0) >")
+          ) {
+            rows = rows.filter((observation: any) =>
+              observation.extraction_status === "retryable_error" &&
+              Number(observation.extraction_attempts ?? 0) < maxAttempts &&
+              Number(observation.next_attempt_at ?? 0) > Number(args[1] ?? now)
+            );
+          } else {
+            rows = rows.filter((observation: any) => {
+              if (Number(observation.extraction_attempts ?? 0) >= maxAttempts) return false;
+              const status = observation.extraction_status ?? "pending";
+              return status === "pending" ||
+                (
+                  status === "retryable_error" &&
+                  Number(observation.next_attempt_at ?? 0) <= now
+                ) ||
+                (
+                  status === "processing" &&
+                  Number(observation.processing_started_at ?? 0) <= leaseCutoff
+                ) ||
+                (
+                  status === "fallback" &&
+                  Number(observation.needs_reprocess ?? 0) === 1
+                ) ||
+                Number(observation.extraction_version ?? 0) < currentVersion;
+            });
+          }
+          return { count: rows.length };
+        }
         if (s.includes("COUNT(*) as count") && s.includes("classification_status = 'retryable_error'") && s.includes("classification_next_attempt_at >")) {
           const now = Number(s.match(/classification_next_attempt_at > (\d+)/)?.[1] ?? 0);
           const count = db.entries.filter((e: any) =>
@@ -646,6 +1015,34 @@ export class D1Mock {
           const row = db.entities.find((e: any) => e.name_normalized === key);
           return row ?? null;
         }
+        if (s.includes("FROM sb_memories") && s.includes("entry_id = ? OR content_hash = ?")) {
+          const entryId = String(args[0]);
+          const contentHash = String(args[1]);
+          const row = db.memories
+            .filter((memory: any) =>
+              memory.invalid_at == null &&
+              memory.expired_at == null &&
+              (memory.entry_id === entryId || memory.content_hash === contentHash)
+            )
+            .sort((a: any, b: any) => {
+              const ar = a.entry_id === entryId ? 0 : 1;
+              const br = b.entry_id === entryId ? 0 : 1;
+              return ar - br || Number(a.created_at ?? 0) - Number(b.created_at ?? 0);
+            })[0];
+          return row ? { id: row.id, confidence: row.confidence ?? null } : null;
+        }
+        if (s.includes("FROM sb_observations") && s.includes("WHERE id = ?")) {
+          const id = String(args[0]);
+          const row = db.observations.find((observation: any) => observation.id === id);
+          if (!row) return null;
+          if (s.includes("extraction_attempts") && s.includes("processing_started_at")) {
+            return {
+              extraction_attempts: row.extraction_attempts ?? 0,
+              processing_started_at: row.processing_started_at ?? null,
+            };
+          }
+          return row;
+        }
         if (s.includes("SELECT id FROM entries") && s.includes("content_hash = ?")) {
           const hash = String(args[0]);
           const row = db.entries.find((e: any) =>
@@ -689,6 +1086,26 @@ export class D1Mock {
       },
       async all() {
         db.statementCount += 1;
+        if (s === "PRAGMA table_info(sb_observations)") {
+          return {
+            results: [
+              "id",
+              "content",
+              "source",
+              "metadata_json",
+              "content_hash",
+              "extraction_status",
+              "extraction_version",
+              "extraction_attempts",
+              "extraction_error",
+              "next_attempt_at",
+              "processing_started_at",
+              "processed_at",
+              "needs_reprocess",
+              "created_at",
+            ].map((name) => ({ name })),
+          };
+        }
         if (
           s.includes("SELECT id, from_memory_id, to_memory_id, relation_type") &&
           s.includes("FROM sb_memory_relations")
@@ -725,6 +1142,20 @@ export class D1Mock {
                 derivedIds.has(String(relation.from_memory_id))
             )
             .map((relation: any) => ({ to_memory_id: relation.to_memory_id }));
+          return { results };
+        }
+        if (s.includes("SELECT id FROM sb_memories") && s.includes("WHERE entry_id IN")) {
+          const entryIds = new Set(args.map(String));
+          const results = db.memories
+            .filter((memory: any) => entryIds.has(String(memory.entry_id)))
+            .map((memory: any) => ({ id: memory.id }));
+          return { results };
+        }
+        if (s.includes("SELECT observation_id FROM sb_memory_sources") && s.includes("WHERE memory_id IN")) {
+          const memoryIds = new Set(args.map(String));
+          const results = db.memorySources
+            .filter((source: any) => memoryIds.has(String(source.memory_id)))
+            .map((source: any) => ({ observation_id: source.observation_id }));
           return { results };
         }
         if (s.includes("SELECT id, vector_ids") && s.includes("FROM entries WHERE id IN")) {
@@ -768,6 +1199,39 @@ export class D1Mock {
               tags: entry.tags,
               source: entry.source,
             }));
+          return { results };
+        }
+        if (
+          s.includes("FROM sb_observations") &&
+          s.includes("ORDER BY created_at ASC") &&
+          s.includes("LIMIT")
+        ) {
+          const maxAttempts = Number(args[0] ?? 3);
+          const now = Number(args[1] ?? Date.now());
+          const leaseCutoff = Number(args[2] ?? 0);
+          const currentVersion = Number(args[3] ?? 1);
+          const limit = Number(args[args.length - 1] ?? 10);
+          const results = [...db.observations]
+            .filter((observation: any) => {
+              if (Number(observation.extraction_attempts ?? 0) >= maxAttempts) return false;
+              const status = observation.extraction_status ?? "pending";
+              return status === "pending" ||
+                (
+                  status === "retryable_error" &&
+                  Number(observation.next_attempt_at ?? 0) <= now
+                ) ||
+                (
+                  status === "processing" &&
+                  Number(observation.processing_started_at ?? 0) <= leaseCutoff
+                ) ||
+                (
+                  status === "fallback" &&
+                  Number(observation.needs_reprocess ?? 0) === 1
+                ) ||
+                Number(observation.extraction_version ?? 0) < currentVersion;
+            })
+            .sort((a: any, b: any) => Number(a.created_at ?? 0) - Number(b.created_at ?? 0))
+            .slice(0, limit);
           return { results };
         }
         // export (cursor + id) and vectorize-pending — avoid matching compress/list queries

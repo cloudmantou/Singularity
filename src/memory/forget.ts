@@ -27,6 +27,11 @@ interface DigestSourceRow {
   source: string;
 }
 
+interface AtomicGraphRows {
+  memoryIds: string[];
+  observationIds: string[];
+}
+
 function chunks<T>(items: T[], size: number): T[][] {
   const result: T[][] = [];
   for (let index = 0; index < items.length; index += size) {
@@ -146,10 +151,50 @@ async function loadSurvivingDigestSources(
   return rows.every(row => parseTags(row.tags) !== null) ? rows : null;
 }
 
+async function loadAtomicGraphRows(
+  db: D1Database,
+  entryIds: string[]
+): Promise<AtomicGraphRows> {
+  const memoryIds = new Set<string>();
+  for (const batch of chunks(entryIds, QUERY_BATCH_SIZE)) {
+    const { results } = await db
+      .prepare(
+        `SELECT id FROM sb_memories
+         WHERE entry_id IN (${placeholders(batch.length)})`
+      )
+      .bind(...batch)
+      .all<{ id: string }>();
+    for (const row of results) {
+      if (row.id) memoryIds.add(row.id);
+    }
+  }
+
+  const observationIds = new Set<string>();
+  const allMemoryIds = [...memoryIds];
+  for (const batch of chunks(allMemoryIds, QUERY_BATCH_SIZE)) {
+    const { results } = await db
+      .prepare(
+        `SELECT observation_id FROM sb_memory_sources
+         WHERE memory_id IN (${placeholders(batch.length)})`
+      )
+      .bind(...batch)
+      .all<{ observation_id: string }>();
+    for (const row of results) {
+      if (row.observation_id) observationIds.add(row.observation_id);
+    }
+  }
+
+  return {
+    memoryIds: allMemoryIds,
+    observationIds: [...observationIds],
+  };
+}
+
 function prepareDatabaseErase(
   db: D1Database,
   ids: string[],
-  survivingDigestSources: DigestSourceRow[]
+  survivingDigestSources: DigestSourceRow[],
+  atomicGraph: AtomicGraphRows
 ) {
   const unrollStatements = survivingDigestSources.flatMap(row => {
     const oldTags = parseTags(row.tags) ?? [];
@@ -171,6 +216,28 @@ function prepareDatabaseErase(
       revision.statement,
     ];
   });
+  const atomicMemoryStatements = chunks(atomicGraph.memoryIds, DELETE_BATCH_SIZE).flatMap(batch => {
+    const inList = placeholders(batch.length);
+    return [
+      db.prepare(`DELETE FROM sb_entity_relations WHERE memory_id IN (${inList})`).bind(...batch),
+      db.prepare(`DELETE FROM sb_memory_entities WHERE memory_id IN (${inList})`).bind(...batch),
+      db.prepare(`DELETE FROM sb_memory_sources WHERE memory_id IN (${inList})`).bind(...batch),
+      db.prepare(`DELETE FROM sb_memories WHERE id IN (${inList})`).bind(...batch),
+    ];
+  });
+  const observationStatements = chunks(atomicGraph.observationIds, DELETE_BATCH_SIZE).map(batch => {
+    const inList = placeholders(batch.length);
+    return db
+      .prepare(
+        `DELETE FROM sb_observations
+         WHERE id IN (${inList})
+           AND NOT EXISTS (
+             SELECT 1 FROM sb_memory_sources s
+             WHERE s.observation_id = sb_observations.id
+           )`
+      )
+      .bind(...batch);
+  });
   const eraseStatements = chunks(ids, DELETE_BATCH_SIZE).flatMap(batch => {
     const inList = placeholders(batch.length);
     return [
@@ -186,7 +253,12 @@ function prepareDatabaseErase(
       db.prepare(`DELETE FROM entries WHERE id IN (${inList})`).bind(...batch),
     ];
   });
-  return [...unrollStatements, ...eraseStatements];
+  return [
+    ...unrollStatements,
+    ...atomicMemoryStatements,
+    ...observationStatements,
+    ...eraseStatements,
+  ];
 }
 
 export async function forgetMemoryGraph(
@@ -213,6 +285,7 @@ export async function forgetMemoryGraph(
     [...trackedIds]
   );
   if (!survivingDigestSources) return { status: "delete_failed" };
+  const atomicGraph = await loadAtomicGraphRows(db, [...trackedIds]);
 
   const vectorIds: string[] = [];
   for (const row of rows) {
@@ -233,7 +306,7 @@ export async function forgetMemoryGraph(
 
   try {
     await db.batch(
-      prepareDatabaseErase(db, [...trackedIds], survivingDigestSources)
+      prepareDatabaseErase(db, [...trackedIds], survivingDigestSources, atomicGraph)
     );
   } catch (error) {
     console.error("Database erase failed after vector deletion; retry is safe:", error);

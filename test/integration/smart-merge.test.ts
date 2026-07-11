@@ -100,8 +100,15 @@ describe("POST /capture — similarity decision guardrails", () => {
     );
     const body = (await response.json()) as any;
 
-    expect(body).toMatchObject({ ok: false, duplicate: true });
+    expect(body).toMatchObject({
+      ok: true,
+      duplicate: true,
+      action: "source_linked",
+      id: "duplicate",
+    });
     expect(db.entries).toHaveLength(1);
+    expect(db.observations).toHaveLength(1);
+    expect(db.memorySources).toHaveLength(1);
     expect(run).not.toHaveBeenCalled();
   });
 

@@ -47,6 +47,21 @@ describe("POST /append", () => {
       classification_status: "succeeded",
       classification_confidence: 0.9,
     });
+    db.memories.push({
+      id: "atomic-old",
+      content: "Original content",
+      entry_id: "entry-1",
+      content_hash: "old-hash",
+      valid_to: null,
+      invalid_at: null,
+      created_at: Date.now(),
+    });
+    db.entityRelations.push({
+      id: "fact-old",
+      memory_id: "atomic-old",
+      valid_to: null,
+      invalid_at: null,
+    });
 
     const res = await worker.fetch(
       req("POST", "/append", { body: { id: "entry-1", addition: "New info" } }),
@@ -66,6 +81,32 @@ describe("POST /append", () => {
         event_type: "APPEND",
         old_content: "Original content",
         new_content: expect.stringContaining("New info"),
+      })
+    );
+    expect(db.memories).toHaveLength(2);
+    const oldAtomic = db.memories.find((memory: any) => memory.id === "atomic-old");
+    const newAtomic = db.memories.find((memory: any) => memory.id !== "atomic-old");
+    expect(oldAtomic.invalid_at).toEqual(expect.any(Number));
+    expect(oldAtomic.expired_at).toBe(oldAtomic.invalid_at);
+    expect(oldAtomic.valid_to).toBe(oldAtomic.invalid_at);
+    expect(db.entityRelations[0].invalid_at).toBe(oldAtomic.invalid_at);
+    expect(db.entityRelations[0].expired_at).toBe(oldAtomic.invalid_at);
+    expect(newAtomic).toMatchObject({
+      entry_id: "entry-1",
+      content: expect.stringContaining("New info"),
+      invalid_at: null,
+      expired_at: null,
+    });
+    expect(db.observations).toContainEqual(
+      expect.objectContaining({
+        id: expect.any(String),
+        content: expect.stringContaining("New info"),
+      })
+    );
+    expect(db.memorySources).toContainEqual(
+      expect.objectContaining({
+        memory_id: newAtomic.id,
+        observation_id: db.observations[0].id,
       })
     );
   });
