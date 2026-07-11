@@ -135,6 +135,9 @@ function graceMs(env: Env): number {
 
 // ─── Thresholds ───────────────────────────────────────────────────────────────
 
+// Exact duplicates are blocked by content hash only — never by vector score.
+// High semantic similarity always ADD-s a new row and links via typed relations.
+/** @deprecated Vector score no longer hard-blocks capture; kept for call-site clarity. */
 const DUPLICATE_BLOCK_THRESHOLD = 0.95;
 const DUPLICATE_FLAG_THRESHOLD = 0.85;
 const CANDIDATE_SCORE_THRESHOLD = 0.45;
@@ -220,6 +223,27 @@ export function withStatus(tags: string[], status: MemoryStatus): string[] {
   return [...cleaned, `${STATUS_PREFIX}${status}`];
 }
 
+/** Who last set status:* — distinguishes user intent from classifier auto-draft. */
+export const STATUS_SOURCE_VALUES = ["user", "classifier", "relation"] as const;
+export type StatusSource = (typeof STATUS_SOURCE_VALUES)[number];
+const STATUS_SOURCE_PREFIX = "status_source:";
+
+export function getStatusSource(tags: string[]): StatusSource | null {
+  const tag = tags.find(t => t.startsWith(STATUS_SOURCE_PREFIX));
+  if (!tag) return null;
+  const value = tag.slice(STATUS_SOURCE_PREFIX.length) as StatusSource;
+  return (STATUS_SOURCE_VALUES as readonly string[]).includes(value) ? value : null;
+}
+
+export function withStatusSource(tags: string[], source: StatusSource): string[] {
+  const cleaned = tags.filter(t => !t.startsWith(STATUS_SOURCE_PREFIX));
+  return [...cleaned, `${STATUS_SOURCE_PREFIX}${source}`];
+}
+
+export function clearStatusSource(tags: string[]): string[] {
+  return tags.filter(t => !t.startsWith(STATUS_SOURCE_PREFIX));
+}
+
 /** Soft marker: model suggested canonical but confidence was below the auto-promote threshold. */
 export const CANONICAL_CANDIDATE_TAG = "canonical-candidate";
 /** Only auto-promote to status:canonical when classifier confidence is at least this. */
@@ -227,9 +251,9 @@ export const CANONICAL_CONFIDENCE_THRESHOLD = 0.85;
 
 /**
  * Apply lifecycle tags from a classification result.
- * High-confidence canonical → status:canonical (if no status yet).
- * Low-confidence canonical → status:draft + canonical-candidate (user must confirm).
- * Never demotes an existing status tag.
+ * High-confidence canonical → status:canonical (if no status, or classifier-owned draft).
+ * Low-confidence canonical → status:draft + status_source:classifier + canonical-candidate.
+ * Never demotes user-set status tags.
  */
 export function applyClassificationLifecycleTags(
   tags: string[],
@@ -240,11 +264,19 @@ export function applyClassificationLifecycleTags(
   if (!canonical) return next;
 
   if (confidence >= CANONICAL_CONFIDENCE_THRESHOLD) {
-    if (getStatus(next) === null) next = withStatus(next, "canonical");
+    const status = getStatus(next);
+    const source = getStatusSource(next);
+    if (status === null || (status === "draft" && source === "classifier")) {
+      next = withStatus(next, "canonical");
+      next = clearStatusSource(next);
+    }
     return next;
   }
 
-  if (getStatus(next) === null) next = withStatus(next, "draft");
+  if (getStatus(next) === null) {
+    next = withStatus(next, "draft");
+    next = withStatusSource(next, "classifier");
+  }
   if (!next.includes(CANONICAL_CANDIDATE_TAG)) next = [...next, CANONICAL_CANDIDATE_TAG];
   return next;
 }
@@ -475,6 +507,7 @@ export async function initializeDatabase(env: Env): Promise<void> {
     `ALTER TABLE entries ADD COLUMN classified_at INTEGER`,
     `ALTER TABLE entries ADD COLUMN contradiction_wins INTEGER DEFAULT 0`,
     `ALTER TABLE entries ADD COLUMN contradiction_losses INTEGER DEFAULT 0`,
+    `ALTER TABLE entries ADD COLUMN content_hash TEXT`,
   ]) {
     try {
       await env.DB.exec(alter);
@@ -486,6 +519,9 @@ export async function initializeDatabase(env: Env): Promise<void> {
   await env.DB.exec(
     `CREATE INDEX IF NOT EXISTS idx_entries_classification_queue
      ON entries(classification_status, classification_next_attempt_at, created_at)`
+  );
+  await env.DB.exec(
+    `CREATE INDEX IF NOT EXISTS idx_entries_content_hash ON entries(content_hash)`
   );
   // Before durable classification fields existed, kind:* tags were the only
   // successful-classification marker. Preserve that work during upgrade with
@@ -547,7 +583,44 @@ async function saveTelemetryConfig(env: Env, config: TelemetryConfig): Promise<v
     .run();
 }
 
-// ─── Duplicate detection ──────────────────────────────────────────────────────
+// ─── Exact-content fingerprint (hard dedup) ───────────────────────────────────
+// Vector similarity never hard-blocks capture. Only a content fingerprint match
+// (normalized whitespace) is treated as an exact duplicate.
+
+export function normalizeContentForDedup(content: string): string {
+  return content.trim().replace(/\s+/g, " ");
+}
+
+export async function contentFingerprint(content: string): Promise<string> {
+  const bytes = new TextEncoder().encode(normalizeContentForDedup(content));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function findExactDuplicateId(
+  env: Env,
+  content: string,
+  hash: string
+): Promise<string | null> {
+  const byHash = await env.DB.prepare(
+    `SELECT id FROM entries
+     WHERE content_hash = ?
+       AND tags NOT LIKE '%"status:deprecated"%'
+     LIMIT 1`
+  ).bind(hash).first<{ id: string }>();
+  if (byHash?.id) return byHash.id;
+
+  // Legacy rows written before content_hash existed.
+  const byContent = await env.DB.prepare(
+    `SELECT id FROM entries
+     WHERE content = ?
+       AND tags NOT LIKE '%"status:deprecated"%'
+     LIMIT 1`
+  ).bind(content).first<{ id: string }>();
+  return byContent?.id ?? null;
+}
+
+// ─── Duplicate / similarity detection ─────────────────────────────────────────
 
 type DuplicateResult =
   | { status: "unique" }
@@ -574,9 +647,8 @@ interface ContradictionResult {
 }
 
 // ─── Smart Merge ──────────────────────────────────────────────────────────────
-// Only applies to the flagged band (0.85–0.95). The combined prompt handles
-// both contradiction detection and merge/replace decisions in a single LLM call,
-// keeping total LLM calls the same as before.
+// Applies to the flagged band (≥0.85), including former hard-block scores (≥0.95).
+// Combined prompt handles contradiction + merge/replace in one LLM call.
 
 export type MergeAction =
   | { action: "keep_both" }
@@ -625,9 +697,9 @@ async function filterActiveVectorMatches(
   });
 }
 
-// Merges duplicate detection, contradiction detection, and smart merge into a
-// single embed + Vectorize query. For flagged entries (0.85–0.95) the combined
-// prompt replaces the contradiction-only prompt — same number of LLM calls.
+// Semantic similarity, contradiction detection, and smart merge in one embed +
+// Vectorize query. High similarity (≥0.85, including former "block" band) is
+// always flagged — never hard-blocked — so ADD + relation can still run.
 export async function checkDuplicateAndContradiction(content: string, env: Env): Promise<{
   duplicate: DuplicateResult;
   contradiction: ContradictionResult;
@@ -641,20 +713,21 @@ export async function checkDuplicateAndContradiction(content: string, env: Env):
     env
   )).slice(0, 5);
 
-  // ── Duplicate: derived from top match ───────────────────────────────────────
+  // ── Similarity band: flag for relation planning; never block by score ───────
   let duplicate: DuplicateResult = { status: "unique" };
   if (matches.length) {
     const top = matches[0];
     const matchId = (top.metadata as any)?.parentId ?? top.id;
-    if (top.score >= DUPLICATE_BLOCK_THRESHOLD) duplicate = { status: "blocked", matchId, score: top.score };
-    else if (top.score >= DUPLICATE_FLAG_THRESHOLD) duplicate = { status: "flagged", matchId, score: top.score };
+    if (top.score >= DUPLICATE_FLAG_THRESHOLD) {
+      // Includes former hard-block band (≥0.95): still ADD, link as similar/etc.
+      duplicate = { status: "flagged", matchId, score: top.score };
+    }
   }
 
-  // ── Skip all LLM work if blocked ─────────────────────────────────────────────
   let contradiction: ContradictionResult = { detected: false };
   let mergeAction: MergeAction | null = null;
 
-  if (duplicate.status !== "blocked") {
+  {
     const candidates = matches.filter(m => m.score >= CANDIDATE_SCORE_THRESHOLD);
     if (candidates.length) {
       const parentIds = [...new Set(
@@ -672,7 +745,7 @@ export async function checkDuplicateAndContradiction(content: string, env: Env):
           .join("\n\n");
 
         if (duplicate.status === "flagged") {
-          // ── Combined prompt: contradiction + merge decision (flagged band only) ──
+          // ── Combined prompt: contradiction + merge (flagged band, including ≥0.95) ──
           // Replaces the contradiction-only prompt — same 1 LLM call, richer result.
           const prompt = `You are deciding what to do with a new memory that is very similar to existing memories.
 
@@ -1404,10 +1477,11 @@ async function commitEntryVersion(
 
   let switchResult: D1Result;
   try {
+    const newHash = await contentFingerprint(input.newContent);
     const results = await env.DB.batch([
       env.DB.prepare(
         `UPDATE entries
-         SET content = ?, tags = ?, vector_ids = ?
+         SET content = ?, tags = ?, vector_ids = ?, content_hash = ?
              , classification_status = 'pending', classification_error = NULL
              , classification_attempts = 0, classification_next_attempt_at = NULL
              , classification_started_at = NULL, classification_confidence = NULL
@@ -1417,6 +1491,7 @@ async function commitEntryVersion(
         input.newContent,
         JSON.stringify(input.newTags),
         JSON.stringify(prepared.vectorIds),
+        newHash,
         input.id,
         input.oldContent,
         activeTagsJson,
@@ -1549,10 +1624,11 @@ async function appendToEntry(
   });
   let switchResult: D1Result;
   try {
+    const newHash = await contentFingerprint(newContent);
     const results = await env.DB.batch([
       env.DB.prepare(
         `UPDATE entries
-         SET content = ?, vector_ids = ?
+         SET content = ?, vector_ids = ?, content_hash = ?
              , classification_status = 'pending', classification_error = NULL
              , classification_attempts = 0, classification_next_attempt_at = NULL
              , classification_started_at = NULL, classification_confidence = NULL
@@ -1561,6 +1637,7 @@ async function appendToEntry(
       ).bind(
         newContent,
         JSON.stringify([...activeVectorIds, newChunkId]),
+        newHash,
         id,
         existingContent,
         activeTagsJson,
@@ -2315,10 +2392,13 @@ async function classifyAndPersistEntry(
       ).bind(candidate.id, candidate.content, startedAt).first<{ tags: string }>();
       if (!current) return "skipped";
       const currentTagsJson = current.tags || "[]";
-      let tags: string[] = JSON.parse(currentTagsJson);
+      const previousTags: string[] = JSON.parse(currentTagsJson);
+      let tags: string[] = [...previousTags];
       tags = withKind(tags, kind);
       tags = applyClassificationLifecycleTags(tags, canonical, confidence);
-      const result = await env.DB.prepare(
+      const classifiedAt = Date.now();
+      const nextTagsJson = JSON.stringify(tags);
+      const updateResult = await env.DB.prepare(
         `UPDATE entries
          SET tags = ?, importance_score = ?, classification_confidence = ?,
              classification_status = 'succeeded', classification_error = NULL,
@@ -2328,17 +2408,45 @@ async function classifyAndPersistEntry(
            AND classification_status = 'processing'
            AND classification_started_at = ?`
       ).bind(
-        JSON.stringify(tags),
+        nextTagsJson,
         importance,
         confidence,
         CURRENT_CLASSIFICATION_VERSION,
-        Date.now(),
+        classifiedAt,
         candidate.id,
         candidate.content,
         currentTagsJson,
         startedAt
       ).run();
-      if (Number(result.meta?.changes ?? 0) === 1) return "succeeded";
+      if (Number(updateResult.meta?.changes ?? 0) !== 1) continue;
+
+      // Permanent audit trail for automatic classification (kind/status/scores).
+      try {
+        const classifyRevision = prepareMemoryRevision(env.DB, {
+          memoryId: candidate.id,
+          eventType: "CLASSIFY",
+          oldContent: candidate.content,
+          newContent: candidate.content,
+          oldMetadata: {
+            tags: previousTags,
+          },
+          newMetadata: {
+            tags,
+            importance,
+            confidence,
+            canonical,
+            kind,
+            classification_version: CURRENT_CLASSIFICATION_VERSION,
+          },
+          reason: "Automatic classification",
+          actor: "classifier",
+          createdAt: classifiedAt,
+        });
+        await classifyRevision.statement.run();
+      } catch (e) {
+        console.error("CLASSIFY revision write failed (non-fatal):", e);
+      }
+      return "succeeded";
     }
     throw new Error("classification_conflict");
   } catch (error) {
@@ -2563,8 +2671,17 @@ export async function captureEntry(
     ...hashtags,
   ])];
 
+  // Hard dedup only for identical content fingerprints (normalized whitespace).
+  // Semantic near-duplicates always proceed to ADD + typed relations.
+  const contentHash = await contentFingerprint(c);
+  const exactId = await findExactDuplicateId(env, c, contentHash);
+  if (exactId) {
+    return { status: "blocked", matchId: exactId, score: 1 };
+  }
+
   const { duplicate: dup, contradiction, mergeAction } = await checkDuplicateAndContradiction(c, env);
 
+  // Vector scores never return blocked after PR-5; keep guard for safety.
   if (dup.status === "blocked") {
     return { status: "blocked", matchId: dup.matchId, score: dup.score };
   }
@@ -2575,11 +2692,15 @@ export async function captureEntry(
   const now = Date.now();
   const baseTags = contradiction.detected ? [...t, "contradiction-resolved"] : t;
   let finalTags = dup.status === "flagged" ? [...baseTags, "duplicate-candidate"] : baseTags;
-  if (relationPlan?.forceDraft) finalTags = withStatus(finalTags, "draft");
+  if (relationPlan?.forceDraft) {
+    finalTags = withStatus(finalTags, "draft");
+    finalTags = withStatusSource(finalTags, "relation");
+  }
 
   const insertStatement = env.DB.prepare(
-    `INSERT INTO entries (id, content, tags, source, created_at, vector_ids) VALUES (?, ?, ?, ?, ?, ?)`
-  ).bind(id, c, JSON.stringify(finalTags), source, now, "[]");
+    `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, content_hash)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).bind(id, c, JSON.stringify(finalTags), source, now, "[]", contentHash);
   const revision = prepareMemoryRevision(env.DB, {
     memoryId: id,
     eventType: "ADD",
@@ -2747,7 +2868,9 @@ export async function applyStatus(id: string, status: MemoryStatus, env: Env): P
   ).bind(id).first() as Record<string, any> | null;
   if (!row) return false;
   const tags: string[] = JSON.parse(row.tags ?? "[]");
-  const nextTags = withStatus(tags, status);
+  let nextTags = withStatus(tags, status);
+  nextTags = withStatusSource(nextTags, "user");
+  nextTags = nextTags.filter(t => t !== CANONICAL_CANDIDATE_TAG);
   const statusRevision = prepareMemoryRevision(env.DB, {
     memoryId: id,
     eventType: "STATUS",

@@ -90,12 +90,49 @@ describe("captureEntry()", () => {
     expect(db.entries[0].content).toBe("padded note");
   });
 
-  // ── Duplicate: blocked ──────────────────────────────────────────────────────
+  // ── Duplicate: exact content hash only ──────────────────────────────────────
 
-  it("returns status=blocked and does not insert when similarity >= 0.95", async () => {
+  it("returns status=blocked for exact content fingerprint match", async () => {
+    const { contentFingerprint } = await import("../../src/index");
+    const content = "Exact same fact";
     db.entries.push({
-      id: "existing", content: "Existing duplicate", tags: "[]", source: "api",
-      created_at: Date.now(), vector_ids: '["existing"]', recall_count: 0, importance_score: 0,
+      id: "existing",
+      content,
+      tags: "[]",
+      source: "api",
+      created_at: Date.now(),
+      vector_ids: '["existing"]',
+      recall_count: 0,
+      importance_score: 0,
+      content_hash: await contentFingerprint(content),
+    });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({
+          matches: [{ id: "existing", score: 0.99, metadata: { parentId: "existing" } }],
+        }),
+      }),
+    });
+    const { ctx } = makeCtx();
+    const result = await captureEntry(content, [], "api", env, ctx);
+    expect(result.status).toBe("blocked");
+    if (result.status !== "blocked") return;
+    expect(result.matchId).toBe("existing");
+    expect(result.score).toBe(1);
+    expect(db.entries).toHaveLength(1);
+  });
+
+  it("does not hard-block high vector similarity — still ADD + link", async () => {
+    db.entries.push({
+      id: "existing",
+      content: "Server address is 192.168.1.10",
+      tags: "[]",
+      source: "api",
+      created_at: Date.now(),
+      vector_ids: '["existing"]',
+      recall_count: 0,
+      importance_score: 0,
+      content_hash: "other-hash",
     });
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
@@ -105,29 +142,35 @@ describe("captureEntry()", () => {
       }),
     });
     const { ctx } = makeCtx();
-    const result = await captureEntry("Duplicate content", [], "api", env, ctx);
-    expect(result.status).toBe("blocked");
-    if (result.status !== "blocked") return;
-    expect(result.matchId).toBe("existing");
-    expect(result.score).toBeCloseTo(0.97);
-    expect(db.entries).toHaveLength(1);
+    const result = await captureEntry("Server address is 192.168.1.11", [], "api", env, ctx);
+    expect(result.status).not.toBe("blocked");
+    expect(db.entries).toHaveLength(2);
+    // High similarity should surface a relation or at least store as flagged/linked
+    expect(["linked", "flagged", "stored", "contradiction", "contradiction_protected"]).toContain(result.status);
   });
 
-  it("does not call ctx.waitUntil when blocked (no scoring needed)", async () => {
+  it("skips embed work when exact hash blocks (no waitUntil vectorize)", async () => {
+    const { contentFingerprint } = await import("../../src/index");
+    const content = "Exact same fact again";
     db.entries.push({
-      id: "existing", content: "Existing duplicate", tags: "[]", source: "api",
-      created_at: Date.now(), vector_ids: '["existing"]', recall_count: 0, importance_score: 0,
+      id: "existing",
+      content,
+      tags: "[]",
+      source: "api",
+      created_at: Date.now(),
+      vector_ids: '["existing"]',
+      recall_count: 0,
+      importance_score: 0,
+      content_hash: await contentFingerprint(content),
     });
+    const query = vi.fn().mockResolvedValue({ matches: [] });
     env = makeTestEnv(db, {
-      VECTORIZE: makeVectorizeMock({
-        query: vi.fn().mockResolvedValue({
-          matches: [{ id: "existing", score: 0.97, metadata: { parentId: "existing" } }],
-        }),
-      }),
+      VECTORIZE: makeVectorizeMock({ query }),
     });
     const pending: Promise<any>[] = [];
     const ctx = { waitUntil: (p: Promise<any>) => pending.push(p) } as any as ExecutionContext;
-    await captureEntry("Duplicate content", [], "api", env, ctx);
+    await captureEntry(content, [], "api", env, ctx);
+    expect(query).not.toHaveBeenCalled();
     expect(pending).toHaveLength(0);
   });
 

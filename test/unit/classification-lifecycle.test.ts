@@ -4,8 +4,10 @@ import {
   CANONICAL_CANDIDATE_TAG,
   CANONICAL_CONFIDENCE_THRESHOLD,
   CURRENT_CLASSIFICATION_VERSION,
+  contentFingerprint,
   formatRelevanceLabel,
   getHalfLifeMs,
+  normalizeContentForDedup,
   relevanceBand,
 } from "../../src/index";
 
@@ -16,12 +18,33 @@ describe("applyClassificationLifecycleTags", () => {
     ).toEqual(["work", "status:canonical"]);
   });
 
-  it("marks low-confidence canonical as draft candidate", () => {
+  it("marks low-confidence canonical as draft candidate with classifier source", () => {
     expect(applyClassificationLifecycleTags(["work"], true, 0.35)).toEqual([
       "work",
       "status:draft",
+      "status_source:classifier",
       CANONICAL_CANDIDATE_TAG,
     ]);
+  });
+
+  it("upgrades classifier-owned draft to canonical when confidence is high", () => {
+    expect(
+      applyClassificationLifecycleTags(
+        ["work", "status:draft", "status_source:classifier", CANONICAL_CANDIDATE_TAG],
+        true,
+        0.9
+      )
+    ).toEqual(["work", "status:canonical"]);
+  });
+
+  it("does not upgrade user-owned draft to canonical automatically", () => {
+    expect(
+      applyClassificationLifecycleTags(
+        ["work", "status:draft", "status_source:user"],
+        true,
+        0.95
+      )
+    ).toEqual(["work", "status:draft", "status_source:user"]);
   });
 
   it("does not demote an existing status on low-confidence canonical", () => {
@@ -73,5 +96,18 @@ describe("relevance labels", () => {
     expect(relevanceBand(0.9)).toBe("high");
     expect(relevanceBand(0.6)).toBe("medium");
     expect(relevanceBand(0.1)).toBe("low");
+  });
+});
+
+describe("content fingerprint", () => {
+  it("normalizes whitespace for dedup", () => {
+    expect(normalizeContentForDedup("  a   b\n")).toBe("a b");
+  });
+
+  it("hashes normalized content stably", async () => {
+    const a = await contentFingerprint("hello   world");
+    const b = await contentFingerprint("hello world");
+    expect(a).toBe(b);
+    expect(a).toMatch(/^[a-f0-9]{64}$/);
   });
 });

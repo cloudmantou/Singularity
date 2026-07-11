@@ -3,6 +3,7 @@ export const MEMORY_REVISION_EVENTS = [
   "UPDATE",
   "APPEND",
   "STATUS",
+  "CLASSIFY",
   "DEPRECATE",
   "ROLLUP",
   "UNROLL",
