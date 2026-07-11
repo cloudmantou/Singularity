@@ -163,27 +163,48 @@ export class D1Mock {
           return { meta: { changes: row ? 1 : 0 } };
         }
         if (s.startsWith("UPDATE entries SET classification_status = 'processing'")) {
-          const [started_at, id, content, maxAttempts, now, leaseCutoff] = args;
+          // Bind order after PR-4:
+          // version, started_at, id, content, maxAttempts, now, leaseCutoff, version
+          const [currentVersion, started_at, id, content, maxAttempts, now, leaseCutoff] = args;
           const row = db.entries.find((e: any) => {
             if (e.id !== id || e.content !== content) return false;
             if (String(e.tags ?? "[]").includes('"status:deprecated"')) return false;
-            if (Number(e.classification_attempts ?? 0) >= Number(maxAttempts)) return false;
             const status = e.classification_status;
+            const staleVersion =
+              status === "succeeded" &&
+              Number(e.classification_version ?? 0) < Number(currentVersion);
+            if (staleVersion) return true;
+            if (Number(e.classification_attempts ?? 0) >= Number(maxAttempts)) return false;
             return status == null || status === "pending" ||
               (status === "retryable_error" && Number(e.classification_next_attempt_at ?? 0) <= Number(now)) ||
               (status === "processing" && Number(e.classification_started_at ?? 0) <= Number(leaseCutoff));
           });
           if (row) {
+            const staleVersion =
+              row.classification_status === "succeeded" &&
+              Number(row.classification_version ?? 0) < Number(currentVersion);
             row.classification_status = "processing";
             row.classification_error = null;
-            row.classification_attempts = Number(row.classification_attempts ?? 0) + 1;
+            row.classification_attempts = staleVersion
+              ? 1
+              : Number(row.classification_attempts ?? 0) + 1;
             row.classification_started_at = started_at;
             row.classification_next_attempt_at = null;
           }
           return { meta: { changes: row ? 1 : 0 } };
         }
         if (s.startsWith("UPDATE entries SET tags = ?, importance_score = ?, classification_confidence = ?")) {
-          const [tags, importance_score, classification_confidence, classified_at, id, content, expected_tags, started_at] = args;
+          const [
+            tags,
+            importance_score,
+            classification_confidence,
+            classification_version,
+            classified_at,
+            id,
+            content,
+            expected_tags,
+            started_at,
+          ] = args;
           const candidate = db.entries.find((e: any) => e.id === id);
           if (candidate && db.beforeClassificationCommit) {
             const hook = db.beforeClassificationCommit;
@@ -203,7 +224,7 @@ export class D1Mock {
               classification_error: null,
               classification_next_attempt_at: null,
               classification_started_at: null,
-              classification_version: 1,
+              classification_version,
               classified_at,
             });
           }
@@ -449,12 +470,16 @@ export class D1Mock {
         if (s.includes("COUNT(*) as count") && s.includes("classification_status IS NULL") && s.includes("classification_started_at")) {
           const now = Number(s.match(/classification_next_attempt_at, 0\) <= (\d+)/)?.[1] ?? 0);
           const leaseCutoff = Number(s.match(/classification_started_at, 0\) <= (\d+)/)?.[1] ?? 0);
+          const versionMatch = s.match(/classification_version, 0\) < (\d+)/);
+          const currentVersion = versionMatch ? Number(versionMatch[1]) : 2;
           const count = db.entries.filter((e: any) => {
             if (String(e.tags ?? "[]").includes('"status:deprecated"')) return false;
+            const status = e.classification_status;
+            if (status === "succeeded" && Number(e.classification_version ?? 0) < currentVersion) return true;
             if (Number(e.classification_attempts ?? 0) >= 3) return false;
-            return e.classification_status == null || e.classification_status === "pending" ||
-              (e.classification_status === "retryable_error" && Number(e.classification_next_attempt_at ?? 0) <= now) ||
-              (e.classification_status === "processing" && Number(e.classification_started_at ?? 0) <= leaseCutoff);
+            return status == null || status === "pending" ||
+              (status === "retryable_error" && Number(e.classification_next_attempt_at ?? 0) <= now) ||
+              (status === "processing" && Number(e.classification_started_at ?? 0) <= leaseCutoff);
           }).length;
           return { count };
         }
@@ -649,7 +674,14 @@ export class D1Mock {
         if (s.includes("SELECT id, recall_count, importance_score") && s.includes("WHERE id IN")) {
           const results = db.entries
             .filter((e: any) => args.includes(e.id))
-            .map((e: any) => ({ id: e.id, recall_count: e.recall_count ?? 0, importance_score: e.importance_score ?? 0, contradiction_wins: e.contradiction_wins ?? 0, contradiction_losses: e.contradiction_losses ?? 0 }));
+            .map((e: any) => ({
+              id: e.id,
+              recall_count: e.recall_count ?? 0,
+              importance_score: e.importance_score ?? 0,
+              contradiction_wins: e.contradiction_wins ?? 0,
+              contradiction_losses: e.contradiction_losses ?? 0,
+              classification_confidence: e.classification_confidence ?? null,
+            }));
           return { results };
         }
         if (s.includes("FROM entries WHERE id IN") && s.includes("tags NOT LIKE")) {
@@ -770,18 +802,25 @@ export class D1Mock {
           const limit = limitMatch ? parseInt(limitMatch[1], 10) : 14;
           const now = Number(s.match(/classification_next_attempt_at, 0\) <= (\d+)/)?.[1] ?? 0);
           const leaseCutoff = Number(s.match(/classification_started_at, 0\) <= (\d+)/)?.[1] ?? 0);
+          const versionMatch = s.match(/classification_version, 0\) < (\d+)/);
+          const currentVersion = versionMatch ? Number(versionMatch[1]) : 2;
           const rows = [...db.entries]
             .filter((e: any) => {
               if (String(e.tags ?? "[]").includes('"status:deprecated"')) return false;
+              const status = e.classification_status;
+              if (status === "succeeded" && Number(e.classification_version ?? 0) < currentVersion) return true;
               if (Number(e.classification_attempts ?? 0) >= 3) return false;
-              return e.classification_status == null || e.classification_status === "pending" ||
-                (e.classification_status === "retryable_error" && Number(e.classification_next_attempt_at ?? 0) <= now) ||
-                (e.classification_status === "processing" && Number(e.classification_started_at ?? 0) <= leaseCutoff);
+              return status == null || status === "pending" ||
+                (status === "retryable_error" && Number(e.classification_next_attempt_at ?? 0) <= now) ||
+                (status === "processing" && Number(e.classification_started_at ?? 0) <= leaseCutoff);
             })
             .sort((a: any, b: any) => {
-              const aPending = a.classification_status == null || a.classification_status === "pending" ? 0 : 1;
-              const bPending = b.classification_status == null || b.classification_status === "pending" ? 0 : 1;
-              return aPending - bPending || a.created_at - b.created_at;
+              const rank = (e: any) => {
+                if (e.classification_status == null || e.classification_status === "pending") return 0;
+                if (e.classification_status === "succeeded") return 2;
+                return 1;
+              };
+              return rank(a) - rank(b) || a.created_at - b.created_at;
             })
             .slice(0, limit)
             .map((e: any) => ({

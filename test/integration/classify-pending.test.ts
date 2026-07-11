@@ -30,7 +30,12 @@ function unclassifiedEntry(id: string, tags: string[] = ["work"]) {
 // written. That's realistic (ambiguous content stays untagged and gets retried —
 // see the "still unclassified" test below) but most of these tests want a
 // classifier that actually resolves, so they supply one explicitly.
-function makeClassifyingAIMock(result: { importance: number; canonical: boolean; kind: "episodic" | "semantic" | "procedural" }) {
+function makeClassifyingAIMock(result: {
+  importance: number;
+  canonical: boolean;
+  kind: "episodic" | "semantic" | "procedural";
+  confidence?: number;
+}) {
   return {
     run: vi.fn().mockImplementation(async (model: string) => {
       if (model === "@cf/baai/bge-small-en-v1.5") return { data: [new Array(384).fill(0.1)] };
@@ -90,7 +95,7 @@ describe("POST /classify-pending", () => {
   });
 
   it("processes unclassified entries, writes tags, and drains remaining to 0", async () => {
-    env = makeTestEnv(db, { AI: makeClassifyingAIMock({ importance: 4, canonical: true, kind: "semantic" }) });
+    env = makeTestEnv(db, { AI: makeClassifyingAIMock({ confidence: 0.9, importance: 4, canonical: true, kind: "semantic" }) });
     db.entries.push(unclassifiedEntry("e1"), unclassifiedEntry("e2"));
     const first = await (await worker.fetch(req("POST", "/classify-pending"), env, ctx)).json() as any;
     expect(first).toMatchObject({ processed: 1, failed: 0, remaining: 1 });
@@ -102,7 +107,8 @@ describe("POST /classify-pending", () => {
       expect(tags).toContain("status:canonical");
       const entry = db.entries.find((e: any) => e.id === id);
       expect(entry.classification_status).toBe("succeeded");
-      expect(entry.classification_confidence).toBe(0.5);
+      expect(entry.classification_confidence).toBe(0.9);
+      expect(entry.classification_version).toBe(2);
       expect(entry.classification_attempts).toBe(1);
       expect(entry.classification_error).toBeNull();
       expect(entry.classified_at).toEqual(expect.any(Number));
@@ -131,10 +137,20 @@ describe("POST /classify-pending", () => {
   });
 
   it("skips entries whose durable classification status is already succeeded", async () => {
-    env = makeTestEnv(db, { AI: makeClassifyingAIMock({ importance: 4, canonical: true, kind: "semantic" }) });
+    env = makeTestEnv(db, { AI: makeClassifyingAIMock({ confidence: 0.9, importance: 4, canonical: true, kind: "semantic" }) });
     db.entries.push(
-      { ...unclassifiedEntry("has-status", ["work", "status:draft"]), classification_status: "succeeded" },
-      { ...unclassifiedEntry("has-kind", ["work", "kind:episodic"]), classification_status: "succeeded" },
+      {
+        ...unclassifiedEntry("has-status", ["work", "status:draft"]),
+        classification_status: "succeeded",
+        classification_version: 2,
+        classification_confidence: 0.9,
+      },
+      {
+        ...unclassifiedEntry("has-kind", ["work", "kind:episodic"]),
+        classification_status: "succeeded",
+        classification_version: 2,
+        classification_confidence: 0.9,
+      },
     );
     const res = await worker.fetch(req("POST", "/classify-pending"), env, ctx);
     const data = await res.json() as any;
@@ -146,7 +162,7 @@ describe("POST /classify-pending", () => {
   });
 
   it("is resumable: re-running after a full drain is a no-op", async () => {
-    env = makeTestEnv(db, { AI: makeClassifyingAIMock({ importance: 4, canonical: true, kind: "semantic" }) });
+    env = makeTestEnv(db, { AI: makeClassifyingAIMock({ confidence: 0.9, importance: 4, canonical: true, kind: "semantic" }) });
     db.entries.push(unclassifiedEntry("only-one"));
     await worker.fetch(req("POST", "/classify-pending"), env, ctx);
     const res2 = await worker.fetch(req("POST", "/classify-pending"), env, ctx);
@@ -329,7 +345,7 @@ describe("POST /classify-pending", () => {
   });
 
   it("promotes canonical status and writes kind for a fully unclassified entry", async () => {
-    env = makeTestEnv(db, { AI: makeClassifyingAIMock({ importance: 5, canonical: true, kind: "episodic" }) });
+    env = makeTestEnv(db, { AI: makeClassifyingAIMock({ confidence: 0.9, importance: 5, canonical: true, kind: "episodic" }) });
     // A pending row is selected from durable classification state and receives
     // both lifecycle and kind tags on success.
     db.entries.push(unclassifiedEntry("neither", ["work"]));
@@ -340,7 +356,7 @@ describe("POST /classify-pending", () => {
   });
 
   it("backfills importance_score together with status and kind", async () => {
-    env = makeTestEnv(db, { AI: makeClassifyingAIMock({ importance: 5, canonical: true, kind: "semantic" }) });
+    env = makeTestEnv(db, { AI: makeClassifyingAIMock({ confidence: 0.9, importance: 5, canonical: true, kind: "semantic" }) });
     db.entries.push(unclassifiedEntry("importance-check"));
     await worker.fetch(req("POST", "/classify-pending"), env, ctx);
     const updated = db.entries.find((e: any) => e.id === "importance-check");
@@ -352,7 +368,7 @@ describe("POST /classify-pending", () => {
     // untagged result), so to exercise this endpoint's own try/catch we force a
     // failure downstream of that call instead: malformed tags JSON blows up
     // JSON.parse inside the handler.
-    env = makeTestEnv(db, { AI: makeClassifyingAIMock({ importance: 4, canonical: true, kind: "semantic" }) });
+    env = makeTestEnv(db, { AI: makeClassifyingAIMock({ confidence: 0.9, importance: 4, canonical: true, kind: "semantic" }) });
     db.entries.push(
       { ...unclassifiedEntry("bad"), tags: "not-json" },
       unclassifiedEntry("good"),
@@ -365,4 +381,73 @@ describe("POST /classify-pending", () => {
     expect(data.remaining).toBe(0);
     expect(data.deferred).toBe(1);
   });
+
+
+  it("does not auto-promote canonical when confidence is below threshold", async () => {
+    env = makeTestEnv(db, {
+      AI: makeClassifyingAIMock({ importance: 4, confidence: 0.35, canonical: true, kind: "semantic" }),
+    });
+    db.entries.push(unclassifiedEntry("low-conf-canon"));
+    await worker.fetch(req("POST", "/classify-pending"), env, ctx);
+    const row = db.entries.find((e: any) => e.id === "low-conf-canon");
+    const tags: string[] = JSON.parse(row.tags);
+    expect(tags).toContain("status:draft");
+    expect(tags).toContain("canonical-candidate");
+    expect(tags).not.toContain("status:canonical");
+    expect(tags).toContain("kind:semantic");
+    expect(row.classification_confidence).toBe(0.35);
+    expect(row.classification_version).toBe(2);
+  });
+
+  it("auto-promotes canonical only when confidence meets the threshold", async () => {
+    env = makeTestEnv(db, {
+      AI: makeClassifyingAIMock({ importance: 5, confidence: 0.85, canonical: true, kind: "semantic" }),
+    });
+    db.entries.push(unclassifiedEntry("high-conf-canon"));
+    await worker.fetch(req("POST", "/classify-pending"), env, ctx);
+    const tags: string[] = JSON.parse(db.entries.find((e: any) => e.id === "high-conf-canon").tags);
+    expect(tags).toContain("status:canonical");
+    expect(tags).not.toContain("canonical-candidate");
+  });
+
+  it("reclassifies succeeded rows on a stale classification_version", async () => {
+    env = makeTestEnv(db, {
+      AI: makeClassifyingAIMock({ importance: 4, confidence: 0.9, canonical: false, kind: "procedural" }),
+    });
+    db.entries.push({
+      ...unclassifiedEntry("stale-version", ["work", "kind:semantic", "status:draft"]),
+      classification_status: "succeeded",
+      classification_confidence: 0.5,
+      classification_attempts: 1,
+      classification_version: 1,
+      classified_at: Date.now() - 10_000,
+    });
+    const data = await (await worker.fetch(req("POST", "/classify-pending"), env, ctx)).json() as any;
+    expect(data.processed).toBe(1);
+    const row = db.entries.find((e: any) => e.id === "stale-version");
+    expect(row).toMatchObject({
+      classification_status: "succeeded",
+      classification_version: 2,
+      classification_confidence: 0.9,
+    });
+    expect(JSON.parse(row.tags)).toContain("kind:procedural");
+  });
+
+  it("scheduled maintenance drains the classification queue", async () => {
+    // Use Workers AI path (not SELFHOST) so the classifying AI mock is reachable.
+    // SELFHOST=1 requires external LLM_BASE_URL/API_KEY and would fail open in unit tests.
+    env = makeTestEnv(db, {
+      AI: makeClassifyingAIMock({ importance: 3, confidence: 0.7, canonical: false, kind: "semantic" }),
+    });
+    db.entries.push(unclassifiedEntry("cron-1"));
+    const pending: Promise<unknown>[] = [];
+    const scheduledCtx = {
+      waitUntil: (p: Promise<unknown>) => { pending.push(p); },
+    } as any;
+    await worker.scheduled({} as any, env, scheduledCtx);
+    await Promise.all(pending);
+    expect(db.entries.find((e: any) => e.id === "cron-1").classification_status).toBe("succeeded");
+    expect(db.entries.find((e: any) => e.id === "cron-1").classification_version).toBe(2);
+  });
+
 });

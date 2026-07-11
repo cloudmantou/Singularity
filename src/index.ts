@@ -220,6 +220,35 @@ export function withStatus(tags: string[], status: MemoryStatus): string[] {
   return [...cleaned, `${STATUS_PREFIX}${status}`];
 }
 
+/** Soft marker: model suggested canonical but confidence was below the auto-promote threshold. */
+export const CANONICAL_CANDIDATE_TAG = "canonical-candidate";
+/** Only auto-promote to status:canonical when classifier confidence is at least this. */
+export const CANONICAL_CONFIDENCE_THRESHOLD = 0.85;
+
+/**
+ * Apply lifecycle tags from a classification result.
+ * High-confidence canonical → status:canonical (if no status yet).
+ * Low-confidence canonical → status:draft + canonical-candidate (user must confirm).
+ * Never demotes an existing status tag.
+ */
+export function applyClassificationLifecycleTags(
+  tags: string[],
+  canonical: boolean,
+  confidence: number,
+): string[] {
+  let next = tags.filter(t => t !== CANONICAL_CANDIDATE_TAG);
+  if (!canonical) return next;
+
+  if (confidence >= CANONICAL_CONFIDENCE_THRESHOLD) {
+    if (getStatus(next) === null) next = withStatus(next, "canonical");
+    return next;
+  }
+
+  if (getStatus(next) === null) next = withStatus(next, "draft");
+  if (!next.includes(CANONICAL_CANDIDATE_TAG)) next = [...next, CANONICAL_CANDIDATE_TAG];
+  return next;
+}
+
 // ─── Memory kind layer (issue #12) ──────────────────────────────────────────────
 // Kind lives as a reserved tag (e.g. "kind:episodic") on entries.tags — no schema
 // change. Absent kind = unknown (unclassified). Orthogonal to status (#119).
@@ -763,10 +792,13 @@ interface VectorizeMatch {
 }
 
 export function getHalfLifeMs(tags: string[]): number {
-  if (tags.includes("task")) return 7 * 24 * 60 * 60 * 1000;  // 7 days
-  if (tags.includes("context")) return 180 * 24 * 60 * 60 * 1000; // 6 months
-  if (tags.includes("work")) return 90 * 24 * 60 * 60 * 1000; // 3 months
-  return 30 * 24 * 60 * 60 * 1000; // 30 days default
+  const DAY = 24 * 60 * 60 * 1000;
+  if (tags.includes("task")) return 7 * DAY;  // 7 days
+  // Procedures/how-tos are durable knowledge — decay much slower than default episodic notes.
+  if (tags.includes("kind:procedural") || tags.includes("procedural")) return 365 * DAY;
+  if (tags.includes("context")) return 180 * DAY; // 6 months
+  if (tags.includes("work")) return 90 * DAY; // 3 months
+  return 30 * DAY; // 30 days default
 }
 
 // Cosine similarity between two vectors. BGE embeddings are not normalized,
@@ -789,7 +821,8 @@ export function rerankWithTimeDecay(
   importanceScores: Map<string, number> = new Map(),
   queryTags: string[] = [],
   contradictionWins: Map<string, number> = new Map(),
-  contradictionLosses: Map<string, number> = new Map()
+  contradictionLosses: Map<string, number> = new Map(),
+  confidenceScores: Map<string, number> = new Map(),
 ): VectorizeMatch[] {
   const now = Date.now();
 
@@ -836,7 +869,24 @@ export function rerankWithTimeDecay(
       const overlap = queryTags.length ? tags.filter(t => queryTags.includes(t)).length : 0;
       const tagBoost = overlap ? Math.min(TAG_BOOST_MAX, 1 + overlap * TAG_BOOST_STEP) : 1.0;
 
-      return { ...match, score: match.score * combinedMultiplier * appendPenalty * rolledUpPenalty * importanceMultiplier * tagBoost };
+      // Mild confidence tilt: low-confidence facts stay visible but rank slightly lower.
+      // Missing confidence (unclassified) → neutral 1.0.
+      const conf = confidenceScores.get(parentId);
+      const confidenceMultiplier =
+        conf == null || !(conf > 0)
+          ? 1.0
+          : 0.9 + Math.min(1, Math.max(0, conf)) * 0.1;
+
+      return {
+        ...match,
+        score: match.score
+          * combinedMultiplier
+          * appendPenalty
+          * rolledUpPenalty
+          * importanceMultiplier
+          * tagBoost
+          * confidenceMultiplier,
+      };
     })
     .sort((a, b) => b.score - a.score);
 }
@@ -919,6 +969,21 @@ const CLASSIFICATION_CLOUDFLARE_BATCH_LIMIT = 1;
 const CLOUDFLARE_IMPORT_MAX_ROWS = 4;
 const CLASSIFICATION_RETRY_BASE_MS = 60_000;
 const CLASSIFICATION_PROCESSING_LEASE_MS = 10 * 60_000;
+/** Bump when the classify prompt/schema changes so succeeded rows re-enter the queue. */
+export const CURRENT_CLASSIFICATION_VERSION = 2;
+
+/** Convert a normalized rank score (0–1, top=1) into a human label — not a probability. */
+export function formatRelevanceLabel(score: number): string {
+  if (score >= 0.85) return "highly relevant";
+  if (score >= 0.55) return "relevant";
+  return "possibly relevant";
+}
+
+export function relevanceBand(score: number): "high" | "medium" | "low" {
+  if (score >= 0.85) return "high";
+  if (score >= 0.55) return "medium";
+  return "low";
+}
 
 export function getClassificationSample(content: string): string {
   if (content.length <= CLASSIFICATION_SAMPLE_MAX_CHARS) return content;
@@ -1074,7 +1139,10 @@ export function buildEntryFilterQuery(params: {
   if (params.after !== undefined) { conds.push(`created_at >= ?`); bindings.push(params.after); }
   if (params.before !== undefined) { conds.push(`created_at <= ?`); bindings.push(params.before); }
 
-  let sql = `SELECT id, content, tags, source, created_at, vector_ids FROM entries`;
+  let sql = `SELECT id, content, tags, source, created_at, vector_ids,
+                    recall_count, importance_score, classification_confidence,
+                    classification_status, classified_at
+             FROM entries`;
   if (conds.length) sql += ` WHERE ` + conds.join(` AND `);
   sql += ` ORDER BY created_at DESC LIMIT ?`;
   bindings.push(params.n);
@@ -1775,6 +1843,20 @@ async function runNightlyCompression(env: Env, ctx: ExecutionContext): Promise<v
 
 async function runScheduledMaintenance(env: Env, ctx: ExecutionContext): Promise<void> {
   await ensureDatabase(env);
+
+  // Drain due classification work (pending + retryable after backoff + stale version).
+  // Without this, retryable_error rows only move if something calls POST /classify-pending.
+  try {
+    await processClassificationQueue(
+      env,
+      env.SELFHOST === "1"
+        ? CLASSIFICATION_SELFHOST_BATCH_LIMIT
+        : CLASSIFICATION_CLOUDFLARE_BATCH_LIMIT
+    );
+  } catch (e) {
+    console.error("Classification queue maintenance failed (non-fatal):", e);
+  }
+
   await flushTelemetry(env.DB);
   await aggregateTelemetryHour(env.DB);
 
@@ -2010,21 +2092,52 @@ export async function recallEntries(
   // The tag path can produce far more than 100 candidates, so chunk the IN query
   // to stay under D1's bound-parameter limit.
   const candidateIds = [...new Set(fusedMatches.map(m => (m.metadata as any)?.parentId ?? m.id))] as string[];
-  const rcRows: { id: string; recall_count: number; importance_score: number; contradiction_wins: number; contradiction_losses: number }[] = [];
+  const rcRows: {
+    id: string;
+    recall_count: number;
+    importance_score: number;
+    contradiction_wins: number;
+    contradiction_losses: number;
+    classification_confidence: number | null;
+  }[] = [];
   for (let i = 0; i < candidateIds.length; i += D1_MAX_BOUND_PARAMS) {
     const batch = candidateIds.slice(i, i + D1_MAX_BOUND_PARAMS);
     const rcPlaceholders = batch.map(() => "?").join(", ");
     const { results: rows } = await env.DB.prepare(
-      `SELECT id, recall_count, importance_score, contradiction_wins, contradiction_losses FROM entries WHERE id IN (${rcPlaceholders})`
-    ).bind(...batch).all() as { results: { id: string; recall_count: number; importance_score: number; contradiction_wins: number; contradiction_losses: number }[] };
+      `SELECT id, recall_count, importance_score, contradiction_wins, contradiction_losses,
+              classification_confidence
+       FROM entries WHERE id IN (${rcPlaceholders})`
+    ).bind(...batch).all() as {
+      results: {
+        id: string;
+        recall_count: number;
+        importance_score: number;
+        contradiction_wins: number;
+        contradiction_losses: number;
+        classification_confidence: number | null;
+      }[];
+    };
     rcRows.push(...rows);
   }
   const recallCounts = new Map(rcRows.map(r => [r.id, r.recall_count ?? 0]));
   const importanceScores = new Map(rcRows.map(r => [r.id, r.importance_score ?? 0]));
   const contradictionWins = new Map(rcRows.map(r => [r.id, r.contradiction_wins ?? 0]));
   const contradictionLosses = new Map(rcRows.map(r => [r.id, r.contradiction_losses ?? 0]));
+  const confidenceScores = new Map(
+    rcRows
+      .filter(r => r.classification_confidence != null && Number(r.classification_confidence) > 0)
+      .map(r => [r.id, Number(r.classification_confidence)])
+  );
 
-  const reranked = rerankWithTimeDecay(fusedMatches, recallCounts, importanceScores, queryTags, contradictionWins, contradictionLosses);
+  const reranked = rerankWithTimeDecay(
+    fusedMatches,
+    recallCounts,
+    importanceScores,
+    queryTags,
+    contradictionWins,
+    contradictionLosses,
+    confidenceScores,
+  );
 
   const seen = new Set<string>();
   const deduped = reranked.filter((m) => {
@@ -2085,8 +2198,8 @@ export async function recallEntries(
     }];
   });
 
-  // Normalize fused scores to 0–1 (top match = 1.0) so the displayed match % is a clean,
-  // monotonically-decreasing scale rather than raw RRF values.
+  // Normalize fused scores to 0–1 (top = 1.0) as a relative rank scale — not probability
+  // or semantic similarity. Callers should label with formatRelevanceLabel(), not "% match".
   const maxScore = matches.reduce((mx, m) => Math.max(mx, m.score), 0);
   if (maxScore > 0) for (const m of matches) m.score = m.score / maxScore;
 
@@ -2138,26 +2251,41 @@ async function claimClassification(
   const result = await env.DB.prepare(
     `UPDATE entries
      SET classification_status = 'processing', classification_error = NULL,
-         classification_attempts = COALESCE(classification_attempts, 0) + 1,
+         classification_attempts = CASE
+           WHEN classification_status = 'succeeded'
+                AND COALESCE(classification_version, 0) < ?
+             THEN 1
+           ELSE COALESCE(classification_attempts, 0) + 1
+         END,
          classification_started_at = ?, classification_next_attempt_at = NULL
      WHERE id = ? AND content = ?
        AND tags NOT LIKE '%"status:deprecated"%'
-       AND COALESCE(classification_attempts, 0) < ?
        AND (
-         classification_status IS NULL
-         OR classification_status = 'pending'
-         OR (classification_status = 'retryable_error'
-             AND COALESCE(classification_next_attempt_at, 0) <= ?)
-         OR (classification_status = 'processing'
-             AND COALESCE(classification_started_at, 0) <= ?)
+         (
+           COALESCE(classification_attempts, 0) < ?
+           AND (
+             classification_status IS NULL
+             OR classification_status = 'pending'
+             OR (classification_status = 'retryable_error'
+                 AND COALESCE(classification_next_attempt_at, 0) <= ?)
+             OR (classification_status = 'processing'
+                 AND COALESCE(classification_started_at, 0) <= ?)
+           )
+         )
+         OR (
+           classification_status = 'succeeded'
+           AND COALESCE(classification_version, 0) < ?
+         )
        )`
   ).bind(
+    CURRENT_CLASSIFICATION_VERSION,
     startedAt,
     candidate.id,
     candidate.content,
     CLASSIFICATION_MAX_ATTEMPTS,
     startedAt,
-    startedAt - CLASSIFICATION_PROCESSING_LEASE_MS
+    startedAt - CLASSIFICATION_PROCESSING_LEASE_MS,
+    CURRENT_CLASSIFICATION_VERSION,
   ).run();
   if (Number(result.meta?.changes ?? 0) !== 1) return null;
   const claimed = await env.DB.prepare(
@@ -2189,13 +2317,13 @@ async function classifyAndPersistEntry(
       const currentTagsJson = current.tags || "[]";
       let tags: string[] = JSON.parse(currentTagsJson);
       tags = withKind(tags, kind);
-      if (canonical && getStatus(tags) === null) tags = withStatus(tags, "canonical");
+      tags = applyClassificationLifecycleTags(tags, canonical, confidence);
       const result = await env.DB.prepare(
         `UPDATE entries
          SET tags = ?, importance_score = ?, classification_confidence = ?,
              classification_status = 'succeeded', classification_error = NULL,
              classification_next_attempt_at = NULL, classification_started_at = NULL,
-             classification_version = 1, classified_at = ?
+             classification_version = ?, classified_at = ?
          WHERE id = ? AND content = ? AND tags = ?
            AND classification_status = 'processing'
            AND classification_started_at = ?`
@@ -2203,6 +2331,7 @@ async function classifyAndPersistEntry(
         JSON.stringify(tags),
         importance,
         confidence,
+        CURRENT_CLASSIFICATION_VERSION,
         Date.now(),
         candidate.id,
         candidate.content,
@@ -2234,6 +2363,100 @@ async function classifyAndPersistEntry(
     ).run();
     return Number(result.meta?.changes ?? 0) === 1 ? "failed" : "skipped";
   }
+}
+
+export interface ClassificationQueueResult {
+  processed: number;
+  failed: number;
+  skipped: number;
+  remaining: number;
+  deferred: number;
+  exhausted: number;
+}
+
+function classificationDueWhereSql(now: number, leaseCutoff: number): string {
+  return (
+    `tags NOT LIKE '%"status:deprecated"%' ` +
+    `AND (` +
+      `(` +
+        `COALESCE(classification_attempts, 0) < ${CLASSIFICATION_MAX_ATTEMPTS} ` +
+        `AND (` +
+          `classification_status IS NULL OR classification_status = 'pending' ` +
+          `OR (classification_status = 'retryable_error' AND COALESCE(classification_next_attempt_at, 0) <= ${now}) ` +
+          `OR (classification_status = 'processing' AND COALESCE(classification_started_at, 0) <= ${leaseCutoff})` +
+        `)` +
+      `)` +
+      ` OR (` +
+        `classification_status = 'succeeded' ` +
+        `AND COALESCE(classification_version, 0) < ${CURRENT_CLASSIFICATION_VERSION}` +
+      `)` +
+    `)`
+  );
+}
+
+/** Process due classification queue rows (pending, retryable, lease-expired, stale version). */
+export async function processClassificationQueue(
+  env: Env,
+  batchLimit: number,
+): Promise<ClassificationQueueResult> {
+  const now = Date.now();
+  const leaseCutoff = now - CLASSIFICATION_PROCESSING_LEASE_MS;
+  const DUE_WHERE = classificationDueWhereSql(now, leaseCutoff);
+
+  const { results: toProcess } = await env.DB.prepare(
+    `SELECT id, content
+     FROM entries
+     WHERE ${DUE_WHERE}
+     ORDER BY CASE
+                WHEN classification_status IS NULL OR classification_status = 'pending' THEN 0
+                WHEN classification_status = 'succeeded' THEN 2
+                ELSE 1
+              END,
+              created_at ASC
+     LIMIT ${batchLimit}`
+  ).all();
+
+  let processed = 0;
+  let failed = 0;
+  let skipped = 0;
+
+  for (const row of toProcess as Record<string, any>[]) {
+    try {
+      const outcome = await classifyAndPersistEntry({
+        id: row.id as string,
+        content: row.content as string,
+      }, env);
+      if (outcome === "succeeded") processed++;
+      else if (outcome === "failed") failed++;
+      else skipped++;
+    } catch (e) {
+      console.error("Classification queue failed for entry", row.id, e);
+      failed++;
+    }
+  }
+
+  const remaining = await env.DB.prepare(
+    `SELECT COUNT(*) as count FROM entries WHERE ${DUE_WHERE}`
+  ).first() as Record<string, any> | null;
+  const deferred = await env.DB.prepare(
+    `SELECT COUNT(*) as count FROM entries
+     WHERE classification_status = 'retryable_error'
+       AND COALESCE(classification_attempts, 0) < ${CLASSIFICATION_MAX_ATTEMPTS}
+       AND classification_next_attempt_at > ${now}`
+  ).first() as Record<string, any> | null;
+  const exhausted = await env.DB.prepare(
+    `SELECT COUNT(*) as count FROM entries
+     WHERE classification_status = 'terminal_error'`
+  ).first() as Record<string, any> | null;
+
+  return {
+    processed,
+    failed,
+    skipped,
+    remaining: (remaining?.count as number) ?? 0,
+    deferred: (deferred?.count as number) ?? 0,
+    exhausted: (exhausted?.count as number) ?? 0,
+  };
 }
 
 // Classify an entry's content and persist durable success/failure state,
@@ -2736,9 +2959,9 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
         const date = new Date(m.createdAt).toLocaleDateString();
         const tagList = m.tags.length ? ` [${m.tags.join(", ")}]` : "";
         const src = m.source ? ` · ${m.source}` : "";
-        const score = (m.score * 100).toFixed(0);
+        const relevance = formatRelevanceLabel(m.score);
         const updateLabel = m.isUpdate ? " [updated]" : "";
-        return `${i + 1}. [${date}${src}${tagList}] (${score}% match)${updateLabel}\n${m.content}`;
+        return `${i + 1}. [${date}${src}${tagList}] (${relevance})${updateLabel}\n${m.content}`;
       }).join("\n\n");
 
       const finalText = insight ? `**Insight:** ${insight}\n\n---\n\n${text}` : text;
@@ -3462,7 +3685,9 @@ const defaultHandler = {
         results: matches.map(m => ({
           id: m.id,
           content: m.content,
+          // Relative rank score 0–100 (top=100). Not probability or cosine accuracy.
           score: parseFloat((m.score * 100).toFixed(1)),
+          relevance: formatRelevanceLabel(m.score),
           tags: m.tags,
           source: m.source,
           created_at: m.createdAt,
@@ -3666,75 +3891,18 @@ const defaultHandler = {
     // POST /classify-pending
     // Bounded, resumable classification worker. It handles legacy pending rows and
     // retries failed rows up to CLASSIFICATION_MAX_ATTEMPTS without looping forever.
+    // The same queue also runs from scheduled maintenance.
     if (url.pathname === "/classify-pending" && request.method === "POST") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
 
-      const now = Date.now();
-      const leaseCutoff = now - CLASSIFICATION_PROCESSING_LEASE_MS;
       // Cloudflare's first invocation may also run schema initialization. Keep
       // enough headroom under D1 Free's 50-query invocation cap; self-hosted
       // SQLite does not have that subrequest limit.
       const batchLimit = env.SELFHOST === "1"
         ? CLASSIFICATION_SELFHOST_BATCH_LIMIT
         : CLASSIFICATION_CLOUDFLARE_BATCH_LIMIT;
-      const DUE_WHERE =
-        `tags NOT LIKE '%"status:deprecated"%' ` +
-        `AND COALESCE(classification_attempts, 0) < ${CLASSIFICATION_MAX_ATTEMPTS} ` +
-        `AND (classification_status IS NULL OR classification_status = 'pending' ` +
-        `OR (classification_status = 'retryable_error' AND COALESCE(classification_next_attempt_at, 0) <= ${now}) ` +
-        `OR (classification_status = 'processing' AND COALESCE(classification_started_at, 0) <= ${leaseCutoff}))`;
-
-      const { results: toProcess } = await env.DB.prepare(
-        `SELECT id, content
-         FROM entries
-         WHERE ${DUE_WHERE}
-         ORDER BY CASE WHEN classification_status IS NULL OR classification_status = 'pending' THEN 0 ELSE 1 END,
-                  created_at ASC
-         LIMIT ${batchLimit}`
-      ).all();
-
-      let processed = 0;
-      let failed = 0;
-      let skipped = 0;
-
-      for (const row of toProcess as Record<string, any>[]) {
-        try {
-          const outcome = await classifyAndPersistEntry({
-            id: row.id as string,
-            content: row.content as string,
-          }, env);
-          if (outcome === "succeeded") processed++;
-          else if (outcome === "failed") failed++;
-          else skipped++;
-        } catch (e) {
-          console.error("Classification backfill failed for entry", row.id, e);
-          failed++;
-        }
-      }
-
-      const remaining = await env.DB.prepare(
-        `SELECT COUNT(*) as count FROM entries WHERE ${DUE_WHERE}`
-      ).first() as Record<string, any> | null;
-      const deferred = await env.DB.prepare(
-        `SELECT COUNT(*) as count FROM entries
-         WHERE classification_status = 'retryable_error'
-           AND COALESCE(classification_attempts, 0) < ${CLASSIFICATION_MAX_ATTEMPTS}
-           AND classification_next_attempt_at > ${now}`
-      ).first() as Record<string, any> | null;
-      const exhausted = await env.DB.prepare(
-        `SELECT COUNT(*) as count FROM entries
-         WHERE classification_status = 'terminal_error'`
-      ).first() as Record<string, any> | null;
-
-      return json({
-        processed,
-        failed,
-        skipped,
-        remaining: (remaining?.count as number) ?? 0,
-        deferred: (deferred?.count as number) ?? 0,
-        exhausted: (exhausted?.count as number) ?? 0,
-      });
+      return json(await processClassificationQueue(env, batchLimit));
     }
 
     // POST /import — Cloudflare / dashboard JSON export → entries (vector_ids cleared)

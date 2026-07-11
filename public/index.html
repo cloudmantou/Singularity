@@ -4092,13 +4092,14 @@
             appendBrainBubble(msgs, t('recall.empty'), 'recall-sys')
           } else {
             const recentActivity = data.mode === 'recent_activity'
-            // REST scores are already 0–100 (one decimal); map directly rather than via
-            // normalizeEntry, whose 0–1 rescale heuristic would turn a 0.8% match into 80%
+            // REST score is a relative rank 0–100 (top=100), not probability.
+            // Prefer server-provided relevance labels; fall back to band from score.
             const entries = data.results.map((m) => ({
               id: m.id,
               content: m.content,
               tags: m.tags || [],
               score: recentActivity ? null : Math.min(100, Math.round(m.score)),
+              relevance: recentActivity ? null : (m.relevance || null),
               createdAt: m.created_at,
               source: m.source || '',
             }))
@@ -4118,7 +4119,9 @@
                 const date = new Date(m.created_at).toLocaleDateString()
                 const tagList = m.tags && m.tags.length ? ` [${m.tags.join(', ')}]` : ''
                 const src = m.source ? ` · ${m.source}` : ''
-                const relevance = recentActivity ? '' : ` (${Math.min(100, Math.round(m.score))}% match)`
+                const relevance = recentActivity
+                  ? ''
+                  : ` (${m.relevance || (m.score >= 85 ? 'highly relevant' : m.score >= 55 ? 'relevant' : 'possibly relevant')})`
                 return `${i + 1}. [${date}${src}${tagList}]${relevance}${m.updated ? ' [updated]' : ''}\n${m.content}`
               }).join('\n\n')
             const res = await fetch(`${WORKER_URL}/chat`, {
@@ -4194,10 +4197,18 @@
         const card = document.createElement('div')
         const isSynthesized = entry.tags.includes('synthesized')
         const isRolledUp = entry.tags.includes('rolled-up')
+        const relevanceLabel = entry.relevance
+          || (entry.score == null
+            ? ''
+            : entry.score >= 85
+              ? 'Highly relevant'
+              : entry.score >= 55
+                ? 'Relevant'
+                : 'Possibly relevant')
         const matchLine = entry.score == null
           ? `<div class="match-line"><span class="match-pct">${escHtml(new Date(entry.createdAt).toLocaleDateString())}${entry.source ? ` · ${escHtml(entry.source)}` : ''}</span></div>`
           : `<div class="match-line">
-      <span class="match-pct">${entry.score}%</span>
+      <span class="match-pct" title="Relative rank score ${entry.score}/100 (not accuracy)">${escHtml(relevanceLabel)}</span>
       <div class="match-bar-bg"><div class="match-bar-fill" style="width:${entry.score}%"></div></div>
     </div>`
         card.className = 'memory-card' + (isSynthesized ? ' card--synthesized' : '') + (isRolledUp ? ' card--rolled-up' : '')

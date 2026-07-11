@@ -115,9 +115,10 @@ function normalizeEntry(e) {
   }
   if (!Array.isArray(tags)) tags = [];
   let score = e.score != null ? e.score : (e.similarity != null ? e.similarity : 0);
-  if (score > 0 && score <= 1) score = Math.round(score * 100);   // 0–1 → percent
+  if (score > 0 && score <= 1) score = Math.round(score * 100);   // 0–1 rank → 0–100 scale
   return {
     score: Math.round(score) || 0,
+    relevance: e.relevance || null,
     content: e.content != null ? e.content : (e.text || ''),
     tags,
     id: e.id != null ? e.id : null

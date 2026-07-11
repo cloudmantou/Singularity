@@ -220,4 +220,27 @@ describe("rerankWithTimeDecay", () => {
     );
     expect(withDefault[0].score).toBeCloseTo(withEmpty[0].score, 6);
   });
+
+
+  it("mildly boosts higher classification confidence without hiding low-confidence rows", () => {
+    const low = match("low", 0.9, NOW - 1 * MS_DAY);
+    const high = match("high", 0.9, NOW - 1 * MS_DAY);
+    const conf = new Map<string, number>([
+      ["low", 0.2],
+      ["high", 0.95],
+    ]);
+    const result = rerankWithTimeDecay(
+      [low, high],
+      new Map(),
+      new Map(),
+      [],
+      new Map(),
+      new Map(),
+      conf,
+    );
+    expect(result[0].id).toBe("high");
+    expect(result[1].id).toBe("low");
+    expect(result[1].score).toBeGreaterThan(0);
+  });
+
 });

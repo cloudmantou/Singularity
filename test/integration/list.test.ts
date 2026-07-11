@@ -149,4 +149,34 @@ describe("GET /list", () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual([]);
   });
+
+
+  it("includes classification and importance fields for UI consumers", async () => {
+    db.entries.push({
+      id: "classed",
+      content: "Classified note",
+      tags: '["work","kind:semantic"]',
+      source: "api",
+      created_at: 1000,
+      vector_ids: "[]",
+      recall_count: 3,
+      importance_score: 4,
+      classification_confidence: 0.91,
+      classification_status: "succeeded",
+      classified_at: 2000,
+    });
+
+    const res = await worker.fetch(req("GET", "/list"), env, ctx);
+    expect(res.status).toBe(200);
+    const data = await res.json() as any[];
+    expect(data[0]).toMatchObject({
+      id: "classed",
+      recall_count: 3,
+      importance_score: 4,
+      classification_confidence: 0.91,
+      classification_status: "succeeded",
+      classified_at: 2000,
+    });
+  });
+
 });
