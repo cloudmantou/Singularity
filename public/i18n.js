@@ -91,6 +91,7 @@
     "remember.clear": "Clear chat",
     "remember.kept": "Kept. I'll remember that.",
     "remember.dup": "Already kept — I have something very similar, so I skipped the duplicate.",
+    "remember.sourceLinked": "Already known — linked this note as a new source.",
     "remember.tagged": "Tagged as:",
     "remember.error": "Something went wrong. Try again.",
 
@@ -355,6 +356,7 @@
     "remember.clear": "清空对话",
     "remember.kept": "已记住。",
     "remember.dup": "内容很相似，已跳过重复，没有再存一份。",
+    "remember.sourceLinked": "这条已知道，已作为新的来源证据关联。",
     "remember.tagged": "标签：",
     "remember.error": "出错了，请重试。",
 

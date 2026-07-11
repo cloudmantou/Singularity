@@ -96,6 +96,10 @@ export class D1Mock {
               (
                 status === "fallback" &&
                 Number(observation.needs_reprocess ?? 0) === 1
+              ) ||
+              (
+                status === "partial_error" &&
+                Number(observation.needs_reprocess ?? 0) === 1
               );
           });
           if (row) {
@@ -898,6 +902,10 @@ export class D1Mock {
                   status === "fallback" &&
                   Number(observation.needs_reprocess ?? 0) === 1
                 ) ||
+                (
+                  status === "partial_error" &&
+                  Number(observation.needs_reprocess ?? 0) === 1
+                ) ||
                 Number(observation.extraction_version ?? 0) < currentVersion;
             });
           } else if (s.includes("extraction_status = 'pending'") && s.includes("NOT EXISTS")) {
@@ -912,6 +920,15 @@ export class D1Mock {
           ) {
             rows = rows.filter((observation: any) =>
               observation.extraction_status === "fallback" &&
+              Number(observation.needs_reprocess ?? 0) === 1 &&
+              Number(observation.extraction_attempts ?? 0) < maxAttempts
+            );
+          } else if (
+            s.includes("extraction_status = 'partial_error'") &&
+            s.includes("needs_reprocess")
+          ) {
+            rows = rows.filter((observation: any) =>
+              observation.extraction_status === "partial_error" &&
               Number(observation.needs_reprocess ?? 0) === 1 &&
               Number(observation.extraction_attempts ?? 0) < maxAttempts
             );
@@ -959,6 +976,10 @@ export class D1Mock {
                 ) ||
                 (
                   status === "fallback" &&
+                  Number(observation.needs_reprocess ?? 0) === 1
+                ) ||
+                (
+                  status === "partial_error" &&
                   Number(observation.needs_reprocess ?? 0) === 1
                 ) ||
                 Number(observation.extraction_version ?? 0) < currentVersion;
@@ -1226,6 +1247,10 @@ export class D1Mock {
                 ) ||
                 (
                   status === "fallback" &&
+                  Number(observation.needs_reprocess ?? 0) === 1
+                ) ||
+                (
+                  status === "partial_error" &&
                   Number(observation.needs_reprocess ?? 0) === 1
                 ) ||
                 Number(observation.extraction_version ?? 0) < currentVersion;

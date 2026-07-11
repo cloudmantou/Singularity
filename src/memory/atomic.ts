@@ -56,6 +56,7 @@ export const OBSERVATION_EXTRACTION_STATUSES = [
   "processing",
   "succeeded",
   "fallback",
+  "partial_error",
   "retryable_error",
   "terminal_error",
 ] as const;

@@ -1053,6 +1053,13 @@
         overflow: hidden;
       }
 
+      .card-meta {
+        margin-top: 7px;
+        color: var(--text-tertiary);
+        font-size: 11.5px;
+        line-height: 1.4;
+      }
+
       .card-footer {
         display: flex;
         align-items: center;
@@ -2586,6 +2593,35 @@
         margin-bottom: 12px;
       }
 
+      .obs-mode-tabs {
+        display: inline-flex;
+        gap: 4px;
+        border: 1px solid var(--border);
+        background: var(--surface-2);
+        border-radius: var(--radius-pill);
+        padding: 3px;
+        margin-bottom: 12px;
+      }
+
+      .obs-mode-tab {
+        border: 0;
+        background: transparent;
+        color: var(--text-secondary);
+        border-radius: var(--radius-pill);
+        padding: 7px 12px;
+        font-size: 12px;
+        cursor: pointer;
+      }
+
+      .obs-mode-tab.active {
+        background: var(--bg-card);
+        color: var(--text-primary);
+        box-shadow: var(--shadow-card);
+      }
+
+      .obs-view { display: none; }
+      .obs-view.active { display: block; }
+
       .obs-privacy-note {
         font-size: 11px;
         color: var(--text-tertiary);
@@ -2692,6 +2728,104 @@
         flex-wrap: wrap;
         gap: 8px;
         padding: 12px 14px 14px;
+      }
+
+      .obs-health-grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 10px;
+        padding: 12px 14px 14px;
+      }
+
+      @media (min-width: 900px) {
+        .obs-health-grid { grid-template-columns: repeat(4, 1fr); }
+      }
+
+      .obs-health-item {
+        border: 0.5px solid var(--border);
+        border-radius: 8px;
+        padding: 10px;
+        background: var(--surface-2);
+      }
+
+      .obs-health-item .value {
+        font-size: 20px;
+        font-weight: 600;
+      }
+
+      .obs-health-item .label {
+        margin-top: 2px;
+        font-size: 11.5px;
+        color: var(--text-secondary);
+      }
+
+      .obs-actions-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        padding: 0 14px 14px;
+      }
+
+      .obs-actions-row button {
+        border: 1px solid var(--border);
+        background: var(--bg-card);
+        color: var(--text-primary);
+        border-radius: var(--radius-pill);
+        padding: 7px 11px;
+        font-size: 12px;
+        cursor: pointer;
+      }
+
+      .obs-bar-list,
+      .obs-change-list {
+        padding: 10px 14px 14px;
+      }
+
+      .obs-bar-row {
+        display: grid;
+        grid-template-columns: 108px 1fr 42px;
+        gap: 10px;
+        align-items: center;
+        font-size: 12px;
+        margin: 9px 0;
+      }
+
+      .obs-bar-track {
+        height: 8px;
+        border-radius: 999px;
+        background: var(--surface-2);
+        overflow: hidden;
+      }
+
+      .obs-bar-fill {
+        height: 100%;
+        border-radius: inherit;
+        background: var(--accent);
+      }
+
+      .obs-entity-cloud {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        padding: 12px 14px 14px;
+      }
+
+      .obs-change-item {
+        display: grid;
+        grid-template-columns: 108px 1fr;
+        gap: 10px;
+        border-bottom: 0.5px solid var(--border);
+        padding: 9px 0;
+        font-size: 12px;
+      }
+
+      .obs-change-item:last-child { border-bottom: 0; }
+
+      .obs-change-item .preview {
+        color: var(--text-secondary);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
 
       .obs-op-chip {
@@ -3115,46 +3249,93 @@
                 <button type="button" class="primary" onclick="obsRefresh()" data-i18n="obs.refresh">刷新</button>
               </div>
               <p class="obs-status" id="obs-status-line" data-i18n="obs.loading">加载中…</p>
-              <p class="obs-privacy-note">请求内容日志可能包含私人记忆；可通过 /settings/telemetry 调整记录级别。</p>
-              <div class="obs-kpi-row" id="obs-kpi-row"></div>
-              <div class="obs-chart-grid">
-                <section class="obs-chart">
-                  <h2>请求量与错误</h2>
-                  <svg id="obs-requests-chart" viewBox="0 0 520 112" role="img" aria-label="请求量与错误趋势"></svg>
-                  <div class="legend" id="obs-requests-chart-meta">—</div>
-                </section>
-                <section class="obs-chart">
-                  <h2>P50 / P95 响应时间</h2>
-                  <svg id="obs-latency-chart" viewBox="0 0 520 112" role="img" aria-label="响应时间趋势"></svg>
-                  <div class="legend" id="obs-latency-chart-meta">—</div>
-                </section>
+              <div class="obs-mode-tabs">
+                <button type="button" class="obs-mode-tab active" id="obs-tab-memory" onclick="obsSwitchMode('memory')">记忆概览</button>
+                <button type="button" class="obs-mode-tab" id="obs-tab-system" onclick="obsSwitchMode('system')">系统运行</button>
               </div>
-              <div class="obs-section">
-                <div class="obs-section-head">
-                  <h2 data-i18n="obs.opsTitle">业务操作分布</h2>
+              <div class="obs-view active" id="obs-view-memory">
+                <div class="obs-kpi-row" id="obs-memory-kpi-row"></div>
+                <div class="obs-section">
+                  <div class="obs-section-head">
+                    <h2>记忆健康</h2>
+                    <span class="sub" style="font-size: 12px; color: var(--text-tertiary)">可修复队列</span>
+                  </div>
+                  <div class="obs-health-grid" id="obs-health-grid"></div>
+                  <div class="obs-actions-row">
+                    <button type="button" onclick="obsRunMaintenance('/extract-pending', { limit: 50 })">处理抽取队列</button>
+                    <button type="button" onclick="obsRunMaintenance('/classify-pending')">分类待处理</button>
+                    <button type="button" onclick="obsRunMaintenance('/vectorize-pending', { limit: 100, includeRecent: true })">向量化待处理</button>
+                  </div>
                 </div>
-                <div class="obs-ops" id="obs-ops-row"></div>
+                <div class="obs-chart-grid">
+                  <section class="obs-section">
+                    <div class="obs-section-head"><h2>知识构成 · kind</h2></div>
+                    <div class="obs-bar-list" id="obs-kind-bars"></div>
+                  </section>
+                  <section class="obs-section">
+                    <div class="obs-section-head"><h2>知识构成 · class</h2></div>
+                    <div class="obs-bar-list" id="obs-class-bars"></div>
+                  </section>
+                </div>
+                <div class="obs-chart-grid">
+                  <section class="obs-section">
+                    <div class="obs-section-head"><h2>核心实体</h2></div>
+                    <div class="obs-entity-cloud" id="obs-entity-cloud"></div>
+                  </section>
+                  <section class="obs-section">
+                    <div class="obs-section-head"><h2>关系类型</h2></div>
+                    <div class="obs-bar-list" id="obs-relation-bars"></div>
+                  </section>
+                </div>
+                <div class="obs-section">
+                  <div class="obs-section-head">
+                    <h2>最近知识变化</h2>
+                  </div>
+                  <div class="obs-change-list" id="obs-change-list"></div>
+                </div>
               </div>
-              <div class="obs-section">
-                <div class="obs-section-head">
-                  <h2 data-i18n="obs.logsTitle">最近请求</h2>
-                  <span class="sub" id="obs-logs-meta" style="font-size: 12px; color: var(--text-tertiary)"></span>
+              <div class="obs-view" id="obs-view-system">
+                <p class="obs-privacy-note">请求内容日志可能包含私人记忆；可通过 /settings/telemetry 调整记录级别。</p>
+                <div class="obs-kpi-row" id="obs-kpi-row"></div>
+                <div class="obs-chart-grid">
+                  <section class="obs-chart">
+                    <h2>请求量与错误</h2>
+                    <svg id="obs-requests-chart" viewBox="0 0 520 112" role="img" aria-label="请求量与错误趋势"></svg>
+                    <div class="legend" id="obs-requests-chart-meta">—</div>
+                  </section>
+                  <section class="obs-chart">
+                    <h2>P50 / P95 响应时间</h2>
+                    <svg id="obs-latency-chart" viewBox="0 0 520 112" role="img" aria-label="响应时间趋势"></svg>
+                    <div class="legend" id="obs-latency-chart-meta">—</div>
+                  </section>
                 </div>
-                <div class="obs-table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th data-i18n="obs.colTime">时间</th>
-                        <th data-i18n="obs.colOp">操作</th>
-                        <th data-i18n="obs.colStatus">状态</th>
-                        <th data-i18n="obs.colMs">耗时</th>
-                        <th data-i18n="obs.colPreview">预览</th>
-                        <th>Trace</th>
-                      </tr>
-                    </thead>
-                    <tbody id="obs-logs-body"></tbody>
-                  </table>
-                  <div class="obs-empty" id="obs-logs-empty" style="display: none" data-i18n="obs.logsEmpty">暂无请求日志。使用记忆功能后会出现数据。</div>
+                <div class="obs-section">
+                  <div class="obs-section-head">
+                    <h2 data-i18n="obs.opsTitle">业务操作分布</h2>
+                  </div>
+                  <div class="obs-ops" id="obs-ops-row"></div>
+                </div>
+                <div class="obs-section">
+                  <div class="obs-section-head">
+                    <h2 data-i18n="obs.logsTitle">最近请求</h2>
+                    <span class="sub" id="obs-logs-meta" style="font-size: 12px; color: var(--text-tertiary)"></span>
+                  </div>
+                  <div class="obs-table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th data-i18n="obs.colTime">时间</th>
+                          <th data-i18n="obs.colOp">操作</th>
+                          <th data-i18n="obs.colStatus">状态</th>
+                          <th data-i18n="obs.colMs">耗时</th>
+                          <th data-i18n="obs.colPreview">预览</th>
+                          <th>Trace</th>
+                        </tr>
+                      </thead>
+                      <tbody id="obs-logs-body"></tbody>
+                    </table>
+                    <div class="obs-empty" id="obs-logs-empty" style="display: none" data-i18n="obs.logsEmpty">暂无请求日志。使用记忆功能后会出现数据。</div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -3693,6 +3874,7 @@
       /* ---------- Observatory (embedded right panel) ---------- */
       let _obsTimer = null
       let _obsLastLogs = []
+      let _obsMode = 'memory'
 
       function obsEsc(s) {
         return String(s ?? '')
@@ -3727,6 +3909,18 @@
         return (x * 100).toFixed(1) + '%'
       }
 
+      function obsFmtNum(n) {
+        return Number(n || 0).toLocaleString(getLang() === 'zh' ? 'zh-CN' : 'en-US')
+      }
+
+      function obsSwitchMode(mode) {
+        _obsMode = mode === 'system' ? 'system' : 'memory'
+        document.getElementById('obs-tab-memory')?.classList.toggle('active', _obsMode === 'memory')
+        document.getElementById('obs-tab-system')?.classList.toggle('active', _obsMode === 'system')
+        document.getElementById('obs-view-memory')?.classList.toggle('active', _obsMode === 'memory')
+        document.getElementById('obs-view-system')?.classList.toggle('active', _obsMode === 'system')
+      }
+
       async function obsApi(path) {
         const res = await fetch(WORKER_URL + path, {
           headers: { Authorization: 'Bearer ' + AUTH_TOKEN },
@@ -3750,10 +3944,12 @@
         const status = document.getElementById('obs-status-line')
         if (status) status.textContent = t('obs.refreshing')
         try {
-          const [data, timeseries] = await Promise.all([
+          const [data, timeseries, memoryOverview] = await Promise.all([
             obsApi('/analytics/overview?hours=' + hours),
             obsApi('/analytics/timeseries?hours=' + hours),
+            obsApi('/analytics/memory-overview'),
           ])
+          obsRenderMemoryOverview(memoryOverview)
           obsRenderKpi(data)
           obsRenderCharts(timeseries.points || [])
           obsRenderOps(data.top_operations || [])
@@ -3776,6 +3972,117 @@
         } catch (e) {
           if (status) status.textContent = t('obs.error') + ': ' + (e.message || e)
         }
+      }
+
+      async function obsRunMaintenance(path, body) {
+        const status = document.getElementById('obs-status-line')
+        if (status) status.textContent = '执行中…'
+        try {
+          const init = {
+            method: 'POST',
+            headers: { Authorization: 'Bearer ' + AUTH_TOKEN },
+          }
+          if (body) {
+            init.headers['Content-Type'] = 'application/json'
+            init.body = JSON.stringify(body)
+          }
+          const res = await fetch(WORKER_URL + path, init)
+          const text = await res.text()
+          const data = text.trim() ? JSON.parse(text) : {}
+          if (!res.ok) throw new Error(data.error || res.statusText)
+          if (status) status.textContent = '已执行 · ' + (data.processed ?? data.totalProcessed ?? data.remaining ?? 0)
+          await obsRefresh()
+        } catch (e) {
+          if (status) status.textContent = t('obs.error') + ': ' + (e.message || e)
+        }
+      }
+
+      function obsRenderMemoryOverview(data) {
+        const totals = data.totals || {}
+        const health = data.health || {}
+        const cards = [
+          { label: 'Observations', value: totals.observations, hint: '原始输入层' },
+          { label: 'Atomic memories', value: totals.atomic_memories, hint: '原子记忆层' },
+          { label: 'Entities', value: totals.entities, hint: '实体索引' },
+          { label: 'Active facts', value: totals.active_facts, hint: '当前有效关系事实' },
+        ]
+        const kpiRow = document.getElementById('obs-memory-kpi-row')
+        if (kpiRow) {
+          kpiRow.innerHTML = cards.map((c) =>
+            `<div class="obs-kpi"><div class="label">${obsEsc(c.label)}</div>` +
+            `<div class="value">${obsEsc(obsFmtNum(c.value))}</div>` +
+            `<div class="hint">${obsEsc(c.hint)}</div></div>`
+          ).join('')
+        }
+
+        const healthItems = [
+          ['extraction_due', '抽取待处理'],
+          ['partial_error', 'Atomic 部分失败'],
+          ['fallback_reprocess', 'Fallback 待重跑'],
+          ['unclassified', '未分类'],
+          ['unvectorized', '未向量化'],
+          ['terminal_errors', '抽取终止错误'],
+          ['classification_terminal_errors', '分类终止错误'],
+          ['unlinked_entity_memories', '未关联实体'],
+        ]
+        const healthGrid = document.getElementById('obs-health-grid')
+        if (healthGrid) {
+          healthGrid.innerHTML = healthItems.map(([key, label]) =>
+            `<div class="obs-health-item"><div class="value">${obsEsc(obsFmtNum(health[key]))}</div>` +
+            `<div class="label">${obsEsc(label)}</div></div>`
+          ).join('')
+        }
+
+        obsRenderBars('obs-kind-bars', data.kinds || [])
+        obsRenderBars('obs-class-bars', data.classes || [])
+        obsRenderBars('obs-relation-bars', data.relation_types || [])
+        obsRenderEntities(data.top_entities || [])
+        obsRenderChanges(data.recent_changes || [])
+      }
+
+      function obsRenderBars(id, rows) {
+        const el = document.getElementById(id)
+        if (!el) return
+        if (!rows.length) {
+          el.innerHTML = '<div class="obs-empty" style="padding:8px">暂无数据</div>'
+          return
+        }
+        const max = Math.max(...rows.map((row) => Number(row.count || 0)), 1)
+        el.innerHTML = rows.map((row) => {
+          const pct = Math.max(4, Math.round((Number(row.count || 0) / max) * 100))
+          return `<div class="obs-bar-row"><span>${obsEsc(row.name || 'unknown')}</span>` +
+            `<div class="obs-bar-track"><div class="obs-bar-fill" style="width:${pct}%"></div></div>` +
+            `<strong>${obsEsc(obsFmtNum(row.count))}</strong></div>`
+        }).join('')
+      }
+
+      function obsRenderEntities(rows) {
+        const el = document.getElementById('obs-entity-cloud')
+        if (!el) return
+        if (!rows.length) {
+          el.innerHTML = '<div class="obs-empty" style="padding:8px">暂无实体</div>'
+          return
+        }
+        el.innerHTML = rows.map((row) =>
+          `<span class="obs-op-chip"><strong>${obsEsc(row.name)}</strong>` +
+          ` · ${obsEsc(row.type || 'other')} · ${obsEsc(obsFmtNum(row.mention_count))}</span>`
+        ).join('')
+      }
+
+      function obsRenderChanges(rows) {
+        const el = document.getElementById('obs-change-list')
+        if (!el) return
+        if (!rows.length) {
+          el.innerHTML = '<div class="obs-empty" style="padding:8px">暂无变化</div>'
+          return
+        }
+        el.innerHTML = rows.map((row) => {
+          const label = row.label || row.type
+          const repair = row.needs_reprocess ? ' · needs repair' : ''
+          return `<div class="obs-change-item"><div class="obs-mono">${obsEsc(obsFmtTime(row.created_at))}</div>` +
+            `<div><span class="obs-pill">${obsEsc(label)}${obsEsc(repair)}</span>` +
+            `<div class="preview">${obsEsc(row.preview || row.memory_id || row.id || '—')}</div></div></div>`
+        }).join('')
       }
 
       function obsRenderKpi(data) {
@@ -4328,12 +4635,21 @@
           : vec === 'pending'
           ? `<span class="tag-chip vec-chip vec-chip--pending" title="${t('card.vecPending')}"><i class="ti ti-clock"></i></span>`
           : `<span class="tag-chip vec-chip vec-chip--off" title="${t('card.vecOff')}">${t('card.notIndexed')}</span>`
+        const metaParts = []
+        if (entry.memory_class) metaParts.push('class ' + entry.memory_class)
+        if (entry.atomic_kind) metaParts.push('kind ' + entry.atomic_kind)
+        if (Number(entry.source_count || 0) > 0) metaParts.push(Number(entry.source_count) + ' sources')
+        if (Number(entry.entity_count || 0) > 0) metaParts.push(Number(entry.entity_count) + ' entities')
+        const metaLine = metaParts.length
+          ? `<div class="card-meta">${metaParts.map(escHtml).join(' · ')}</div>`
+          : ''
 
         const card = document.createElement('div')
         card.className = 'memory-card' + (isSynthesized ? ' card--synthesized' : '') + (isRolledUp ? ' card--rolled-up' : '')
         card.dataset.id = entry.id
         card.innerHTML = `
 <div class="card-content" style="cursor: pointer;">${escHtml(entry.content)}</div>
+${metaLine}
 <div class="card-footer">
   <div class="card-tags">${tags.map((tag) => `<span class="tag-chip${tag === 'synthesized' ? ' tag-chip--synthesized' : ''}">${escHtml(tag)}</span>`).join('')}${vecChip}</div>
   <div class="card-actions">
@@ -4398,7 +4714,10 @@
         try {
           const result = await apiCapture(content || raw, tags, 'web-ui')
           loadingEl.remove()
-          if (result.duplicate) {
+          if (result.duplicate && result.action === 'source_linked') {
+            appendBrainBubble(msgs, result.message || t('remember.sourceLinked'), 'sys-note')
+            updateStatus()
+          } else if (result.duplicate) {
             appendBrainBubble(msgs, t('remember.dup'), 'sys-note')
           } else {
             appendBrainBubble(msgs, t('remember.kept'), 'sys-note')

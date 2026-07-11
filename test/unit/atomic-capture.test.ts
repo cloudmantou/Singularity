@@ -256,6 +256,19 @@ describe("captureEntry atomic dual-write", () => {
         created_at: 4,
       },
       {
+        id: "partial-error",
+        content: "legacy saved but atomic dual-write failed",
+        source: "api",
+        metadata_json: "{}",
+        extraction_status: "partial_error",
+        extraction_attempts: 1,
+        next_attempt_at: null,
+        processing_started_at: null,
+        extraction_version: 1,
+        needs_reprocess: 1,
+        created_at: 4.5,
+      },
+      {
         id: "retryable-deferred",
         content: "retryable later",
         source: "api",
@@ -309,13 +322,69 @@ describe("captureEntry atomic dual-write", () => {
     expect(result).toMatchObject({
       dryRun: true,
       limit: 5,
-      due: 5,
+      due: 6,
       deferred: 1,
       exhausted: 1,
       orphanPending: 1,
       fallbackReprocess: 1,
+      partialError: 1,
       retryableDue: 1,
       staleProcessing: 1,
+    });
+  });
+
+  it("marks observations partial_error when atomic dual-write fails after legacy storage", async () => {
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({ matches: [] }),
+      }),
+      AI: makeExtractionAI({
+        facts: [
+          {
+            content: "Singularity atomic 写入失败也要可修复。",
+            kind: "semantic",
+            memory_class: "fact",
+            importance: 4,
+            confidence: 0.9,
+          },
+        ],
+      }),
+    });
+
+    const originalBatch = db.batch.bind(db);
+    let failedAtomicBatch = false;
+    db.batch = vi.fn(async (statements: any[]) => {
+      if (!failedAtomicBatch && db.entries.length > 0 && db.memories.length === 0 && statements.length === 2) {
+        failedAtomicBatch = true;
+        throw new Error("atomic batch exploded");
+      }
+      return originalBatch(statements);
+    }) as any;
+
+    const ctx = makeCtx();
+    const result = await captureEntry(
+      "Singularity atomic 写入失败也要可修复。",
+      ["work"],
+      "api",
+      env,
+      ctx.ctx
+    );
+    await ctx.drain();
+
+    expect(result.status).toBe("stored");
+    expect(db.entries).toHaveLength(1);
+    expect(db.memories).toHaveLength(0);
+    expect(db.observations).toHaveLength(1);
+    expect(db.observations[0]).toMatchObject({
+      extraction_status: "partial_error",
+      needs_reprocess: 1,
+      extraction_error: "atomic batch exploded",
+    });
+
+    const queue = await inspectExtractionQueue(env, 5);
+    expect(queue).toMatchObject({
+      due: 1,
+      partialError: 1,
     });
   });
 

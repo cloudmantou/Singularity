@@ -1252,7 +1252,33 @@ export function buildEntryFilterQuery(params: {
 
   let sql = `SELECT id, content, tags, source, created_at, vector_ids,
                     recall_count, importance_score, classification_confidence,
-                    classification_status, classified_at
+                    classification_status, classified_at,
+                    (SELECT kind FROM sb_memories
+                     WHERE entry_id = entries.id
+                       AND invalid_at IS NULL
+                       AND expired_at IS NULL
+                     ORDER BY created_at DESC
+                     LIMIT 1) as atomic_kind,
+                    (SELECT memory_class FROM sb_memories
+                     WHERE entry_id = entries.id
+                       AND invalid_at IS NULL
+                       AND expired_at IS NULL
+                     ORDER BY created_at DESC
+                     LIMIT 1) as memory_class,
+                    (SELECT COUNT(*) FROM sb_memory_sources
+                     WHERE memory_id IN (
+                       SELECT id FROM sb_memories
+                       WHERE entry_id = entries.id
+                         AND invalid_at IS NULL
+                         AND expired_at IS NULL
+                     )) as source_count,
+                    (SELECT COUNT(DISTINCT entity_id) FROM sb_memory_entities
+                     WHERE memory_id IN (
+                       SELECT id FROM sb_memories
+                       WHERE entry_id = entries.id
+                         AND invalid_at IS NULL
+                         AND expired_at IS NULL
+                     )) as entity_count
              FROM entries`;
   if (conds.length) sql += ` WHERE ` + conds.join(` AND `);
   sql += ` ORDER BY created_at DESC LIMIT ?`;
@@ -2813,6 +2839,10 @@ type ObservationExtractionProcessResult =
   | { status: "failed"; observationId: string; error: string; final: boolean }
   | { status: "skipped"; observationId: string };
 
+type AtomicWriteResult =
+  | { ok: true; memoryId: string }
+  | { ok: false; error: string };
+
 export interface ExtractionQueueDryRunResult {
   dryRun: true;
   limit: number;
@@ -2821,6 +2851,7 @@ export interface ExtractionQueueDryRunResult {
   exhausted: number;
   orphanPending: number;
   fallbackReprocess: number;
+  partialError: number;
   retryableDue: number;
   staleProcessing: number;
 }
@@ -2888,6 +2919,7 @@ async function leaseObservationForExtraction(
          OR (extraction_status = 'retryable_error' AND COALESCE(next_attempt_at, 0) <= ?)
          OR (extraction_status = 'processing' AND COALESCE(processing_started_at, 0) <= ?)
          OR (extraction_status = 'fallback' AND COALESCE(needs_reprocess, 0) = 1)
+         OR (extraction_status = 'partial_error' AND COALESCE(needs_reprocess, 0) = 1)
          OR COALESCE(extraction_version, 0) < ?
        )`
   )
@@ -2985,6 +3017,21 @@ async function markObservationExtractionFailure(
       input.startedAt
     )
     .run();
+}
+
+async function markObservationAtomicPartialError(
+  env: Env,
+  input: { id: string; error: string; processedAt: number }
+): Promise<void> {
+  await markObservationExtractionFailure(env, {
+    id: input.id,
+    startedAt: null,
+    status: "partial_error",
+    error: input.error,
+    nextAttemptAt: null,
+    processedAt: input.processedAt,
+    needsReprocess: true,
+  });
 }
 
 async function captureExtractedFactsFromObservation(
@@ -3111,6 +3158,7 @@ export async function processExtractionQueue(
          OR (extraction_status = 'retryable_error' AND COALESCE(next_attempt_at, 0) <= ?)
          OR (extraction_status = 'processing' AND COALESCE(processing_started_at, 0) <= ?)
          OR (extraction_status = 'fallback' AND COALESCE(needs_reprocess, 0) = 1)
+         OR (extraction_status = 'partial_error' AND COALESCE(needs_reprocess, 0) = 1)
          OR COALESCE(extraction_version, 0) < ?
        )
      ORDER BY created_at ASC
@@ -3146,6 +3194,7 @@ export async function processExtractionQueue(
          OR (extraction_status = 'retryable_error' AND COALESCE(next_attempt_at, 0) <= ?)
          OR (extraction_status = 'processing' AND COALESCE(processing_started_at, 0) <= ?)
          OR (extraction_status = 'fallback' AND COALESCE(needs_reprocess, 0) = 1)
+         OR (extraction_status = 'partial_error' AND COALESCE(needs_reprocess, 0) = 1)
          OR COALESCE(extraction_version, 0) < ?
        )`
   )
@@ -3201,6 +3250,7 @@ export async function inspectExtractionQueue(
          OR (extraction_status = 'retryable_error' AND COALESCE(next_attempt_at, 0) <= ?)
          OR (extraction_status = 'processing' AND COALESCE(processing_started_at, 0) <= ?)
          OR (extraction_status = 'fallback' AND COALESCE(needs_reprocess, 0) = 1)
+         OR (extraction_status = 'partial_error' AND COALESCE(needs_reprocess, 0) = 1)
          OR COALESCE(extraction_version, 0) < ?
        )`
   )
@@ -3242,6 +3292,15 @@ export async function inspectExtractionQueue(
     .bind(ATOMIC_EXTRACTION_MAX_ATTEMPTS)
     .first<{ count: number }>();
 
+  const partialError = await env.DB.prepare(
+    `SELECT COUNT(*) as count FROM sb_observations
+     WHERE extraction_status = 'partial_error'
+       AND COALESCE(needs_reprocess, 0) = 1
+       AND COALESCE(extraction_attempts, 0) < ?`
+  )
+    .bind(ATOMIC_EXTRACTION_MAX_ATTEMPTS)
+    .first<{ count: number }>();
+
   const retryableDue = await env.DB.prepare(
     `SELECT COUNT(*) as count FROM sb_observations
      WHERE extraction_status = 'retryable_error'
@@ -3268,6 +3327,7 @@ export async function inspectExtractionQueue(
     exhausted: Number(exhausted?.count ?? 0),
     orphanPending: Number(orphanPending?.count ?? 0),
     fallbackReprocess: Number(fallbackReprocess?.count ?? 0),
+    partialError: Number(partialError?.count ?? 0),
     retryableDue: Number(retryableDue?.count ?? 0),
     staleProcessing: Number(staleProcessing?.count ?? 0),
   };
@@ -3293,7 +3353,7 @@ async function dualWriteAtomicMemory(
     atomic?: AtomicFactDraft;
     createdAt: number;
   }
-): Promise<void> {
+): Promise<AtomicWriteResult> {
   const memoryId = crypto.randomUUID();
   try {
     await env.DB.batch([
@@ -3338,8 +3398,10 @@ async function dualWriteAtomicMemory(
         createdAt: input.createdAt,
       });
     }
+    return { ok: true, memoryId };
   } catch (e) {
     console.error("Atomic memory dual-write failed (non-fatal):", e);
+    return { ok: false, error: atomicExtractionErrorMessage(e) };
   }
 }
 
@@ -3382,6 +3444,11 @@ async function captureSingleFact(
         };
       } catch (e) {
         console.error("Duplicate source link failed; preserving legacy duplicate block:", e);
+        await markObservationAtomicPartialError(env, {
+          id: options.observationId,
+          error: atomicExtractionErrorMessage(e),
+          processedAt: Date.now(),
+        });
       }
     }
     return { status: "blocked", matchId: exactId, score: 1 };
@@ -3438,7 +3505,7 @@ async function captureSingleFact(
   await env.DB.batch(statements);
 
   if (options.observationId) {
-    await dualWriteAtomicMemory(env, {
+    const atomicWrite = await dualWriteAtomicMemory(env, {
       entryId: id,
       content: c,
       contentHash,
@@ -3446,6 +3513,13 @@ async function captureSingleFact(
       atomic: options.atomic,
       createdAt: now,
     });
+    if (!atomicWrite.ok) {
+      await markObservationAtomicPartialError(env, {
+        id: options.observationId,
+        error: atomicWrite.error,
+        processedAt: Date.now(),
+      });
+    }
   }
 
   logMemoryEvent(id, "created", {
@@ -3645,6 +3719,11 @@ export async function captureEntry(
           };
         } catch (e) {
           console.error("Duplicate observation source link failed; preserving legacy duplicate block:", e);
+          await markObservationAtomicPartialError(env, {
+            id: observationId,
+            error: atomicExtractionErrorMessage(e),
+            processedAt: Date.now(),
+          });
         }
       }
       return { status: "blocked", matchId: exactId, score: 1 };
@@ -5484,6 +5563,203 @@ const defaultHandler = {
       });
       await saveTelemetryConfig(env, config);
       return json({ ok: true, telemetry: config });
+    }
+
+    // GET /analytics/memory-overview — four-layer memory health and composition.
+    if (url.pathname === "/analytics/memory-overview" && request.method === "GET") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      const now = Date.now();
+      const graceCutoff = now - graceMs(env);
+      const [
+        totals,
+        queue,
+        unclassified,
+        unvectorized,
+        classificationTerminalErrors,
+        orphanAtomicMemories,
+        unlinkedEntityMemories,
+        kindRows,
+        classRows,
+        topEntities,
+        relationTypes,
+        observationRows,
+        sourceRows,
+        revisionRows,
+      ] = await Promise.all([
+        env.DB.prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM sb_observations) as observations,
+             (SELECT COUNT(*) FROM sb_memories
+              WHERE invalid_at IS NULL AND expired_at IS NULL) as atomic_memories,
+             (SELECT COUNT(*) FROM sb_entities) as entities,
+             (SELECT COUNT(*) FROM sb_entity_relations
+              WHERE invalid_at IS NULL
+                AND expired_at IS NULL
+                AND (valid_to IS NULL OR valid_to > ?)) as active_facts`
+        ).bind(now).first<Record<string, unknown>>(),
+        inspectExtractionQueue(env, 50),
+        env.DB.prepare(
+          `SELECT COUNT(*) as count FROM entries
+           WHERE tags NOT LIKE '%"status:deprecated"%'
+             AND (classification_status IS NULL OR classification_status <> 'succeeded')`
+        ).first<{ count: number }>(),
+        env.DB.prepare(
+          `SELECT COUNT(*) as count FROM entries
+           WHERE vector_ids = '[]'
+             AND tags NOT LIKE '%"status:deprecated"%'
+             AND created_at < ?`
+        ).bind(graceCutoff).first<{ count: number }>(),
+        env.DB.prepare(
+          `SELECT COUNT(*) as count FROM entries
+           WHERE classification_status = 'terminal_error'`
+        ).first<{ count: number }>(),
+        env.DB.prepare(
+          `SELECT COUNT(*) as count FROM sb_memories
+           WHERE invalid_at IS NULL
+             AND expired_at IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM sb_memory_sources
+               WHERE sb_memory_sources.memory_id = sb_memories.id
+             )`
+        ).first<{ count: number }>(),
+        env.DB.prepare(
+          `SELECT COUNT(*) as count FROM sb_memories
+           WHERE invalid_at IS NULL
+             AND expired_at IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM sb_memory_entities
+               WHERE sb_memory_entities.memory_id = sb_memories.id
+             )`
+        ).first<{ count: number }>(),
+        env.DB.prepare(
+          `SELECT COALESCE(kind, 'unknown') as name, COUNT(*) as count
+           FROM sb_memories
+           WHERE invalid_at IS NULL AND expired_at IS NULL
+           GROUP BY COALESCE(kind, 'unknown')
+           ORDER BY count DESC, name ASC`
+        ).all(),
+        env.DB.prepare(
+          `SELECT COALESCE(memory_class, 'unknown') as name, COUNT(*) as count
+           FROM sb_memories
+           WHERE invalid_at IS NULL AND expired_at IS NULL
+           GROUP BY COALESCE(memory_class, 'unknown')
+           ORDER BY count DESC, name ASC`
+        ).all(),
+        env.DB.prepare(
+          `SELECT id, name, entity_type, mention_count
+           FROM sb_entities
+           ORDER BY mention_count DESC, updated_at DESC
+           LIMIT 12`
+        ).all(),
+        env.DB.prepare(
+          `SELECT relation_type as name, COUNT(*) as count
+           FROM sb_entity_relations
+           WHERE invalid_at IS NULL
+             AND expired_at IS NULL
+             AND (valid_to IS NULL OR valid_to > ?)
+           GROUP BY relation_type
+           ORDER BY count DESC, name ASC
+           LIMIT 12`
+        ).bind(now).all(),
+        env.DB.prepare(
+          `SELECT id, source, extraction_status, needs_reprocess,
+                  created_at, processed_at, substr(content, 1, 180) as preview
+           FROM sb_observations
+           ORDER BY created_at DESC
+           LIMIT 10`
+        ).all(),
+        env.DB.prepare(
+          `SELECT s.memory_id, s.observation_id, s.role, s.created_at,
+                  o.source, substr(o.content, 1, 180) as preview
+           FROM sb_memory_sources s
+           LEFT JOIN sb_observations o ON o.id = s.observation_id
+           ORDER BY s.created_at DESC
+           LIMIT 10`
+        ).all(),
+        env.DB.prepare(
+          `SELECT id, memory_id, event_type, actor, reason, created_at
+           FROM sb_memory_revisions
+           ORDER BY created_at DESC
+           LIMIT 10`
+        ).all(),
+      ]);
+
+      const recentChanges = [
+        ...((observationRows.results ?? []) as Record<string, unknown>[]).map((row) => ({
+          type: "observation",
+          id: row.id,
+          label: row.extraction_status,
+          source: row.source,
+          preview: row.preview,
+          created_at: row.created_at,
+          needs_reprocess: Number(row.needs_reprocess ?? 0) === 1,
+        })),
+        ...((sourceRows.results ?? []) as Record<string, unknown>[]).map((row) => ({
+          type: "source_linked",
+          id: row.observation_id,
+          memory_id: row.memory_id,
+          source: row.source,
+          preview: row.preview,
+          created_at: row.created_at,
+        })),
+        ...((revisionRows.results ?? []) as Record<string, unknown>[]).map((row) => ({
+          type: "revision",
+          id: row.id,
+          memory_id: row.memory_id,
+          label: row.event_type,
+          source: row.actor,
+          preview: row.reason,
+          created_at: row.created_at,
+        })),
+      ]
+        .sort((a, b) => Number(b.created_at ?? 0) - Number(a.created_at ?? 0))
+        .slice(0, 12);
+
+      return json({
+        ok: true,
+        generated_at: now,
+        totals: {
+          observations: Number(totals?.observations ?? 0),
+          atomic_memories: Number(totals?.atomic_memories ?? 0),
+          entities: Number(totals?.entities ?? 0),
+          active_facts: Number(totals?.active_facts ?? 0),
+        },
+        health: {
+          extraction_due: queue.due,
+          fallback_reprocess: queue.fallbackReprocess,
+          partial_error: queue.partialError,
+          orphan_pending: queue.orphanPending,
+          retryable_due: queue.retryableDue,
+          stale_processing: queue.staleProcessing,
+          terminal_errors: queue.exhausted,
+          unclassified: Number(unclassified?.count ?? 0),
+          unvectorized: Number(unvectorized?.count ?? 0),
+          classification_terminal_errors: Number(classificationTerminalErrors?.count ?? 0),
+          orphan_atomic_memories: Number(orphanAtomicMemories?.count ?? 0),
+          unlinked_entity_memories: Number(unlinkedEntityMemories?.count ?? 0),
+        },
+        kinds: (kindRows.results ?? []).map((row: any) => ({
+          name: String(row.name ?? "unknown"),
+          count: Number(row.count ?? 0),
+        })),
+        classes: (classRows.results ?? []).map((row: any) => ({
+          name: String(row.name ?? "unknown"),
+          count: Number(row.count ?? 0),
+        })),
+        top_entities: (topEntities.results ?? []).map((row: any) => ({
+          id: row.id,
+          name: row.name,
+          type: row.entity_type,
+          mention_count: Number(row.mention_count ?? 0),
+        })),
+        relation_types: (relationTypes.results ?? []).map((row: any) => ({
+          name: String(row.name ?? "unknown"),
+          count: Number(row.count ?? 0),
+        })),
+        recent_changes: recentChanges,
+      });
     }
 
     // GET /analytics/overview — Observatory KPIs (last 24h by default)
