@@ -393,6 +393,60 @@
         color: var(--text-primary);
       }
 
+      .runtime-warning {
+        margin: 0 18px 10px;
+        padding: 11px 12px;
+        border: 0.5px solid color-mix(in srgb, var(--danger) 42%, transparent);
+        border-radius: 12px;
+        background: var(--danger-soft);
+        color: var(--danger);
+        display: flex;
+        align-items: flex-start;
+        gap: 9px;
+        font-size: 12.5px;
+        line-height: 1.45;
+        flex-shrink: 0;
+        animation: bubble-in 0.24s var(--ease) both;
+      }
+
+      .runtime-warning[hidden] {
+        display: none;
+      }
+
+      .runtime-warning i {
+        font-size: 16px;
+        margin-top: 1px;
+        flex-shrink: 0;
+      }
+
+      .runtime-warning span {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .runtime-warning button {
+        width: 24px;
+        height: 24px;
+        border: none;
+        border-radius: 50%;
+        background: transparent;
+        color: var(--danger);
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+      }
+
+      .runtime-warning button:hover {
+        background: color-mix(in srgb, var(--danger) 12%, transparent);
+      }
+
+      .runtime-warning button i {
+        font-size: 15px;
+        margin: 0;
+      }
+
       /* ============ SCREENS ============ */
       #screens {
         flex: 1;
@@ -3229,6 +3283,14 @@
           <button class="topbar-menu" onclick="openMenu()"><i class="ti ti-dots"></i></button>
         </div>
 
+        <div id="runtime-warning" class="runtime-warning" role="status" aria-live="polite" hidden>
+          <i class="ti ti-alert-triangle"></i>
+          <span id="runtime-warning-text"></span>
+          <button type="button" onclick="dismissRuntimeWarning()" data-i18n-title="warning.dismiss" title="关闭">
+            <i class="ti ti-x"></i>
+          </button>
+        </div>
+
         <div id="screens">
           <div class="screen" id="screen-observatory">
             <div class="obs-panel">
@@ -4348,6 +4410,15 @@
         return parseApiJsonResponse(res, 'Append failed')
       }
 
+      async function apiUpdate(id, content) {
+        const res = await fetch(`${WORKER_URL}/update`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${AUTH_TOKEN}` },
+          body: JSON.stringify({ id, content }),
+        })
+        return parseApiJsonResponse(res, 'Edit failed')
+      }
+
       async function apiForget(id) {
         const res = await fetch(`${WORKER_URL}/forget`, {
           method: 'POST',
@@ -4360,6 +4431,25 @@
       async function apiList(n = 50) {
         const res = await fetch(`${WORKER_URL}/list?n=${n}`, { headers: { Authorization: `Bearer ${AUTH_TOKEN}` } })
         return res.json()
+      }
+
+      function showRuntimeWarning(message) {
+        const bar = document.getElementById('runtime-warning')
+        const text = document.getElementById('runtime-warning-text')
+        if (!bar || !text) return
+        text.textContent = message || t('warning.generic')
+        bar.hidden = false
+      }
+
+      function dismissRuntimeWarning() {
+        const bar = document.getElementById('runtime-warning')
+        if (bar) bar.hidden = true
+      }
+
+      function showAtomicSyncWarning(result) {
+        if (result && result.warning === 'atomic_sync_failed') {
+          showRuntimeWarning(t('warning.atomicSyncFailed'))
+        }
       }
 
       function sendSuggestion(text) {
@@ -4750,6 +4840,11 @@ ${metaLine}
       }
       function closeAppend() {
         document.getElementById('append-sheet').classList.remove('open')
+        const btn = document.getElementById('append-save-btn')
+        if (btn) {
+          btn.disabled = false
+          btn.textContent = t('append.save')
+        }
         pendingAppendId = null
       }
       async function saveAppend() {
@@ -4759,7 +4854,8 @@ ${metaLine}
         btn.disabled = true
         btn.textContent = t('append.saving')
         try {
-          await apiAppend(pendingAppendId, addition)
+          const result = await apiAppend(pendingAppendId, addition)
+          showAtomicSyncWarning(result)
           closeAppend()
           loadRecent()
           updateStatus()
@@ -4786,6 +4882,11 @@ ${metaLine}
 
       function closeEdit() {
         document.getElementById('edit-sheet').classList.remove('open')
+        const btn = document.getElementById('edit-save-btn')
+        if (btn) {
+          btn.disabled = false
+          btn.textContent = t('edit.save')
+        }
         pendingEditId = null
       }
 
@@ -4794,16 +4895,13 @@ ${metaLine}
         if (!newContent || !pendingEditId) return
         const btn = document.getElementById('edit-save-btn')
         btn.disabled = true
-        btn.textContent = t('append.saving')
+        btn.textContent = t('edit.saving')
         try {
-          const res = await fetch(`${WORKER_URL}/update`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${AUTH_TOKEN}` },
-            body: JSON.stringify({ id: pendingEditId, content: newContent }),
-          })
-          if (!res.ok) throw new Error(t('auth.serverError', { status: res.status }))
+          const result = await apiUpdate(pendingEditId, newContent)
+          showAtomicSyncWarning(result)
           closeEdit()
           loadRecent()
+          updateStatus()
         } catch (e) {
           btn.disabled = false
           btn.textContent = t('edit.save')

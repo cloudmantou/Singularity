@@ -5,16 +5,25 @@ import { describe, expect, it } from "vitest";
 const html = readFileSync(path.join(process.cwd(), "public/index.html"), "utf8");
 
 describe("web memory mutation API contract", () => {
-  it("uses REST for append and forget instead of routing the UI through MCP", () => {
+  it("uses REST for append, update, and forget instead of routing the UI through MCP", () => {
     expect(html).not.toContain("async function apiMcp");
     expect(html).toMatch(/async function apiAppend[\s\S]*?\/append/);
+    expect(html).toMatch(/async function apiUpdate[\s\S]*?\/update/);
     expect(html).toMatch(/async function apiForget[\s\S]*?\/forget/);
-    expect(html).toContain("await apiAppend(pendingAppendId, addition)");
+    expect(html).toContain("const result = await apiAppend(pendingAppendId, addition)");
+    expect(html).toContain("const result = await apiUpdate(pendingEditId, newContent)");
     expect(html).toContain("await apiForget(idToForget)");
   });
 
-  it("validates capture, append, and forget REST responses", () => {
-    expect((html.match(/parseApiJsonResponse\(/g) ?? []).length).toBeGreaterThanOrEqual(3);
+  it("validates capture, append, update, and forget REST responses", () => {
+    expect((html.match(/parseApiJsonResponse\(/g) ?? []).length).toBeGreaterThanOrEqual(4);
+  });
+
+  it("surfaces non-fatal atomic memory sync warnings from append and update", () => {
+    expect(html).toContain('id="runtime-warning"');
+    expect(html).toContain("function showAtomicSyncWarning(result)");
+    expect(html).toContain("result.warning === 'atomic_sync_failed'");
+    expect((html.match(/showAtomicSyncWarning\(result\)/g) ?? []).length).toBeGreaterThanOrEqual(2);
   });
 
   it("imports backups sequentially in D1-safe batches", () => {

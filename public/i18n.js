@@ -40,6 +40,9 @@
     "status.thinking": "thinking…",
     "status.listening": "listening…",
     "status.ready": "ready",
+    "warning.dismiss": "Dismiss",
+    "warning.generic": "Saved, but a background sync warning occurred.",
+    "warning.atomicSyncFailed": "Content was saved, but the knowledge layer did not sync. Open Observatory and run extraction repair.",
 
     // recall
     "recall.eyebrow": "Recall",
@@ -309,6 +312,9 @@
     "status.thinking": "思考中…",
     "status.listening": "聆听中…",
     "status.ready": "就绪",
+    "warning.dismiss": "关闭",
+    "warning.generic": "内容已保存，但后台同步出现警告。",
+    "warning.atomicSyncFailed": "内容已保存，但知识层同步失败。请在观测台运行抽取修复。",
 
     "recall.eyebrow": "回忆",
     "recall.hero": "随便问你存过的事——我会用你自己的话找出来并回答。",
