@@ -36,6 +36,7 @@ describe("web memory mutation API contract", () => {
     expect(html).toContain("graphFacts: m.graph_facts || []");
     expect(html).toContain("timeBasis: m.time_basis || null");
     expect(html).toContain("Time basis:");
+    expect(html).toContain("语义向量服务不可用，当前使用关键词 + 知识图谱降级召回。");
     expect(html).toContain("Matched entities:");
     expect(html).toContain("Current graph facts:");
     expect(html).toContain("const graphContext = [");

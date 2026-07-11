@@ -159,6 +159,8 @@ CREATE TABLE IF NOT EXISTS sb_entity_relations (
   to_entity_id TEXT NOT NULL,
   relation_type TEXT NOT NULL,
   fact TEXT,
+  fact_hash TEXT,
+  evidence_count INTEGER NOT NULL DEFAULT 1,
   memory_id TEXT,
   observation_id TEXT,
   score REAL,
@@ -175,3 +177,16 @@ CREATE INDEX IF NOT EXISTS idx_sb_entity_relations_from
 CREATE INDEX IF NOT EXISTS idx_sb_entity_relations_to
   ON sb_entity_relations(to_entity_id, relation_type, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sb_entity_relations_memory ON sb_entity_relations(memory_id);
+CREATE INDEX IF NOT EXISTS idx_sb_entity_relations_fact_hash
+  ON sb_entity_relations(from_entity_id, to_entity_id, relation_type, fact_hash);
+
+CREATE TABLE IF NOT EXISTS sb_fact_sources (
+  id TEXT PRIMARY KEY,
+  relation_id TEXT NOT NULL,
+  memory_id TEXT,
+  observation_id TEXT,
+  created_at INTEGER NOT NULL,
+  UNIQUE(relation_id, memory_id, observation_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sb_fact_sources_relation ON sb_fact_sources(relation_id);
+CREATE INDEX IF NOT EXISTS idx_sb_fact_sources_memory ON sb_fact_sources(memory_id);

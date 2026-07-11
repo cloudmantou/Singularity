@@ -219,7 +219,56 @@ function prepareDatabaseErase(
   const atomicMemoryStatements = chunks(atomicGraph.memoryIds, DELETE_BATCH_SIZE).flatMap(batch => {
     const inList = placeholders(batch.length);
     return [
-      db.prepare(`DELETE FROM sb_entity_relations WHERE memory_id IN (${inList})`).bind(...batch),
+      db.prepare(
+        `UPDATE sb_entity_relations
+         SET evidence_count = (
+               SELECT COUNT(*) FROM sb_fact_sources
+               WHERE relation_id = sb_entity_relations.id
+                 AND (memory_id IS NULL OR memory_id NOT IN (${inList}))
+             ),
+             memory_id = (
+               SELECT memory_id FROM sb_fact_sources
+               WHERE relation_id = sb_entity_relations.id
+                 AND memory_id IS NOT NULL
+                 AND memory_id NOT IN (${inList})
+               ORDER BY created_at ASC
+               LIMIT 1
+             ),
+             observation_id = (
+               SELECT observation_id FROM sb_fact_sources
+               WHERE relation_id = sb_entity_relations.id
+                 AND (memory_id IS NULL OR memory_id NOT IN (${inList}))
+                 AND observation_id IS NOT NULL
+               ORDER BY created_at ASC
+               LIMIT 1
+             )
+         WHERE id IN (
+             SELECT relation_id FROM sb_fact_sources
+             WHERE memory_id IN (${inList})
+           )
+           AND id IN (
+             SELECT relation_id FROM sb_fact_sources
+             WHERE memory_id IS NULL OR memory_id NOT IN (${inList})
+           )`
+      ).bind(...batch, ...batch, ...batch, ...batch, ...batch),
+      db.prepare(
+        `DELETE FROM sb_entity_relations
+         WHERE (
+             id IN (
+               SELECT relation_id FROM sb_fact_sources
+               WHERE memory_id IN (${inList})
+             )
+             AND id NOT IN (
+               SELECT relation_id FROM sb_fact_sources
+               WHERE memory_id IS NULL OR memory_id NOT IN (${inList})
+             )
+           )
+           OR (
+             memory_id IN (${inList})
+             AND id NOT IN (SELECT relation_id FROM sb_fact_sources)
+           )`
+      ).bind(...batch, ...batch, ...batch),
+      db.prepare(`DELETE FROM sb_fact_sources WHERE memory_id IN (${inList})`).bind(...batch),
       db.prepare(`DELETE FROM sb_memory_entities WHERE memory_id IN (${inList})`).bind(...batch),
       db.prepare(`DELETE FROM sb_memory_sources WHERE memory_id IN (${inList})`).bind(...batch),
       db.prepare(`DELETE FROM sb_memories WHERE id IN (${inList})`).bind(...batch),

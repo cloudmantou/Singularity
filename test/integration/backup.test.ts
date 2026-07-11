@@ -114,6 +114,11 @@ describe("full memory backup import/export", () => {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run("fact-1", "entity-1", "entity-2", "uses", "Singularity uses SQLite", "mem-1", "obs-1", 0.91, null, null, null, null, now - 2000, "{}", now - 2000);
     db.prepare(
+      `INSERT INTO sb_fact_sources
+       (id, relation_id, memory_id, observation_id, created_at)
+       VALUES (?, ?, ?, ?, ?)`
+    ).run("fact-source-1", "fact-1", "mem-1", "obs-1", now - 2000);
+    db.prepare(
       `INSERT INTO sb_memory_relations
        (id, from_memory_id, to_memory_id, relation_type, score, metadata_json, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)`
@@ -139,6 +144,7 @@ describe("full memory backup import/export", () => {
       entities: 2,
       memoryEntities: 1,
       entityRelations: 1,
+      factSources: 1,
       memoryRelations: 1,
       revisions: 1,
     });
@@ -159,6 +165,7 @@ describe("full memory backup import/export", () => {
     expect(imported.inserted).toBe(2);
     expect(imported.graph.memories.imported).toBe(1);
     expect(imported.graph.entityRelations.imported).toBe(1);
+    expect(imported.graph.factSources.imported).toBe(1);
     expect(imported.integrity.ok).toBe(true);
 
     const restoredExport = await worker.fetch(

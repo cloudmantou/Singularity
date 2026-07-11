@@ -50,6 +50,41 @@ export function normalizeEntityFactKey(fact: string | null | undefined): string 
     .slice(0, 500);
 }
 
+function stableHash(input: string): string {
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < input.length; i++) {
+    const ch = input.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 =
+    Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^
+    Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 =
+    Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^
+    Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return `${(h2 >>> 0).toString(16).padStart(8, "0")}${(h1 >>> 0)
+    .toString(16)
+    .padStart(8, "0")}`;
+}
+
+function entityRelationFactHash(input: {
+  fromEntityId: string;
+  toEntityId: string;
+  relationType: EntityRelationType;
+  fact?: string | null;
+}): string {
+  return stableHash(
+    [
+      input.fromEntityId,
+      input.toEntityId,
+      input.relationType,
+      normalizeEntityFactKey(input.fact),
+    ].join("\u001f")
+  );
+}
+
 export function normalizeEntityType(raw: unknown): EntityType | null {
   if (typeof raw !== "string") return null;
   const v = raw.trim().toLowerCase().replace(/\s+/g, "_");
@@ -173,6 +208,8 @@ export const ENTITY_SCHEMA_STATEMENTS = [
     to_entity_id TEXT NOT NULL,
     relation_type TEXT NOT NULL,
     fact TEXT,
+    fact_hash TEXT,
+    evidence_count INTEGER NOT NULL DEFAULT 1,
     memory_id TEXT,
     observation_id TEXT,
     score REAL,
@@ -190,6 +227,18 @@ export const ENTITY_SCHEMA_STATEMENTS = [
     ON sb_entity_relations(to_entity_id, relation_type, created_at DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_sb_entity_relations_memory
     ON sb_entity_relations(memory_id)`,
+  `CREATE TABLE IF NOT EXISTS sb_fact_sources (
+    id TEXT PRIMARY KEY,
+    relation_id TEXT NOT NULL,
+    memory_id TEXT,
+    observation_id TEXT,
+    created_at INTEGER NOT NULL,
+    UNIQUE(relation_id, memory_id, observation_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_sb_fact_sources_relation
+    ON sb_fact_sources(relation_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_sb_fact_sources_memory
+    ON sb_fact_sources(memory_id)`,
   // Temporal fields on atomic memories (idempotent ALTERs applied in ensure path).
 ] as const;
 
@@ -202,6 +251,8 @@ export async function ensureEntityDataModel(db: D1Database): Promise<void> {
     `ALTER TABLE sb_memories ADD COLUMN invalid_at INTEGER`,
     `ALTER TABLE sb_memories ADD COLUMN expired_at INTEGER`,
     `ALTER TABLE sb_entity_relations ADD COLUMN expired_at INTEGER`,
+    `ALTER TABLE sb_entity_relations ADD COLUMN fact_hash TEXT`,
+    `ALTER TABLE sb_entity_relations ADD COLUMN evidence_count INTEGER NOT NULL DEFAULT 1`,
   ]) {
     try {
       await db.exec(alter);
@@ -210,6 +261,10 @@ export async function ensureEntityDataModel(db: D1Database): Promise<void> {
       if (!/duplicate column name|already exists/i.test(message)) throw error;
     }
   }
+  await db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_sb_entity_relations_fact_hash
+      ON sb_entity_relations(from_entity_id, to_entity_id, relation_type, fact_hash)`
+  );
 }
 
 export async function upsertEntity(
@@ -282,6 +337,48 @@ export async function linkMemoryEntity(
     .run();
 }
 
+async function insertFactSource(
+  db: D1Database,
+  input: {
+    relationId: string;
+    memoryId?: string | null;
+    observationId?: string | null;
+    createdAt: number;
+  }
+): Promise<boolean> {
+  const existing = await db
+    .prepare(
+      `SELECT id FROM sb_fact_sources
+       WHERE relation_id = ?
+         AND COALESCE(memory_id, '') = ?
+         AND COALESCE(observation_id, '') = ?
+       LIMIT 1`
+    )
+    .bind(
+      input.relationId,
+      input.memoryId ?? "",
+      input.observationId ?? ""
+    )
+    .first<{ id: string }>();
+  if (existing?.id) return false;
+
+  const result = await db
+    .prepare(
+      `INSERT OR IGNORE INTO sb_fact_sources (
+         id, relation_id, memory_id, observation_id, created_at
+       ) VALUES (?, ?, ?, ?, ?)`
+    )
+    .bind(
+      crypto.randomUUID(),
+      input.relationId,
+      input.memoryId ?? null,
+      input.observationId ?? null,
+      input.createdAt
+    )
+    .run();
+  return Number(result.meta?.changes ?? 0) > 0;
+}
+
 export async function insertEntityRelation(
   db: D1Database,
   input: {
@@ -302,14 +399,17 @@ export async function insertEntityRelation(
   }
 ): Promise<string> {
   const factKey = normalizeEntityFactKey(input.fact);
+  const factHash = entityRelationFactHash(input);
   const existing = await db
     .prepare(
       `SELECT id FROM sb_entity_relations
        WHERE from_entity_id = ?
          AND to_entity_id = ?
          AND relation_type = ?
-         AND COALESCE(memory_id, '') = ?
-         AND lower(trim(COALESCE(fact, ''))) = ?
+         AND (
+           fact_hash = ?
+           OR (fact_hash IS NULL AND lower(trim(COALESCE(fact, ''))) = ?)
+         )
          AND invalid_at IS NULL
          AND expired_at IS NULL
        LIMIT 1`
@@ -318,21 +418,53 @@ export async function insertEntityRelation(
       input.fromEntityId,
       input.toEntityId,
       input.relationType,
-      input.memoryId ?? "",
+      factHash,
       factKey
     )
     .first<{ id: string }>();
-  if (existing?.id) return existing.id;
+  if (existing?.id) {
+    const sourceInserted = await insertFactSource(db, {
+      relationId: existing.id,
+      memoryId: input.memoryId ?? null,
+      observationId: input.observationId ?? null,
+      createdAt: input.createdAt,
+    });
+    await db
+      .prepare(
+        `UPDATE sb_entity_relations
+         SET fact_hash = COALESCE(fact_hash, ?),
+             evidence_count = CASE
+               WHEN ? = 1 THEN COALESCE(evidence_count, 1) + 1
+               ELSE COALESCE(evidence_count, 1)
+             END,
+             score = CASE
+               WHEN ? IS NULL THEN score
+               WHEN score IS NULL OR score < ? THEN ?
+               ELSE score
+             END
+         WHERE id = ?`
+      )
+      .bind(
+        factHash,
+        sourceInserted ? 1 : 0,
+        input.score ?? null,
+        input.score ?? null,
+        input.score ?? null,
+        existing.id
+      )
+      .run();
+    return existing.id;
+  }
 
   const id = crypto.randomUUID();
   await db
     .prepare(
       `INSERT INTO sb_entity_relations (
-         id, from_entity_id, to_entity_id, relation_type, fact,
+         id, from_entity_id, to_entity_id, relation_type, fact, fact_hash, evidence_count,
          memory_id, observation_id, score,
          valid_from, valid_to, invalid_at, expired_at, reference_time,
          metadata_json, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       id,
@@ -340,6 +472,8 @@ export async function insertEntityRelation(
       input.toEntityId,
       input.relationType,
       input.fact?.trim() || null,
+      factHash,
+      1,
       input.memoryId ?? null,
       input.observationId ?? null,
       input.score ?? null,
@@ -352,6 +486,12 @@ export async function insertEntityRelation(
       input.createdAt
     )
     .run();
+  await insertFactSource(db, {
+    relationId: id,
+    memoryId: input.memoryId ?? null,
+    observationId: input.observationId ?? null,
+    createdAt: input.createdAt,
+  });
   return id;
 }
 
@@ -520,7 +660,7 @@ export async function getEntityGraph(
     .prepare(
       `SELECT r.id, r.from_entity_id, r.to_entity_id, r.relation_type, r.fact, r.memory_id,
               r.observation_id, r.score, r.valid_from, r.valid_to, r.invalid_at,
-              r.expired_at, r.reference_time, r.created_at,
+              r.expired_at, r.reference_time, r.evidence_count, r.created_at,
               fe.name AS from_name, te.name AS to_name
        FROM sb_entity_relations r
        JOIN sb_entities fe ON fe.id = r.from_entity_id

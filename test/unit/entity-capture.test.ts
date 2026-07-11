@@ -3,6 +3,7 @@ import { captureEntry } from "../../src/index";
 import { makeTestDb, makeTestEnv, makeVectorizeMock } from "../helpers/make-env";
 import type { Env } from "../../src/index";
 import type { D1Mock } from "../helpers/d1-mock";
+import { attachEntitiesToMemory } from "../../src/memory/entities";
 
 function makeCtx() {
   const pending: Promise<any>[] = [];
@@ -103,5 +104,71 @@ describe("entity dual-write from capture", () => {
     expect(uses.valid_from).toBe(1_700_000_000_000);
     expect(uses.reference_time).toBe(1_700_000_000_000);
     expect(db.memories[0].reference_time).toBeTruthy();
+  });
+
+  it("aggregates the same entity relation across multiple memory sources", async () => {
+    const now = Date.now();
+    await attachEntitiesToMemory(db as unknown as D1Database, {
+      memoryId: "mem-1",
+      observationId: "obs-1",
+      entities: [
+        { name: "Singularity", entityType: "project" },
+        { name: "SQLite", entityType: "product" },
+      ],
+      relations: [
+        {
+          from: "Singularity",
+          to: "SQLite",
+          relationType: "uses",
+          fact: "Singularity uses SQLite",
+        },
+      ],
+      score: 0.8,
+      createdAt: now - 100,
+    });
+    await attachEntitiesToMemory(db as unknown as D1Database, {
+      memoryId: "mem-2",
+      observationId: "obs-2",
+      entities: [
+        { name: "Singularity", entityType: "project" },
+        { name: "SQLite", entityType: "product" },
+      ],
+      relations: [
+        {
+          from: "Singularity",
+          to: "SQLite",
+          relationType: "uses",
+          fact: " singularity uses sqlite ",
+        },
+      ],
+      score: 0.9,
+      createdAt: now,
+    });
+    const repeatedNullObservationSource = {
+      memoryId: "mem-3",
+      entities: [
+        { name: "Singularity", entityType: "project" as const },
+        { name: "SQLite", entityType: "product" as const },
+      ],
+      relations: [
+        {
+          from: "Singularity",
+          to: "SQLite",
+          relationType: "uses" as const,
+          fact: "Singularity uses SQLite",
+        },
+      ],
+      score: 0.7,
+      createdAt: now + 100,
+    };
+    await attachEntitiesToMemory(db as unknown as D1Database, repeatedNullObservationSource);
+    await attachEntitiesToMemory(db as unknown as D1Database, repeatedNullObservationSource);
+
+    const uses = db.entityRelations.filter((relation) => relation.relation_type === "uses");
+    expect(uses).toHaveLength(1);
+    expect(uses[0].evidence_count).toBe(3);
+    expect(uses[0].score).toBe(0.9);
+    expect(db.factSources).toHaveLength(3);
+    expect(db.factSources.map((source) => source.memory_id).sort()).toEqual(["mem-1", "mem-2", "mem-3"]);
   });
 });

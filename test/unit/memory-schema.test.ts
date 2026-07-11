@@ -168,6 +168,12 @@ describe("memory data model", () => {
       .prepare(`PRAGMA table_info('sb_entity_relations')`)
       .all() as Array<{ name: string }>;
     expect(relationColumns.map((column) => column.name)).toContain("expired_at");
+    expect(relationColumns.map((column) => column.name)).toContain("fact_hash");
+    expect(relationColumns.map((column) => column.name)).toContain("evidence_count");
+    const factSources = raw
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sb_fact_sources'`)
+      .get();
+    expect(factSources).toBeTruthy();
   });
 
   it("rejects invalid relation endpoints, types, and scores before SQL", () => {
@@ -335,6 +341,100 @@ describe("memory data model", () => {
       .prepare(`SELECT memory_id FROM sb_entity_relations ORDER BY memory_id`)
       .all<{ memory_id: string }>();
     expect(factEdges.map(row => row.memory_id)).toEqual(["atomic-other"]);
+  });
+
+  it("removes only the forgotten source from aggregated fact relations on real SQLite", async () => {
+    const db = new SqliteD1Database(raw) as unknown as D1Database;
+    await db.exec(`
+      CREATE TABLE entries (
+        id TEXT PRIMARY KEY,
+        content TEXT NOT NULL,
+        tags TEXT NOT NULL,
+        source TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        vector_ids TEXT NOT NULL
+      )
+    `);
+    await ensureMemoryDataModel(db);
+    await db.batch([
+      db.prepare(`INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?)`)
+        .bind("primary", "shared fact source one", '["work"]', "api", 1, '["primary-vector"]'),
+      db.prepare(`INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?)`)
+        .bind("secondary", "shared fact source two", '["work"]', "api", 2, '["secondary-vector"]'),
+      db.prepare(
+        `INSERT INTO sb_observations (id, content, source, metadata_json, created_at)
+         VALUES (?, ?, ?, ?, ?)`
+      ).bind("obs-primary", "shared fact source one", "api", "{}", 1),
+      db.prepare(
+        `INSERT INTO sb_observations (id, content, source, metadata_json, created_at)
+         VALUES (?, ?, ?, ?, ?)`
+      ).bind("obs-secondary", "shared fact source two", "api", "{}", 2),
+      db.prepare(
+        `INSERT INTO sb_memories (
+           id, content, kind, memory_class, importance, confidence,
+           entry_id, content_hash, observed_at, valid_from, valid_to,
+           reference_time, invalid_at, entities_json, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind("atomic-primary", "shared fact source one", "semantic", null, null, null, "primary", "hash-primary", 1, null, null, 1, null, "[]", 1),
+      db.prepare(
+        `INSERT INTO sb_memories (
+           id, content, kind, memory_class, importance, confidence,
+           entry_id, content_hash, observed_at, valid_from, valid_to,
+           reference_time, invalid_at, entities_json, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind("atomic-secondary", "shared fact source two", "semantic", null, null, null, "secondary", "hash-secondary", 2, null, null, 2, null, "[]", 2),
+      db.prepare(
+        `INSERT INTO sb_memory_sources (id, memory_id, observation_id, role, score, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind("src-primary", "atomic-primary", "obs-primary", "derived_from", null, 1),
+      db.prepare(
+        `INSERT INTO sb_memory_sources (id, memory_id, observation_id, role, score, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind("src-secondary", "atomic-secondary", "obs-secondary", "derived_from", null, 2),
+      db.prepare(
+        `INSERT INTO sb_entity_relations (
+           id, from_entity_id, to_entity_id, relation_type, fact,
+           fact_hash, evidence_count, memory_id, observation_id, score,
+           valid_from, valid_to, invalid_at, expired_at, reference_time,
+           metadata_json, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind("fact-shared", "entity-a", "entity-b", "uses", "A uses B", "hash-shared", 2, "atomic-primary", "obs-primary", 0.9, null, null, null, null, 1, "{}", 1),
+      db.prepare(
+        `INSERT INTO sb_fact_sources (id, relation_id, memory_id, observation_id, created_at)
+         VALUES (?, ?, ?, ?, ?)`
+      ).bind("fact-source-primary", "fact-shared", "atomic-primary", "obs-primary", 1),
+      db.prepare(
+        `INSERT INTO sb_fact_sources (id, relation_id, memory_id, observation_id, created_at)
+         VALUES (?, ?, ?, ?, ?)`
+      ).bind("fact-source-secondary", "fact-shared", "atomic-secondary", "obs-secondary", 2),
+    ]);
+
+    const deleteByIds = vi.fn().mockResolvedValue({ mutationId: "deleted" });
+    const result = await forgetMemoryGraph(
+      "secondary",
+      db,
+      { deleteByIds } as unknown as VectorizeIndex
+    );
+
+    expect(result).toMatchObject({ status: "deleted", derivedCount: 0, vectorCount: 1 });
+    expect(deleteByIds).toHaveBeenCalledWith(["secondary-vector"]);
+    const relation = await db
+      .prepare(
+        `SELECT memory_id, observation_id, evidence_count
+         FROM sb_entity_relations
+         WHERE id = ?`
+      )
+      .bind("fact-shared")
+      .first<{ memory_id: string; observation_id: string; evidence_count: number }>();
+    expect(relation).toEqual({
+      memory_id: "atomic-primary",
+      observation_id: "obs-primary",
+      evidence_count: 1,
+    });
+    const { results: sources } = await db
+      .prepare(`SELECT memory_id FROM sb_fact_sources ORDER BY memory_id`)
+      .all<{ memory_id: string }>();
+    expect(sources.map(row => row.memory_id)).toEqual(["atomic-primary"]);
   });
 
   it("records a revision only when the guarded vector generation becomes active", async () => {

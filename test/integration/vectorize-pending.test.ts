@@ -52,6 +52,17 @@ describe("POST /vectorize-pending", () => {
     expect(data.remaining).toBe(0);
   });
 
+  it("batches embeddings across multiple pending entries", async () => {
+    db.entries.push(pastGraceEntry("e1"), pastGraceEntry("e2"), pastGraceEntry("e3"));
+
+    await worker.fetch(req("POST", "/vectorize-pending"), env, ctx);
+
+    const embeddingCalls = ((env.AI.run as any).mock.calls as any[])
+      .filter(([model]) => model === "@cf/baai/bge-small-en-v1.5");
+    expect(embeddingCalls).toHaveLength(1);
+    expect(embeddingCalls[0][1].text).toHaveLength(3);
+  });
+
   it("updates vector_ids in D1 after successful re-embed", async () => {
     db.entries.push(pastGraceEntry("fix-me"));
     await worker.fetch(req("POST", "/vectorize-pending"), env, ctx);
@@ -128,12 +139,12 @@ describe("POST /vectorize-pending", () => {
 
   it("counts failed and continues when storeEntry throws for one entry", async () => {
     db.entries.push(pastGraceEntry("bad"), pastGraceEntry("good"));
-    let callCount = 0;
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
-        insert: vi.fn().mockImplementation(() => {
-          callCount++;
-          if (callCount === 1) throw new Error("Vectorize error");
+        insert: vi.fn().mockImplementation((vectors: any[]) => {
+          if (vectors.some((vector) => vector.metadata?.parentId === "bad")) {
+            throw new Error("Vectorize error");
+          }
           return Promise.resolve({ mutationId: "m" });
         }),
       }),
@@ -242,6 +253,28 @@ describe("POST /vectorize-pending", () => {
     expect(db.entries[0].pending_vector_ids).toBeNull();
     expect(db.entries[0].pending_embedding_fingerprint).toBeNull();
     expect(db.entries[0].embedding_fingerprint).toBe(reindexData.pendingFingerprint);
+  });
+
+  it("batches pending blue-green rebuild embeddings across entries", async () => {
+    db.entries.push(
+      {
+        ...pastGraceEntry("active-1"),
+        vector_ids: '["active-1-old"]',
+      },
+      {
+        ...pastGraceEntry("active-2"),
+        vector_ids: '["active-2-old"]',
+      }
+    );
+
+    await worker.fetch(req("POST", "/settings/models/reindex"), env, ctx);
+    await worker.fetch(req("POST", "/vectorize-pending"), env, ctx);
+
+    const embeddingCalls = ((env.AI.run as any).mock.calls as any[])
+      .filter(([model]) => model === "@cf/baai/bge-small-en-v1.5");
+    expect(embeddingCalls).toHaveLength(1);
+    expect(embeddingCalls[0][1].text).toHaveLength(2);
+    expect(db.entries.every((entry: any) => entry.pending_vector_ids == null)).toBe(true);
   });
 
   it("does not activate blue-green vectors while recent pending rows remain in grace", async () => {

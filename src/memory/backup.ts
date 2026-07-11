@@ -9,6 +9,7 @@ const GRAPH_ARRAY_KEYS = [
   "entities",
   "memoryEntities",
   "entityRelations",
+  "factSources",
   "memoryRelations",
   "revisions",
 ] as const;
@@ -41,6 +42,7 @@ export interface MemoryBackupV4 {
   entities: BackupRow[];
   memoryEntities: BackupRow[];
   entityRelations: BackupRow[];
+  factSources: BackupRow[];
   memoryRelations: BackupRow[];
   revisions: BackupRow[];
 }
@@ -110,10 +112,19 @@ export async function inspectMemoryBackupIntegrity(db: D1Database): Promise<Back
         WHERE e.id IS NULL) as entity_relations_missing_to_entity,
        (SELECT COUNT(*) FROM sb_entity_relations er
         LEFT JOIN sb_memories m ON m.id = er.memory_id
-        WHERE er.memory_id IS NOT NULL AND m.id IS NULL) as entity_relations_missing_memory,
+       WHERE er.memory_id IS NOT NULL AND m.id IS NULL) as entity_relations_missing_memory,
        (SELECT COUNT(*) FROM sb_entity_relations er
         LEFT JOIN sb_observations o ON o.id = er.observation_id
         WHERE er.observation_id IS NOT NULL AND o.id IS NULL) as entity_relations_missing_observation,
+       (SELECT COUNT(*) FROM sb_fact_sources fs
+        LEFT JOIN sb_entity_relations er ON er.id = fs.relation_id
+        WHERE er.id IS NULL) as fact_sources_missing_relation,
+       (SELECT COUNT(*) FROM sb_fact_sources fs
+        LEFT JOIN sb_memories m ON m.id = fs.memory_id
+        WHERE fs.memory_id IS NOT NULL AND m.id IS NULL) as fact_sources_missing_memory,
+       (SELECT COUNT(*) FROM sb_fact_sources fs
+        LEFT JOIN sb_observations o ON o.id = fs.observation_id
+        WHERE fs.observation_id IS NOT NULL AND o.id IS NULL) as fact_sources_missing_observation,
        (SELECT COUNT(*) FROM sb_memory_relations r
         LEFT JOIN entries e ON e.id = r.from_memory_id
         WHERE e.id IS NULL) as memory_relations_missing_from_entry,
@@ -146,6 +157,7 @@ export async function exportMemoryBackup(
     entities,
     memoryEntities,
     entityRelations,
+    factSources,
     memoryRelations,
     revisions,
   ] = await Promise.all([
@@ -181,9 +193,13 @@ export async function exportMemoryBackup(
                 FROM sb_memory_entities
                 ORDER BY created_at DESC, id DESC`),
     allRows(db, `SELECT id, from_entity_id, to_entity_id, relation_type, fact,
-                       memory_id, observation_id, score, valid_from, valid_to,
-                       invalid_at, expired_at, reference_time, metadata_json, created_at
+                       fact_hash, evidence_count, memory_id, observation_id,
+                       score, valid_from, valid_to, invalid_at, expired_at,
+                       reference_time, metadata_json, created_at
                 FROM sb_entity_relations
+                ORDER BY created_at DESC, id DESC`),
+    allRows(db, `SELECT id, relation_id, memory_id, observation_id, created_at
+                FROM sb_fact_sources
                 ORDER BY created_at DESC, id DESC`),
     allRows(db, `SELECT id, from_memory_id, to_memory_id, relation_type,
                        score, metadata_json, created_at
@@ -207,6 +223,7 @@ export async function exportMemoryBackup(
       entities: countRows(entities),
       memoryEntities: countRows(memoryEntities),
       entityRelations: countRows(entityRelations),
+      factSources: countRows(factSources),
       memoryRelations: countRows(memoryRelations),
       revisions: countRows(revisions),
     },
@@ -218,6 +235,7 @@ export async function exportMemoryBackup(
     entities,
     memoryEntities,
     entityRelations,
+    factSources,
     memoryRelations,
     revisions,
   };
@@ -428,16 +446,19 @@ export async function importMemoryBackup(
   graph.entityRelations = await importTable(db, rowsFor(body, "entityRelations"), (row) =>
     db.prepare(
       `${insertVerb(mode)} INTO sb_entity_relations (
-         id, from_entity_id, to_entity_id, relation_type, fact, memory_id,
-         observation_id, score, valid_from, valid_to, invalid_at, expired_at,
+         id, from_entity_id, to_entity_id, relation_type, fact, fact_hash,
+         evidence_count, memory_id, observation_id, score,
+         valid_from, valid_to, invalid_at, expired_at,
          reference_time, metadata_json, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       requiredText(row, "id"),
       requiredText(row, "from_entity_id"),
       requiredText(row, "to_entity_id"),
       textOrDefault(row, "relation_type", "related_to"),
       textOrNull(row, "fact"),
+      textOrNull(row, "fact_hash"),
+      intOrDefault(row, "evidence_count", 1),
       textOrNull(row, "memory_id"),
       textOrNull(row, "observation_id"),
       numberOrNull(row, "score"),
@@ -447,6 +468,20 @@ export async function importMemoryBackup(
       numberOrNull(row, "expired_at"),
       numberOrNull(row, "reference_time"),
       jsonText(row, "metadata_json", "{}"),
+      intOrDefault(row, "created_at", Date.now())
+    )
+  );
+
+  graph.factSources = await importTable(db, rowsFor(body, "factSources"), (row) =>
+    db.prepare(
+      `${insertVerb(mode)} INTO sb_fact_sources (
+         id, relation_id, memory_id, observation_id, created_at
+       ) VALUES (?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "id"),
+      requiredText(row, "relation_id"),
+      textOrNull(row, "memory_id"),
+      textOrNull(row, "observation_id"),
       intOrDefault(row, "created_at", Date.now())
     )
   );

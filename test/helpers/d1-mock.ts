@@ -10,6 +10,7 @@ export class D1Mock {
   entities: any[] = [];
   memoryEntities: any[] = [];
   entityRelations: any[] = [];
+  factSources: any[] = [];
   statementCount = 0;
   execCount = 0;
   beforeClassificationCommit?: (row: any) => boolean | void;
@@ -255,6 +256,18 @@ export class D1Mock {
           }
           return { meta: { changes } };
         }
+        if (s.startsWith("UPDATE sb_entity_relations SET fact_hash")) {
+          const [fact_hash, sourceInserted, scoreA, scoreB, scoreC, id] = args;
+          const row = db.entityRelations.find((relation: any) => relation.id === id);
+          if (row) {
+            row.fact_hash = row.fact_hash ?? fact_hash;
+            row.evidence_count = Number(row.evidence_count ?? 1) + (Number(sourceInserted) === 1 ? 1 : 0);
+            if (scoreA != null && (row.score == null || Number(row.score) < Number(scoreB))) {
+              row.score = scoreC;
+            }
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
         if (s.startsWith("UPDATE sb_memories SET invalid_at")) {
           const hasExpiredAt = s.startsWith("UPDATE sb_memories SET invalid_at = ?, expired_at = ?");
           const [invalid_at, maybe_expired_at, maybe_valid_to, maybe_entry_id] = args;
@@ -309,6 +322,8 @@ export class D1Mock {
           let to_entity_id: any;
           let relation_type: any;
           let fact: any;
+          let fact_hash: any;
+          let evidence_count: any;
           let memory_id: any;
           let observation_id: any;
           let score: any;
@@ -319,13 +334,22 @@ export class D1Mock {
           let reference_time: any;
           let metadata_json: any;
           let created_at: any;
-          if (args.length >= 15) {
+          if (args.length >= 17) {
+            [
+              id, from_entity_id, to_entity_id, relation_type, fact,
+              fact_hash, evidence_count, memory_id, observation_id, score,
+              valid_from, valid_to, invalid_at, expired_at, reference_time,
+              metadata_json, created_at,
+            ] = args;
+          } else if (args.length >= 15) {
             [
               id, from_entity_id, to_entity_id, relation_type, fact,
               memory_id, observation_id, score,
               valid_from, valid_to, invalid_at, expired_at, reference_time,
               metadata_json, created_at,
             ] = args;
+            fact_hash = null;
+            evidence_count = 1;
           } else {
             [
               id, from_entity_id, to_entity_id, relation_type, fact,
@@ -334,14 +358,29 @@ export class D1Mock {
               metadata_json, created_at,
             ] = args;
             expired_at = null;
+            fact_hash = null;
+            evidence_count = 1;
           }
           db.entityRelations.push({
             id, from_entity_id, to_entity_id, relation_type, fact,
+            fact_hash, evidence_count,
             memory_id, observation_id, score,
             valid_from, valid_to, invalid_at, expired_at, reference_time,
             metadata_json, created_at,
           });
           return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("INSERT OR IGNORE INTO sb_fact_sources")) {
+          const [id, relation_id, memory_id, observation_id, created_at] = args;
+          const exists = db.factSources.some((source: any) =>
+            source.relation_id === relation_id &&
+            source.memory_id === memory_id &&
+            source.observation_id === observation_id
+          );
+          if (!exists) {
+            db.factSources.push({ id, relation_id, memory_id, observation_id, created_at });
+          }
+          return { meta: { changes: exists ? 0 : 1 } };
         }
 
         if (s.startsWith("INSERT INTO sb_memory_relations")) {
@@ -403,11 +442,68 @@ export class D1Mock {
           );
           return { meta: { changes: before - db.revisions.length } };
         }
-        if (s.startsWith("DELETE FROM sb_entity_relations WHERE memory_id IN")) {
+        if (s.startsWith("DELETE FROM sb_entity_relations WHERE memory_id IN") && !s.includes("id NOT IN")) {
           const memoryIds = new Set(args.map(String));
           const before = db.entityRelations.length;
           db.entityRelations = db.entityRelations.filter(
             (relation: any) => !memoryIds.has(String(relation.memory_id))
+          );
+          return { meta: { changes: before - db.entityRelations.length } };
+        }
+        if (s.startsWith("DELETE FROM sb_fact_sources WHERE memory_id IN")) {
+          const memoryIds = new Set(args.map(String));
+          const before = db.factSources.length;
+          db.factSources = db.factSources.filter(
+            (source: any) => !memoryIds.has(String(source.memory_id))
+          );
+          return { meta: { changes: before - db.factSources.length } };
+        }
+        if (s.startsWith("UPDATE sb_entity_relations SET evidence_count")) {
+          const memoryIds = new Set(args.map(String));
+          const affectedRelationIds = new Set(
+            db.factSources
+              .filter((source: any) => memoryIds.has(String(source.memory_id)))
+              .map((source: any) => source.relation_id)
+          );
+          let changes = 0;
+          for (const relation of db.entityRelations) {
+            if (!affectedRelationIds.has(relation.id)) continue;
+            const sources = db.factSources.filter((source: any) =>
+              source.relation_id === relation.id &&
+              (source.memory_id == null || !memoryIds.has(String(source.memory_id)))
+            );
+            if (!sources.length) continue;
+            relation.evidence_count = sources.length;
+            relation.memory_id = sources.find((source: any) => source.memory_id != null)?.memory_id ?? null;
+            relation.observation_id = sources.find((source: any) => source.observation_id != null)?.observation_id ?? null;
+            changes++;
+          }
+          return { meta: { changes } };
+        }
+        if (s.startsWith("DELETE FROM sb_entity_relations") && s.includes("id NOT IN")) {
+          const memoryIds = new Set(args.map(String));
+          const sourcedRelationIds = new Set(db.factSources.map((source: any) => source.relation_id));
+          const affectedRelationIds = new Set(
+            db.factSources
+              .filter((source: any) => memoryIds.has(String(source.memory_id)))
+              .map((source: any) => source.relation_id)
+          );
+          const survivingRelationIds = new Set(
+            db.factSources
+              .filter((source: any) =>
+                source.memory_id == null || !memoryIds.has(String(source.memory_id))
+              )
+              .map((source: any) => source.relation_id)
+          );
+          const before = db.entityRelations.length;
+          db.entityRelations = db.entityRelations.filter(
+            (relation: any) => {
+              const exhaustedRelation =
+                affectedRelationIds.has(relation.id) && !survivingRelationIds.has(relation.id);
+              const legacyDeletingRelation =
+                memoryIds.has(String(relation.memory_id)) && !sourcedRelationIds.has(relation.id);
+              return !exhaustedRelation && !legacyDeletingRelation;
+            }
           );
           return { meta: { changes: before - db.entityRelations.length } };
         }
@@ -1204,14 +1300,25 @@ export class D1Mock {
           const row = db.entities.find((e: any) => e.name_normalized === key);
           return row ?? null;
         }
+        if (s.includes("SELECT id FROM sb_fact_sources")) {
+          const [relationId, memoryId, observationId] = args.map(String);
+          const row = db.factSources.find((source: any) =>
+            String(source.relation_id) === relationId &&
+            String(source.memory_id ?? "") === memoryId &&
+            String(source.observation_id ?? "") === observationId
+          );
+          return row ? { id: row.id } : null;
+        }
         if (s.includes("SELECT id FROM sb_entity_relations") && s.includes("from_entity_id = ?")) {
-          const [fromEntityId, toEntityId, relationType, memoryId, factKey] = args.map(String);
+          const [fromEntityId, toEntityId, relationType, factHash, factKey] = args.map(String);
           const row = db.entityRelations.find((relation: any) =>
             String(relation.from_entity_id) === fromEntityId &&
             String(relation.to_entity_id) === toEntityId &&
             String(relation.relation_type) === relationType &&
-            String(relation.memory_id ?? "") === memoryId &&
-            String(relation.fact ?? "").trim().toLowerCase() === factKey &&
+            (
+              String(relation.fact_hash ?? "") === factHash ||
+              (!relation.fact_hash && String(relation.fact ?? "").trim().toLowerCase() === factKey)
+            ) &&
             relation.invalid_at == null &&
             relation.expired_at == null
           );
@@ -1904,5 +2011,6 @@ export class D1Mock {
     this.entities = [];
     this.memoryEntities = [];
     this.entityRelations = [];
+    this.factSources = [];
   }
 }

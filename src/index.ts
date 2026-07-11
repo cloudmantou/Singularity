@@ -215,6 +215,8 @@ const DIGEST_MAX_TOKENS = 400;
 // ─── Vectorize constants ──────────────────────────────────────────────────────
 
 const VECTORIZE_TOP_K_MULTIPLIER = 3;
+const EMBEDDING_INPUT_BATCH_SIZE = 64;
+const VECTORIZE_INSERT_BATCH_SIZE = 100;
 // getByIds batch size for tag-scoped recall — Vectorize rejects more than 20 IDs
 // per call (VECTOR_GET_ERROR, code 40007)
 const VECTORIZE_GET_BY_IDS_BATCH = 20;
@@ -528,10 +530,16 @@ async function embedMany(
 ): Promise<number[][]> {
   if (!texts.length) return [];
   const provider = await createEmbedding(env, embeddingRole);
-  if (provider.embedMany) {
-    return provider.embedMany(texts, { purpose });
+  const out: number[][] = [];
+  for (let i = 0; i < texts.length; i += EMBEDDING_INPUT_BATCH_SIZE) {
+    const slice = texts.slice(i, i + EMBEDDING_INPUT_BATCH_SIZE);
+    if (provider.embedMany) {
+      out.push(...await provider.embedMany(slice, { purpose }));
+    } else {
+      out.push(...await Promise.all(slice.map((text) => provider.embed(text, { purpose }))));
+    }
   }
-  return Promise.all(texts.map((text) => provider.embed(text, { purpose })));
+  return out;
 }
 
 // ─── Database initialization ──────────────────────────────────────────────────
@@ -1377,6 +1385,26 @@ interface PreparedEntryVectors {
   vectorIds: string[];
 }
 
+interface VectorizeQueueRow {
+  id: string;
+  content: string;
+  tags: string;
+  source: string;
+  created_at: number;
+  content_hash?: string | null;
+}
+
+interface PreparedEntryVectorBatchItem extends PreparedEntryVectors {
+  row: VectorizeQueueRow;
+  contentHash?: string;
+}
+
+interface VectorizeBatchResult {
+  processed: number;
+  failed: number;
+  skipped: number;
+}
+
 function createVectorGeneration(): string {
   return crypto.randomUUID();
 }
@@ -1430,6 +1458,16 @@ async function insertPreparedVectors(
   await env.VECTORIZE.insert(prepared.vectors);
 }
 
+async function insertPreparedVectorBatch(
+  env: Env,
+  items: PreparedEntryVectorBatchItem[]
+): Promise<void> {
+  const vectors = items.flatMap((item) => item.vectors);
+  for (let i = 0; i < vectors.length; i += VECTORIZE_INSERT_BATCH_SIZE) {
+    await env.VECTORIZE.insert(vectors.slice(i, i + VECTORIZE_INSERT_BATCH_SIZE));
+  }
+}
+
 async function cleanupPreparedVectors(
   env: Env,
   vectorIds: string[],
@@ -1468,6 +1506,75 @@ async function hasActiveEntryVectors(env: Env): Promise<boolean> {
        AND tags NOT LIKE '%"status:deprecated"%'`
   ).first() as Record<string, any> | null;
   return Number(row?.count ?? 0) > 0;
+}
+
+async function prepareEntryVectorBatch(
+  env: Env,
+  rows: VectorizeQueueRow[],
+  options: {
+    embeddingFingerprint?: string;
+    embeddingRole?: EmbeddingProfileRole;
+    includeContentHash?: boolean;
+  } = {}
+): Promise<PreparedEntryVectorBatchItem[]> {
+  if (!rows.length) return [];
+
+  const plans = await Promise.all(rows.map(async (row) => {
+    const tags = JSON.parse(row.tags) as string[];
+    const chunks = chunkText(row.content);
+    const generation = createVectorGeneration();
+    const vectorBaseId = `g-${generation}`;
+    const contentHash = options.includeContentHash
+      ? row.content_hash ?? await contentFingerprint(row.content)
+      : undefined;
+    return { row, tags, chunks, vectorBaseId, contentHash };
+  }));
+
+  const texts = plans.flatMap((plan) => plan.chunks);
+  const embeddings = await embedMany(
+    texts,
+    env,
+    "document",
+    options.embeddingRole ?? "active"
+  );
+  if (embeddings.length !== texts.length) {
+    throw new Error(
+      `Embedding batch size mismatch: expected ${texts.length}, got ${embeddings.length}`
+    );
+  }
+
+  let offset = 0;
+  return plans.map((plan) => {
+    const vectors = plan.chunks.map((chunk, i) => {
+      const metadata: Record<string, any> = {
+        content: chunk,
+        parentId: plan.row.id,
+        chunkIndex: i,
+        totalChunks: plan.chunks.length,
+        tags: plan.tags,
+        source: plan.row.source,
+        created_at: plan.row.created_at,
+      };
+      if (options.embeddingFingerprint) {
+        metadata.embedding_fingerprint = options.embeddingFingerprint;
+      }
+      plan.tags.forEach((tag) => {
+        metadata[`tag_${tag}`] = true;
+      });
+      return {
+        id: plan.chunks.length === 1 ? plan.vectorBaseId : `${plan.vectorBaseId}-chunk-${i}`,
+        values: embeddings[offset + i],
+        metadata,
+      };
+    });
+    offset += plan.chunks.length;
+    return {
+      row: plan.row,
+      contentHash: plan.contentHash,
+      vectors,
+      vectorIds: vectors.map((vector) => vector.id),
+    };
+  });
 }
 
 async function storePendingEntryVectors(
@@ -1527,6 +1634,66 @@ async function storePendingEntryVectors(
   }
 
   return prepared.vectorIds;
+}
+
+async function storePendingEntryVectorBatch(
+  env: Env,
+  rows: VectorizeQueueRow[],
+  pendingFingerprint: string
+): Promise<VectorizeBatchResult> {
+  const prepared = await prepareEntryVectorBatch(env, rows, {
+    embeddingFingerprint: pendingFingerprint,
+    embeddingRole: "pending",
+    includeContentHash: true,
+  });
+  const allVectorIds = prepared.flatMap((item) => item.vectorIds);
+  try {
+    await insertPreparedVectorBatch(env, prepared);
+  } catch (error) {
+    await cleanupPreparedVectors(env, allVectorIds, "Pending vector batch insert");
+    throw error;
+  }
+
+  let processed = 0;
+  let failed = 0;
+  let skipped = 0;
+  for (const item of prepared) {
+    const hash = item.contentHash ?? await contentFingerprint(item.row.content);
+    try {
+      const result = await env.DB.prepare(
+        `UPDATE entries
+         SET pending_vector_ids = ?,
+             pending_embedding_fingerprint = ?,
+             pending_content_hash = ?,
+             content_hash = COALESCE(content_hash, ?)
+         WHERE id = ?
+           AND pending_vector_ids = ?
+           AND pending_embedding_fingerprint = ?
+           AND content = ?
+           AND tags NOT LIKE '%"status:deprecated"%'`
+      ).bind(
+        JSON.stringify(item.vectorIds),
+        pendingFingerprint,
+        hash,
+        hash,
+        item.row.id,
+        "[]",
+        pendingFingerprint,
+        item.row.content
+      ).run();
+      if (result.meta?.changes === 0) {
+        await cleanupPreparedVectors(env, item.vectorIds, "Stale pending vector batch write");
+        skipped++;
+      } else {
+        processed++;
+      }
+    } catch (error) {
+      await cleanupPreparedVectors(env, item.vectorIds, "Pending vector batch write");
+      console.error("Pending vector batch write failed for entry", item.row.id, error);
+      failed++;
+    }
+  }
+  return { processed, failed, skipped };
 }
 
 async function activatePendingVectors(
@@ -1681,6 +1848,58 @@ async function storeEntry(
   }
 
   return prepared.vectorIds;
+}
+
+async function storeEntryVectorBatch(
+  env: Env,
+  rows: VectorizeQueueRow[],
+  pendingFingerprint: string | null
+): Promise<VectorizeBatchResult> {
+  const prepared = await prepareEntryVectorBatch(env, rows, {
+    embeddingRole: "active",
+  });
+  const allVectorIds = prepared.flatMap((item) => item.vectorIds);
+  try {
+    await insertPreparedVectorBatch(env, prepared);
+  } catch (error) {
+    await cleanupPreparedVectors(env, allVectorIds, "Initial vector batch insert");
+    throw error;
+  }
+
+  let processed = 0;
+  let failed = 0;
+  let skipped = 0;
+  for (const item of prepared) {
+    try {
+      const result = await env.DB.prepare(
+        `UPDATE entries
+         SET vector_ids = ?,
+             pending_vector_ids = ?,
+             pending_embedding_fingerprint = ?,
+             pending_content_hash = NULL
+         WHERE id = ? AND vector_ids = ? AND content = ?
+           AND tags NOT LIKE '%"status:deprecated"%'`
+      ).bind(
+        JSON.stringify(item.vectorIds),
+        pendingFingerprint ? "[]" : null,
+        pendingFingerprint,
+        item.row.id,
+        "[]",
+        item.row.content
+      ).run();
+      if (result.meta?.changes === 0) {
+        await cleanupPreparedVectors(env, item.vectorIds, "Stale initial vector batch write");
+        skipped++;
+      } else {
+        processed++;
+      }
+    } catch (error) {
+      await cleanupPreparedVectors(env, item.vectorIds, "Initial vector batch write");
+      console.error("Initial vector batch write failed for entry", item.row.id, error);
+      failed++;
+    }
+  }
+  return { processed, failed, skipped };
 }
 
 // Delete vectors that are no longer referenced after a re-embed. Generations
@@ -5961,31 +6180,44 @@ const defaultHandler = {
       let processed = 0;
       let failed = 0;
       let skipped = 0;
+      const queueRows = (toProcess as Record<string, any>[]).map((row) => ({
+        id: row.id as string,
+        content: row.content as string,
+        tags: row.tags as string,
+        source: row.source as string,
+        created_at: row.created_at as number,
+        content_hash: row.content_hash as string | null | undefined,
+      }));
 
-      for (const row of toProcess as Record<string, any>[]) {
+      if (queueRows.length) {
         try {
-          const ids = usePendingProfile && pendingFingerprint
-            ? await storePendingEntryVectors(env, {
-                id: row.id as string,
-                content: row.content as string,
-                tags: row.tags as string,
-                source: row.source as string,
-                created_at: row.created_at as number,
-                content_hash: row.content_hash as string | null,
-              }, pendingFingerprint)
-            : await storeEntry(
-                env,
-                row.id as string,
-                row.content as string,
-                JSON.parse(row.tags as string),
-                row.source as string,
-                row.created_at as number
-              );
-          if (ids.length) processed++;
-          else skipped++;
-        } catch (e) {
-          console.error("Re-embed failed for entry", row.id, e);
-          failed++;
+          const batchResult = usePendingProfile && pendingFingerprint
+            ? await storePendingEntryVectorBatch(env, queueRows, pendingFingerprint)
+            : await storeEntryVectorBatch(env, queueRows, pendingFingerprint);
+          processed += batchResult.processed;
+          failed += batchResult.failed;
+          skipped += batchResult.skipped;
+        } catch (batchError) {
+          console.error("Batch vectorize failed; falling back to per-entry mode:", batchError);
+          for (const row of queueRows) {
+            try {
+              const ids = usePendingProfile && pendingFingerprint
+                ? await storePendingEntryVectors(env, row, pendingFingerprint)
+                : await storeEntry(
+                    env,
+                    row.id,
+                    row.content,
+                    JSON.parse(row.tags),
+                    row.source,
+                    row.created_at
+                  );
+              if (ids.length) processed++;
+              else skipped++;
+            } catch (e) {
+              console.error("Re-embed failed for entry", row.id, e);
+              failed++;
+            }
+          }
         }
       }
 

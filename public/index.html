@@ -4524,6 +4524,13 @@
           // Server/auth errors must not render as "no results" — let the catch handle them
           if (!recallRes.ok || !data.ok) throw new Error(data.error || 'recall failed')
           loadingEl.remove()
+          if (data.degraded_mode) {
+            appendBrainBubble(
+              msgs,
+              '语义向量服务不可用，当前使用关键词 + 知识图谱降级召回。',
+              'recall-sys'
+            )
+          }
           if (!data.results || !data.results.length) {
             appendBrainBubble(msgs, t('recall.empty'), 'recall-sys')
           } else {
