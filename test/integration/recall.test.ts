@@ -729,4 +729,198 @@ describe("GET /recall", () => {
     const data = await res.json() as any;
     expect(data.results[0].id).toBe("v19");
   });
+
+  it("boosts current entity-linked memories and returns score details", async () => {
+    const now = Date.now();
+    db.entries.push(
+      { id: "peer", content: "Generic database note", tags: "[]", source: "api", created_at: now, vector_ids: '["peer"]', recall_count: 0, importance_score: 0 },
+      { id: "singularity-entry", content: "Singularity currently uses SQLite for local storage", tags: "[]", source: "api", created_at: now, vector_ids: '["singularity-entry"]', recall_count: 0, importance_score: 0 },
+    );
+    db.memories.push({
+      id: "memory-singularity",
+      entry_id: "singularity-entry",
+      content: "Singularity currently uses SQLite for local storage",
+      kind: "semantic",
+      memory_class: "fact",
+      importance: 4,
+      confidence: 0.92,
+      valid_from: null,
+      valid_to: null,
+      invalid_at: null,
+      expired_at: null,
+      created_at: now,
+    });
+    db.entities.push({
+      id: "entity-singularity",
+      name: "Singularity",
+      name_normalized: "singularity",
+      entity_type: "project",
+      mention_count: 1,
+      updated_at: now,
+    });
+    db.memoryEntities.push({
+      id: "me-singularity",
+      memory_id: "memory-singularity",
+      entity_id: "entity-singularity",
+      role: "mentions",
+      score: 0.95,
+      created_at: now,
+    });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({
+          matches: [makeMatch("peer", 0.9), makeMatch("singularity-entry", 0.9)],
+        }),
+      }),
+    });
+
+    const res = await worker.fetch(
+      req("GET", `/recall?query=${encodeURIComponent("Singularity 用什么数据库")}`),
+      env,
+      ctx
+    );
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.results[0].id).toBe("singularity-entry");
+    expect(data.results[0].matched_entities).toContain("Singularity");
+    expect(data.results[0].score_details.entity).toBeGreaterThan(0);
+    expect(data.results[0].score_details.temporal).toBe(1);
+    expect(data.results[0].score_details.semantic).toBeGreaterThan(0);
+  });
+
+  it("surfaces graph-only current fact candidates when dense and keyword recall miss", async () => {
+    const now = Date.now();
+    db.entries.push({
+      id: "graph-entry",
+      content: "The local durable store is SQLite.",
+      tags: "[]",
+      source: "api",
+      created_at: now,
+      vector_ids: "[]",
+      recall_count: 0,
+      importance_score: 0,
+    });
+    db.memories.push({
+      id: "memory-graph",
+      entry_id: "graph-entry",
+      content: "The local durable store is SQLite.",
+      kind: "semantic",
+      memory_class: "fact",
+      importance: 4,
+      confidence: 0.91,
+      valid_from: null,
+      valid_to: null,
+      invalid_at: null,
+      expired_at: null,
+      created_at: now,
+    });
+    db.entities.push(
+      { id: "entity-singularity", name: "Singularity", name_normalized: "singularity", entity_type: "project", mention_count: 2, updated_at: now },
+      { id: "entity-sqlite", name: "SQLite", name_normalized: "sqlite", entity_type: "product", mention_count: 1, updated_at: now },
+    );
+    db.memoryEntities.push({
+      id: "me-graph",
+      memory_id: "memory-graph",
+      entity_id: "entity-singularity",
+      role: "mentions",
+      score: 0.9,
+      created_at: now,
+    });
+    db.entityRelations.push({
+      id: "fact-graph",
+      from_entity_id: "entity-singularity",
+      to_entity_id: "entity-sqlite",
+      relation_type: "uses",
+      fact: "Singularity uses SQLite",
+      memory_id: "memory-graph",
+      observation_id: "obs-graph",
+      score: 0.92,
+      valid_from: null,
+      valid_to: null,
+      invalid_at: null,
+      expired_at: null,
+      reference_time: now,
+      created_at: now,
+    });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({ matches: [] }),
+      }),
+    });
+
+    const res = await worker.fetch(
+      req("GET", `/recall?query=${encodeURIComponent("Singularity 的数据库是什么")}`),
+      env,
+      ctx
+    );
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.results).toHaveLength(1);
+    expect(data.results[0].id).toBe("graph-entry");
+    expect(data.results[0].score_details.semantic).toBe(0);
+    expect(data.results[0].score_details.entity).toBeGreaterThan(0);
+    expect(data.results[0].score_details.relation).toBeGreaterThan(0);
+    expect(data.results[0].graph_facts).toContain("Singularity uses SQLite");
+  });
+
+  it("does not surface expired entity facts as current graph-only recall results", async () => {
+    const now = Date.now();
+    db.entries.push({
+      id: "expired-entry",
+      content: "Old project storage plan",
+      tags: "[]",
+      source: "api",
+      created_at: now - 10_000,
+      vector_ids: "[]",
+      recall_count: 0,
+      importance_score: 0,
+    });
+    db.memories.push({
+      id: "memory-expired",
+      entry_id: "expired-entry",
+      content: "Old project storage plan",
+      kind: "semantic",
+      memory_class: "fact",
+      importance: 3,
+      confidence: 0.8,
+      valid_from: now - 100_000,
+      valid_to: now - 1_000,
+      invalid_at: null,
+      expired_at: null,
+      created_at: now - 10_000,
+    });
+    db.entities.push({
+      id: "entity-singularity",
+      name: "Singularity",
+      name_normalized: "singularity",
+      entity_type: "project",
+      mention_count: 1,
+      updated_at: now,
+    });
+    db.memoryEntities.push({
+      id: "me-expired",
+      memory_id: "memory-expired",
+      entity_id: "entity-singularity",
+      role: "mentions",
+      score: 0.95,
+      created_at: now - 10_000,
+    });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({ matches: [] }),
+      }),
+    });
+
+    const res = await worker.fetch(
+      req("GET", `/recall?query=${encodeURIComponent("Singularity 当前方案")}`),
+      env,
+      ctx
+    );
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.results).toEqual([]);
+  });
 });

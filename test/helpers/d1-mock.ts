@@ -1179,6 +1179,131 @@ export class D1Mock {
             .map((source: any) => ({ observation_id: source.observation_id }));
           return { results };
         }
+        if (
+          s.includes("FROM sb_entities") &&
+          s.includes("instr(?, name_normalized)") &&
+          s.includes("ORDER BY length(name_normalized)")
+        ) {
+          const normalizedQuery = String(args[0] ?? "");
+          const limit = Number(args[args.length - 1] ?? 8);
+          const results = [...db.entities]
+            .filter((entity: any) => {
+              const name = String(entity.name_normalized ?? "");
+              return name.length >= 2 && normalizedQuery.includes(name);
+            })
+            .sort((a: any, b: any) =>
+              String(b.name_normalized ?? "").length - String(a.name_normalized ?? "").length ||
+              Number(b.mention_count ?? 0) - Number(a.mention_count ?? 0) ||
+              Number(b.updated_at ?? 0) - Number(a.updated_at ?? 0)
+            )
+            .slice(0, limit)
+            .map((entity: any) => ({
+              id: entity.id,
+              name: entity.name,
+              name_normalized: entity.name_normalized,
+              entity_type: entity.entity_type ?? null,
+              mention_count: entity.mention_count ?? 0,
+            }));
+          return { results };
+        }
+        if (
+          s.includes("FROM sb_memory_entities me") &&
+          s.includes("JOIN sb_memories m ON m.id = me.memory_id") &&
+          s.includes("JOIN sb_entities e ON e.id = me.entity_id")
+        ) {
+          const inMatch = s.match(/me\.entity_id IN \(([^)]*)\)/);
+          const entityIdCount = inMatch ? inMatch[1].split(",").filter(Boolean).length : 0;
+          const entityIds = new Set(args.slice(0, entityIdCount).map(String));
+          const asOf = Number(args[entityIdCount] ?? Date.now());
+          const limit = Number(args[args.length - 1] ?? 100);
+          const results = db.memoryEntities
+            .filter((link: any) => entityIds.has(String(link.entity_id)))
+            .map((link: any) => {
+              const memory = db.memories.find((m: any) => m.id === link.memory_id);
+              const entity = db.entities.find((e: any) => e.id === link.entity_id);
+              return { link, memory, entity };
+            })
+            .filter(({ memory }: any) =>
+              memory &&
+              memory.entry_id &&
+              memory.invalid_at == null &&
+              memory.expired_at == null &&
+              (memory.valid_from == null || Number(memory.valid_from) <= asOf) &&
+              (memory.valid_to == null || Number(memory.valid_to) > asOf)
+            )
+            .sort((a: any, b: any) =>
+              Number(b.link.score ?? 0) - Number(a.link.score ?? 0) ||
+              Number(b.memory.created_at ?? 0) - Number(a.memory.created_at ?? 0)
+            )
+            .slice(0, limit)
+            .map(({ link, memory, entity }: any) => ({
+              entry_id: memory.entry_id,
+              memory_id: memory.id,
+              created_at: memory.created_at,
+              valid_from: memory.valid_from ?? null,
+              valid_to: memory.valid_to ?? null,
+              invalid_at: memory.invalid_at ?? null,
+              expired_at: memory.expired_at ?? null,
+              importance: memory.importance ?? null,
+              confidence: memory.confidence ?? null,
+              entity_score: link.score ?? null,
+              entity_name: entity?.name ?? null,
+            }));
+          return { results };
+        }
+        if (
+          s.includes("FROM sb_entity_relations r") &&
+          s.includes("JOIN sb_memories m ON m.id = r.memory_id") &&
+          s.includes("JOIN sb_entities fe ON fe.id = r.from_entity_id")
+        ) {
+          const inMatch = s.match(/r\.from_entity_id IN \(([^)]*)\)/);
+          const entityIdCount = inMatch ? inMatch[1].split(",").filter(Boolean).length : 0;
+          const fromIds = new Set(args.slice(0, entityIdCount).map(String));
+          const toIds = new Set(args.slice(entityIdCount, entityIdCount * 2).map(String));
+          const asOf = Number(args[entityIdCount * 2] ?? Date.now());
+          const limit = Number(args[args.length - 1] ?? 100);
+          const results = db.entityRelations
+            .filter((relation: any) =>
+              fromIds.has(String(relation.from_entity_id)) ||
+              toIds.has(String(relation.to_entity_id))
+            )
+            .map((relation: any) => {
+              const memory = db.memories.find((m: any) => m.id === relation.memory_id);
+              const from = db.entities.find((e: any) => e.id === relation.from_entity_id);
+              const to = db.entities.find((e: any) => e.id === relation.to_entity_id);
+              return { relation, memory, from, to };
+            })
+            .filter(({ relation, memory }: any) =>
+              memory &&
+              memory.entry_id &&
+              relation.invalid_at == null &&
+              relation.expired_at == null &&
+              (relation.valid_from == null || Number(relation.valid_from) <= asOf) &&
+              (relation.valid_to == null || Number(relation.valid_to) > asOf) &&
+              memory.invalid_at == null &&
+              memory.expired_at == null
+            )
+            .sort((a: any, b: any) =>
+              Number(b.relation.score ?? 0) - Number(a.relation.score ?? 0) ||
+              Number(b.relation.created_at ?? 0) - Number(a.relation.created_at ?? 0)
+            )
+            .slice(0, limit)
+            .map(({ relation, memory, from, to }: any) => ({
+              entry_id: memory.entry_id,
+              memory_created_at: memory.created_at,
+              memory_id: relation.memory_id,
+              relation_type: relation.relation_type,
+              fact: relation.fact ?? null,
+              score: relation.score ?? null,
+              valid_from: relation.valid_from ?? null,
+              valid_to: relation.valid_to ?? null,
+              invalid_at: relation.invalid_at ?? null,
+              expired_at: relation.expired_at ?? null,
+              from_name: from?.name ?? null,
+              to_name: to?.name ?? null,
+            }));
+          return { results };
+        }
         if (s.includes("SELECT id, vector_ids") && s.includes("FROM entries WHERE id IN")) {
           const ids = new Set(args.map(String));
           const results = db.entries
