@@ -36,6 +36,18 @@ CREATE INDEX IF NOT EXISTS idx_entries_classification_queue
 CREATE INDEX IF NOT EXISTS idx_entries_pending_vectors
   ON entries(pending_embedding_fingerprint, pending_vector_ids, created_at);
 
+CREATE TABLE IF NOT EXISTS sb_vector_cleanup_queue (
+  id TEXT PRIMARY KEY,
+  vector_id TEXT NOT NULL UNIQUE,
+  reason TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sb_vector_cleanup_queue_created
+  ON sb_vector_cleanup_queue(created_at);
+
 CREATE TABLE IF NOT EXISTS sb_memory_relations (
   id             TEXT PRIMARY KEY,
   from_memory_id TEXT NOT NULL,

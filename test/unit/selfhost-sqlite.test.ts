@@ -209,15 +209,24 @@ describe("SqliteVectorizeIndex", () => {
       { id: "indexed", values: [0, 1], metadata: { parentId: "indexed" } },
       { id: "json-only", values: [1, 0], metadata: { parentId: "json-only" } },
     ]);
-    raw
-      .prepare(`UPDATE sb_vectors SET vec_rowid = NULL WHERE id = ?`)
-      .run("json-only");
+    const vecTable = raw.prepare(
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sb_vectors_vec_2'`
+    ).get();
+    if (vecTable) {
+      raw
+        .prepare(`DELETE FROM sb_vectors_vec_2 WHERE rowid = (SELECT vec_rowid FROM sb_vectors WHERE id = ?)`)
+        .run("json-only");
+    } else {
+      raw
+        .prepare(`UPDATE sb_vectors SET vec_rowid = NULL WHERE id = ?`)
+        .run("json-only");
+    }
 
     const { matches } = await vec.query([1, 0], { topK: 1 });
     expect(matches[0].id).toBe("json-only");
   });
 
-  it("uses queryText as an FTS candidate prefilter before cosine ranking", async () => {
+  it("uses queryText as an auxiliary FTS candidate source without gating semantic KNN", async () => {
     const ftsTable = raw.prepare(
       `SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name = 'sb_vector_fts'`
     ).get() as { name: string; sql: string } | undefined;
@@ -241,12 +250,13 @@ describe("SqliteVectorizeIndex", () => {
     ]);
 
     const { matches } = await vec.query([1, 0], {
-      topK: 1,
+      topK: 2,
       returnMetadata: "all",
       queryText: ftsTable.sql.includes("trigram") ? "lite vec" : "sqlite vector",
     } as any);
 
-    expect(matches[0].id).toBe("lexical-hit");
+    expect(matches[0].id).toBe("semantic-only");
+    expect(matches.map((match) => match.id)).toContain("lexical-hit");
   });
 });
 

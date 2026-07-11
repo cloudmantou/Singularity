@@ -66,16 +66,33 @@ export async function saveStoredModelSettings(
   settings: ModelSettings
 ): Promise<void> {
   await ensureSettingsTable(db);
-  const now = settings.updatedAt ?? Date.now();
-  settings.updatedAt = now;
-  await db
+  const saved = normalizeStoredModelSettings(settings);
+  await prepareStoredModelSettingsSave(db, saved).run();
+  cache = saved;
+}
+
+export function prepareStoredModelSettingsSave(
+  db: D1Database,
+  settings: ModelSettings
+): D1PreparedStatement {
+  const saved = normalizeStoredModelSettings(settings);
+  return db
     .prepare(
       `INSERT INTO sb_app_settings (key, value, updated_at) VALUES (?, ?, ?)
        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
     )
-    .bind(SETTINGS_KEY, JSON.stringify(settings), now)
-    .run();
+    .bind(SETTINGS_KEY, JSON.stringify(saved), saved.updatedAt);
+}
+
+export function setStoredModelSettingsCache(settings: ModelSettings | null): void {
   cache = settings;
+}
+
+function normalizeStoredModelSettings(settings: ModelSettings): ModelSettings {
+  return {
+    ...settings,
+    updatedAt: settings.updatedAt ?? Date.now(),
+  };
 }
 
 export async function getEffectiveModelSettings(

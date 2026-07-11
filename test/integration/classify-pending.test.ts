@@ -134,9 +134,9 @@ describe("POST /classify-pending", () => {
     expect(data).toMatchObject({ processed: 1, failed: 0, remaining: 9 });
     expect(db.execCount).toBeGreaterThan(0);
     // Cold-start schema now includes atomic memory, Vector V2 profile fields,
-    // and fact-source provenance for aggregated entity relations;
+    // vector cleanup queue, and fact-source provenance for aggregated entity relations;
     // keep a bounded D1 headroom check instead of letting init grow unnoticed.
-    expect(db.statementCount).toBeLessThanOrEqual(90);
+    expect(db.statementCount).toBeLessThanOrEqual(92);
   });
 
   it("skips entries whose durable classification status is already succeeded", async () => {

@@ -124,6 +124,10 @@ function similarityFromCosineDistance(distance: number): number {
   return Math.max(-1, Math.min(1, 1 - distance));
 }
 
+function rrf(rank: number): number {
+  return 1 / (60 + rank + 1);
+}
+
 export class SqliteVectorizeIndex {
   private ftsAvailable = false;
   private ftsTokenizer: "trigram" | "unicode61" | null = null;
@@ -243,11 +247,19 @@ export class SqliteVectorizeIndex {
     options: SqliteVectorizeQueryOptions = {}
   ): Promise<VectorizeMatches> {
     const topK = options.topK ?? 10;
-    const candidateIds = this.ftsCandidateIds(options.queryText, Math.max(topK * 20, 50));
-    const scored = candidateIds.length > 0
+    const vectorLimit = Math.max(topK * 20, 50);
+    const lexicalLimit = Math.max(topK * 20, 50);
+    const vectorScored =
+      this.queryVec0(vector, vectorLimit, Boolean(options.returnValues)) ??
+      this.scoreRows(this.selectAllRows(), vector, options.returnValues)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, vectorLimit);
+    const candidateIds = this.ftsCandidateIds(options.queryText, lexicalLimit);
+    const lexicalScored = candidateIds.length > 0
       ? this.scoreRows(this.selectRowsByIds(candidateIds), vector, options.returnValues)
-      : this.queryVec0(vector, topK, Boolean(options.returnValues)) ??
-        this.scoreRows(this.selectAllRows(), vector, options.returnValues);
+          .sort((a, b) => b.score - a.score)
+      : [];
+    const scored = this.mergeVectorAndLexical(vectorScored, lexicalScored);
 
     scored.sort((a, b) => b.score - a.score);
     const matches = scored.slice(0, topK).map((m) => {
@@ -483,6 +495,16 @@ export class SqliteVectorizeIndex {
         return null;
       }
       this.ensureVecTable(dim);
+      const missing = this.db.prepare(
+        `SELECT COUNT(*) as count
+         FROM sb_vectors m
+         LEFT JOIN ${vecTableName(dim)} v ON v.rowid = m.vec_rowid
+         WHERE m.vector_dim = ?
+           AND (m.vec_rowid IS NULL OR v.rowid IS NULL)`
+      ).get(dim) as { count: number };
+      if (Number(missing.count ?? 0) > 0) {
+        return null;
+      }
       const rows = this.db
         .prepare(
           `SELECT m.id, m.values_json, m.metadata_json, v.distance
@@ -526,6 +548,38 @@ export class SqliteVectorizeIndex {
         console.warn("Skipping incompatible vector row during query:", error);
         return [];
       }
+    });
+  }
+
+  private mergeVectorAndLexical(
+    vectorRows: ScoredVector[],
+    lexicalRows: ScoredVector[]
+  ): ScoredVector[] {
+    const byId = new Map<string, ScoredVector & { vectorRank?: number; lexicalRank?: number }>();
+    vectorRows.forEach((row, index) => {
+      byId.set(row.id, { ...row, vectorRank: index });
+    });
+    lexicalRows.forEach((row, index) => {
+      const existing = byId.get(row.id);
+      if (existing) {
+        existing.score = Math.max(existing.score, row.score);
+        existing.lexicalRank = index;
+        if (!existing.values && row.values) existing.values = row.values;
+        existing.metadata = { ...row.metadata, ...existing.metadata };
+      } else {
+        byId.set(row.id, { ...row, lexicalRank: index });
+      }
+    });
+
+    return [...byId.values()].map((row) => {
+      const vectorBoost = row.vectorRank == null ? 0 : 0.04 * rrf(row.vectorRank);
+      const lexicalBoost = row.lexicalRank == null ? 0 : 0.02 * rrf(row.lexicalRank);
+      return {
+        id: row.id,
+        score: Math.max(-1, Math.min(1, row.score + vectorBoost + lexicalBoost)),
+        metadata: row.metadata,
+        values: row.values,
+      };
     });
   }
 

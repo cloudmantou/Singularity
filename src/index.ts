@@ -29,7 +29,9 @@ import {
   getEffectiveModelSettings,
   loadStoredModelSettings,
   overlayProviderEnvFromSettings,
+  prepareStoredModelSettingsSave,
   saveStoredModelSettings,
+  setStoredModelSettingsCache,
 } from "./settings/store";
 import { importEntries, parseImportPayload, type ImportMode } from "./import-entries";
 import {
@@ -585,6 +587,21 @@ export async function initializeDatabase(env: Env): Promise<void> {
   await env.DB.exec(
     `CREATE INDEX IF NOT EXISTS idx_entries_pending_vectors
      ON entries(pending_embedding_fingerprint, pending_vector_ids, created_at)`
+  );
+  await env.DB.exec(
+    `CREATE TABLE IF NOT EXISTS sb_vector_cleanup_queue (
+      id TEXT PRIMARY KEY,
+      vector_id TEXT NOT NULL UNIQUE,
+      reason TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    )`
+  );
+  await env.DB.exec(
+    `CREATE INDEX IF NOT EXISTS idx_sb_vector_cleanup_queue_created
+     ON sb_vector_cleanup_queue(created_at)`
   );
   // Before durable classification fields existed, kind:* tags were the only
   // successful-classification marker. Preserve that work during upgrade with
@@ -1715,28 +1732,6 @@ async function storePendingEntryVectorBatch(
   return { processed, failed, skipped };
 }
 
-async function activatePendingVectors(
-  env: Env,
-  pendingFingerprint: string
-): Promise<number> {
-  const result = await env.DB.prepare(
-    `UPDATE entries
-     SET vector_ids = pending_vector_ids,
-         embedding_fingerprint = pending_embedding_fingerprint,
-         pending_vector_ids = NULL,
-         pending_embedding_fingerprint = NULL,
-         pending_content_hash = NULL,
-         pending_revision_id = NULL
-     WHERE pending_embedding_fingerprint = ?
-       AND pending_vector_ids IS NOT NULL
-       AND pending_vector_ids != '[]'
-       AND pending_content_hash IS NOT NULL
-       AND pending_revision_id IS NOT NULL
-       AND content_hash = pending_content_hash`
-  ).bind(pendingFingerprint).run();
-  return Number(result.meta?.changes ?? 0);
-}
-
 async function countPendingActivationConflicts(
   env: Env,
   pendingFingerprint: string
@@ -1761,6 +1756,12 @@ interface PendingActivationIntegrity {
   blocked: number;
 }
 
+interface PendingActivationRow {
+  id: string;
+  vector_ids: string;
+  pending_vector_ids: string;
+}
+
 async function inspectPendingActivationIntegrity(
   env: Env,
   pendingFingerprint: string
@@ -1781,6 +1782,179 @@ async function inspectPendingActivationIntegrity(
     activatable: Number(activatableRow?.count ?? 0),
     blocked,
   };
+}
+
+async function listPendingActivationRows(
+  env: Env,
+  pendingFingerprint: string
+): Promise<PendingActivationRow[]> {
+  const { results } = await env.DB.prepare(
+    `SELECT id, vector_ids, pending_vector_ids
+     FROM entries
+     WHERE pending_embedding_fingerprint = ?
+       AND pending_vector_ids IS NOT NULL
+       AND pending_vector_ids != '[]'
+       AND pending_content_hash IS NOT NULL
+       AND pending_revision_id IS NOT NULL
+       AND content_hash = pending_content_hash`
+  ).bind(pendingFingerprint).all<PendingActivationRow>();
+  return (results ?? []) as PendingActivationRow[];
+}
+
+function staleVectorIdsAfterActivation(rows: PendingActivationRow[]): string[] {
+  const stale = new Set<string>();
+  const next = new Set<string>();
+  for (const row of rows) {
+    for (const id of parseVectorIds(row.pending_vector_ids)) next.add(id);
+  }
+  for (const row of rows) {
+    for (const id of parseVectorIds(row.vector_ids)) {
+      if (!next.has(id)) stale.add(id);
+    }
+  }
+  return [...stale];
+}
+
+async function enqueueVectorCleanup(
+  env: Env,
+  vectorIds: string[],
+  reason: string,
+  error?: unknown
+): Promise<number> {
+  const ids = [...new Set(vectorIds)].filter(Boolean);
+  if (!ids.length) return 0;
+  const now = Date.now();
+  const lastError = error == null
+    ? null
+    : error instanceof Error
+      ? error.message.slice(0, 500)
+      : String(error).slice(0, 500);
+  let queued = 0;
+  for (const id of ids) {
+    const result = await env.DB.prepare(
+      `INSERT INTO sb_vector_cleanup_queue (
+         id, vector_id, reason, attempts, last_error, created_at, updated_at
+       ) VALUES (?, ?, ?, 0, ?, ?, ?)
+       ON CONFLICT(vector_id) DO UPDATE SET
+         reason = excluded.reason,
+         last_error = COALESCE(excluded.last_error, sb_vector_cleanup_queue.last_error),
+         updated_at = excluded.updated_at`
+    ).bind(crypto.randomUUID(), id, reason, lastError, now, now).run();
+    queued += Number(result.meta?.changes ?? 0) > 0 ? 1 : 0;
+  }
+  return queued;
+}
+
+async function deleteVectorsOrQueue(
+  env: Env,
+  vectorIds: string[],
+  reason: string
+): Promise<{ deleted: number; queued: number }> {
+  const ids = [...new Set(vectorIds)].filter(Boolean);
+  if (!ids.length) return { deleted: 0, queued: 0 };
+  let deleted = 0;
+  for (let i = 0; i < ids.length; i += D1_MAX_BOUND_PARAMS) {
+    const batch = ids.slice(i, i + D1_MAX_BOUND_PARAMS);
+    try {
+      await env.VECTORIZE.deleteByIds(batch);
+      deleted += batch.length;
+    } catch (error) {
+      const queued = await enqueueVectorCleanup(env, ids.slice(i), reason, error);
+      return { deleted, queued };
+    }
+  }
+  return { deleted, queued: 0 };
+}
+
+async function processVectorCleanupQueue(
+  env: Env,
+  limit = 100
+): Promise<{ attempted: number; deleted: number; failed: number }> {
+  const { results } = await env.DB.prepare(
+    `SELECT vector_id, attempts
+     FROM sb_vector_cleanup_queue
+     ORDER BY created_at ASC
+     LIMIT ?`
+  ).bind(Math.max(1, Math.min(limit, 500))).all<{ vector_id: string; attempts: number }>();
+  const rows = results ?? [];
+  if (!rows.length) return { attempted: 0, deleted: 0, failed: 0 };
+
+  let deleted = 0;
+  let failed = 0;
+  for (let i = 0; i < rows.length; i += D1_MAX_BOUND_PARAMS) {
+    const batch = rows.slice(i, i + D1_MAX_BOUND_PARAMS);
+    const ids = batch.map(row => row.vector_id).filter(Boolean);
+    if (!ids.length) continue;
+    try {
+      await env.VECTORIZE.deleteByIds(ids);
+      const placeholders = ids.map(() => "?").join(", ");
+      const result = await env.DB.prepare(
+        `DELETE FROM sb_vector_cleanup_queue WHERE vector_id IN (${placeholders})`
+      ).bind(...ids).run();
+      deleted += Number(result.meta?.changes ?? ids.length);
+    } catch (error) {
+      failed += ids.length;
+      const message = error instanceof Error
+        ? error.message.slice(0, 500)
+        : String(error).slice(0, 500);
+      const now = Date.now();
+      await env.DB.batch(ids.map(id =>
+        env.DB.prepare(
+          `UPDATE sb_vector_cleanup_queue
+           SET attempts = attempts + 1,
+               last_error = ?,
+               updated_at = ?
+           WHERE vector_id = ?`
+        ).bind(message, now, id)
+      ));
+    }
+  }
+
+  return { attempted: rows.length, deleted, failed };
+}
+
+async function activatePendingVectorsAndSettings(
+  env: Env,
+  pendingFingerprint: string,
+  promotedSettings: ReturnType<typeof promoteEmbeddingFingerprint>
+): Promise<number> {
+  await ensureSettingsTable(env.DB);
+  const settingsToSave = {
+    ...promotedSettings,
+    updatedAt: promotedSettings.updatedAt ?? Date.now(),
+  };
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE entries
+       SET vector_ids = pending_vector_ids,
+           embedding_fingerprint = pending_embedding_fingerprint,
+           pending_vector_ids = NULL,
+           pending_embedding_fingerprint = NULL,
+           pending_content_hash = NULL,
+           pending_revision_id = NULL
+       WHERE pending_embedding_fingerprint = ?
+         AND pending_vector_ids IS NOT NULL
+         AND pending_vector_ids != '[]'
+         AND pending_content_hash IS NOT NULL
+         AND pending_revision_id IS NOT NULL
+         AND content_hash = pending_content_hash`
+    ).bind(pendingFingerprint),
+    prepareStoredModelSettingsSave(env.DB, settingsToSave),
+  ]);
+  setStoredModelSettingsCache(settingsToSave);
+  return Number(results[0]?.meta?.changes ?? 0);
+}
+
+async function countPendingRebuildRows(
+  env: Env,
+  pendingFingerprint: string
+): Promise<number> {
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) as count FROM entries
+     WHERE pending_embedding_fingerprint = ?
+       AND pending_vector_ids IS NOT NULL`
+  ).bind(pendingFingerprint).first() as Record<string, any> | null;
+  return Number(row?.count ?? 0);
 }
 
 async function listPendingRebuildVectorIds(
@@ -2484,6 +2658,12 @@ async function runNightlyCompression(env: Env, ctx: ExecutionContext): Promise<v
 
 async function runScheduledMaintenance(env: Env, ctx: ExecutionContext): Promise<void> {
   await ensureDatabase(env);
+
+  try {
+    await processVectorCleanupQueue(env);
+  } catch (e) {
+    console.error("Vector cleanup queue maintenance failed (non-fatal):", e);
+  }
 
   // Drain due classification work (pending + retryable after backoff + stale version).
   // Without this, retryable_error rows only move if something calls POST /classify-pending.
@@ -6267,6 +6447,8 @@ const defaultHandler = {
       let activated = 0;
       let activationBlocked = 0;
       let activationIntegrity: PendingActivationIntegrity | null = null;
+      let staleVectorsDeleted = 0;
+      let staleVectorsQueued = 0;
 
       // Promote pending embedding fingerprint when full reindex completes cleanly
       if (remainingN === 0 && failed === 0) {
@@ -6279,8 +6461,23 @@ const defaultHandler = {
             );
             activationBlocked = activationIntegrity.blocked;
             if (activationBlocked === 0) {
-              activated = await activatePendingVectors(env, stored.pendingEmbeddingFingerprint);
-              await saveStoredModelSettings(env.DB, promoteEmbeddingFingerprint(stored));
+              const activationRows = await listPendingActivationRows(
+                env,
+                stored.pendingEmbeddingFingerprint
+              );
+              const staleVectorIds = staleVectorIdsAfterActivation(activationRows);
+              activated = await activatePendingVectorsAndSettings(
+                env,
+                stored.pendingEmbeddingFingerprint,
+                promoteEmbeddingFingerprint(stored)
+              );
+              const cleanup = await deleteVectorsOrQueue(
+                env,
+                staleVectorIds,
+                "blue_green_activation"
+              );
+              staleVectorsDeleted = cleanup.deleted;
+              staleVectorsQueued = cleanup.queued;
             }
           }
         } catch (e) {
@@ -6299,6 +6496,8 @@ const defaultHandler = {
         activated,
         activationBlocked,
         activationIntegrity: activationIntegrity ?? undefined,
+        staleVectorsDeleted,
+        staleVectorsQueued,
       });
     }
 
@@ -6766,11 +6965,62 @@ const defaultHandler = {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
 
+      let body: { cancelExisting?: boolean } = {};
+      try {
+        body = await request.json();
+      } catch {
+        /* empty body OK */
+      }
       const { effective, stored } = await getEffectiveModelSettings(env);
+      let cancelledExisting = false;
+      let cancelledEntriesCleared = 0;
+      let cancelledPendingVectorsDeleted = 0;
+      let cancelledPendingVectorsQueued = 0;
+
+      if (stored?.pendingEmbeddingFingerprint) {
+        const existingPendingFingerprint = stored.pendingEmbeddingFingerprint;
+        const pendingRows = await countPendingRebuildRows(env, existingPendingFingerprint);
+        if (pendingRows > 0) {
+          if (body.cancelExisting !== true) {
+            return json({
+              ok: false,
+              error: "rebuild_already_running",
+              pendingFingerprint: existingPendingFingerprint,
+              pendingRows,
+              next: "POST /settings/models/reindex with {\"cancelExisting\":true} to discard the pending rebuild and start a new one.",
+            }, 409);
+          }
+
+          const pendingVectorIds = await listPendingRebuildVectorIds(env, existingPendingFingerprint);
+          const cleanup = await deleteVectorsOrQueue(
+            env,
+            pendingVectorIds,
+            "cancel_existing_rebuild"
+          );
+          if (
+            pendingVectorIds.length > 0 &&
+            cleanup.deleted + cleanup.queued < pendingVectorIds.length
+          ) {
+            return json({
+              ok: false,
+              error: "pending_rebuild_cleanup_incomplete",
+              pendingFingerprint: existingPendingFingerprint,
+              pendingVectors: pendingVectorIds.length,
+              pendingVectorsDeleted: cleanup.deleted,
+              pendingVectorsQueued: cleanup.queued,
+            }, 500);
+          }
+          cancelledEntriesCleared = await clearPendingRebuildRows(env, existingPendingFingerprint);
+          cancelledPendingVectorsDeleted = cleanup.deleted;
+          cancelledPendingVectorsQueued = cleanup.queued;
+          cancelledExisting = true;
+        }
+      }
+
       const activeEmbedding = activeEmbeddingOf(effective);
       const pendingEmbedding = pendingEmbeddingOf(effective);
       const pending = embeddingFingerprintOf(pendingEmbedding);
-      const settingsForQueue = stored ?? mergeFromEnvOnly(env);
+      const settingsForQueue = structuredClone(stored ?? mergeFromEnvOnly(env));
       settingsForQueue.activeEmbedding = cloneEmbeddingSettings(activeEmbedding);
       settingsForQueue.embeddingFingerprint =
         effective.embeddingFingerprint ?? embeddingFingerprintOf(activeEmbedding);
@@ -6796,6 +7046,10 @@ const defaultHandler = {
         clearedVectors: 0,
         entriesReset: 0,
         entriesQueued: rows,
+        cancelledExisting,
+        cancelledEntriesCleared,
+        cancelledPendingVectorsDeleted,
+        cancelledPendingVectorsQueued,
         reindexRequired: true,
         pendingFingerprint: pending,
         next: "Loop POST /vectorize-pending {\"limit\":100,\"includeRecent\":true} until remaining=0. Active fingerprint promotes only when finished with failed=0.",

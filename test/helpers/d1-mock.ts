@@ -11,6 +11,8 @@ export class D1Mock {
   memoryEntities: any[] = [];
   entityRelations: any[] = [];
   factSources: any[] = [];
+  appSettings: Record<string, { value: string; updated_at: number }> = {};
+  vectorCleanupQueue: any[] = [];
   statementCount = 0;
   execCount = 0;
   beforeClassificationCommit?: (row: any) => boolean | void;
@@ -34,7 +36,50 @@ export class D1Mock {
     const makeStmt = (args: any[]) => ({
       async run() {
         db.statementCount += 1;
-        
+
+        if (s.startsWith("INSERT INTO sb_app_settings")) {
+          const [key, value, updated_at] = args;
+          db.appSettings[String(key)] = { value: String(value), updated_at: Number(updated_at) };
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("INSERT INTO sb_vector_cleanup_queue")) {
+          const [id, vector_id, reason, last_error, created_at, updated_at] = args;
+          const existing = db.vectorCleanupQueue.find((row: any) => row.vector_id === vector_id);
+          if (existing) {
+            existing.reason = reason;
+            existing.last_error = last_error ?? existing.last_error;
+            existing.updated_at = updated_at;
+          } else {
+            db.vectorCleanupQueue.push({
+              id,
+              vector_id,
+              reason,
+              attempts: 0,
+              last_error,
+              created_at,
+              updated_at,
+            });
+          }
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("UPDATE sb_vector_cleanup_queue SET attempts = attempts + 1")) {
+          const [last_error, updated_at, vector_id] = args;
+          const row = db.vectorCleanupQueue.find((item: any) => item.vector_id === vector_id);
+          if (row) {
+            row.attempts = Number(row.attempts ?? 0) + 1;
+            row.last_error = last_error;
+            row.updated_at = updated_at;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("DELETE FROM sb_vector_cleanup_queue WHERE vector_id IN")) {
+          const ids = new Set(args.map(String));
+          const before = db.vectorCleanupQueue.length;
+          db.vectorCleanupQueue = db.vectorCleanupQueue.filter(
+            (row: any) => !ids.has(String(row.vector_id))
+          );
+          return { meta: { changes: before - db.vectorCleanupQueue.length } };
+        }
         if (s.startsWith("INSERT INTO sb_observations")) {
           if (args.length >= 14) {
             const [
@@ -1066,6 +1111,10 @@ export class D1Mock {
       },
       async first() {
         db.statementCount += 1;
+        if (s.includes("SELECT value FROM sb_app_settings WHERE key = ?")) {
+          const row = db.appSettings[String(args[0])];
+          return row ? { value: row.value } : null;
+        }
         if (s.includes("SELECT vector_ids FROM entries WHERE id")) {
           const row = db.entries.find((e: any) => e.id === args[0]);
           return row ? { vector_ids: row.vector_ids } : null;
@@ -1410,6 +1459,18 @@ export class D1Mock {
       },
       async all() {
         db.statementCount += 1;
+        if (s.includes("SELECT vector_id, attempts") && s.includes("FROM sb_vector_cleanup_queue")) {
+          const limit = Number(args[0] ?? 100);
+          return {
+            results: [...db.vectorCleanupQueue]
+              .sort((a: any, b: any) => Number(a.created_at ?? 0) - Number(b.created_at ?? 0))
+              .slice(0, limit)
+              .map((row: any) => ({
+                vector_id: row.vector_id,
+                attempts: row.attempts ?? 0,
+              })),
+          };
+        }
         if (s === "PRAGMA table_info(sb_observations)") {
           return {
             results: [
@@ -1730,6 +1791,27 @@ export class D1Mock {
           return { results: rows };
         }
         if (
+          s.includes("SELECT id, vector_ids, pending_vector_ids") &&
+          s.includes("pending_embedding_fingerprint = ?")
+        ) {
+          const pendingFingerprint = String(args[0]);
+          const results = db.entries
+            .filter((e: any) =>
+              e.pending_embedding_fingerprint === pendingFingerprint &&
+              e.pending_vector_ids != null &&
+              e.pending_vector_ids !== "[]" &&
+              e.pending_content_hash != null &&
+              e.pending_revision_id != null &&
+              e.content_hash === e.pending_content_hash
+            )
+            .map((e: any) => ({
+              id: e.id,
+              vector_ids: e.vector_ids,
+              pending_vector_ids: e.pending_vector_ids,
+            }));
+          return { results };
+        }
+        if (
           s.includes("SELECT pending_vector_ids FROM entries") &&
           s.includes("pending_embedding_fingerprint = ?") &&
           s.includes("pending_vector_ids IS NOT NULL")
@@ -2027,5 +2109,7 @@ export class D1Mock {
     this.memoryEntities = [];
     this.entityRelations = [];
     this.factSources = [];
+    this.appSettings = {};
+    this.vectorCleanupQueue = [];
   }
 }

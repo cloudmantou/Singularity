@@ -248,12 +248,42 @@ describe("POST /vectorize-pending", () => {
     expect(data.failed).toBe(0);
     expect(data.remaining).toBe(0);
     expect(data.activated).toBe(1);
+    expect(data.staleVectorsDeleted).toBe(1);
+    expect(data.staleVectorsQueued).toBe(0);
+    expect(env.VECTORIZE.deleteByIds).toHaveBeenCalledWith(["active-old"]);
     expect(activeIds).toHaveLength(1);
     expect(activeIds[0]).not.toBe("active-old");
     expect(db.entries[0].pending_vector_ids).toBeNull();
     expect(db.entries[0].pending_embedding_fingerprint).toBeNull();
     expect(db.entries[0].pending_revision_id).toBeNull();
     expect(db.entries[0].embedding_fingerprint).toBe(reindexData.pendingFingerprint);
+  });
+
+  it("queues stale active vectors when post-activation deletion fails", async () => {
+    const deleteByIds = vi.fn().mockRejectedValue(new Error("vector delete unavailable"));
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({ deleteByIds }),
+    });
+    db.entries.push({
+      ...pastGraceEntry("active"),
+      vector_ids: '["active-old"]',
+    });
+
+    await worker.fetch(req("POST", "/settings/models/reindex"), env, ctx);
+    const res = await worker.fetch(req("POST", "/vectorize-pending"), env, ctx);
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.activated).toBe(1);
+    expect(data.staleVectorsDeleted).toBe(0);
+    expect(data.staleVectorsQueued).toBe(1);
+    expect(db.entries[0].vector_ids).not.toBe('["active-old"]');
+    expect(db.vectorCleanupQueue).toHaveLength(1);
+    expect(db.vectorCleanupQueue[0]).toMatchObject({
+      vector_id: "active-old",
+      reason: "blue_green_activation",
+      attempts: 0,
+    });
   });
 
   it("batches pending blue-green rebuild embeddings across entries", async () => {
@@ -358,6 +388,83 @@ describe("POST /vectorize-pending", () => {
     expect(old.pending_vector_ids).not.toBeNull();
     expect(recent.vector_ids).toBe('["recent-active"]');
     expect(recent.pending_vector_ids).not.toBeNull();
+  });
+
+  it("rejects starting a second rebuild while pending vectors are still referenced", async () => {
+    db.entries.push(
+      {
+        ...pastGraceEntry("old"),
+        vector_ids: '["old-active"]',
+      },
+      {
+        id: "recent",
+        content: "Recent memory",
+        tags: "[]",
+        source: "api",
+        created_at: Date.now(),
+        vector_ids: '["recent-active"]',
+        recall_count: 0,
+        importance_score: 0,
+      }
+    );
+
+    const first = await worker.fetch(req("POST", "/settings/models/reindex"), env, ctx);
+    const firstData = await first.json() as any;
+    await worker.fetch(req("POST", "/vectorize-pending"), env, ctx);
+
+    const res = await worker.fetch(req("POST", "/settings/models/reindex"), env, ctx);
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(409);
+    expect(data.error).toBe("rebuild_already_running");
+    expect(data.pendingFingerprint).toBe(firstData.pendingFingerprint);
+    expect(data.pendingRows).toBe(2);
+  });
+
+  it("can explicitly cancel an existing pending rebuild before starting a new one", async () => {
+    const deleteByIds = vi.fn().mockResolvedValue({ mutationId: "delete" });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({ deleteByIds }),
+    });
+    db.entries.push(
+      {
+        ...pastGraceEntry("old"),
+        vector_ids: '["old-active"]',
+      },
+      {
+        id: "recent",
+        content: "Recent memory",
+        tags: "[]",
+        source: "api",
+        created_at: Date.now(),
+        vector_ids: '["recent-active"]',
+        recall_count: 0,
+        importance_score: 0,
+      }
+    );
+
+    await worker.fetch(req("POST", "/settings/models/reindex"), env, ctx);
+    await worker.fetch(req("POST", "/vectorize-pending"), env, ctx);
+    const oldPendingIds = JSON.parse(
+      db.entries.find((entry: any) => entry.id === "old").pending_vector_ids
+    );
+
+    const res = await worker.fetch(
+      req("POST", "/settings/models/reindex", { body: { cancelExisting: true } }),
+      env,
+      ctx
+    );
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.cancelledExisting).toBe(true);
+    expect(data.cancelledEntriesCleared).toBe(2);
+    expect(data.cancelledPendingVectorsDeleted).toBe(oldPendingIds.length);
+    expect(data.cancelledPendingVectorsQueued).toBe(0);
+    expect(data.entriesQueued).toBe(2);
+    expect(deleteByIds).toHaveBeenCalledWith(oldPendingIds);
+    expect(db.entries.every((entry: any) => entry.pending_vector_ids === "[]")).toBe(true);
+    expect(db.entries.every((entry: any) => entry.pending_revision_id == null)).toBe(true);
   });
 
   it("cancels a pending blue-green rebuild and deletes prepared pending vectors", async () => {
