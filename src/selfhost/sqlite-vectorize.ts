@@ -59,7 +59,7 @@ interface SqliteVectorizeQueryOptions {
   returnMetadata?: boolean | "none" | "indexed" | "all";
   returnValues?: boolean;
   filter?: Record<string, unknown>;
-  /** Self-host extension: lexical candidate prefilter before vector ranking. */
+  /** Deprecated self-host extension. Lexical recall is exposed through queryLexical(). */
   queryText?: string;
 }
 
@@ -122,10 +122,6 @@ function vecTableName(dim: number): string {
 function similarityFromCosineDistance(distance: number): number {
   if (!Number.isFinite(distance)) return 0;
   return Math.max(-1, Math.min(1, 1 - distance));
-}
-
-function rrf(rank: number): number {
-  return 1 / (60 + rank + 1);
 }
 
 export class SqliteVectorizeIndex {
@@ -247,19 +243,15 @@ export class SqliteVectorizeIndex {
     options: SqliteVectorizeQueryOptions = {}
   ): Promise<VectorizeMatches> {
     const topK = options.topK ?? 10;
-    const vectorLimit = Math.max(topK * 20, 50);
-    const lexicalLimit = Math.max(topK * 20, 50);
-    const vectorScored =
-      this.queryVec0(vector, vectorLimit, Boolean(options.returnValues)) ??
-      this.scoreRows(this.selectAllRows(), vector, options.returnValues)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, vectorLimit);
-    const candidateIds = this.ftsCandidateIds(options.queryText, lexicalLimit);
-    const lexicalScored = candidateIds.length > 0
-      ? this.scoreRows(this.selectRowsByIds(candidateIds), vector, options.returnValues)
-          .sort((a, b) => b.score - a.score)
-      : [];
-    const scored = this.mergeVectorAndLexical(vectorScored, lexicalScored);
+    const scored =
+      options.filter
+        ? this.scoreRows(this.selectRowsForFilter(options.filter), vector, options.returnValues)
+        : (
+            this.queryVec0(vector, Math.max(topK, 50), Boolean(options.returnValues)) ??
+            this.scoreRows(this.selectAllRows(), vector, options.returnValues)
+          )
+            .sort((a, b) => b.score - a.score)
+            .slice(0, Math.max(topK, 50));
 
     scored.sort((a, b) => b.score - a.score);
     const matches = scored.slice(0, topK).map((m) => {
@@ -275,6 +267,10 @@ export class SqliteVectorizeIndex {
     });
 
     return { matches, count: matches.length } as VectorizeMatches;
+  }
+
+  queryLexical(queryText: string, topK = 10): string[] {
+    return this.ftsCandidateIds(queryText, Math.max(1, Math.min(topK, 500)));
   }
 
   async describe(): Promise<VectorizeIndexDetails> {
@@ -551,38 +547,6 @@ export class SqliteVectorizeIndex {
     });
   }
 
-  private mergeVectorAndLexical(
-    vectorRows: ScoredVector[],
-    lexicalRows: ScoredVector[]
-  ): ScoredVector[] {
-    const byId = new Map<string, ScoredVector & { vectorRank?: number; lexicalRank?: number }>();
-    vectorRows.forEach((row, index) => {
-      byId.set(row.id, { ...row, vectorRank: index });
-    });
-    lexicalRows.forEach((row, index) => {
-      const existing = byId.get(row.id);
-      if (existing) {
-        existing.score = Math.max(existing.score, row.score);
-        existing.lexicalRank = index;
-        if (!existing.values && row.values) existing.values = row.values;
-        existing.metadata = { ...row.metadata, ...existing.metadata };
-      } else {
-        byId.set(row.id, { ...row, lexicalRank: index });
-      }
-    });
-
-    return [...byId.values()].map((row) => {
-      const vectorBoost = row.vectorRank == null ? 0 : 0.04 * rrf(row.vectorRank);
-      const lexicalBoost = row.lexicalRank == null ? 0 : 0.02 * rrf(row.lexicalRank);
-      return {
-        id: row.id,
-        score: Math.max(-1, Math.min(1, row.score + vectorBoost + lexicalBoost)),
-        metadata: row.metadata,
-        values: row.values,
-      };
-    });
-  }
-
   private ftsCandidateIds(queryText: string | undefined, limit: number): string[] {
     if (!this.ftsAvailable) return [];
     if (this.ftsTokenizer === "trigram") {
@@ -625,6 +589,45 @@ export class SqliteVectorizeIndex {
       if (row) rows.push(row);
     }
     return rows;
+  }
+
+  private selectRowsForFilter(filter: Record<string, unknown> | undefined): VectorRow[] {
+    if (!filter || Object.keys(filter).length === 0) return this.selectAllRows();
+    const supported = new Set(["parentId", "source", "embedding_fingerprint", "tag"]);
+    for (const key of Object.keys(filter)) {
+      if (!supported.has(key)) throw new Error(`Unsupported local vector filter: ${key}`);
+    }
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    if (typeof filter.parentId === "string") {
+      clauses.push(`json_extract(metadata_json, '$.parentId') = ?`);
+      params.push(filter.parentId);
+    }
+    if (typeof filter.source === "string") {
+      clauses.push(`json_extract(metadata_json, '$.source') = ?`);
+      params.push(filter.source);
+    }
+    if (typeof filter.embedding_fingerprint === "string") {
+      clauses.push(`json_extract(metadata_json, '$.embedding_fingerprint') = ?`);
+      params.push(filter.embedding_fingerprint);
+    }
+    if (typeof filter.tag === "string") {
+      clauses.push(
+        `EXISTS (
+          SELECT 1
+          FROM json_each(json_extract(metadata_json, '$.tags'))
+          WHERE value = ?
+        )`
+      );
+      params.push(filter.tag);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    return this.db
+      .prepare(
+        `SELECT id, values_json, metadata_json, vec_rowid, vector_dim
+         FROM sb_vectors ${where}`
+      )
+      .all(...params) as VectorRow[];
   }
 
   private selectAllRows(): VectorRow[] {

@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS entries (
   pending_vector_ids TEXT,
   pending_embedding_fingerprint TEXT,
   pending_content_hash TEXT,
-  pending_revision_id TEXT
+  pending_revision_id TEXT,
+  pending_rebuild_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_entries_content_hash ON entries(content_hash);
@@ -35,18 +36,69 @@ CREATE INDEX IF NOT EXISTS idx_entries_classification_queue
   ON entries(classification_status, classification_next_attempt_at, created_at);
 CREATE INDEX IF NOT EXISTS idx_entries_pending_vectors
   ON entries(pending_embedding_fingerprint, pending_vector_ids, created_at);
+CREATE INDEX IF NOT EXISTS idx_entries_pending_rebuild
+  ON entries(pending_rebuild_id, pending_vector_ids, created_at);
+
+CREATE TABLE IF NOT EXISTS sb_vector_rebuilds (
+  id TEXT PRIMARY KEY,
+  slot TEXT NOT NULL UNIQUE DEFAULT 'current',
+  state TEXT NOT NULL,
+  active_fingerprint TEXT NOT NULL,
+  pending_fingerprint TEXT NOT NULL,
+  expected_entries INTEGER NOT NULL DEFAULT 0,
+  processed_entries INTEGER NOT NULL DEFAULT 0,
+  failed_entries INTEGER NOT NULL DEFAULT 0,
+  conflict_entries INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  CHECK (slot = 'current'),
+  CHECK (
+    state IN (
+      'queued',
+      'building',
+      'ready',
+      'activating',
+      'active',
+      'cancelling',
+      'cancelled',
+      'failed'
+    )
+  )
+);
 
 CREATE TABLE IF NOT EXISTS sb_vector_cleanup_queue (
   id TEXT PRIMARY KEY,
   vector_id TEXT NOT NULL UNIQUE,
   reason TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'ready',
   attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER,
+  rebuild_id TEXT,
   last_error TEXT,
   created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  CHECK (state IN ('ready', 'blocked', 'failed', 'completed'))
 );
 CREATE INDEX IF NOT EXISTS idx_sb_vector_cleanup_queue_created
   ON sb_vector_cleanup_queue(created_at);
+CREATE INDEX IF NOT EXISTS idx_vector_cleanup_due
+  ON sb_vector_cleanup_queue(state, next_attempt_at, created_at);
+
+CREATE TABLE IF NOT EXISTS sb_vector_cleanup_batches (
+  id TEXT PRIMARY KEY,
+  rebuild_id TEXT NOT NULL,
+  vector_ids_json TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'prepared',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  CHECK (state IN ('prepared', 'ready', 'processing', 'failed', 'completed', 'blocked'))
+);
+CREATE INDEX IF NOT EXISTS idx_vector_cleanup_batches_due
+  ON sb_vector_cleanup_batches(state, next_attempt_at, created_at);
 
 CREATE TABLE IF NOT EXISTS sb_memory_relations (
   id             TEXT PRIMARY KEY,

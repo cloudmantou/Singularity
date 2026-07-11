@@ -1,5 +1,14 @@
 import { COMPRESSION_IMPORTANCE_THRESHOLD, COMPRESSION_MIN_RECALL } from "../../src/index";
 
+function parseJsonArray(raw: unknown): string[] {
+  try {
+    const parsed = JSON.parse(String(raw ?? "[]"));
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
 export class D1Mock {
   entries: any[] = [];
   relations: any[] = [];
@@ -12,7 +21,9 @@ export class D1Mock {
   entityRelations: any[] = [];
   factSources: any[] = [];
   appSettings: Record<string, { value: string; updated_at: number }> = {};
+  vectorRebuilds: any[] = [];
   vectorCleanupQueue: any[] = [];
+  vectorCleanupBatches: any[] = [];
   statementCount = 0;
   execCount = 0;
   beforeClassificationCommit?: (row: any) => boolean | void;
@@ -42,11 +53,180 @@ export class D1Mock {
           db.appSettings[String(key)] = { value: String(value), updated_at: Number(updated_at) };
           return { meta: { changes: 1 } };
         }
+        if (s.startsWith("UPDATE sb_app_settings SET value = ?")) {
+          const [value, updated_at, rebuild_id] = args;
+          const rebuild = db.vectorRebuilds.find(
+            (row: any) => row.id === rebuild_id && row.state === "activating"
+          );
+          if (!rebuild) return { meta: { changes: 0 } };
+          db.appSettings.model_settings = { value: String(value), updated_at: Number(updated_at) };
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("INSERT INTO sb_vector_rebuilds")) {
+          const [id, active_fingerprint, pending_fingerprint, created_at, updated_at] = args;
+          const expected_entries = db.entries.filter(
+            (entry: any) => !String(entry.tags ?? "[]").includes('"status:deprecated"')
+          ).length;
+          const existing = db.vectorRebuilds.find((row: any) => row.slot === "current");
+          const next = {
+            id,
+            slot: "current",
+            state: "queued",
+            active_fingerprint,
+            pending_fingerprint,
+            expected_entries,
+            processed_entries: 0,
+            failed_entries: 0,
+            conflict_entries: 0,
+            last_error: null,
+            created_at,
+            updated_at,
+          };
+          if (existing) Object.assign(existing, next);
+          else db.vectorRebuilds.push(next);
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("UPDATE sb_vector_rebuilds SET state = 'cancelling'")) {
+          const [updated_at, id] = args;
+          const row = db.vectorRebuilds.find((item: any) =>
+            item.id === id && !["active", "cancelled", "failed"].includes(item.state)
+          );
+          if (row) {
+            row.state = "cancelling";
+            row.updated_at = updated_at;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE sb_vector_rebuilds SET state = 'cancelled'")) {
+          const [updated_at, id] = args;
+          const row = db.vectorRebuilds.find((item: any) =>
+            item.id === id && item.state === "cancelling"
+          );
+          if (row) {
+            row.state = "cancelled";
+            row.updated_at = updated_at;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE sb_vector_rebuilds SET state = ?,")) {
+          const [state, rebuild_id, updated_at, id] = args;
+          const row = db.vectorRebuilds.find((item: any) =>
+            item.id === id && ["queued", "building", "ready"].includes(item.state)
+          );
+          if (row) {
+            row.state = state;
+            row.processed_entries = db.entries.filter((entry: any) =>
+              entry.pending_rebuild_id === rebuild_id &&
+              entry.pending_vector_ids != null &&
+              entry.pending_vector_ids !== "[]"
+            ).length;
+            row.updated_at = updated_at;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE sb_vector_rebuilds SET state = 'activating'")) {
+          const [updated_at, id, count_rebuild_id, conflict_rebuild_id] = args;
+          const row = db.vectorRebuilds.find((item: any) =>
+            item.id === id && ["queued", "building", "ready"].includes(item.state)
+          );
+          if (!row) return { meta: { changes: 0 } };
+          const scoped = db.entries.filter((entry: any) => entry.pending_rebuild_id === count_rebuild_id);
+          const hasConflict = db.entries.some((entry: any) =>
+            entry.pending_rebuild_id === conflict_rebuild_id &&
+            (
+              entry.pending_vector_ids == null ||
+              entry.pending_vector_ids === "[]" ||
+              entry.pending_content_hash == null ||
+              entry.content_hash == null ||
+              entry.pending_revision_id == null ||
+              entry.pending_content_hash !== entry.content_hash
+            )
+          );
+          if (scoped.length !== Number(row.expected_entries ?? 0) || hasConflict) {
+            return { meta: { changes: 0 } };
+          }
+          row.state = "activating";
+          row.conflict_entries = 0;
+          row.last_error = null;
+          row.updated_at = updated_at;
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("UPDATE sb_vector_rebuilds SET state = 'active'")) {
+          const [updated_at, id] = args;
+          const row = db.vectorRebuilds.find((item: any) =>
+            item.id === id && item.state === "activating"
+          );
+          if (row) {
+            row.state = "active";
+            row.updated_at = updated_at;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("INSERT INTO sb_vector_cleanup_batches")) {
+          const [id, rebuild_id, vector_ids_json, state, created_at, updated_at] = args;
+          db.vectorCleanupBatches.push({
+            id,
+            rebuild_id,
+            vector_ids_json,
+            state,
+            attempts: 0,
+            next_attempt_at: null,
+            last_error: null,
+            created_at,
+            updated_at,
+          });
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("UPDATE sb_vector_cleanup_batches SET state = 'ready'")) {
+          const [updated_at, rebuild_id] = args;
+          let changes = 0;
+          for (const row of db.vectorCleanupBatches) {
+            if (row.rebuild_id === rebuild_id && row.state === "prepared") {
+              row.state = "ready";
+              row.updated_at = updated_at;
+              changes++;
+            }
+          }
+          return { meta: { changes } };
+        }
+        if (s.startsWith("UPDATE sb_vector_cleanup_batches SET state = 'completed'")) {
+          const [updated_at, id] = args;
+          const row = db.vectorCleanupBatches.find((item: any) => item.id === id);
+          if (row) {
+            row.state = "completed";
+            row.updated_at = updated_at;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE sb_vector_cleanup_batches SET state = 'blocked'")) {
+          const [last_error, updated_at, id] = args;
+          const row = db.vectorCleanupBatches.find((item: any) => item.id === id);
+          if (row) {
+            row.state = "blocked";
+            row.last_error = last_error;
+            row.updated_at = updated_at;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE sb_vector_cleanup_batches SET attempts = attempts + 1")) {
+          const [state, next_attempt_at, last_error, updated_at, id] = args;
+          const row = db.vectorCleanupBatches.find((item: any) => item.id === id);
+          if (row) {
+            row.attempts = Number(row.attempts ?? 0) + 1;
+            row.state = state;
+            row.next_attempt_at = next_attempt_at;
+            row.last_error = last_error;
+            row.updated_at = updated_at;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
         if (s.startsWith("INSERT INTO sb_vector_cleanup_queue")) {
-          const [id, vector_id, reason, last_error, created_at, updated_at] = args;
+          const [id, vector_id, reason, state, rebuild_id, last_error, created_at, updated_at] = args;
           const existing = db.vectorCleanupQueue.find((row: any) => row.vector_id === vector_id);
           if (existing) {
             existing.reason = reason;
+            existing.state = state;
+            existing.rebuild_id = rebuild_id ?? existing.rebuild_id;
             existing.last_error = last_error ?? existing.last_error;
             existing.updated_at = updated_at;
           } else {
@@ -54,7 +234,10 @@ export class D1Mock {
               id,
               vector_id,
               reason,
+              state,
               attempts: 0,
+              next_attempt_at: null,
+              rebuild_id,
               last_error,
               created_at,
               updated_at,
@@ -63,10 +246,22 @@ export class D1Mock {
           return { meta: { changes: 1 } };
         }
         if (s.startsWith("UPDATE sb_vector_cleanup_queue SET attempts = attempts + 1")) {
-          const [last_error, updated_at, vector_id] = args;
+          const [state, next_attempt_at, last_error, updated_at, vector_id] = args;
           const row = db.vectorCleanupQueue.find((item: any) => item.vector_id === vector_id);
           if (row) {
             row.attempts = Number(row.attempts ?? 0) + 1;
+            row.state = state;
+            row.next_attempt_at = next_attempt_at;
+            row.last_error = last_error;
+            row.updated_at = updated_at;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE sb_vector_cleanup_queue SET state = 'blocked'")) {
+          const [last_error, updated_at, vector_id] = args;
+          const row = db.vectorCleanupQueue.find((item: any) => item.vector_id === vector_id);
+          if (row) {
+            row.state = "blocked";
             row.last_error = last_error;
             row.updated_at = updated_at;
           }
@@ -723,7 +918,7 @@ export class D1Mock {
           return { meta: { changes: row ? 1 : 0 } };
         }
         if (s.startsWith("UPDATE entries SET pending_vector_ids = '[]'")) {
-          const [pending_embedding_fingerprint] = args;
+          const [pending_embedding_fingerprint, pending_rebuild_id] = args;
           let changes = 0;
           for (const row of db.entries) {
             if (String(row.tags ?? "[]").includes('"status:deprecated"')) continue;
@@ -731,6 +926,7 @@ export class D1Mock {
             row.pending_embedding_fingerprint = pending_embedding_fingerprint;
             row.pending_content_hash = null;
             row.pending_revision_id = null;
+            row.pending_rebuild_id = pending_rebuild_id;
             changes++;
           }
           return { meta: { changes } };
@@ -745,16 +941,21 @@ export class D1Mock {
             id,
             expected_pending_vector_ids,
             expected_pending_embedding_fingerprint,
-            expected_content,
+            maybe_expected_pending_rebuild_id,
+            maybe_expected_content,
           ] = args;
           const hasPendingRevisionId = s.includes("pending_revision_id = ?");
           const pending_revision_id = hasPendingRevisionId ? maybe_pending_revision_id : null;
           const content_hash = hasPendingRevisionId ? maybe_content_hash : maybe_pending_revision_id;
+          const hasPendingRebuildId = s.includes("pending_rebuild_id = ?");
+          const expected_pending_rebuild_id = hasPendingRebuildId ? maybe_expected_pending_rebuild_id : undefined;
+          const expected_content = hasPendingRebuildId ? maybe_expected_content : maybe_expected_pending_rebuild_id;
           const row = db.entries.find(
             (e: any) =>
               e.id === id &&
               e.pending_vector_ids === expected_pending_vector_ids &&
               e.pending_embedding_fingerprint === expected_pending_embedding_fingerprint &&
+              (!hasPendingRebuildId || e.pending_rebuild_id === expected_pending_rebuild_id) &&
               e.content === expected_content &&
               !String(e.tags ?? "[]").includes('"status:deprecated"')
           );
@@ -776,16 +977,21 @@ export class D1Mock {
             row.pending_embedding_fingerprint = null;
             row.pending_content_hash = null;
             row.pending_revision_id = null;
+            row.pending_rebuild_id = null;
             changes++;
           }
           return { meta: { changes } };
         }
         if (s.startsWith("UPDATE entries SET vector_ids = pending_vector_ids")) {
-          const [pending_embedding_fingerprint] = args;
+          const [pending_rebuild_id, state_rebuild_id] = args;
+          const rebuild = db.vectorRebuilds.find(
+            (item: any) => item.id === state_rebuild_id && item.state === "activating"
+          );
+          if (!rebuild) return { meta: { changes: 0 } };
           let changes = 0;
           for (const row of db.entries) {
             if (
-              row.pending_embedding_fingerprint === pending_embedding_fingerprint &&
+              row.pending_rebuild_id === pending_rebuild_id &&
               row.pending_vector_ids != null &&
               row.pending_vector_ids !== "[]" &&
               row.pending_content_hash != null &&
@@ -798,6 +1004,7 @@ export class D1Mock {
               row.pending_embedding_fingerprint = null;
               row.pending_content_hash = null;
               row.pending_revision_id = null;
+              row.pending_rebuild_id = null;
               changes++;
             }
           }
@@ -1111,6 +1318,23 @@ export class D1Mock {
       },
       async first() {
         db.statementCount += 1;
+        if (s.includes("SELECT id, state, active_fingerprint") && s.includes("FROM sb_vector_rebuilds")) {
+          const pendingFingerprint = args.length ? String(args[0]) : null;
+          const row = db.vectorRebuilds.find((item: any) =>
+            item.slot === "current" &&
+            !["active", "cancelled", "failed"].includes(item.state) &&
+            (!pendingFingerprint || item.pending_fingerprint === pendingFingerprint)
+          );
+          return row ? { ...row } : null;
+        }
+        if (s.includes("SELECT 1 as referenced") && s.includes("json_each")) {
+          const [activeId, pendingId] = args.map(String);
+          const referenced = db.entries.some((entry: any) =>
+            parseJsonArray(entry.vector_ids).includes(activeId) ||
+            parseJsonArray(entry.pending_vector_ids).includes(pendingId)
+          );
+          return referenced ? { referenced: 1 } : null;
+        }
         if (s.includes("SELECT value FROM sb_app_settings WHERE key = ?")) {
           const row = db.appSettings[String(args[0])];
           return row ? { value: row.value } : null;
@@ -1138,8 +1362,10 @@ export class D1Mock {
         }
         if (s.includes("COUNT(*) as count") && s.includes("pending_embedding_fingerprint = ?") && s.includes("pending_content_hash != content_hash")) {
           const pendingFingerprint = String(args[0]);
+          const rebuildId = s.includes("pending_rebuild_id = ?") ? String(args[1]) : null;
           const count = db.entries.filter((e: any) =>
             e.pending_embedding_fingerprint === pendingFingerprint &&
+            (!rebuildId || e.pending_rebuild_id === rebuildId) &&
             e.pending_vector_ids != null &&
             e.pending_vector_ids !== "[]" &&
             (
@@ -1153,8 +1379,10 @@ export class D1Mock {
         }
         if (s.includes("COUNT(*) as count") && s.includes("pending_embedding_fingerprint = ?") && s.includes("content_hash = pending_content_hash")) {
           const pendingFingerprint = String(args[0]);
+          const rebuildId = s.includes("pending_rebuild_id = ?") ? String(args[1]) : null;
           const count = db.entries.filter((e: any) =>
             e.pending_embedding_fingerprint === pendingFingerprint &&
+            (!rebuildId || e.pending_rebuild_id === rebuildId) &&
             e.pending_vector_ids != null &&
             e.pending_vector_ids !== "[]" &&
             e.pending_content_hash != null &&
@@ -1173,10 +1401,13 @@ export class D1Mock {
         }
         if (s.includes("COUNT(*) as count") && s.includes("pending_vector_ids = '[]'") && s.includes("pending_embedding_fingerprint = ?")) {
           const pendingFingerprint = String(args[0]);
-          const cutoff = s.includes("created_at <") ? Number(args[1]) : null;
+          const hasRebuildId = s.includes("pending_rebuild_id = ?");
+          const rebuildId = hasRebuildId ? String(args[1]) : null;
+          const cutoff = s.includes("created_at <") ? Number(hasRebuildId ? args[2] : args[1]) : null;
           const count = db.entries.filter((e: any) =>
             e.pending_vector_ids === '[]' &&
             e.pending_embedding_fingerprint === pendingFingerprint &&
+            (!rebuildId || e.pending_rebuild_id === rebuildId) &&
             (cutoff == null || e.created_at < cutoff) &&
             (!s.includes("tags NOT LIKE") || !String(e.tags ?? "[]").includes('"status:deprecated"'))
           ).length;
@@ -1459,10 +1690,65 @@ export class D1Mock {
       },
       async all() {
         db.statementCount += 1;
+        if (s.includes("SELECT id, vector_ids, pending_vector_ids") && s.includes("pending_rebuild_id = ?")) {
+          const pendingFingerprint = String(args[0]);
+          const rebuildId = String(args[1]);
+          const results = db.entries
+            .filter((e: any) =>
+              e.pending_embedding_fingerprint === pendingFingerprint &&
+              e.pending_rebuild_id === rebuildId &&
+              e.pending_vector_ids != null &&
+              e.pending_vector_ids !== "[]" &&
+              e.pending_content_hash != null &&
+              e.pending_revision_id != null &&
+              e.content_hash === e.pending_content_hash
+            )
+            .map((e: any) => ({
+              id: e.id,
+              vector_ids: e.vector_ids,
+              pending_vector_ids: e.pending_vector_ids,
+            }));
+          return { results };
+        }
+        if (s.includes("SELECT id, vector_ids, pending_vector_ids") && s.includes("pending_embedding_fingerprint = ?")) {
+          const pendingFingerprint = String(args[0]);
+          const results = db.entries
+            .filter((e: any) =>
+              e.pending_embedding_fingerprint === pendingFingerprint &&
+              e.pending_vector_ids != null &&
+              e.pending_vector_ids !== "[]" &&
+              e.pending_content_hash != null &&
+              e.pending_revision_id != null &&
+              e.content_hash === e.pending_content_hash
+            )
+            .map((e: any) => ({
+              id: e.id,
+              vector_ids: e.vector_ids,
+              pending_vector_ids: e.pending_vector_ids,
+            }));
+          return { results };
+        }
+        if (s.includes("SELECT id, vector_ids_json, attempts") && s.includes("FROM sb_vector_cleanup_batches")) {
+          const now = Number(args[0] ?? Date.now());
+          const limit = Number(args[1] ?? 100);
+          return {
+            results: [...db.vectorCleanupBatches]
+              .filter((row: any) => row.state === "ready" && Number(row.next_attempt_at ?? 0) <= now)
+              .sort((a: any, b: any) => Number(a.created_at ?? 0) - Number(b.created_at ?? 0))
+              .slice(0, limit)
+              .map((row: any) => ({
+                id: row.id,
+                vector_ids_json: row.vector_ids_json,
+                attempts: row.attempts ?? 0,
+              })),
+          };
+        }
         if (s.includes("SELECT vector_id, attempts") && s.includes("FROM sb_vector_cleanup_queue")) {
-          const limit = Number(args[0] ?? 100);
+          const now = Number(args[0] ?? Date.now());
+          const limit = Number(args[1] ?? args[0] ?? 100);
           return {
             results: [...db.vectorCleanupQueue]
+              .filter((row: any) => (row.state ?? "ready") === "ready" && Number(row.next_attempt_at ?? 0) <= now)
               .sort((a: any, b: any) => Number(a.created_at ?? 0) - Number(b.created_at ?? 0))
               .slice(0, limit)
               .map((row: any) => ({
@@ -1769,12 +2055,15 @@ export class D1Mock {
           s.includes("ORDER BY created_at DESC LIMIT")
         ) {
           const pendingFingerprint = String(args[0]);
-          const cutoff = Number(args[1]);
+          const hasRebuildId = s.includes("pending_rebuild_id = ?");
+          const rebuildId = hasRebuildId ? String(args[1]) : null;
+          const cutoff = Number(hasRebuildId ? args[2] : args[1]);
           const limit = Number(args[args.length - 1]);
           const rows = [...db.entries]
             .filter((e: any) =>
               e.pending_vector_ids === "[]" &&
               e.pending_embedding_fingerprint === pendingFingerprint &&
+              (!rebuildId || e.pending_rebuild_id === rebuildId) &&
               e.created_at < cutoff &&
               (!s.includes("tags NOT LIKE") || !String(e.tags ?? "[]").includes('"status:deprecated"'))
             )
@@ -1787,6 +2076,7 @@ export class D1Mock {
               source: e.source,
               created_at: e.created_at,
               content_hash: e.content_hash ?? null,
+              pending_rebuild_id: e.pending_rebuild_id ?? null,
             }));
           return { results: rows };
         }
@@ -1817,9 +2107,11 @@ export class D1Mock {
           s.includes("pending_vector_ids IS NOT NULL")
         ) {
           const pendingFingerprint = String(args[0]);
+          const rebuildId = s.includes("pending_rebuild_id = ?") ? String(args[1]) : null;
           const results = db.entries
             .filter((e: any) =>
               e.pending_embedding_fingerprint === pendingFingerprint &&
+              (!rebuildId || e.pending_rebuild_id === rebuildId) &&
               e.pending_vector_ids != null &&
               e.pending_vector_ids !== "[]"
             )
@@ -2110,6 +2402,8 @@ export class D1Mock {
     this.entityRelations = [];
     this.factSources = [];
     this.appSettings = {};
+    this.vectorRebuilds = [];
     this.vectorCleanupQueue = [];
+    this.vectorCleanupBatches = [];
   }
 }

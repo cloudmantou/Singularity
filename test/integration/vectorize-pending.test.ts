@@ -248,19 +248,28 @@ describe("POST /vectorize-pending", () => {
     expect(data.failed).toBe(0);
     expect(data.remaining).toBe(0);
     expect(data.activated).toBe(1);
-    expect(data.staleVectorsDeleted).toBe(1);
+    expect(data.staleVectorsDeleted).toBe(0);
     expect(data.staleVectorsQueued).toBe(0);
-    expect(env.VECTORIZE.deleteByIds).toHaveBeenCalledWith(["active-old"]);
+    expect(data.cleanupBatchesPrepared).toBe(1);
+    expect(data.cleanupBatchesReady).toBe(1);
+    expect(env.VECTORIZE.deleteByIds).not.toHaveBeenCalled();
+    expect(db.vectorCleanupBatches).toHaveLength(1);
+    expect(db.vectorCleanupBatches[0]).toMatchObject({
+      rebuild_id: reindexData.rebuildId,
+      state: "ready",
+    });
+    expect(JSON.parse(db.vectorCleanupBatches[0].vector_ids_json)).toEqual(["active-old"]);
     expect(activeIds).toHaveLength(1);
     expect(activeIds[0]).not.toBe("active-old");
     expect(db.entries[0].pending_vector_ids).toBeNull();
     expect(db.entries[0].pending_embedding_fingerprint).toBeNull();
     expect(db.entries[0].pending_revision_id).toBeNull();
+    expect(db.entries[0].pending_rebuild_id).toBeNull();
     expect(db.entries[0].embedding_fingerprint).toBe(reindexData.pendingFingerprint);
   });
 
-  it("queues stale active vectors when post-activation deletion fails", async () => {
-    const deleteByIds = vi.fn().mockRejectedValue(new Error("vector delete unavailable"));
+  it("deletes ready stale active vector batches during scheduled cleanup", async () => {
+    const deleteByIds = vi.fn().mockResolvedValue({ mutationId: "delete" });
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({ deleteByIds }),
     });
@@ -276,14 +285,20 @@ describe("POST /vectorize-pending", () => {
     expect(res.status).toBe(200);
     expect(data.activated).toBe(1);
     expect(data.staleVectorsDeleted).toBe(0);
-    expect(data.staleVectorsQueued).toBe(1);
+    expect(data.staleVectorsQueued).toBe(0);
     expect(db.entries[0].vector_ids).not.toBe('["active-old"]');
-    expect(db.vectorCleanupQueue).toHaveLength(1);
-    expect(db.vectorCleanupQueue[0]).toMatchObject({
-      vector_id: "active-old",
-      reason: "blue_green_activation",
-      attempts: 0,
-    });
+    expect(db.vectorCleanupBatches).toHaveLength(1);
+    expect(db.vectorCleanupBatches[0].state).toBe("ready");
+    expect(deleteByIds).not.toHaveBeenCalled();
+
+    const pending: Promise<any>[] = [];
+    await (worker as any).scheduled({} as any, env, {
+      waitUntil: (promise: Promise<any>) => pending.push(promise),
+    } as any);
+    await Promise.all(pending);
+
+    expect(deleteByIds).toHaveBeenCalledWith(["active-old"]);
+    expect(db.vectorCleanupBatches[0].state).toBe("completed");
   });
 
   it("batches pending blue-green rebuild embeddings across entries", async () => {
@@ -459,15 +474,20 @@ describe("POST /vectorize-pending", () => {
     expect(res.status).toBe(200);
     expect(data.cancelledExisting).toBe(true);
     expect(data.cancelledEntriesCleared).toBe(2);
-    expect(data.cancelledPendingVectorsDeleted).toBe(oldPendingIds.length);
-    expect(data.cancelledPendingVectorsQueued).toBe(0);
+    expect(data.cancelledPendingVectorsDeleted).toBe(0);
+    expect(data.cancelledPendingVectorsQueued).toBe(oldPendingIds.length);
+    expect(data.cancelledCleanupBatchesPrepared).toBe(1);
     expect(data.entriesQueued).toBe(2);
-    expect(deleteByIds).toHaveBeenCalledWith(oldPendingIds);
+    expect(deleteByIds).not.toHaveBeenCalled();
+    expect(db.vectorCleanupBatches).toHaveLength(1);
+    expect(JSON.parse(db.vectorCleanupBatches[0].vector_ids_json)).toEqual(oldPendingIds);
+    expect(db.vectorCleanupBatches[0].state).toBe("ready");
     expect(db.entries.every((entry: any) => entry.pending_vector_ids === "[]")).toBe(true);
     expect(db.entries.every((entry: any) => entry.pending_revision_id == null)).toBe(true);
+    expect(db.entries.every((entry: any) => entry.pending_rebuild_id != null)).toBe(true);
   });
 
-  it("cancels a pending blue-green rebuild and deletes prepared pending vectors", async () => {
+  it("cancels a pending blue-green rebuild and prepares pending vectors for durable cleanup", async () => {
     const deleteByIds = vi.fn().mockResolvedValue({ mutationId: "delete" });
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({ deleteByIds }),
@@ -505,12 +525,18 @@ describe("POST /vectorize-pending", () => {
     expect(res.status).toBe(200);
     expect(data.ok).toBe(true);
     expect(data.cancelled).toBe(true);
-    expect(data.pendingVectorsDeleted).toBe(pendingIds.length);
+    expect(data.pendingVectorsDeleted).toBe(0);
+    expect(data.pendingVectorsQueued).toBe(pendingIds.length);
+    expect(data.cleanupBatchesPrepared).toBe(1);
     expect(data.entriesCleared).toBe(2);
-    expect(deleteByIds).toHaveBeenCalledWith(pendingIds);
+    expect(deleteByIds).not.toHaveBeenCalled();
+    expect(db.vectorCleanupBatches).toHaveLength(1);
+    expect(JSON.parse(db.vectorCleanupBatches[0].vector_ids_json)).toEqual(pendingIds);
+    expect(db.vectorCleanupBatches[0].state).toBe("ready");
     expect(db.entries.every((entry: any) => entry.pending_vector_ids == null)).toBe(true);
     expect(db.entries.every((entry: any) => entry.pending_embedding_fingerprint == null)).toBe(true);
     expect(db.entries.every((entry: any) => entry.pending_revision_id == null)).toBe(true);
+    expect(db.entries.every((entry: any) => entry.pending_rebuild_id == null)).toBe(true);
     expect(db.entries[0].vector_ids).toBe('["old-active"]');
     expect(db.entries[1].vector_ids).toBe('["recent-active"]');
   });

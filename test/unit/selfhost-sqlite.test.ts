@@ -172,6 +172,21 @@ describe("SqliteVectorizeIndex", () => {
     expect(after.matches.find((m) => m.id === "v1")).toBeUndefined();
   });
 
+  it("applies metadata filters before pure vector scoring", async () => {
+    await vec.insert([
+      { id: "keep-a", values: [1, 0], metadata: { parentId: "keep", source: "api" } },
+      { id: "drop-a", values: [0.99, 0.01], metadata: { parentId: "drop", source: "api" } },
+      { id: "keep-b", values: [0.8, 0.2], metadata: { parentId: "keep", source: "api" } },
+    ]);
+
+    const { matches } = await vec.query([1, 0], {
+      topK: 5,
+      filter: { parentId: "keep" },
+    } as any);
+
+    expect(matches.map((match) => match.id)).toEqual(["keep-a", "keep-b"]);
+  });
+
   it("mirrors vectors into sqlite-vec vec0 tables when the extension is available", async () => {
     await vec.insert([
       { id: "d2-a", values: [1, 0], metadata: { parentId: "p2a" } },
@@ -226,7 +241,7 @@ describe("SqliteVectorizeIndex", () => {
     expect(matches[0].id).toBe("json-only");
   });
 
-  it("uses queryText as an auxiliary FTS candidate source without gating semantic KNN", async () => {
+  it("keeps queryText out of vector KNN and exposes lexical recall separately", async () => {
     const ftsTable = raw.prepare(
       `SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name = 'sb_vector_fts'`
     ).get() as { name: string; sql: string } | undefined;
@@ -250,13 +265,18 @@ describe("SqliteVectorizeIndex", () => {
     ]);
 
     const { matches } = await vec.query([1, 0], {
-      topK: 2,
+      topK: 1,
       returnMetadata: "all",
       queryText: ftsTable.sql.includes("trigram") ? "lite vec" : "sqlite vector",
     } as any);
+    const lexicalIds = vec.queryLexical(
+      ftsTable.sql.includes("trigram") ? "lite vec" : "sqlite vector",
+      10
+    );
 
     expect(matches[0].id).toBe("semantic-only");
-    expect(matches.map((match) => match.id)).toContain("lexical-hit");
+    expect(matches.map((match) => match.id)).not.toContain("lexical-hit");
+    expect(lexicalIds).toContain("lexical-hit");
   });
 });
 
