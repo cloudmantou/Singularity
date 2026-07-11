@@ -1,6 +1,7 @@
 import { vi } from "vitest";
 import { D1Mock } from "./d1-mock";
 import type { Env } from "../../src/index";
+import { resetSettingsCache } from "../../src/settings/store";
 
 export function makeVectorizeMock(overrides: Partial<VectorizeIndex> = {}): VectorizeIndex {
   return {
@@ -16,9 +17,11 @@ export function makeVectorizeMock(overrides: Partial<VectorizeIndex> = {}): Vect
 
 export function makeAIMock(): Ai {
   return {
-    run: vi.fn().mockImplementation(async (model: string) => {
-      if (model === "@cf/baai/bge-small-en-v1.5")
-        return { data: [new Array(384).fill(0.1)] };
+    run: vi.fn().mockImplementation(async (model: string, payload?: Record<string, unknown>) => {
+      if (model === "@cf/baai/bge-small-en-v1.5") {
+        const texts = Array.isArray(payload?.text) ? payload.text : [payload?.text ?? ""];
+        return { data: texts.map((_, index) => new Array(384).fill(0.1 + index / 1000)) };
+      }
       return new ReadableStream({
         start(c) {
           c.enqueue(new TextEncoder().encode('data: {"response":"3"}\n\n'));
@@ -30,7 +33,10 @@ export function makeAIMock(): Ai {
   } as unknown as Ai;
 }
 
-export function makeTestDb() { return new D1Mock(); }
+export function makeTestDb() {
+  resetSettingsCache();
+  return new D1Mock();
+}
 
 export function makeKVMock(): KVNamespace {
   return {

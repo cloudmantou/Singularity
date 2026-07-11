@@ -156,19 +156,45 @@ describe("OpenAICompatibleEmbedding", () => {
   });
 
   it("returns data[0].embedding", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({
-        ok: true,
-        json: async () => ({ data: [{ embedding: [0.1, 0.2, 0.3] }] }),
-      })
-    );
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: [{ embedding: [0.1, 0.2, 0.3] }] }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
     const emb = new OpenAICompatibleEmbedding({
       baseURL: "https://api.openai.com/v1",
       apiKey: "sk",
       model: "text-embedding-3-small",
     });
     await expect(emb.embed("hello")).resolves.toEqual([0.1, 0.2, 0.3]);
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(init.body).input).toBe("hello");
+  });
+
+  it("embeds OpenAI-compatible batches with array input", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: [
+          { index: 1, embedding: [0.3, 0.4] },
+          { index: 0, embedding: [0.1, 0.2] },
+        ],
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const emb = new OpenAICompatibleEmbedding({
+      baseURL: "https://api.openai.com/v1",
+      apiKey: "sk",
+      model: "text-embedding-3-small",
+      dimensions: 2,
+    });
+
+    await expect(emb.embedMany(["first", "second"])).resolves.toEqual([
+      [0.1, 0.2],
+      [0.3, 0.4],
+    ]);
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(init.body).input).toEqual(["first", "second"]);
   });
 
   it("uses MiniMax native texts/type body and vectors[] response", async () => {

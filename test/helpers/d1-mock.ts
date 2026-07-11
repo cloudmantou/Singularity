@@ -543,6 +543,58 @@ export class D1Mock {
           if (row) row.vector_ids = vector_ids;
           return { meta: { changes: row ? 1 : 0 } };
         }
+        if (s.startsWith("UPDATE entries SET pending_vector_ids = '[]'")) {
+          const [pending_embedding_fingerprint] = args;
+          let changes = 0;
+          for (const row of db.entries) {
+            if (String(row.tags ?? "[]").includes('"status:deprecated"')) continue;
+            row.pending_vector_ids = "[]";
+            row.pending_embedding_fingerprint = pending_embedding_fingerprint;
+            changes++;
+          }
+          return { meta: { changes } };
+        }
+        if (s.startsWith("UPDATE entries SET pending_vector_ids = ?, pending_embedding_fingerprint = ?")) {
+          const [
+            pending_vector_ids,
+            pending_embedding_fingerprint,
+            id,
+            expected_pending_vector_ids,
+            expected_pending_embedding_fingerprint,
+            expected_content,
+          ] = args;
+          const row = db.entries.find(
+            (e: any) =>
+              e.id === id &&
+              e.pending_vector_ids === expected_pending_vector_ids &&
+              e.pending_embedding_fingerprint === expected_pending_embedding_fingerprint &&
+              e.content === expected_content &&
+              !String(e.tags ?? "[]").includes('"status:deprecated"')
+          );
+          if (row) {
+            row.pending_vector_ids = pending_vector_ids;
+            row.pending_embedding_fingerprint = pending_embedding_fingerprint;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE entries SET vector_ids = pending_vector_ids")) {
+          const [pending_embedding_fingerprint] = args;
+          let changes = 0;
+          for (const row of db.entries) {
+            if (
+              row.pending_embedding_fingerprint === pending_embedding_fingerprint &&
+              row.pending_vector_ids != null &&
+              row.pending_vector_ids !== "[]"
+            ) {
+              row.vector_ids = row.pending_vector_ids;
+              row.embedding_fingerprint = row.pending_embedding_fingerprint;
+              row.pending_vector_ids = null;
+              row.pending_embedding_fingerprint = null;
+              changes++;
+            }
+          }
+          return { meta: { changes } };
+        }
         if (s.startsWith("UPDATE entries SET vector_ids")) {
           const [vector_ids, id] = args;
           const row = db.entries.find((e: any) => e.id === id);
@@ -861,6 +913,25 @@ export class D1Mock {
             : 0;
           const unclassified = db.entries.filter((e: any) => e.classification_status !== "succeeded").length;
           return { count, avg_importance, unvectorized, unclassified };
+        }
+        if (s.includes("COUNT(*) as count") && s.includes("pending_embedding_fingerprint = ?") && s.includes("pending_vector_ids IS NOT NULL")) {
+          const pendingFingerprint = String(args[0]);
+          const count = db.entries.filter((e: any) =>
+            e.pending_embedding_fingerprint === pendingFingerprint &&
+            e.pending_vector_ids != null
+          ).length;
+          return { count };
+        }
+        if (s.includes("COUNT(*) as count") && s.includes("pending_vector_ids = '[]'") && s.includes("pending_embedding_fingerprint = ?")) {
+          const pendingFingerprint = String(args[0]);
+          const cutoff = s.includes("created_at <") ? Number(args[1]) : null;
+          const count = db.entries.filter((e: any) =>
+            e.pending_vector_ids === '[]' &&
+            e.pending_embedding_fingerprint === pendingFingerprint &&
+            (cutoff == null || e.created_at < cutoff) &&
+            (!s.includes("tags NOT LIKE") || !String(e.tags ?? "[]").includes('"status:deprecated"'))
+          ).length;
+          return { count };
         }
         if (s.includes("COUNT(*) as count") && s.includes("vector_ids = '[]'") && s.includes("created_at <")) {
           const cutoff = Number(args[0]);
@@ -1408,6 +1479,33 @@ export class D1Mock {
             .sort((a: any, b: any) => Number(a.created_at ?? 0) - Number(b.created_at ?? 0))
             .slice(0, limit);
           return { results };
+        }
+        if (
+          s.includes("FROM entries") &&
+          s.includes("pending_vector_ids = '[]'") &&
+          s.includes("pending_embedding_fingerprint = ?") &&
+          s.includes("ORDER BY created_at DESC LIMIT")
+        ) {
+          const pendingFingerprint = String(args[0]);
+          const cutoff = Number(args[1]);
+          const limit = Number(args[args.length - 1]);
+          const rows = [...db.entries]
+            .filter((e: any) =>
+              e.pending_vector_ids === "[]" &&
+              e.pending_embedding_fingerprint === pendingFingerprint &&
+              e.created_at < cutoff &&
+              (!s.includes("tags NOT LIKE") || !String(e.tags ?? "[]").includes('"status:deprecated"'))
+            )
+            .sort((a: any, b: any) => b.created_at - a.created_at || (b.id < a.id ? 1 : -1))
+            .slice(0, limit)
+            .map((e: any) => ({
+              id: e.id,
+              content: e.content,
+              tags: e.tags,
+              source: e.source,
+              created_at: e.created_at,
+            }));
+          return { results: rows };
         }
         // export (cursor + id) and vectorize-pending — avoid matching compress/list queries
         if (

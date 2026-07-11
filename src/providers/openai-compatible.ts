@@ -321,15 +321,7 @@ function isMiniMaxEmbeddingHost(baseURL: string): boolean {
   );
 }
 
-/**
- * Extract a single embedding vector from OpenAI-compatible or MiniMax-native responses.
- * OpenAI: { data: [{ embedding: number[] }] }
- * MiniMax: { vectors: number[][], base_resp: { status_code } }
- */
-export function extractEmbeddingVector(
-  json: Record<string, unknown>
-): number[] | null {
-  // MiniMax error envelope
+function assertMiniMaxEmbeddingOk(json: Record<string, unknown>): void {
   const baseResp = json.base_resp as
     | { status_code?: number; status_msg?: string }
     | undefined;
@@ -338,29 +330,61 @@ export function extractEmbeddingVector(
       `MiniMax embedding error ${baseResp.status_code}: ${baseResp.status_msg || "unknown"}`
     );
   }
+}
+
+function isNumberVector(value: unknown): value is number[] {
+  return Array.isArray(value) && value.every((x) => typeof x === "number");
+}
+
+/**
+ * Extract embedding vectors from OpenAI-compatible or MiniMax-native responses.
+ * OpenAI: { data: [{ embedding: number[], index?: number }] }
+ * MiniMax: { vectors: number[][], base_resp: { status_code } }
+ */
+export function extractEmbeddingVectors(
+  json: Record<string, unknown>
+): number[][] | null {
+  assertMiniMaxEmbeddingOk(json);
 
   // OpenAI / SiliconFlow / Zhipu
   const data = json.data;
-  if (Array.isArray(data) && data[0] && typeof data[0] === "object") {
-    const emb = (data[0] as { embedding?: unknown }).embedding;
-    if (Array.isArray(emb) && emb.every((x) => typeof x === "number")) {
-      return emb as number[];
+  if (Array.isArray(data) && data.length > 0) {
+    const rows = data
+      .filter((item): item is { embedding?: unknown; index?: number } =>
+        Boolean(item && typeof item === "object")
+      )
+      .map((item, fallbackIndex) => ({
+        index: typeof item.index === "number" ? item.index : fallbackIndex,
+        embedding: item.embedding,
+      }))
+      .filter((item): item is { index: number; embedding: number[] } =>
+        isNumberVector(item.embedding)
+      )
+      .sort((a, b) => a.index - b.index);
+    if (rows.length === data.length) {
+      return rows.map((row) => row.embedding);
     }
   }
 
   // MiniMax native: vectors: number[][]
   const vectors = json.vectors;
-  if (Array.isArray(vectors) && Array.isArray(vectors[0])) {
-    const emb = vectors[0] as unknown[];
-    if (emb.every((x) => typeof x === "number")) return emb as number[];
+  if (Array.isArray(vectors) && vectors.length > 0) {
+    const valid = vectors.filter(isNumberVector);
+    if (valid.length === vectors.length) return valid;
   }
 
   // Rare: top-level embedding
-  if (Array.isArray(json.embedding) && (json.embedding as unknown[]).every((x) => typeof x === "number")) {
-    return json.embedding as number[];
+  if (isNumberVector(json.embedding)) {
+    return [json.embedding];
   }
 
   return null;
+}
+
+export function extractEmbeddingVector(
+  json: Record<string, unknown>
+): number[] | null {
+  return extractEmbeddingVectors(json)?.[0] ?? null;
 }
 
 export class OpenAICompatibleEmbedding implements EmbeddingProvider {
@@ -381,17 +405,31 @@ export class OpenAICompatibleEmbedding implements EmbeddingProvider {
   }
 
   async embed(text: string, options: EmbedOptions = {}): Promise<number[]> {
+    const [embedding] = await this.requestEmbeddings([text], options, false);
+    return embedding;
+  }
+
+  async embedMany(texts: string[], options: EmbedOptions = {}): Promise<number[][]> {
+    return this.requestEmbeddings(texts, options, true);
+  }
+
+  private async requestEmbeddings(
+    texts: string[],
+    options: EmbedOptions,
+    batchInput: boolean
+  ): Promise<number[][]> {
+    if (!texts.length) return [];
     const started = Date.now();
     // MiniMax embo-01: texts + type (db|query), not OpenAI input
     const body: Record<string, unknown> = this.miniMax
       ? {
           model: this.model || "embo-01",
-          texts: [text],
+          texts,
           type: options.purpose === "query" ? "query" : "db",
         }
       : {
           model: this.model,
-          input: text,
+          input: batchInput ? texts : texts[0],
         };
     // Only OpenAI / some Qwen models support dimensions — SiliconFlow BGE rejects it.
     // MiniMax native API does not take dimensions.
@@ -422,19 +460,22 @@ export class OpenAICompatibleEmbedding implements EmbeddingProvider {
       const json = (await response.json()) as Record<string, unknown> & {
         usage?: { prompt_tokens?: number; total_tokens?: number };
       };
-      const embedding = extractEmbeddingVector(json);
-      if (!Array.isArray(embedding)) {
+      const embeddings = extractEmbeddingVectors(json);
+      if (!Array.isArray(embeddings) || embeddings.length !== texts.length) {
         const keys = Object.keys(json).slice(0, 12).join(",");
         throw new Error(
-          `Embedding response missing vector (expected data[0].embedding or vectors[0]; keys=${keys}). ` +
+          `Embedding response missing vector batch (expected data[].embedding or vectors[]; keys=${keys}). ` +
             (this.miniMax
               ? "MiniMax 需用原生格式 texts/type；若仍失败请改用硅基流动 BGE。"
               : "检查模型是否支持 /embeddings。")
         );
       }
-      if (this.dimensions != null && embedding.length !== this.dimensions) {
+      const mismatched = this.dimensions != null
+        ? embeddings.find((embedding) => embedding.length !== this.dimensions)
+        : undefined;
+      if (this.dimensions != null && mismatched) {
         throw new Error(
-          `Embedding dimension mismatch: expected ${this.dimensions}, got ${embedding.length}`
+          `Embedding dimension mismatch: expected ${this.dimensions}, got ${mismatched.length}`
         );
       }
       logModelCall({
@@ -445,9 +486,9 @@ export class OpenAICompatibleEmbedding implements EmbeddingProvider {
         status: "success",
         input_tokens: json.usage?.prompt_tokens ?? json.usage?.total_tokens ?? null,
         total_tokens: json.usage?.total_tokens ?? null,
-        input: text,
+        input: texts.join("\n---\n").slice(0, 2000),
       });
-      return embedding;
+      return embeddings;
     } catch (e) {
       logModelCall({
         call_type: "embedding",
@@ -455,7 +496,7 @@ export class OpenAICompatibleEmbedding implements EmbeddingProvider {
         model: this.model,
         duration_ms: Date.now() - started,
         status: "error",
-        input: text,
+        input: texts.join("\n---\n").slice(0, 2000),
         error_message: e instanceof Error ? e.message : String(e),
       });
       throw e;

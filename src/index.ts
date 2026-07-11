@@ -516,6 +516,19 @@ async function embed(
   return (await createEmbedding(env)).embed(text, { purpose });
 }
 
+async function embedMany(
+  texts: string[],
+  env: Env,
+  purpose: "document" | "query" = "document"
+): Promise<number[][]> {
+  if (!texts.length) return [];
+  const provider = await createEmbedding(env);
+  if (provider.embedMany) {
+    return provider.embedMany(texts, { purpose });
+  }
+  return Promise.all(texts.map((text) => provider.embed(text, { purpose })));
+}
+
 // ─── Database initialization ──────────────────────────────────────────────────
 
 export async function initializeDatabase(env: Env): Promise<void> {
@@ -536,6 +549,9 @@ export async function initializeDatabase(env: Env): Promise<void> {
     `ALTER TABLE entries ADD COLUMN contradiction_wins INTEGER DEFAULT 0`,
     `ALTER TABLE entries ADD COLUMN contradiction_losses INTEGER DEFAULT 0`,
     `ALTER TABLE entries ADD COLUMN content_hash TEXT`,
+    `ALTER TABLE entries ADD COLUMN embedding_fingerprint TEXT`,
+    `ALTER TABLE entries ADD COLUMN pending_vector_ids TEXT`,
+    `ALTER TABLE entries ADD COLUMN pending_embedding_fingerprint TEXT`,
   ]) {
     try {
       await env.DB.exec(alter);
@@ -550,6 +566,10 @@ export async function initializeDatabase(env: Env): Promise<void> {
   );
   await env.DB.exec(
     `CREATE INDEX IF NOT EXISTS idx_entries_content_hash ON entries(content_hash)`
+  );
+  await env.DB.exec(
+    `CREATE INDEX IF NOT EXISTS idx_entries_pending_vectors
+     ON entries(pending_embedding_fingerprint, pending_vector_ids, created_at)`
   );
   // Before durable classification fields existed, kind:* tags were the only
   // successful-classification marker. Preserve that work during upgrade with
@@ -735,7 +755,9 @@ export async function checkDuplicateAndContradiction(content: string, env: Env):
 }> {
   const sample = getDuplicateCheckSample(content);
   const values = await embed(sample, env);
-  const queried = await env.VECTORIZE.query(values, { topK: 50, returnMetadata: "all" });
+  const queried = env.SELFHOST === "1"
+    ? await (env.VECTORIZE as any).query(values, { topK: 50, returnMetadata: "all", queryText: sample })
+    : await env.VECTORIZE.query(values, { topK: 50, returnMetadata: "all" });
   const matches = (await filterActiveVectorMatches(
     queried.matches as VectorizeMatch[],
     env
@@ -1361,34 +1383,35 @@ async function prepareEntryVectors(
   tags: string[],
   source: string,
   now: number,
-  generation?: string
+  generation?: string,
+  embeddingFingerprint?: string
 ): Promise<PreparedEntryVectors> {
   const chunks = chunkText(content);
   const vectorBaseId = generation ? `g-${generation}` : id;
+  const embeddings = await embedMany(chunks, env);
 
-  const vectors = await Promise.all(
-    chunks.map(async (chunk, i) => {
-      const metadata: Record<string, any> = {
-        content: chunk,
-        parentId: id,
-        chunkIndex: i,
-        totalChunks: chunks.length,
-        tags,
-        source,
-        created_at: now,
-      };
+  const vectors = chunks.map((chunk, i) => {
+    const metadata: Record<string, any> = {
+      content: chunk,
+      parentId: id,
+      chunkIndex: i,
+      totalChunks: chunks.length,
+      tags,
+      source,
+      created_at: now,
+    };
+    if (embeddingFingerprint) metadata.embedding_fingerprint = embeddingFingerprint;
 
-      tags.forEach(t => {
-        metadata[`tag_${t}`] = true;
-      });
+    tags.forEach(t => {
+      metadata[`tag_${t}`] = true;
+    });
 
-      return {
-        id: chunks.length === 1 ? vectorBaseId : `${vectorBaseId}-chunk-${i}`,
-        values: await embed(chunk, env),
-        metadata,
-      };
-    })
-  );
+    return {
+      id: chunks.length === 1 ? vectorBaseId : `${vectorBaseId}-chunk-${i}`,
+      values: embeddings[i],
+      metadata,
+    };
+  });
 
   return { vectors, vectorIds: vectors.map((vector) => vector.id) };
 }
@@ -1411,6 +1434,75 @@ async function cleanupPreparedVectors(
   } catch (error) {
     console.error(`${context} vector compensation failed:`, error);
   }
+}
+
+async function storePendingEntryVectors(
+  env: Env,
+  row: { id: string; content: string; tags: string; source: string; created_at: number },
+  pendingFingerprint: string
+): Promise<string[]> {
+  const prepared = await prepareEntryVectors(
+    env,
+    row.id,
+    row.content,
+    JSON.parse(row.tags),
+    row.source,
+    row.created_at,
+    createVectorGeneration(),
+    pendingFingerprint
+  );
+
+  try {
+    await insertPreparedVectors(env, prepared);
+  } catch (error) {
+    await cleanupPreparedVectors(env, prepared.vectorIds, "Pending vector insert");
+    throw error;
+  }
+
+  try {
+    const result = await env.DB.prepare(
+      `UPDATE entries
+       SET pending_vector_ids = ?, pending_embedding_fingerprint = ?
+       WHERE id = ?
+         AND pending_vector_ids = ?
+         AND pending_embedding_fingerprint = ?
+         AND content = ?
+         AND tags NOT LIKE '%"status:deprecated"%'`
+    ).bind(
+      JSON.stringify(prepared.vectorIds),
+      pendingFingerprint,
+      row.id,
+      "[]",
+      pendingFingerprint,
+      row.content
+    ).run();
+    if (result.meta?.changes === 0) {
+      await cleanupPreparedVectors(env, prepared.vectorIds, "Stale pending vector write");
+      return [];
+    }
+  } catch (error) {
+    await cleanupPreparedVectors(env, prepared.vectorIds, "Pending vector write");
+    throw error;
+  }
+
+  return prepared.vectorIds;
+}
+
+async function activatePendingVectors(
+  env: Env,
+  pendingFingerprint: string
+): Promise<number> {
+  const result = await env.DB.prepare(
+    `UPDATE entries
+     SET vector_ids = pending_vector_ids,
+         embedding_fingerprint = pending_embedding_fingerprint,
+         pending_vector_ids = NULL,
+         pending_embedding_fingerprint = NULL
+     WHERE pending_embedding_fingerprint = ?
+       AND pending_vector_ids IS NOT NULL
+       AND pending_vector_ids != '[]'`
+  ).bind(pendingFingerprint).run();
+  return Number(result.meta?.changes ?? 0);
 }
 
 // ─── Store entry (full embed + chunk) ────────────────────────────────────────
@@ -2648,7 +2740,9 @@ export async function recallEntries(
     denseLogicalLimit = Math.min(topK * VECTORIZE_TOP_K_MULTIPLIER, 50);
     const [denseResults, kwRows] = await Promise.all([
       values
-        ? env.VECTORIZE.query(values, { topK: 50, returnMetadata: "all" })
+        ? env.SELFHOST === "1"
+          ? (env.VECTORIZE as any).query(values, { topK: 50, returnMetadata: "all", queryText: embedQuery })
+          : env.VECTORIZE.query(values, { topK: 50, returnMetadata: "all" })
         : Promise.resolve({ matches: [] as VectorizeMatch[] }),
       keywordSearch(tokens, env),
     ]);
@@ -5599,47 +5693,89 @@ const defaultHandler = {
         ? Date.now() + 86_400_000
         : Date.now() - graceMs(env);
 
-      const { results: toProcess } = await env.DB.prepare(
-        `SELECT id, content, tags, source, created_at FROM entries
-         WHERE vector_ids = '[]'
-           AND tags NOT LIKE '%"status:deprecated"%'
-           AND created_at < ?
-         ORDER BY created_at DESC LIMIT ?`
-      ).bind(graceCutoff, limit).all();
+      const storedSettings = await loadStoredModelSettings(env.DB).catch(() => null);
+      const pendingFingerprint = storedSettings?.pendingEmbeddingFingerprint ?? null;
+      const pendingTotal = pendingFingerprint
+        ? await env.DB.prepare(
+            `SELECT COUNT(*) as count FROM entries
+             WHERE pending_embedding_fingerprint = ?
+               AND pending_vector_ids IS NOT NULL`
+          ).bind(pendingFingerprint).first() as Record<string, any> | null
+        : null;
+      const usePendingProfile = Boolean(pendingFingerprint && Number(pendingTotal?.count ?? 0) > 0);
+      const pendingQueue =
+        usePendingProfile && pendingFingerprint
+          ? await env.DB.prepare(
+              `SELECT id, content, tags, source, created_at FROM entries
+               WHERE pending_vector_ids = '[]'
+                 AND pending_embedding_fingerprint = ?
+                 AND tags NOT LIKE '%"status:deprecated"%'
+                 AND created_at < ?
+               ORDER BY created_at DESC LIMIT ?`
+            ).bind(pendingFingerprint, graceCutoff, limit).all()
+          : { results: [] };
+      const { results: toProcess } = usePendingProfile
+        ? pendingQueue
+        : await env.DB.prepare(
+            `SELECT id, content, tags, source, created_at FROM entries
+             WHERE vector_ids = '[]'
+               AND tags NOT LIKE '%"status:deprecated"%'
+               AND created_at < ?
+             ORDER BY created_at DESC LIMIT ?`
+          ).bind(graceCutoff, limit).all();
 
       let processed = 0;
       let failed = 0;
+      let skipped = 0;
 
       for (const row of toProcess as Record<string, any>[]) {
         try {
-          await storeEntry(
-            env,
-            row.id as string,
-            row.content as string,
-            JSON.parse(row.tags as string),
-            row.source as string,
-            row.created_at as number
-          );
-          processed++;
+          const ids = usePendingProfile && pendingFingerprint
+            ? await storePendingEntryVectors(env, {
+                id: row.id as string,
+                content: row.content as string,
+                tags: row.tags as string,
+                source: row.source as string,
+                created_at: row.created_at as number,
+              }, pendingFingerprint)
+            : await storeEntry(
+                env,
+                row.id as string,
+                row.content as string,
+                JSON.parse(row.tags as string),
+                row.source as string,
+                row.created_at as number
+              );
+          if (ids.length) processed++;
+          else skipped++;
         } catch (e) {
           console.error("Re-embed failed for entry", row.id, e);
           failed++;
         }
       }
 
-      const remaining = await env.DB.prepare(
-        `SELECT COUNT(*) as count FROM entries
-         WHERE vector_ids = '[]'
-           AND tags NOT LIKE '%"status:deprecated"%'
-           AND created_at < ?`
-      ).bind(graceCutoff).first() as Record<string, any> | null;
+      const remaining = usePendingProfile && pendingFingerprint
+        ? await env.DB.prepare(
+            `SELECT COUNT(*) as count FROM entries
+             WHERE pending_vector_ids = '[]'
+               AND pending_embedding_fingerprint = ?
+               AND tags NOT LIKE '%"status:deprecated"%'`
+          ).bind(pendingFingerprint).first() as Record<string, any> | null
+        : await env.DB.prepare(
+            `SELECT COUNT(*) as count FROM entries
+             WHERE vector_ids = '[]'
+               AND tags NOT LIKE '%"status:deprecated"%'
+               AND created_at < ?`
+          ).bind(graceCutoff).first() as Record<string, any> | null;
       const remainingN = (remaining?.count as number) ?? 0;
+      let activated = 0;
 
       // Promote pending embedding fingerprint when full reindex completes cleanly
       if (remainingN === 0 && failed === 0) {
         try {
-          const stored = await loadStoredModelSettings(env.DB);
+          const stored = storedSettings ?? await loadStoredModelSettings(env.DB);
           if (stored?.pendingEmbeddingFingerprint) {
+            activated = await activatePendingVectors(env, stored.pendingEmbeddingFingerprint);
             await saveStoredModelSettings(env.DB, promoteEmbeddingFingerprint(stored));
           }
         } catch (e) {
@@ -5650,8 +5786,12 @@ const defaultHandler = {
       return json({
         processed,
         failed,
+        skipped,
         remaining: remainingN,
         limit,
+        mode: usePendingProfile ? "blue_green" : "legacy",
+        pendingFingerprint: pendingFingerprint ?? undefined,
+        activated,
       });
     }
 
@@ -5925,7 +6065,7 @@ const defaultHandler = {
         embeddingFingerprintChanged: reindexRequired,
         reindexRequired,
         warning: reindexRequired
-          ? "向量配置已变更。请点击「开始重建」或 POST /settings/models/reindex，再循环调用 vectorize-pending，完成前语义检索可能不准确。"
+          ? "向量配置已变更。请点击「开始重建」或 POST /settings/models/reindex，再循环调用 vectorize-pending；重建期间旧向量继续作为活跃集。"
           : undefined,
         settings: toPublicModelSettings(effective, {
           hasStored: Boolean(stored),
@@ -6053,41 +6193,36 @@ const defaultHandler = {
       }
     }
 
-    // POST /settings/models/reindex — clear vectors + reset vector_ids; fingerprint stays pending until vectorize completes
+    // POST /settings/models/reindex — blue/green vector rebuild.
+    // Existing vector_ids stay active; vectorize-pending writes pending_vector_ids
+    // and promotes them only after the whole pending profile finishes cleanly.
     if (url.pathname === "/settings/models/reindex" && request.method === "POST") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
 
       const { effective, stored } = await getEffectiveModelSettings(env);
-      if (stored) {
-        const pending = embeddingFingerprintOf(effective.embedding);
-        stored.pendingEmbeddingFingerprint = pending;
-        // Do NOT promote active fingerprint here — wait until remaining=0
-        await saveStoredModelSettings(env.DB, stored);
-      }
-
-      let clearedVectors = 0;
-      try {
-        const clear = (env.VECTORIZE as any).clearAll;
-        if (typeof clear === "function") {
-          clearedVectors = await clear.call(env.VECTORIZE);
-        }
-      } catch (e) {
-        console.error("Vector clear failed:", e);
-      }
+      const pending = embeddingFingerprintOf(effective.embedding);
+      const settingsForQueue = stored ?? mergeFromEnvOnly(env);
+      settingsForQueue.pendingEmbeddingFingerprint = pending;
+      // Do NOT promote active fingerprint here — wait until remaining=0.
+      await saveStoredModelSettings(env.DB, settingsForQueue);
 
       const update = await env.DB.prepare(
-        `UPDATE entries SET vector_ids = '[]'`
-      ).run();
+        `UPDATE entries
+         SET pending_vector_ids = '[]',
+             pending_embedding_fingerprint = ?
+         WHERE tags NOT LIKE '%"status:deprecated"%'`
+      ).bind(pending).run();
       const rows = (update as any)?.meta?.changes ?? 0;
 
       return json({
         ok: true,
-        clearedVectors,
-        entriesReset: rows,
+        mode: "blue_green",
+        clearedVectors: 0,
+        entriesReset: 0,
+        entriesQueued: rows,
         reindexRequired: true,
-        pendingFingerprint:
-          stored?.pendingEmbeddingFingerprint ?? embeddingFingerprintOf(effective.embedding),
+        pendingFingerprint: pending,
         next: "Loop POST /vectorize-pending {\"limit\":100,\"includeRecent\":true} until remaining=0. Active fingerprint promotes only when finished with failed=0.",
       });
     }

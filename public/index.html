@@ -5586,7 +5586,7 @@ ${metaLine}
         })
         const data = await readJsonResponse(r)
         if (!r.ok || !data.ok) throw new Error(data.error || t('models.reindexFail'))
-        setModelsMsg(t('models.reindexReset', { n: data.entriesReset || 0 }))
+        setModelsMsg(t('models.reindexReset', { n: data.entriesQueued ?? data.entriesReset ?? 0 }))
         await runVectorizeLoop({ limit: 100, includeRecent: true })
       }
 

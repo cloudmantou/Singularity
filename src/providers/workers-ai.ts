@@ -184,13 +184,23 @@ export class WorkersAIEmbedding implements EmbeddingProvider {
   ) {}
 
   async embed(text: string): Promise<number[]> {
+    const [vector] = await this.embedMany([text]);
+    return vector;
+  }
+
+  async embedMany(texts: string[]): Promise<number[][]> {
+    if (!texts.length) return [];
     const started = Date.now();
     try {
-      const result = (await this.ai.run(this.model as any, { text: [text] })) as {
+      const result = (await this.ai.run(this.model as any, { text: texts })) as {
         data?: number[][];
       };
-      const vector = result?.data?.[0];
-      if (!Array.isArray(vector)) {
+      const vectors = result?.data;
+      if (
+        !Array.isArray(vectors) ||
+        vectors.length !== texts.length ||
+        vectors.some((vector) => !Array.isArray(vector))
+      ) {
         throw new Error("Workers AI embedding response missing data[0]");
       }
       logModelCall({
@@ -199,9 +209,9 @@ export class WorkersAIEmbedding implements EmbeddingProvider {
         model: this.model,
         duration_ms: Date.now() - started,
         status: "success",
-        input: text,
+        input: texts.join("\n---\n").slice(0, 2000),
       });
-      return vector;
+      return vectors;
     } catch (error) {
       logModelCall({
         call_type: "embedding",
@@ -209,7 +219,7 @@ export class WorkersAIEmbedding implements EmbeddingProvider {
         model: this.model,
         duration_ms: Date.now() - started,
         status: "error",
-        input: text,
+        input: texts.join("\n---\n").slice(0, 2000),
         error_message: error instanceof Error ? error.message : String(error),
       });
       throw error;

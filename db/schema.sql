@@ -19,7 +19,10 @@ CREATE TABLE IF NOT EXISTS entries (
   classified_at                  INTEGER,
   contradiction_wins   INTEGER DEFAULT 0,
   contradiction_losses INTEGER DEFAULT 0,
-  content_hash          TEXT
+  content_hash          TEXT,
+  embedding_fingerprint TEXT,
+  pending_vector_ids TEXT,
+  pending_embedding_fingerprint TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_entries_content_hash ON entries(content_hash);
@@ -28,6 +31,8 @@ CREATE INDEX IF NOT EXISTS idx_entries_created_at ON entries(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_entries_source ON entries(source);
 CREATE INDEX IF NOT EXISTS idx_entries_classification_queue
   ON entries(classification_status, classification_next_attempt_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_entries_pending_vectors
+  ON entries(pending_embedding_fingerprint, pending_vector_ids, created_at);
 
 CREATE TABLE IF NOT EXISTS sb_memory_relations (
   id             TEXT PRIMARY KEY,

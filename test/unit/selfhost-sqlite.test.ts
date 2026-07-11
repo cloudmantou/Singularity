@@ -170,6 +170,37 @@ describe("SqliteVectorizeIndex", () => {
     const after = await vec.query([1, 0, 0], { topK: 5 });
     expect(after.matches.find((m) => m.id === "v1")).toBeUndefined();
   });
+
+  it("uses queryText as an FTS candidate prefilter before cosine ranking", async () => {
+    const ftsTable = raw.prepare(
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sb_vector_fts'`
+    ).get();
+    if (!ftsTable) {
+      expect(ftsTable).toBeUndefined();
+      return;
+    }
+
+    await vec.insert([
+      {
+        id: "semantic-only",
+        values: [1, 0],
+        metadata: { parentId: "semantic", content: "unrelated runtime note" },
+      },
+      {
+        id: "lexical-hit",
+        values: [0, 1],
+        metadata: { parentId: "lexical", content: "sqlite vector profile rebuild" },
+      },
+    ]);
+
+    const { matches } = await vec.query([1, 0], {
+      topK: 1,
+      returnMetadata: "all",
+      queryText: "sqlite vector",
+    } as any);
+
+    expect(matches[0].id).toBe("lexical-hit");
+  });
 });
 
 describe("SqliteKVNamespace", () => {

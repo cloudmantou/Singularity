@@ -16,4 +16,6 @@ export interface EmbedOptions {
 export interface EmbeddingProvider {
   /** Embed a single string; returns a dense float vector. */
   embed(text: string, options?: EmbedOptions): Promise<number[]>;
+  /** Embed multiple strings in provider-native batches when supported. */
+  embedMany?(texts: string[], options?: EmbedOptions): Promise<number[][]>;
 }

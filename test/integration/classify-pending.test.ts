@@ -133,8 +133,9 @@ describe("POST /classify-pending", () => {
     const data = await (await worker.fetch(req("POST", "/classify-pending"), env, ctx)).json() as any;
     expect(data).toMatchObject({ processed: 1, failed: 0, remaining: 9 });
     expect(db.execCount).toBeGreaterThan(0);
-    // Cold-start schema now includes atomic memory tables; keep a D1 Free headroom bound.
-    expect(db.statementCount).toBeLessThanOrEqual(80);
+    // Cold-start schema now includes atomic memory + Vector V2 profile fields;
+    // keep a bounded D1 headroom check instead of letting init grow unnoticed.
+    expect(db.statementCount).toBeLessThanOrEqual(84);
   });
 
   it("skips entries whose durable classification status is already succeeded", async () => {
