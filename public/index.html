@@ -4541,6 +4541,7 @@
               scoreDetails: m.score_details || {},
               matchedEntities: m.matched_entities || [],
               graphFacts: m.graph_facts || [],
+              timeBasis: m.time_basis || null,
             }))
             answerBubble = document.createElement('div')
             answerBubble.className = 'ex-a-row'
@@ -4570,6 +4571,7 @@
                 const graphContext = [
                   matchedEntities.length ? `Matched entities:\n${matchedEntities.map((entity) => `- ${entity}`).join('\n')}` : '',
                   graphFacts.length ? `Current graph facts:\n${graphFacts.map((fact) => `- ${fact}`).join('\n')}` : '',
+                  m.time_basis ? `Time basis: ${formatTimeBasis(m.time_basis)}` : '',
                 ].filter(Boolean).join('\n')
                 return `${i + 1}. [${date}${src}${tagList}]${relevance}${m.updated ? ' [updated]' : ''}\n${m.content}${graphContext ? `\n${graphContext}` : ''}`
               }).join('\n\n')
@@ -4645,7 +4647,22 @@
       function formatRecallSignal(value) {
         const number = Number(value)
         if (!Number.isFinite(number) || number <= 0) return null
-        return `${Math.round(Math.max(0, Math.min(1, number)) * 100)}%`
+        const clamped = Math.max(0, Math.min(1, number))
+        if (clamped >= 0.8) return 'High'
+        if (clamped >= 0.45) return 'Medium'
+        return 'Low'
+      }
+
+      function formatTimeBasis(value) {
+        const labels = {
+          explicit_window: 'explicit valid window',
+          explicit_start: 'explicit start time',
+          explicit_end: 'explicit end time',
+          reference_time: 'reference time',
+          inferred_current: 'current-state inference',
+          none: 'none',
+        }
+        return labels[value] || String(value || '')
       }
 
       function makeRecallExplainLine(label, value) {
@@ -4684,11 +4701,14 @@
           ? `<div class="card-meta">${graphMetaParts.map(escHtml).join(' · ')}</div>`
           : ''
         const scoreDetails = entry.scoreDetails || {}
+        const timeValue = entry.timeBasis
+          ? formatTimeBasis(entry.timeBasis)
+          : formatRecallSignal(scoreDetails.temporal)
         const explainRows = [
           makeRecallExplainLine('Semantic', formatRecallSignal(scoreDetails.semantic)),
           makeRecallExplainLine('Keyword', formatRecallSignal(scoreDetails.keyword)),
           makeRecallExplainLine('Entity', matchedEntities.length ? matchedEntities.join(', ') : formatRecallSignal(scoreDetails.entity)),
-          makeRecallExplainLine('Time', formatRecallSignal(scoreDetails.temporal)),
+          makeRecallExplainLine('Time', timeValue),
           makeRecallExplainLine('Relation', graphFacts.length ? graphFacts.join(' · ') : formatRecallSignal(scoreDetails.relation)),
           makeRecallExplainLine('Importance', formatRecallSignal(scoreDetails.importance)),
           makeRecallExplainLine('Confidence', formatRecallSignal(scoreDetails.confidence)),

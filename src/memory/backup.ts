@@ -156,7 +156,7 @@ export async function exportMemoryBackup(
                        classification_version, classified_at,
                        contradiction_wins, contradiction_losses, content_hash,
                        embedding_fingerprint, pending_vector_ids,
-                       pending_embedding_fingerprint
+                       pending_embedding_fingerprint, pending_content_hash
                 FROM entries
                 ORDER BY created_at DESC, id DESC`),
     allRows(db, `SELECT id, content, source, metadata_json, content_hash,

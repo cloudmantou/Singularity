@@ -185,6 +185,39 @@ describe("POST /vectorize-pending", () => {
     expect(db.entries[0].pending_embedding_fingerprint).toBe(data.pendingFingerprint);
   });
 
+  it("keeps a newly saved embedding config pending when active vectors already exist", async () => {
+    db.entries.push({
+      ...pastGraceEntry("active"),
+      vector_ids: '["active-old"]',
+    });
+
+    const res = await worker.fetch(
+      req("PUT", "/settings/models", {
+        body: {
+          embedding: {
+            provider: "custom",
+            baseURL: "https://embed-new.example/v1",
+            apiKey: "new-key",
+            model: "new-embedding",
+            dimensions: 768,
+            supportsDimensionsParameter: false,
+          },
+        },
+      }),
+      env,
+      ctx
+    );
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.reindexRequired).toBe(true);
+    expect(data.settings.embedding.model).toBe("new-embedding");
+    expect(data.settings.pendingEmbedding.model).toBe("new-embedding");
+    expect(data.settings.activeEmbedding.provider).toBe("none");
+    expect(data.settings.embeddingFingerprint).not.toBe(data.settings.pendingEmbeddingFingerprint);
+    expect(db.entries[0].vector_ids).toBe('["active-old"]');
+  });
+
   it("activates pending vectors only after the blue-green queue is complete", async () => {
     db.entries.push({
       ...pastGraceEntry("active"),
@@ -243,5 +276,98 @@ describe("POST /vectorize-pending", () => {
     expect(old.pending_vector_ids).not.toBe("[]");
     expect(recent.vector_ids).toBe('["recent-active"]');
     expect(recent.pending_vector_ids).toBe("[]");
+  });
+
+  it("blocks blue-green activation when pending vectors were built for stale content", async () => {
+    db.entries.push(
+      {
+        ...pastGraceEntry("old"),
+        vector_ids: '["old-active"]',
+      },
+      {
+        id: "recent",
+        content: "Recent memory",
+        tags: "[]",
+        source: "api",
+        created_at: Date.now(),
+        vector_ids: '["recent-active"]',
+        recall_count: 0,
+        importance_score: 0,
+      }
+    );
+
+    await worker.fetch(req("POST", "/settings/models/reindex"), env, ctx);
+    await worker.fetch(req("POST", "/vectorize-pending"), env, ctx);
+    const old = db.entries.find((entry: any) => entry.id === "old");
+    expect(old.pending_vector_ids).not.toBe("[]");
+    expect(old.pending_content_hash).toBeTruthy();
+
+    old.content = "Edited after pending vector build";
+    old.content_hash = "edited-content-hash";
+
+    const res = await worker.fetch(
+      req("POST", "/vectorize-pending", { body: { includeRecent: true } }),
+      env,
+      ctx
+    );
+    const data = await res.json() as any;
+    const recent = db.entries.find((entry: any) => entry.id === "recent");
+
+    expect(data.mode).toBe("blue_green");
+    expect(data.remaining).toBe(0);
+    expect(data.activated).toBe(0);
+    expect(data.activationBlocked).toBe(1);
+    expect(data.activationIntegrity).toEqual({ activatable: 1, blocked: 1 });
+    expect(old.vector_ids).toBe('["old-active"]');
+    expect(old.pending_vector_ids).not.toBeNull();
+    expect(recent.vector_ids).toBe('["recent-active"]');
+    expect(recent.pending_vector_ids).not.toBeNull();
+  });
+
+  it("cancels a pending blue-green rebuild and deletes prepared pending vectors", async () => {
+    const deleteByIds = vi.fn().mockResolvedValue({ mutationId: "delete" });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({ deleteByIds }),
+    });
+    db.entries.push(
+      {
+        ...pastGraceEntry("old"),
+        vector_ids: '["old-active"]',
+      },
+      {
+        id: "recent",
+        content: "Recent memory",
+        tags: "[]",
+        source: "api",
+        created_at: Date.now(),
+        vector_ids: '["recent-active"]',
+        recall_count: 0,
+        importance_score: 0,
+      }
+    );
+
+    await worker.fetch(req("POST", "/settings/models/reindex"), env, ctx);
+    await worker.fetch(req("POST", "/vectorize-pending"), env, ctx);
+    const pendingIds = JSON.parse(
+      db.entries.find((entry: any) => entry.id === "old").pending_vector_ids
+    );
+
+    const res = await worker.fetch(
+      req("POST", "/settings/models/reindex/cancel"),
+      env,
+      ctx
+    );
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.ok).toBe(true);
+    expect(data.cancelled).toBe(true);
+    expect(data.pendingVectorsDeleted).toBe(pendingIds.length);
+    expect(data.entriesCleared).toBe(2);
+    expect(deleteByIds).toHaveBeenCalledWith(pendingIds);
+    expect(db.entries.every((entry: any) => entry.pending_vector_ids == null)).toBe(true);
+    expect(db.entries.every((entry: any) => entry.pending_embedding_fingerprint == null)).toBe(true);
+    expect(db.entries[0].vector_ids).toBe('["old-active"]');
+    expect(db.entries[1].vector_ids).toBe('["recent-active"]');
   });
 });

@@ -12,14 +12,18 @@ import { z } from "zod";
 import { createEmbedding, createLLM } from "./providers";
 import {
   applyModelSettingsPatch,
+  activeEmbeddingOf,
+  cloneEmbeddingSettings,
   embeddingFingerprintOf,
   emptyModelSettings,
   isDevLocalProvider,
+  pendingEmbeddingOf,
   isMaskedSecret,
   promoteEmbeddingFingerprint,
   toPublicModelSettings,
   type ModelSettingsPatchBody,
 } from "./settings/model-settings";
+import type { EmbeddingProfileRole } from "./settings/store";
 import {
   ensureSettingsTable,
   getEffectiveModelSettings,
@@ -519,10 +523,11 @@ async function embed(
 async function embedMany(
   texts: string[],
   env: Env,
-  purpose: "document" | "query" = "document"
+  purpose: "document" | "query" = "document",
+  embeddingRole: EmbeddingProfileRole = "active"
 ): Promise<number[][]> {
   if (!texts.length) return [];
-  const provider = await createEmbedding(env);
+  const provider = await createEmbedding(env, embeddingRole);
   if (provider.embedMany) {
     return provider.embedMany(texts, { purpose });
   }
@@ -552,6 +557,7 @@ export async function initializeDatabase(env: Env): Promise<void> {
     `ALTER TABLE entries ADD COLUMN embedding_fingerprint TEXT`,
     `ALTER TABLE entries ADD COLUMN pending_vector_ids TEXT`,
     `ALTER TABLE entries ADD COLUMN pending_embedding_fingerprint TEXT`,
+    `ALTER TABLE entries ADD COLUMN pending_content_hash TEXT`,
   ]) {
     try {
       await env.DB.exec(alter);
@@ -1384,11 +1390,12 @@ async function prepareEntryVectors(
   source: string,
   now: number,
   generation?: string,
-  embeddingFingerprint?: string
+  embeddingFingerprint?: string,
+  embeddingRole: EmbeddingProfileRole = "active"
 ): Promise<PreparedEntryVectors> {
   const chunks = chunkText(content);
   const vectorBaseId = generation ? `g-${generation}` : id;
-  const embeddings = await embedMany(chunks, env);
+  const embeddings = await embedMany(chunks, env, "document", embeddingRole);
 
   const vectors = chunks.map((chunk, i) => {
     const metadata: Record<string, any> = {
@@ -1436,11 +1443,39 @@ async function cleanupPreparedVectors(
   }
 }
 
+function parseVectorIds(raw: unknown): string[] {
+  if (typeof raw !== "string") return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.filter((id): id is string => typeof id === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+async function pendingEmbeddingFingerprintForQueue(env: Env): Promise<string | null> {
+  const stored = await loadStoredModelSettings(env.DB).catch(() => null);
+  return stored?.pendingEmbeddingFingerprint ?? null;
+}
+
+async function hasActiveEntryVectors(env: Env): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) as count FROM entries
+     WHERE vector_ids IS NOT NULL
+       AND vector_ids != '[]'
+       AND tags NOT LIKE '%"status:deprecated"%'`
+  ).first() as Record<string, any> | null;
+  return Number(row?.count ?? 0) > 0;
+}
+
 async function storePendingEntryVectors(
   env: Env,
-  row: { id: string; content: string; tags: string; source: string; created_at: number },
+  row: { id: string; content: string; tags: string; source: string; created_at: number; content_hash?: string | null },
   pendingFingerprint: string
 ): Promise<string[]> {
+  const hash = row.content_hash ?? await contentFingerprint(row.content);
   const prepared = await prepareEntryVectors(
     env,
     row.id,
@@ -1449,7 +1484,8 @@ async function storePendingEntryVectors(
     row.source,
     row.created_at,
     createVectorGeneration(),
-    pendingFingerprint
+    pendingFingerprint,
+    "pending"
   );
 
   try {
@@ -1462,7 +1498,10 @@ async function storePendingEntryVectors(
   try {
     const result = await env.DB.prepare(
       `UPDATE entries
-       SET pending_vector_ids = ?, pending_embedding_fingerprint = ?
+       SET pending_vector_ids = ?,
+           pending_embedding_fingerprint = ?,
+           pending_content_hash = ?,
+           content_hash = COALESCE(content_hash, ?)
        WHERE id = ?
          AND pending_vector_ids = ?
          AND pending_embedding_fingerprint = ?
@@ -1471,6 +1510,8 @@ async function storePendingEntryVectors(
     ).bind(
       JSON.stringify(prepared.vectorIds),
       pendingFingerprint,
+      hash,
+      hash,
       row.id,
       "[]",
       pendingFingerprint,
@@ -1497,10 +1538,86 @@ async function activatePendingVectors(
      SET vector_ids = pending_vector_ids,
          embedding_fingerprint = pending_embedding_fingerprint,
          pending_vector_ids = NULL,
-         pending_embedding_fingerprint = NULL
+         pending_embedding_fingerprint = NULL,
+         pending_content_hash = NULL
+     WHERE pending_embedding_fingerprint = ?
+       AND pending_vector_ids IS NOT NULL
+       AND pending_vector_ids != '[]'
+       AND pending_content_hash IS NOT NULL
+       AND content_hash = pending_content_hash`
+  ).bind(pendingFingerprint).run();
+  return Number(result.meta?.changes ?? 0);
+}
+
+async function countPendingActivationConflicts(
+  env: Env,
+  pendingFingerprint: string
+): Promise<number> {
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) as count FROM entries
+     WHERE pending_embedding_fingerprint = ?
+       AND pending_vector_ids IS NOT NULL
+       AND pending_vector_ids != '[]'
+       AND (
+         pending_content_hash IS NULL OR
+         content_hash IS NULL OR
+         pending_content_hash != content_hash
+       )`
+  ).bind(pendingFingerprint).first() as Record<string, any> | null;
+  return Number(row?.count ?? 0);
+}
+
+interface PendingActivationIntegrity {
+  activatable: number;
+  blocked: number;
+}
+
+async function inspectPendingActivationIntegrity(
+  env: Env,
+  pendingFingerprint: string
+): Promise<PendingActivationIntegrity> {
+  const [activatableRow, blocked] = await Promise.all([
+    env.DB.prepare(
+      `SELECT COUNT(*) as count FROM entries
+       WHERE pending_embedding_fingerprint = ?
+         AND pending_vector_ids IS NOT NULL
+         AND pending_vector_ids != '[]'
+         AND pending_content_hash IS NOT NULL
+         AND content_hash = pending_content_hash`
+    ).bind(pendingFingerprint).first() as Promise<Record<string, any> | null>,
+    countPendingActivationConflicts(env, pendingFingerprint),
+  ]);
+  return {
+    activatable: Number(activatableRow?.count ?? 0),
+    blocked,
+  };
+}
+
+async function listPendingRebuildVectorIds(
+  env: Env,
+  pendingFingerprint: string
+): Promise<string[]> {
+  const { results } = await env.DB.prepare(
+    `SELECT pending_vector_ids FROM entries
      WHERE pending_embedding_fingerprint = ?
        AND pending_vector_ids IS NOT NULL
        AND pending_vector_ids != '[]'`
+  ).bind(pendingFingerprint).all() as { results: Array<Record<string, unknown>> };
+  return [...new Set(
+    (results ?? []).flatMap((row) => parseVectorIds(row.pending_vector_ids))
+  )];
+}
+
+async function clearPendingRebuildRows(
+  env: Env,
+  pendingFingerprint: string
+): Promise<number> {
+  const result = await env.DB.prepare(
+    `UPDATE entries
+     SET pending_vector_ids = NULL,
+         pending_embedding_fingerprint = NULL,
+         pending_content_hash = NULL
+     WHERE pending_embedding_fingerprint = ?`
   ).bind(pendingFingerprint).run();
   return Number(result.meta?.changes ?? 0);
 }
@@ -1516,6 +1633,7 @@ async function storeEntry(
   source: string,
   now: number
 ): Promise<string[]> {
+  const pendingFingerprint = await pendingEmbeddingFingerprintForQueue(env);
   const prepared = await prepareEntryVectors(
     env,
     id,
@@ -1539,10 +1657,20 @@ async function storeEntry(
     // move the pointer backwards.
     const result = await env.DB.prepare(
       `UPDATE entries
-       SET vector_ids = ?
+       SET vector_ids = ?,
+           pending_vector_ids = ?,
+           pending_embedding_fingerprint = ?,
+           pending_content_hash = NULL
        WHERE id = ? AND vector_ids = ? AND content = ?
          AND tags NOT LIKE '%"status:deprecated"%'`
-    ).bind(JSON.stringify(prepared.vectorIds), id, "[]", content).run();
+    ).bind(
+      JSON.stringify(prepared.vectorIds),
+      pendingFingerprint ? "[]" : null,
+      pendingFingerprint,
+      id,
+      "[]",
+      content
+    ).run();
     if (result.meta?.changes === 0) {
       await cleanupPreparedVectors(env, prepared.vectorIds, "Stale initial vector write");
       return [];
@@ -1603,13 +1731,15 @@ async function commitEntryVersion(
   }
 
   let activeOldVectorIds: string[];
+  let oldPendingVectorIds: string[] = [];
   let activeTagsJson: string;
+  const pendingFingerprint = await pendingEmbeddingFingerprintForQueue(env);
   try {
     // Embedding can take long enough for the background initial vectorization
     // to advance only the index pointer. Adopt that newer pointer when the
     // content is unchanged; reject an actual concurrent content write.
     const current = await env.DB.prepare(
-      `SELECT content, tags, vector_ids FROM entries WHERE id = ?`
+      `SELECT content, tags, vector_ids, pending_vector_ids FROM entries WHERE id = ?`
     ).bind(input.id).first() as Record<string, any> | null;
     if (!current || current.content !== input.oldContent) {
       throw new Error("Entry content changed while vectors were being prepared");
@@ -1620,6 +1750,7 @@ async function commitEntryVersion(
     }
     activeTagsJson = current.tags ?? "[]";
     activeOldVectorIds = JSON.parse(current.vector_ids ?? "[]");
+    oldPendingVectorIds = parseVectorIds(current.pending_vector_ids);
   } catch (error) {
     await cleanupPreparedVectors(env, prepared.vectorIds, "Version refresh");
     throw error;
@@ -1646,6 +1777,8 @@ async function commitEntryVersion(
       env.DB.prepare(
         `UPDATE entries
          SET content = ?, tags = ?, vector_ids = ?, content_hash = ?
+             , pending_vector_ids = ?, pending_embedding_fingerprint = ?
+             , pending_content_hash = NULL
              , classification_status = 'pending', classification_error = NULL
              , classification_attempts = 0, classification_next_attempt_at = NULL
              , classification_started_at = NULL, classification_confidence = NULL
@@ -1656,6 +1789,8 @@ async function commitEntryVersion(
         JSON.stringify(input.newTags),
         JSON.stringify(prepared.vectorIds),
         newHash,
+        pendingFingerprint ? "[]" : null,
+        pendingFingerprint,
         input.id,
         input.oldContent,
         activeTagsJson,
@@ -1675,6 +1810,9 @@ async function commitEntryVersion(
 
   try {
     await deleteStaleVectors(env, activeOldVectorIds, prepared.vectorIds);
+    if (oldPendingVectorIds.length) {
+      await cleanupPreparedVectors(env, oldPendingVectorIds, "Old pending vector cleanup");
+    }
   } catch (error) {
     // The new generation is already active. Retrieval validates every dense
     // match against D1 vector_ids, so these old vectors become excluded cleanup
@@ -1756,10 +1894,12 @@ async function appendToEntry(
   }
 
   let activeVectorIds: string[];
+  let oldPendingVectorIds: string[] = [];
   let activeTagsJson: string;
+  const pendingFingerprint = await pendingEmbeddingFingerprintForQueue(env);
   try {
     const current = await env.DB.prepare(
-      `SELECT content, tags, vector_ids FROM entries WHERE id = ?`
+      `SELECT content, tags, vector_ids, pending_vector_ids FROM entries WHERE id = ?`
     ).bind(id).first() as Record<string, any> | null;
     if (!current || current.content !== existingContent) {
       throw new Error("Entry content changed while the append vector was being prepared");
@@ -1770,6 +1910,7 @@ async function appendToEntry(
     }
     activeTagsJson = current.tags ?? "[]";
     activeVectorIds = JSON.parse(current.vector_ids ?? "[]");
+    oldPendingVectorIds = parseVectorIds(current.pending_vector_ids);
   } catch (error) {
     await cleanupPreparedVectors(env, [newChunkId], "Append refresh");
     throw error;
@@ -1793,6 +1934,8 @@ async function appendToEntry(
       env.DB.prepare(
         `UPDATE entries
          SET content = ?, vector_ids = ?, content_hash = ?
+             , pending_vector_ids = ?, pending_embedding_fingerprint = ?
+             , pending_content_hash = NULL
              , classification_status = 'pending', classification_error = NULL
              , classification_attempts = 0, classification_next_attempt_at = NULL
              , classification_started_at = NULL, classification_confidence = NULL
@@ -1802,6 +1945,8 @@ async function appendToEntry(
         newContent,
         JSON.stringify([...activeVectorIds, newChunkId]),
         newHash,
+        pendingFingerprint ? "[]" : null,
+        pendingFingerprint,
         id,
         existingContent,
         activeTagsJson,
@@ -1817,6 +1962,9 @@ async function appendToEntry(
   if (switchResult.meta?.changes === 0) {
     await cleanupPreparedVectors(env, [newChunkId], "Stale append");
     throw new Error("Entry changed while the append vector was being prepared");
+  }
+  if (oldPendingVectorIds.length) {
+    await cleanupPreparedVectors(env, oldPendingVectorIds, "Old pending append vector cleanup");
   }
   return newContent;
 }
@@ -2131,6 +2279,7 @@ export interface RecallMatch {
   scoreDetails?: RecallScoreDetails;
   matchedEntities?: string[];
   graphFacts?: string[];
+  timeBasis?: TemporalEvidence;
 }
 
 export interface RecallSearchResult {
@@ -2161,11 +2310,36 @@ interface GraphRecallSignal {
   createdAt: number;
   entity: number;
   temporal: number;
+  temporalEvidence: TemporalEvidence;
+  temporalAnchorsHistory: boolean;
   relation: number;
   entityNames: string[];
   facts: string[];
   signalKeys: Set<string>;
 }
+
+type TemporalEvidence =
+  | "explicit_window"
+  | "explicit_start"
+  | "explicit_end"
+  | "reference_time"
+  | "inferred_current"
+  | "none";
+
+interface TemporalAssessment {
+  score: number;
+  evidence: TemporalEvidence;
+  anchorsHistory: boolean;
+}
+
+const TEMPORAL_EVIDENCE_RANK: Record<TemporalEvidence, number> = {
+  none: 0,
+  inferred_current: 1,
+  explicit_end: 2,
+  reference_time: 3,
+  explicit_start: 4,
+  explicit_window: 5,
+};
 
 const GRAPH_ENTITY_MATCH_LIMIT = 8;
 const GRAPH_ENTITY_MATCH_CANDIDATE_LIMIT = 80;
@@ -2213,15 +2387,36 @@ function activeAt(row: { valid_from?: unknown; valid_to?: unknown; invalid_at?: 
 }
 
 function temporalScoreAt(
-  row: { valid_from?: unknown; valid_to?: unknown; invalid_at?: unknown; expired_at?: unknown },
+  row: { valid_from?: unknown; valid_to?: unknown; invalid_at?: unknown; expired_at?: unknown; reference_time?: unknown },
   asOf: number
 ): number {
-  if (!activeAt(row, asOf)) return 0;
+  return temporalAssessmentAt(row, asOf).score;
+}
+
+function temporalAssessmentAt(
+  row: { valid_from?: unknown; valid_to?: unknown; invalid_at?: unknown; expired_at?: unknown; reference_time?: unknown },
+  asOf: number
+): TemporalAssessment {
+  if (!activeAt(row, asOf)) {
+    return { score: 0, evidence: "none", anchorsHistory: false };
+  }
   const hasFrom = row.valid_from != null && Number.isFinite(Number(row.valid_from));
   const hasTo = row.valid_to != null && Number.isFinite(Number(row.valid_to));
-  if (hasFrom && hasTo) return 1;
-  if (hasFrom || hasTo) return 0.8;
-  return 0.6;
+  const referenceTime = row.reference_time == null ? null : Number(row.reference_time);
+  const hasReference = referenceTime != null && Number.isFinite(referenceTime);
+  if (hasFrom && hasTo) {
+    return { score: 1, evidence: "explicit_window", anchorsHistory: true };
+  }
+  if (hasFrom) {
+    return { score: 0.8, evidence: "explicit_start", anchorsHistory: true };
+  }
+  if (hasReference && referenceTime <= asOf) {
+    return { score: 0.8, evidence: "reference_time", anchorsHistory: true };
+  }
+  if (hasTo) {
+    return { score: 0.8, evidence: "explicit_end", anchorsHistory: false };
+  }
+  return { score: 0.6, evidence: "inferred_current", anchorsHistory: false };
 }
 
 function parseEntityAliases(raw: unknown): string[] {
@@ -2285,6 +2480,8 @@ function addGraphSignal(
     createdAt: number;
     entity?: number;
     temporal?: number;
+    temporalEvidence?: TemporalEvidence;
+    temporalAnchorsHistory?: boolean;
     relation?: number;
     entityNames?: string[];
     fact?: string | null;
@@ -2297,6 +2494,8 @@ function addGraphSignal(
     createdAt: input.createdAt,
     entity: 0,
     temporal: 0,
+    temporalEvidence: "none" as TemporalEvidence,
+    temporalAnchorsHistory: false,
     relation: 0,
     entityNames: [],
     facts: [],
@@ -2313,6 +2512,15 @@ function addGraphSignal(
   current.createdAt = Math.max(current.createdAt, input.createdAt || 0);
   current.entity = Math.max(current.entity, input.entity ?? 0);
   current.temporal = Math.max(current.temporal, input.temporal ?? 0);
+  if (
+    input.temporalEvidence &&
+    TEMPORAL_EVIDENCE_RANK[input.temporalEvidence] >
+      TEMPORAL_EVIDENCE_RANK[current.temporalEvidence]
+  ) {
+    current.temporalEvidence = input.temporalEvidence;
+  }
+  current.temporalAnchorsHistory =
+    current.temporalAnchorsHistory || input.temporalAnchorsHistory === true;
   current.relation = Math.max(current.relation, input.relation ?? 0);
   for (const name of input.entityNames ?? []) {
     if (name && !current.entityNames.includes(name)) current.entityNames.push(name);
@@ -2430,6 +2638,7 @@ async function buildGraphRecallSignals(
 
   const { results: directRows } = await env.DB.prepare(
     `SELECT m.entry_id, m.id AS memory_id, m.created_at, m.valid_from, m.valid_to,
+            m.reference_time,
             m.invalid_at, m.expired_at, m.importance, m.confidence,
             me.entity_id, me.score AS entity_score, e.name AS entity_name
      FROM sb_memory_entities me
@@ -2452,14 +2661,16 @@ async function buildGraphRecallSignals(
     const parentId = String(row.entry_id ?? "");
     if (!parentId) continue;
     const entityScore = clamp01(row.entity_score ?? 0.75);
-    const temporal = temporalScoreAt(row, asOf);
+    const temporal = temporalAssessmentAt(row, asOf);
     addGraphSignal(signals, {
       parentId,
       signalKey: ["entity", parentId, String(row.memory_id ?? ""), String(row.entity_id ?? "")].join(":"),
       boost: GRAPH_DIRECT_BASE_BOOST * Math.max(0.65, entityScore) + GRAPH_TEMPORAL_BASE_BOOST,
       createdAt: Number(row.created_at ?? 0),
       entity: entityScore || 0.75,
-      temporal,
+      temporal: temporal.score,
+      temporalEvidence: temporal.evidence,
+      temporalAnchorsHistory: temporal.anchorsHistory,
       entityNames: [String(row.entity_name ?? "")].filter(Boolean),
     });
   }
@@ -2469,6 +2680,7 @@ async function buildGraphRecallSignals(
     `SELECT m.entry_id, m.created_at AS memory_created_at,
             r.memory_id, r.from_entity_id, r.to_entity_id, r.relation_type, r.fact, r.score,
             r.valid_from, r.valid_to, r.invalid_at, r.expired_at,
+            COALESCE(r.reference_time, m.reference_time) AS reference_time,
             fe.name AS from_name, te.name AS to_name
      FROM sb_entity_relations r
      JOIN sb_memories m ON m.id = r.memory_id
@@ -2493,14 +2705,16 @@ async function buildGraphRecallSignals(
     const parentId = String(row.entry_id ?? "");
     if (!parentId) continue;
     const relationScore = clamp01(row.score ?? 0.6);
-    const temporal = temporalScoreAt(row, asOf);
+    const temporal = temporalAssessmentAt(row, asOf);
     addGraphSignal(signals, {
       parentId,
       signalKey: graphFactSignalKey(row),
       boost: GRAPH_RELATION_BASE_BOOST * Math.max(0.5, relationScore) + GRAPH_TEMPORAL_BASE_BOOST,
       createdAt: Number(row.memory_created_at ?? 0),
       relation: relationScore || 0.6,
-      temporal,
+      temporal: temporal.score,
+      temporalEvidence: temporal.evidence,
+      temporalAnchorsHistory: temporal.anchorsHistory,
       entityNames: [String(row.from_name ?? ""), String(row.to_name ?? "")].filter(Boolean),
       fact: typeof row.fact === "string" ? row.fact.slice(0, 300) : null,
     });
@@ -2531,6 +2745,8 @@ function applyGraphRecallSignals(
       }),
       graph_entities: signal.entityNames.slice(0, 8),
       graph_facts: signal.facts.slice(0, 5),
+      graph_temporal_evidence: signal.temporalEvidence,
+      graph_temporal_anchors_history: signal.temporalAnchorsHistory,
     };
     return {
       ...match,
@@ -2560,6 +2776,8 @@ function applyGraphRecallSignals(
         }),
         graph_entities: signal.entityNames.slice(0, 8),
         graph_facts: signal.facts.slice(0, 5),
+        graph_temporal_evidence: signal.temporalEvidence,
+        graph_temporal_anchors_history: signal.temporalAnchorsHistory,
       },
     });
   }
@@ -2873,7 +3091,10 @@ export async function recallEntries(
 
     const createdAt = Number(row.created_at ?? 0);
     const hasGraphTemporalSignal = Number(scoreDetails?.temporal ?? 0) > 0;
-    if (!hasGraphTemporalSignal) {
+    const historicalWindowRequested = after !== undefined || before !== undefined;
+    const graphAnchorsHistoricalWindow =
+      hasGraphTemporalSignal && meta?.graph_temporal_anchors_history === true;
+    if (!hasGraphTemporalSignal || (historicalWindowRequested && !graphAnchorsHistoricalWindow)) {
       if (after !== undefined && createdAt < after) return [];
       if (before !== undefined && createdAt > before) return [];
     }
@@ -2895,6 +3116,9 @@ export async function recallEntries(
         : undefined,
       graphFacts: Array.isArray(meta?.graph_facts)
         ? meta.graph_facts.map(String).filter(Boolean).slice(0, 5)
+        : undefined,
+      timeBasis: typeof meta?.graph_temporal_evidence === "string"
+        ? meta.graph_temporal_evidence as TemporalEvidence
         : undefined,
     }];
   });
@@ -4384,13 +4608,14 @@ export async function deprecateEntry(
   actor = "system"
 ): Promise<boolean> {
   const row = await env.DB.prepare(
-    `SELECT content, tags, source, vector_ids FROM entries WHERE id = ?`
+    `SELECT content, tags, source, vector_ids, pending_vector_ids FROM entries WHERE id = ?`
   ).bind(id).first() as Record<string, any> | null;
   if (!row) return false;
 
   const tags: string[] = JSON.parse(row.tags ?? "[]");
   const nextTags = withStatus(tags, "deprecated");
   const vectorIds: string[] = JSON.parse(row.vector_ids ?? "[]");
+  const pendingVectorIds = parseVectorIds(row.pending_vector_ids);
   const now = Date.now();
 
   const deprecateRevision = prepareMemoryRevision(env.DB, {
@@ -4405,14 +4630,22 @@ export async function deprecateEntry(
     createdAt: now,
   });
   await env.DB.batch([
-    env.DB.prepare(`UPDATE entries SET tags = ?, vector_ids = ? WHERE id = ?`)
-      .bind(JSON.stringify(nextTags), "[]", id),
+    env.DB.prepare(
+      `UPDATE entries
+       SET tags = ?,
+           vector_ids = ?,
+           pending_vector_ids = NULL,
+           pending_embedding_fingerprint = NULL,
+           pending_content_hash = NULL
+       WHERE id = ?`
+    ).bind(JSON.stringify(nextTags), "[]", id),
     deprecateRevision.statement,
   ]);
   await deprecateEntryAtomicMemory(env.DB, { entryId: id, invalidAt: now });
 
   try {
-    if (vectorIds.length) await env.VECTORIZE.deleteByIds(vectorIds);
+    const idsToDelete = [...new Set([...vectorIds, ...pendingVectorIds])];
+    if (idsToDelete.length) await env.VECTORIZE.deleteByIds(idsToDelete);
   } catch (e) {
     console.error("Vectorize deleteByIds failed during deprecate (non-fatal):", e);
   }
@@ -5452,6 +5685,7 @@ const defaultHandler = {
           score_details: m.scoreDetails,
           matched_entities: m.matchedEntities ?? [],
           graph_facts: m.graphFacts ?? [],
+          time_basis: m.timeBasis ?? null,
         })),
         insight: insight || null,
       });
@@ -5706,7 +5940,7 @@ const defaultHandler = {
       const pendingQueue =
         usePendingProfile && pendingFingerprint
           ? await env.DB.prepare(
-              `SELECT id, content, tags, source, created_at FROM entries
+              `SELECT id, content, tags, source, created_at, content_hash FROM entries
                WHERE pending_vector_ids = '[]'
                  AND pending_embedding_fingerprint = ?
                  AND tags NOT LIKE '%"status:deprecated"%'
@@ -5737,6 +5971,7 @@ const defaultHandler = {
                 tags: row.tags as string,
                 source: row.source as string,
                 created_at: row.created_at as number,
+                content_hash: row.content_hash as string | null,
               }, pendingFingerprint)
             : await storeEntry(
                 env,
@@ -5769,14 +6004,23 @@ const defaultHandler = {
           ).bind(graceCutoff).first() as Record<string, any> | null;
       const remainingN = (remaining?.count as number) ?? 0;
       let activated = 0;
+      let activationBlocked = 0;
+      let activationIntegrity: PendingActivationIntegrity | null = null;
 
       // Promote pending embedding fingerprint when full reindex completes cleanly
       if (remainingN === 0 && failed === 0) {
         try {
           const stored = storedSettings ?? await loadStoredModelSettings(env.DB);
           if (stored?.pendingEmbeddingFingerprint) {
-            activated = await activatePendingVectors(env, stored.pendingEmbeddingFingerprint);
-            await saveStoredModelSettings(env.DB, promoteEmbeddingFingerprint(stored));
+            activationIntegrity = await inspectPendingActivationIntegrity(
+              env,
+              stored.pendingEmbeddingFingerprint
+            );
+            activationBlocked = activationIntegrity.blocked;
+            if (activationBlocked === 0) {
+              activated = await activatePendingVectors(env, stored.pendingEmbeddingFingerprint);
+              await saveStoredModelSettings(env.DB, promoteEmbeddingFingerprint(stored));
+            }
           }
         } catch (e) {
           console.error("Fingerprint promote failed:", e);
@@ -5792,6 +6036,8 @@ const defaultHandler = {
         mode: usePendingProfile ? "blue_green" : "legacy",
         pendingFingerprint: pendingFingerprint ?? undefined,
         activated,
+        activationBlocked,
+        activationIntegrity: activationIntegrity ?? undefined,
       });
     }
 
@@ -6032,25 +6278,30 @@ const defaultHandler = {
         );
       }
 
-      const nextFp = embeddingFingerprintOf(next.embedding);
-      const activeFp = previous.embeddingFingerprint;
-      const embConfigChanged =
-        nextFp !== embeddingFingerprintOf(previous.embedding) ||
-        nextFp !== activeFp;
+      if (body.embedding) {
+        const nextFp = embeddingFingerprintOf(next.embedding);
+        const previousActiveEmbedding = activeEmbeddingOf(previous);
+        const previousActiveFp =
+          previous.embeddingFingerprint ?? embeddingFingerprintOf(previousActiveEmbedding);
+        const hasExistingActiveVectors = await hasActiveEntryVectors(env);
 
-      // Never stamp active fingerprint on ordinary save — only pending when changed
-      if (!activeFp && !isDevLocalProvider(next.embedding.provider)) {
-        // First-time embed config: mark as pending until first reindex/vectorize completes
-        next.pendingEmbeddingFingerprint = nextFp;
-        if (!next.embeddingFingerprint) {
-          // No existing vectors assumed — activate immediately
+        if (!previous.embeddingFingerprint && !previous.activeEmbedding && !hasExistingActiveVectors) {
+          // First-time embed config: no old active generation exists, so activate directly.
+          next.activeEmbedding = cloneEmbeddingSettings(next.embedding);
           next.embeddingFingerprint = nextFp;
+          next.pendingEmbedding = undefined;
+          next.pendingEmbeddingFingerprint = undefined;
+        } else if (nextFp !== previousActiveFp) {
+          next.activeEmbedding = cloneEmbeddingSettings(previousActiveEmbedding);
+          next.embeddingFingerprint = previousActiveFp;
+          next.pendingEmbedding = cloneEmbeddingSettings(next.embedding);
+          next.pendingEmbeddingFingerprint = nextFp;
+        } else {
+          next.activeEmbedding = cloneEmbeddingSettings(next.embedding);
+          next.embeddingFingerprint = nextFp;
+          next.pendingEmbedding = undefined;
           next.pendingEmbeddingFingerprint = undefined;
         }
-      } else if (embConfigChanged) {
-        next.pendingEmbeddingFingerprint = nextFp;
-        // keep previous embeddingFingerprint (active) until reindex finishes
-        next.embeddingFingerprint = previous.embeddingFingerprint;
       }
 
       await saveStoredModelSettings(env.DB, next);
@@ -6193,6 +6444,60 @@ const defaultHandler = {
       }
     }
 
+    // POST /settings/models/reindex/cancel — abandon a pending blue/green rebuild.
+    if (url.pathname === "/settings/models/reindex/cancel" && request.method === "POST") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      const stored = await loadStoredModelSettings(env.DB);
+      const pendingFingerprint = stored?.pendingEmbeddingFingerprint;
+      if (!stored || !pendingFingerprint) {
+        return json({
+          ok: true,
+          cancelled: false,
+          message: "No pending vector rebuild is active.",
+        });
+      }
+
+      const pendingVectorIds = await listPendingRebuildVectorIds(env, pendingFingerprint);
+      try {
+        for (let i = 0; i < pendingVectorIds.length; i += D1_MAX_BOUND_PARAMS) {
+          await env.VECTORIZE.deleteByIds(pendingVectorIds.slice(i, i + D1_MAX_BOUND_PARAMS));
+        }
+      } catch (error) {
+        return json(
+          {
+            ok: false,
+            cancelled: false,
+            pendingFingerprint,
+            pendingVectors: pendingVectorIds.length,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          500
+        );
+      }
+
+      const entriesCleared = await clearPendingRebuildRows(env, pendingFingerprint);
+      const activeEmbedding = activeEmbeddingOf(stored);
+      const next = structuredClone(stored);
+      next.activeEmbedding = cloneEmbeddingSettings(activeEmbedding);
+      next.embedding = cloneEmbeddingSettings(activeEmbedding);
+      next.embeddingFingerprint =
+        stored.embeddingFingerprint ?? embeddingFingerprintOf(activeEmbedding);
+      next.pendingEmbedding = undefined;
+      next.pendingEmbeddingFingerprint = undefined;
+      await saveStoredModelSettings(env.DB, next);
+
+      return json({
+        ok: true,
+        cancelled: true,
+        pendingFingerprint,
+        pendingVectorsDeleted: pendingVectorIds.length,
+        entriesCleared,
+        reindexRequired: false,
+      });
+    }
+
     // POST /settings/models/reindex — blue/green vector rebuild.
     // Existing vector_ids stay active; vectorize-pending writes pending_vector_ids
     // and promotes them only after the whole pending profile finishes cleanly.
@@ -6201,8 +6506,15 @@ const defaultHandler = {
       if (authErr) return authErr;
 
       const { effective, stored } = await getEffectiveModelSettings(env);
-      const pending = embeddingFingerprintOf(effective.embedding);
+      const activeEmbedding = activeEmbeddingOf(effective);
+      const pendingEmbedding = pendingEmbeddingOf(effective);
+      const pending = embeddingFingerprintOf(pendingEmbedding);
       const settingsForQueue = stored ?? mergeFromEnvOnly(env);
+      settingsForQueue.activeEmbedding = cloneEmbeddingSettings(activeEmbedding);
+      settingsForQueue.embeddingFingerprint =
+        effective.embeddingFingerprint ?? embeddingFingerprintOf(activeEmbedding);
+      settingsForQueue.embedding = cloneEmbeddingSettings(pendingEmbedding);
+      settingsForQueue.pendingEmbedding = cloneEmbeddingSettings(pendingEmbedding);
       settingsForQueue.pendingEmbeddingFingerprint = pending;
       // Do NOT promote active fingerprint here — wait until remaining=0.
       await saveStoredModelSettings(env.DB, settingsForQueue);
@@ -6210,7 +6522,8 @@ const defaultHandler = {
       const update = await env.DB.prepare(
         `UPDATE entries
          SET pending_vector_ids = '[]',
-             pending_embedding_fingerprint = ?
+             pending_embedding_fingerprint = ?,
+             pending_content_hash = NULL
          WHERE tags NOT LIKE '%"status:deprecated"%'`
       ).bind(pending).run();
       const rows = (update as any)?.meta?.changes ?? 0;
@@ -6703,6 +7016,7 @@ function mergeFromEnvOnly(env: Env) {
       dimensions: parseInt(env.EMBEDDING_DIM || "384", 10) || 384,
     };
     base.embeddingFingerprint = embeddingFingerprintOf(base.embedding);
+    base.activeEmbedding = cloneEmbeddingSettings(base.embedding);
   } else if (
     isDevLocalProvider(env.EMBEDDING_PROVIDER) &&
     (env.ALLOW_DEV_EMBEDDING === "1" || env.ALLOW_DEV_EMBEDDING === "true")
@@ -6714,6 +7028,8 @@ function mergeFromEnvOnly(env: Env) {
       model: "local-hash",
       dimensions: parseInt(env.EMBEDDING_DIM || "384", 10) || 384,
     };
+    base.embeddingFingerprint = embeddingFingerprintOf(base.embedding);
+    base.activeEmbedding = cloneEmbeddingSettings(base.embedding);
   }
   return base;
 }

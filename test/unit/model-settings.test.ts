@@ -7,6 +7,7 @@ import { SqliteD1Database } from "../../src/selfhost/sqlite-d1";
 import {
   applyModelSettingsPatch,
   emptyModelSettings,
+  embeddingFingerprintOf,
   maskSecret,
   mergeModelSettings,
   normalizeApiKey,
@@ -15,6 +16,7 @@ import {
 import {
   loadStoredModelSettings,
   resetSettingsCache,
+  resolveProviderEnv,
   saveStoredModelSettings,
   getEffectiveModelSettings,
 } from "../../src/settings/store";
@@ -169,5 +171,45 @@ describe("settings store (sqlite)", () => {
       LLM_API_KEY: "env",
     });
     expect(effective.llm.baseURL).toBe("https://llm.example/v1");
+  });
+
+  it("resolves active and pending embedding profiles separately", async () => {
+    const db = d1 as unknown as D1Database;
+    const settings = emptyModelSettings();
+    settings.activeEmbedding = {
+      provider: "custom",
+      baseURL: "https://embed-old.example/v1",
+      apiKey: "old-key",
+      model: "old-embedding",
+      dimensions: 384,
+      supportsDimensionsParameter: true,
+    };
+    settings.pendingEmbedding = {
+      provider: "custom",
+      baseURL: "https://embed-new.example/v1",
+      apiKey: "new-key",
+      model: "new-embedding",
+      dimensions: 768,
+      supportsDimensionsParameter: false,
+    };
+    settings.embedding = { ...settings.pendingEmbedding };
+    settings.embeddingFingerprint = embeddingFingerprintOf(settings.activeEmbedding);
+    settings.pendingEmbeddingFingerprint = embeddingFingerprintOf(settings.pendingEmbedding);
+    await saveStoredModelSettings(db, settings);
+
+    const activeEnv = await resolveProviderEnv({ DB: db }, "active") as any;
+    const pendingEnv = await resolveProviderEnv({ DB: db }, "pending") as any;
+
+    expect(activeEnv.EMBEDDING_BASE_URL).toBe("https://embed-old.example/v1");
+    expect(activeEnv.EMBEDDING_API_KEY).toBe("old-key");
+    expect(activeEnv.EMBEDDING_MODEL).toBe("old-embedding");
+    expect(activeEnv.EMBEDDING_DIM).toBe("384");
+    expect(activeEnv.EMBEDDING_SEND_DIMENSIONS).toBe("1");
+
+    expect(pendingEnv.EMBEDDING_BASE_URL).toBe("https://embed-new.example/v1");
+    expect(pendingEnv.EMBEDDING_API_KEY).toBe("new-key");
+    expect(pendingEnv.EMBEDDING_MODEL).toBe("new-embedding");
+    expect(pendingEnv.EMBEDDING_DIM).toBe("768");
+    expect(pendingEnv.EMBEDDING_SEND_DIMENSIONS).toBe("0");
   });
 });

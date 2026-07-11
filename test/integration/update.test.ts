@@ -302,6 +302,35 @@ describe("POST /update", () => {
     expect(data.ok).toBe(true);
   });
 
+  it("clears stale pending vectors and requeues edited content during blue-green rebuild", async () => {
+    const deleteByIdsMock = vi.fn().mockResolvedValue({ mutationId: "cleanup" });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({ deleteByIds: deleteByIdsMock }),
+    });
+    seedEntry(db, {
+      vector_ids: '["active-old"]',
+      content_hash: "old-content-hash",
+    } as any);
+
+    await worker.fetch(req("POST", "/settings/models/reindex"), env, ctx);
+    const pendingFingerprint = db.entries[0].pending_embedding_fingerprint;
+    db.entries[0].pending_vector_ids = '["pending-old"]';
+    db.entries[0].pending_content_hash = "old-content-hash";
+
+    const res = await worker.fetch(
+      req("POST", "/update", { body: { id: "entry-abc", content: "Updated content" } }),
+      env,
+      ctx
+    );
+
+    expect(res.status).toBe(200);
+    expect(db.entries[0].content).toBe("Updated content");
+    expect(db.entries[0].pending_vector_ids).toBe("[]");
+    expect(db.entries[0].pending_embedding_fingerprint).toBe(pendingFingerprint);
+    expect(db.entries[0].pending_content_hash).toBeNull();
+    expect(deleteByIdsMock).toHaveBeenCalledWith(["pending-old"]);
+  });
+
   it("removes the prepared generation when the D1 version switch fails", async () => {
     const insertMock = vi.fn().mockResolvedValue({ mutationId: "insert" });
     const deleteByIdsMock = vi.fn().mockResolvedValue({ mutationId: "delete" });

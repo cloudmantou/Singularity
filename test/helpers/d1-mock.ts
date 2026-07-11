@@ -499,12 +499,17 @@ export class D1Mock {
         if (s.startsWith("UPDATE entries SET content = ?, vector_ids")) {
           if (s.includes("AND content = ? AND tags = ? AND vector_ids = ?")) {
             const hasHash = s.includes("content_hash");
-            const [content, vector_ids, a2, a3, a4, a5, a6] = args;
-            const content_hash = hasHash ? a2 : null;
-            const id = hasHash ? a3 : a2;
-            const expected_content = hasHash ? a4 : a3;
-            const expected_tags = hasHash ? a5 : a4;
-            const expected_vector_ids = hasHash ? a6 : a5;
+            const hasPending = s.includes("pending_vector_ids");
+            const content = args[0];
+            const vector_ids = args[1];
+            let index = 2;
+            const content_hash = hasHash ? args[index++] : null;
+            const pending_vector_ids = hasPending ? args[index++] : undefined;
+            const pending_embedding_fingerprint = hasPending ? args[index++] : undefined;
+            const id = args[index++];
+            const expected_content = args[index++];
+            const expected_tags = args[index++];
+            const expected_vector_ids = args[index++];
             const row = db.entries.find(
               (e: any) =>
                 e.id === id &&
@@ -516,6 +521,11 @@ export class D1Mock {
               row.content = content;
               row.vector_ids = vector_ids;
               if (hasHash) row.content_hash = content_hash;
+              if (hasPending) {
+                row.pending_vector_ids = pending_vector_ids;
+                row.pending_embedding_fingerprint = pending_embedding_fingerprint;
+                row.pending_content_hash = null;
+              }
               if (s.includes("classification_status = 'pending'")) resetClassification(row);
             }
             return { meta: { changes: row ? 1 : 0 } };
@@ -528,7 +538,32 @@ export class D1Mock {
         if (s.startsWith("UPDATE entries SET tags = ?, vector_ids")) {
           const [tags, vector_ids, id] = args;
           const row = db.entries.find((e: any) => e.id === id);
-          if (row) { row.tags = tags; row.vector_ids = vector_ids; }
+          if (row) {
+            row.tags = tags;
+            row.vector_ids = vector_ids;
+            if (s.includes("pending_vector_ids = NULL")) {
+              row.pending_vector_ids = null;
+              row.pending_embedding_fingerprint = null;
+              row.pending_content_hash = null;
+            }
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE entries SET vector_ids = ?,")) {
+          const [vector_ids, pending_vector_ids, pending_embedding_fingerprint, id, expected_vector_ids, expected_content] = args;
+          const row = db.entries.find(
+            (e: any) =>
+              e.id === id &&
+              e.vector_ids === expected_vector_ids &&
+              e.content === expected_content &&
+              !String(e.tags ?? "[]").includes('"status:deprecated"')
+          );
+          if (row) {
+            row.vector_ids = vector_ids;
+            row.pending_vector_ids = pending_vector_ids;
+            row.pending_embedding_fingerprint = pending_embedding_fingerprint;
+            row.pending_content_hash = null;
+          }
           return { meta: { changes: row ? 1 : 0 } };
         }
         if (s.startsWith("UPDATE entries SET vector_ids = ? WHERE id = ? AND vector_ids = ? AND content = ?")) {
@@ -550,6 +585,7 @@ export class D1Mock {
             if (String(row.tags ?? "[]").includes('"status:deprecated"')) continue;
             row.pending_vector_ids = "[]";
             row.pending_embedding_fingerprint = pending_embedding_fingerprint;
+            row.pending_content_hash = null;
             changes++;
           }
           return { meta: { changes } };
@@ -558,6 +594,8 @@ export class D1Mock {
           const [
             pending_vector_ids,
             pending_embedding_fingerprint,
+            pending_content_hash,
+            content_hash,
             id,
             expected_pending_vector_ids,
             expected_pending_embedding_fingerprint,
@@ -574,8 +612,22 @@ export class D1Mock {
           if (row) {
             row.pending_vector_ids = pending_vector_ids;
             row.pending_embedding_fingerprint = pending_embedding_fingerprint;
+            row.pending_content_hash = pending_content_hash;
+            if (row.content_hash == null) row.content_hash = content_hash;
           }
           return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE entries SET pending_vector_ids = NULL")) {
+          const [pending_embedding_fingerprint] = args;
+          let changes = 0;
+          for (const row of db.entries) {
+            if (row.pending_embedding_fingerprint !== pending_embedding_fingerprint) continue;
+            row.pending_vector_ids = null;
+            row.pending_embedding_fingerprint = null;
+            row.pending_content_hash = null;
+            changes++;
+          }
+          return { meta: { changes } };
         }
         if (s.startsWith("UPDATE entries SET vector_ids = pending_vector_ids")) {
           const [pending_embedding_fingerprint] = args;
@@ -584,12 +636,15 @@ export class D1Mock {
             if (
               row.pending_embedding_fingerprint === pending_embedding_fingerprint &&
               row.pending_vector_ids != null &&
-              row.pending_vector_ids !== "[]"
+              row.pending_vector_ids !== "[]" &&
+              row.pending_content_hash != null &&
+              row.content_hash === row.pending_content_hash
             ) {
               row.vector_ids = row.pending_vector_ids;
               row.embedding_fingerprint = row.pending_embedding_fingerprint;
               row.pending_vector_ids = null;
               row.pending_embedding_fingerprint = null;
+              row.pending_content_hash = null;
               changes++;
             }
           }
@@ -773,14 +828,18 @@ export class D1Mock {
         if (s.startsWith("UPDATE entries SET content = ?, tags = ?, vector_ids = ?")) {
           if (s.includes("AND content = ? AND tags = ? AND vector_ids = ?")) {
             const hasHash = s.includes("content_hash");
+            const hasPending = s.includes("pending_vector_ids");
             const content = args[0];
             const tags = args[1];
             const vector_ids = args[2];
-            const content_hash = hasHash ? args[3] : null;
-            const id = hasHash ? args[4] : args[3];
-            const expected_content = hasHash ? args[5] : args[4];
-            const expected_tags = hasHash ? args[6] : args[5];
-            const expected_vector_ids = hasHash ? args[7] : args[6];
+            let index = 3;
+            const content_hash = hasHash ? args[index++] : null;
+            const pending_vector_ids = hasPending ? args[index++] : undefined;
+            const pending_embedding_fingerprint = hasPending ? args[index++] : undefined;
+            const id = args[index++];
+            const expected_content = args[index++];
+            const expected_tags = args[index++];
+            const expected_vector_ids = args[index++];
             const row = db.entries.find(
               (e: any) =>
                 e.id === id &&
@@ -793,6 +852,11 @@ export class D1Mock {
               row.tags = tags;
               row.vector_ids = vector_ids;
               if (hasHash) row.content_hash = content_hash;
+              if (hasPending) {
+                row.pending_vector_ids = pending_vector_ids;
+                row.pending_embedding_fingerprint = pending_embedding_fingerprint;
+                row.pending_content_hash = null;
+              }
               if (s.includes("classification_status = 'pending'")) resetClassification(row);
             }
             return { meta: { changes: row ? 1 : 0 } };
@@ -914,6 +978,31 @@ export class D1Mock {
           const unclassified = db.entries.filter((e: any) => e.classification_status !== "succeeded").length;
           return { count, avg_importance, unvectorized, unclassified };
         }
+        if (s.includes("COUNT(*) as count") && s.includes("pending_embedding_fingerprint = ?") && s.includes("pending_content_hash != content_hash")) {
+          const pendingFingerprint = String(args[0]);
+          const count = db.entries.filter((e: any) =>
+            e.pending_embedding_fingerprint === pendingFingerprint &&
+            e.pending_vector_ids != null &&
+            e.pending_vector_ids !== "[]" &&
+            (
+              e.pending_content_hash == null ||
+              e.content_hash == null ||
+              e.pending_content_hash !== e.content_hash
+            )
+          ).length;
+          return { count };
+        }
+        if (s.includes("COUNT(*) as count") && s.includes("pending_embedding_fingerprint = ?") && s.includes("content_hash = pending_content_hash")) {
+          const pendingFingerprint = String(args[0]);
+          const count = db.entries.filter((e: any) =>
+            e.pending_embedding_fingerprint === pendingFingerprint &&
+            e.pending_vector_ids != null &&
+            e.pending_vector_ids !== "[]" &&
+            e.pending_content_hash != null &&
+            e.content_hash === e.pending_content_hash
+          ).length;
+          return { count };
+        }
         if (s.includes("COUNT(*) as count") && s.includes("pending_embedding_fingerprint = ?") && s.includes("pending_vector_ids IS NOT NULL")) {
           const pendingFingerprint = String(args[0]);
           const count = db.entries.filter((e: any) =>
@@ -938,6 +1027,14 @@ export class D1Mock {
           const count = db.entries.filter((e: any) =>
             e.vector_ids === '[]' &&
             e.created_at < cutoff &&
+            (!s.includes("tags NOT LIKE") || !String(e.tags ?? "[]").includes('"status:deprecated"'))
+          ).length;
+          return { count };
+        }
+        if (s.includes("COUNT(*) as count") && s.includes("vector_ids IS NOT NULL") && s.includes("vector_ids != '[]'")) {
+          const count = db.entries.filter((e: any) =>
+            e.vector_ids != null &&
+            e.vector_ids !== "[]" &&
             (!s.includes("tags NOT LIKE") || !String(e.tags ?? "[]").includes('"status:deprecated"'))
           ).length;
           return { count };
@@ -1335,6 +1432,7 @@ export class D1Mock {
               created_at: memory.created_at,
               valid_from: memory.valid_from ?? null,
               valid_to: memory.valid_to ?? null,
+              reference_time: memory.reference_time ?? null,
               invalid_at: memory.invalid_at ?? null,
               expired_at: memory.expired_at ?? null,
               importance: memory.importance ?? null,
@@ -1393,6 +1491,7 @@ export class D1Mock {
               score: relation.score ?? null,
               valid_from: relation.valid_from ?? null,
               valid_to: relation.valid_to ?? null,
+              reference_time: relation.reference_time ?? memory.reference_time ?? null,
               invalid_at: relation.invalid_at ?? null,
               expired_at: relation.expired_at ?? null,
               from_name: from?.name ?? null,
@@ -1504,8 +1603,24 @@ export class D1Mock {
               tags: e.tags,
               source: e.source,
               created_at: e.created_at,
+              content_hash: e.content_hash ?? null,
             }));
           return { results: rows };
+        }
+        if (
+          s.includes("SELECT pending_vector_ids FROM entries") &&
+          s.includes("pending_embedding_fingerprint = ?") &&
+          s.includes("pending_vector_ids IS NOT NULL")
+        ) {
+          const pendingFingerprint = String(args[0]);
+          const results = db.entries
+            .filter((e: any) =>
+              e.pending_embedding_fingerprint === pendingFingerprint &&
+              e.pending_vector_ids != null &&
+              e.pending_vector_ids !== "[]"
+            )
+            .map((e: any) => ({ pending_vector_ids: e.pending_vector_ids }));
+          return { results };
         }
         // export (cursor + id) and vectorize-pending — avoid matching compress/list queries
         if (

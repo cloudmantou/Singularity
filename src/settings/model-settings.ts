@@ -22,8 +22,13 @@ export interface EmbeddingSettings {
 
 export interface ModelSettings {
   llm: LlmSettings;
+  /** Desired/current form value. During rebuild this is the pending embedding config. */
   embedding: EmbeddingSettings;
   updatedAt?: number;
+  /** Embedding config used by the active vector_ids generation. */
+  activeEmbedding?: EmbeddingSettings;
+  /** Embedding config used to build pending_vector_ids. */
+  pendingEmbedding?: EmbeddingSettings;
   /** Fingerprint of vectors currently in the index. */
   embeddingFingerprint?: string;
   /** Fingerprint of saved config waiting for full reindex. */
@@ -41,6 +46,16 @@ export interface PublicModelSettings {
     supportsDimensionsParameter?: boolean;
   };
   updatedAt?: number;
+  activeEmbedding?: Omit<EmbeddingSettings, "apiKey"> & {
+    apiKey: string;
+    hasApiKey: boolean;
+    supportsDimensionsParameter?: boolean;
+  };
+  pendingEmbedding?: Omit<EmbeddingSettings, "apiKey"> & {
+    apiKey: string;
+    hasApiKey: boolean;
+    supportsDimensionsParameter?: boolean;
+  };
   embeddingFingerprint?: string;
   pendingEmbeddingFingerprint?: string;
   status: {
@@ -338,6 +353,33 @@ export function embeddingFingerprintOf(emb: EmbeddingSettings): string {
   ].join("|");
 }
 
+export function cloneEmbeddingSettings(embedding: EmbeddingSettings): EmbeddingSettings {
+  return { ...embedding };
+}
+
+export function activeEmbeddingOf(settings: ModelSettings): EmbeddingSettings {
+  return cloneEmbeddingSettings(settings.activeEmbedding ?? settings.embedding);
+}
+
+export function pendingEmbeddingOf(settings: ModelSettings): EmbeddingSettings {
+  return cloneEmbeddingSettings(settings.pendingEmbedding ?? settings.embedding);
+}
+
+function publicEmbeddingProfile(
+  embedding: EmbeddingSettings | undefined
+): PublicModelSettings["activeEmbedding"] | undefined {
+  if (!embedding) return undefined;
+  return {
+    provider: embedding.provider,
+    baseURL: embedding.baseURL,
+    model: embedding.model,
+    dimensions: embedding.dimensions,
+    supportsDimensionsParameter: embedding.supportsDimensionsParameter,
+    apiKey: "",
+    hasApiKey: Boolean(embedding.apiKey),
+  };
+}
+
 export function isDevLocalProvider(provider: string | undefined): boolean {
   const p = (provider || "").toLowerCase();
   return p === "local" || p === "local-hash" || p === "local-hash-dev";
@@ -502,6 +544,8 @@ export function mergeModelSettings(
       supportsDimensionsParameter: supportsDim,
     },
     updatedAt: s.updatedAt,
+    activeEmbedding: s.activeEmbedding ? cloneEmbeddingSettings(s.activeEmbedding) : undefined,
+    pendingEmbedding: s.pendingEmbedding ? cloneEmbeddingSettings(s.pendingEmbedding) : undefined,
     embeddingFingerprint: s.embeddingFingerprint,
     pendingEmbeddingFingerprint: s.pendingEmbeddingFingerprint,
   };
@@ -565,6 +609,8 @@ export function toPublicModelSettings(
       supportsDimensionsParameter: effective.embedding.supportsDimensionsParameter,
     },
     updatedAt: effective.updatedAt,
+    activeEmbedding: publicEmbeddingProfile(effective.activeEmbedding),
+    pendingEmbedding: publicEmbeddingProfile(effective.pendingEmbedding),
     embeddingFingerprint: effective.embeddingFingerprint,
     pendingEmbeddingFingerprint: effective.pendingEmbeddingFingerprint,
     status: {
@@ -661,8 +707,12 @@ export function promoteEmbeddingFingerprint(settings: ModelSettings): ModelSetti
   if (next.pendingEmbeddingFingerprint) {
     next.embeddingFingerprint = next.pendingEmbeddingFingerprint;
     next.pendingEmbeddingFingerprint = undefined;
+    next.activeEmbedding = cloneEmbeddingSettings(next.pendingEmbedding ?? next.embedding);
+    next.embedding = cloneEmbeddingSettings(next.activeEmbedding);
+    next.pendingEmbedding = undefined;
   } else {
     next.embeddingFingerprint = embeddingFingerprintOf(next.embedding);
+    next.activeEmbedding = cloneEmbeddingSettings(next.embedding);
   }
   return next;
 }

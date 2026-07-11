@@ -12,7 +12,7 @@ import {
   OpenAICompatibleLLM,
   thinkingDisabledBody,
 } from "./openai-compatible";
-import { resolveProviderEnv } from "../settings/store";
+import { resolveProviderEnv, type EmbeddingProfileRole } from "../settings/store";
 import {
   DEFAULT_WORKERS_EMBEDDING_MODEL,
   DEFAULT_WORKERS_LLM_MODEL,
@@ -152,8 +152,11 @@ export async function createLLM(env: ProviderEnv): Promise<LLMProvider> {
 }
 
 /** Async: merges control-plane DB settings, then builds embedding client. */
-export async function createEmbedding(env: ProviderEnv): Promise<EmbeddingProvider> {
-  const resolved = await resolveProviderEnv(env);
+export async function createEmbedding(
+  env: ProviderEnv,
+  embeddingRole: EmbeddingProfileRole = "active"
+): Promise<EmbeddingProvider> {
+  const resolved = await resolveProviderEnv(env, embeddingRole);
   return buildEmbedding(resolved);
 }
 

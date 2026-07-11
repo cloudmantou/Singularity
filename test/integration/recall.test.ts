@@ -786,6 +786,7 @@ describe("GET /recall", () => {
     expect(data.results[0].matched_entities).toContain("Singularity");
     expect(data.results[0].score_details.entity).toBeGreaterThan(0);
     expect(data.results[0].score_details.temporal).toBe(0.6);
+    expect(data.results[0].time_basis).toBe("inferred_current");
     expect(data.results[0].score_details.semantic).toBeGreaterThan(0);
   });
 
@@ -984,8 +985,71 @@ describe("GET /recall", () => {
     expect(data.results[0].score_details.semantic).toBe(0);
     expect(data.results[0].score_details.entity).toBeGreaterThan(0);
     expect(data.results[0].score_details.relation).toBeGreaterThan(0);
-    expect(data.results[0].score_details.temporal).toBe(0.6);
+    expect(data.results[0].score_details.temporal).toBe(0.8);
+    expect(data.results[0].time_basis).toBe("reference_time");
     expect(data.results[0].graph_facts).toContain("Singularity uses SQLite");
+  });
+
+  it("does not let inferred-current graph facts bypass a historical window", async () => {
+    const now = Date.now();
+    const after = now - 30 * 86_400_000;
+    const before = now - 10 * 86_400_000;
+    db.entries.push({
+      id: "current-only-entry",
+      content: "Singularity currently uses the local durable store.",
+      tags: "[]",
+      source: "api",
+      created_at: now,
+      vector_ids: "[]",
+      recall_count: 0,
+      importance_score: 0,
+    });
+    db.memories.push({
+      id: "memory-current-only",
+      entry_id: "current-only-entry",
+      content: "Singularity currently uses the local durable store.",
+      kind: "semantic",
+      memory_class: "fact",
+      importance: 4,
+      confidence: 0.9,
+      valid_from: null,
+      valid_to: null,
+      reference_time: null,
+      invalid_at: null,
+      expired_at: null,
+      created_at: now,
+    });
+    db.entities.push({
+      id: "entity-singularity",
+      name: "Singularity",
+      name_normalized: "singularity",
+      entity_type: "project",
+      mention_count: 1,
+      updated_at: now,
+    });
+    db.memoryEntities.push({
+      id: "me-current-only",
+      memory_id: "memory-current-only",
+      entity_id: "entity-singularity",
+      role: "mentions",
+      score: 0.94,
+      created_at: now,
+    });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({ matches: [] }),
+      }),
+    });
+
+    const res = await worker.fetch(
+      req("GET", `/recall?query=${encodeURIComponent("Singularity historical storage")}&after=${after}&before=${before}`),
+      env,
+      ctx
+    );
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.results).toEqual([]);
   });
 
   it("keeps graph-temporal facts in historical windows even when the entry was created earlier", async () => {
@@ -1050,6 +1114,7 @@ describe("GET /recall", () => {
     expect(data.results).toHaveLength(1);
     expect(data.results[0].id).toBe("historical-graph-entry");
     expect(data.results[0].score_details.temporal).toBe(0.8);
+    expect(data.results[0].time_basis).toBe("explicit_start");
     expect(data.results[0].matched_entities).toContain("Singularity");
   });
 

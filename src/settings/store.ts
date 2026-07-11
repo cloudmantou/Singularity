@@ -4,9 +4,12 @@
  */
 
 import {
+  activeEmbeddingOf,
   emptyModelSettings,
   isDevLocalProvider,
   mergeModelSettings,
+  pendingEmbeddingOf,
+  type EmbeddingSettings,
   type ModelSettings,
   type SettingsEnvInput,
 } from "./model-settings";
@@ -82,52 +85,69 @@ export async function getEffectiveModelSettings(
   return { effective: mergeModelSettings(stored, env), stored };
 }
 
+export type EmbeddingProfileRole = "active" | "pending" | "current";
+
+function overlayEmbeddingProfile<T extends SettingsEnvInput>(
+  env: T,
+  embedding: EmbeddingSettings
+): T {
+  const embLocal = isDevLocalProvider(embedding.provider);
+  const embOpenAI =
+    !embLocal &&
+    embedding.provider !== "none" &&
+    embedding.provider !== "workers" &&
+    Boolean(embedding.baseURL && embedding.apiKey);
+  return {
+    ...env,
+    EMBEDDING_BASE_URL: embLocal
+      ? undefined
+      : embedding.baseURL || env.EMBEDDING_BASE_URL || undefined,
+    EMBEDDING_API_KEY: embLocal
+      ? undefined
+      : embedding.apiKey || env.EMBEDDING_API_KEY || undefined,
+    EMBEDDING_MODEL: embLocal
+      ? undefined
+      : embedding.model || env.EMBEDDING_MODEL || undefined,
+    EMBEDDING_PROVIDER: embLocal
+      ? "local-hash-dev"
+      : embOpenAI
+        ? embedding.provider
+        : env.EMBEDDING_PROVIDER,
+    EMBEDDING_DIM: String(embedding.dimensions || 384),
+    EMBEDDING_SEND_DIMENSIONS:
+      embedding.supportsDimensionsParameter === false ? "0" : "1",
+    ALLOW_DEV_EMBEDDING: embLocal
+      ? env.ALLOW_DEV_EMBEDDING || "true"
+      : env.ALLOW_DEV_EMBEDDING,
+  } as T;
+}
+
 /**
  * ProviderEnv fields derived from control-plane + env for createLLM/createEmbedding.
  */
 export async function resolveProviderEnv<T extends SettingsEnvInput & { DB?: D1Database }>(
-  env: T
+  env: T,
+  embeddingRole: EmbeddingProfileRole = "active"
 ): Promise<T> {
   if (!env.DB) return env;
 
   const { effective } = await getEffectiveModelSettings(
     env as SettingsEnvInput & { DB: D1Database }
   );
+  const embedding =
+    embeddingRole === "pending"
+      ? pendingEmbeddingOf(effective)
+      : embeddingRole === "current"
+        ? effective.embedding
+        : activeEmbeddingOf(effective);
 
-  const embLocal = isDevLocalProvider(effective.embedding.provider);
-  const embOpenAI =
-    !embLocal &&
-    effective.embedding.provider !== "none" &&
-    effective.embedding.provider !== "workers" &&
-    Boolean(effective.embedding.baseURL && effective.embedding.apiKey);
-
-  return {
+  return overlayEmbeddingProfile({
     ...env,
     LLM_BASE_URL: effective.llm.baseURL || undefined,
     LLM_API_KEY: effective.llm.apiKey || undefined,
     LLM_MODEL: effective.llm.model || undefined,
-    EMBEDDING_BASE_URL: embLocal
-      ? undefined
-      : effective.embedding.baseURL || env.EMBEDDING_BASE_URL || undefined,
-    EMBEDDING_API_KEY: embLocal
-      ? undefined
-      : effective.embedding.apiKey || env.EMBEDDING_API_KEY || undefined,
-    EMBEDDING_MODEL: embLocal
-      ? undefined
-      : effective.embedding.model || env.EMBEDDING_MODEL || undefined,
-    EMBEDDING_PROVIDER: embLocal
-      ? "local-hash-dev"
-      : embOpenAI
-        ? effective.embedding.provider
-        : env.EMBEDDING_PROVIDER,
-    EMBEDDING_DIM: String(effective.embedding.dimensions || 384),
-    EMBEDDING_SEND_DIMENSIONS:
-      effective.embedding.supportsDimensionsParameter === false ? "0" : "1",
-    ALLOW_DEV_EMBEDDING: embLocal
-      ? env.ALLOW_DEV_EMBEDDING || "true"
-      : env.ALLOW_DEV_EMBEDDING,
     SELFHOST: env.SELFHOST,
-  } as T;
+  } as T, embedding);
 }
 
 /** Build a one-off env overlay from a candidate config without writing to DB. */
