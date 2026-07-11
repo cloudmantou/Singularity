@@ -4500,6 +4500,9 @@
               relevance: recentActivity ? null : (m.relevance || null),
               createdAt: m.created_at,
               source: m.source || '',
+              scoreDetails: m.score_details || {},
+              matchedEntities: m.matched_entities || [],
+              graphFacts: m.graph_facts || [],
             }))
             answerBubble = document.createElement('div')
             answerBubble.className = 'ex-a-row'
@@ -4520,7 +4523,17 @@
                 const relevance = recentActivity
                   ? ''
                   : ` (${m.relevance || (m.score >= 85 ? 'highly relevant' : m.score >= 55 ? 'relevant' : 'possibly relevant')})`
-                return `${i + 1}. [${date}${src}${tagList}]${relevance}${m.updated ? ' [updated]' : ''}\n${m.content}`
+                const matchedEntities = Array.isArray(m.matched_entities)
+                  ? m.matched_entities.map(String).filter(Boolean).slice(0, 8)
+                  : []
+                const graphFacts = Array.isArray(m.graph_facts)
+                  ? m.graph_facts.map(String).filter(Boolean).slice(0, 5)
+                  : []
+                const graphContext = [
+                  matchedEntities.length ? `Matched entities:\n${matchedEntities.map((entity) => `- ${entity}`).join('\n')}` : '',
+                  graphFacts.length ? `Current graph facts:\n${graphFacts.map((fact) => `- ${fact}`).join('\n')}` : '',
+                ].filter(Boolean).join('\n')
+                return `${i + 1}. [${date}${src}${tagList}]${relevance}${m.updated ? ' [updated]' : ''}\n${m.content}${graphContext ? `\n${graphContext}` : ''}`
               }).join('\n\n')
             const res = await fetch(`${WORKER_URL}/chat`, {
               method: 'POST',
@@ -4609,10 +4622,23 @@
       <span class="match-pct" title="Relative rank score ${entry.score}/100 (not accuracy)">${escHtml(relevanceLabel)}</span>
       <div class="match-bar-bg"><div class="match-bar-fill" style="width:${entry.score}%"></div></div>
     </div>`
+        const matchedEntities = Array.isArray(entry.matchedEntities)
+          ? entry.matchedEntities.map(String).filter(Boolean).slice(0, 8)
+          : []
+        const graphFacts = Array.isArray(entry.graphFacts)
+          ? entry.graphFacts.map(String).filter(Boolean).slice(0, 5)
+          : []
+        const graphMetaParts = []
+        if (matchedEntities.length) graphMetaParts.push(`Matched entities: ${matchedEntities.join(', ')}`)
+        if (graphFacts.length) graphMetaParts.push(`Current graph facts: ${graphFacts.join(' · ')}`)
+        const graphMetaLine = graphMetaParts.length
+          ? `<div class="card-meta">${graphMetaParts.map(escHtml).join(' · ')}</div>`
+          : ''
         card.className = 'memory-card' + (isSynthesized ? ' card--synthesized' : '') + (isRolledUp ? ' card--rolled-up' : '')
         card.innerHTML = `
     ${matchLine}
     <div class="card-content" style="cursor: pointer;">${escHtml(entry.content)}</div>
+    ${graphMetaLine}
     <div class="card-footer">
       <div class="card-tags">${entry.tags.map((tag) => `<span class="tag-chip${tag === 'synthesized' ? ' tag-chip--synthesized' : ''}">${escHtml(tag)}</span>`).join('')}</div>
       <div class="card-actions">

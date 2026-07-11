@@ -2077,6 +2077,7 @@ const GRAPH_RELATION_MEMORY_LIMIT = 100;
 const GRAPH_DIRECT_BASE_BOOST = 0.026;
 const GRAPH_RELATION_BASE_BOOST = 0.014;
 const GRAPH_TEMPORAL_BASE_BOOST = 0.008;
+const GRAPH_TOTAL_BOOST_MAX = 0.08;
 
 function clamp01(value: unknown): number {
   const n = Number(value);
@@ -2138,7 +2139,10 @@ function addGraphSignal(
     entityNames: [],
     facts: [],
   };
-  current.boost = Math.max(current.boost, 0) + Math.max(0, input.boost);
+  current.boost = Math.min(
+    GRAPH_TOTAL_BOOST_MAX,
+    Math.max(current.boost, 0) + Math.max(0, input.boost)
+  );
   current.createdAt = Math.max(current.createdAt, input.createdAt || 0);
   current.entity = Math.max(current.entity, input.entity ?? 0);
   current.temporal = Math.max(current.temporal, input.temporal ?? 0);
@@ -2468,9 +2472,19 @@ export async function recallEntries(
   }
 
   const tokens = tokenizeQuery(embedQuery);
-  const [values, queryTags] = await Promise.all([
-    embed(embedQuery, env, "query"),
-    inferQueryTags(embedQuery, env),
+  const [values, queryTags, graphSignals] = await Promise.all([
+    embed(embedQuery, env, "query").catch((error) => {
+      console.error("Recall embedding failed; continuing with keyword/graph recall:", error);
+      return null;
+    }),
+    inferQueryTags(embedQuery, env).catch((error) => {
+      console.error("Recall tag inference failed (non-fatal):", error);
+      return [];
+    }),
+    buildGraphRecallSignals(embedQuery, env, before ?? now).catch((error) => {
+      console.error("Graph recall signals failed (non-fatal):", error);
+      return new Map<string, GraphRecallSignal>();
+    }),
   ]);
 
   let keywordRows: KeywordRow[] = [];
@@ -2490,30 +2504,36 @@ export async function recallEntries(
     if (!tagRows.length) return { matches: [], insight: "" };
     keywordRows = tagRows as unknown as KeywordRow[];
 
-    const vectorIds = [...new Set(
-      (tagRows as any[]).flatMap(r => JSON.parse((r.vector_ids as string) ?? "[]") as string[])
-    )];
-    if (!vectorIds.length) return { matches: [], insight: "" };
+    if (!values) {
+      results = { matches: [] };
+    } else {
+      const vectorIds = [...new Set(
+        (tagRows as any[]).flatMap(r => JSON.parse((r.vector_ids as string) ?? "[]") as string[])
+      )];
+      if (!vectorIds.length) return { matches: [], insight: "" };
 
-    const vectors: VectorizeVector[] = [];
-    for (let i = 0; i < vectorIds.length; i += VECTORIZE_GET_BY_IDS_BATCH) {
-      vectors.push(...await env.VECTORIZE.getByIds(vectorIds.slice(i, i + VECTORIZE_GET_BY_IDS_BATCH)));
+      const vectors: VectorizeVector[] = [];
+      for (let i = 0; i < vectorIds.length; i += VECTORIZE_GET_BY_IDS_BATCH) {
+        vectors.push(...await env.VECTORIZE.getByIds(vectorIds.slice(i, i + VECTORIZE_GET_BY_IDS_BATCH)));
+      }
+
+      results = {
+        matches: vectors.map(v => ({
+          id: v.id,
+          score: cosineSim(values, v.values as number[]),
+          metadata: v.metadata,
+        })) as VectorizeMatch[],
+      };
     }
-
-    results = {
-      matches: vectors.map(v => ({
-        id: v.id,
-        score: cosineSim(values, v.values as number[]),
-        metadata: v.metadata,
-      })) as VectorizeMatch[],
-    };
   } else {
     // Cloudflare Vectorize caps topK at 50 when returnMetadata="all" (error 40025).
     // Overfetch before validating active generations so stale cleanup debt cannot
     // consume the entire logical candidate window.
     denseLogicalLimit = Math.min(topK * VECTORIZE_TOP_K_MULTIPLIER, 50);
     const [denseResults, kwRows] = await Promise.all([
-      env.VECTORIZE.query(values, { topK: 50, returnMetadata: "all" }),
+      values
+        ? env.VECTORIZE.query(values, { topK: 50, returnMetadata: "all" })
+        : Promise.resolve({ matches: [] as VectorizeMatch[] }),
       keywordSearch(tokens, env),
     ]);
     results = denseResults;
@@ -2534,12 +2554,6 @@ export async function recallEntries(
       : denseLogicalLimit;
     results = { matches: activeMatches.slice(0, activeLimit) };
   }
-
-  const graphSignals = await buildGraphRecallSignals(embedQuery, env, before ?? now)
-    .catch((error) => {
-      console.error("Graph recall signals failed (non-fatal):", error);
-      return new Map<string, GraphRecallSignal>();
-    });
 
   // Always-on hybrid retrieval: fuse dense + keyword candidates via RRF. On the tag path
   // keyword is a re-ranking signal only (allowKeywordOnly=false); on the default path it can
@@ -2609,53 +2623,50 @@ export async function recallEntries(
 
   if (!deduped.length) return { matches: [], insight: "" };
 
-  // Fetch full content from D1 for all matched parent IDs, applying filters: auto-pattern
-  // exclusion, status:deprecated exclusion, optional kind match, and optional after/before range
+  // Fetch full content from D1 for all matched parent IDs. Entry-level time filters are
+  // applied after hydration so graph-temporal facts can be judged by fact validity rather
+  // than the original entry creation time.
   const parentIds = deduped.map((m) => (m.metadata as any)?.parentId ?? m.id);
   const placeholders = parentIds.map(() => "?").join(", ");
   const d1Bindings: (string | number)[] = [...parentIds];
   let d1Sql = `SELECT id, content, tags, source, created_at FROM entries WHERE id IN (${placeholders}) AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"status:deprecated"%'`;
   if (kind && (KIND_VALUES as readonly string[]).includes(kind)) {
     // Safe to interpolate: `kind` is validated against the KIND_VALUES enum just above,
-    // so only "episodic"/"semantic" can reach the string. Kept as a literal (not a bound
-    // param) so it doesn't shift the positional after/before bindings below.
+    // so only "episodic"/"semantic" can reach the string.
     d1Sql += ` AND tags LIKE '%"kind:${kind}"%'`;
   }
-  if (after !== undefined) { d1Sql += ` AND created_at >= ?`; d1Bindings.push(after); }
-  if (before !== undefined) { d1Sql += ` AND created_at <= ?`; d1Bindings.push(before); }
   const { results: d1Rows } = await env.DB.prepare(d1Sql).bind(...d1Bindings).all() as { results: Record<string, any>[] };
 
   const d1Map = new Map(d1Rows.map((r) => [r.id as string, r]));
-
-  // Increment recall_count for entries actually shown
-  ctx.waitUntil(
-    Promise.all(
-      [...d1Map.keys()].map(id =>
-        env.DB.prepare(`UPDATE entries SET recall_count = recall_count + 1 WHERE id = ?`).bind(id).run()
-      )
-    ).catch(e => console.error("recall_count update failed (non-fatal):", e))
-  );
 
   const matches: RecallMatch[] = deduped.flatMap((m) => {
     const meta = m.metadata as Record<string, any>;
     const parentId = (meta?.parentId ?? m.id) as string;
     const row = d1Map.get(parentId);
     const isUpdate = !!meta?.isUpdate;
+    const scoreDetails = meta?.score_details as RecallScoreDetails | undefined;
 
     if (!row) {
       // D1 row not found — either filtered out (e.g. status:deprecated) or genuinely missing
       return [];
     }
 
+    const createdAt = Number(row.created_at ?? 0);
+    const hasGraphTemporalSignal = Number(scoreDetails?.temporal ?? 0) > 0;
+    if (!hasGraphTemporalSignal) {
+      if (after !== undefined && createdAt < after) return [];
+      if (before !== undefined && createdAt > before) return [];
+    }
+
     return [{
       id: parentId,
       content: row.content as string,
       score: m.score,
-      createdAt: row.created_at as number,
+      createdAt,
       tags: JSON.parse(row.tags ?? "[]"),
       source: row.source as string,
       isUpdate,
-      scoreDetails: mergeScoreDetails(meta?.score_details, {
+      scoreDetails: mergeScoreDetails(scoreDetails, {
         importance: clamp01((importanceScores.get(parentId) ?? 0) / 5),
         confidence: confidenceScores.get(parentId),
       }),
@@ -2667,6 +2678,15 @@ export async function recallEntries(
         : undefined,
     }];
   });
+
+  // Increment recall_count for entries actually shown.
+  ctx.waitUntil(
+    Promise.all(
+      matches.map(match =>
+        env.DB.prepare(`UPDATE entries SET recall_count = recall_count + 1 WHERE id = ?`).bind(match.id).run()
+      )
+    ).catch(e => console.error("recall_count update failed (non-fatal):", e))
+  );
 
   // Normalize fused scores to 0–1 (top = 1.0) as a relative rank scale — not probability
   // or semantic similarity. Callers should label with formatRelevanceLabel(), not "% match".

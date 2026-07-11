@@ -29,4 +29,13 @@ describe("web memory mutation API contract", () => {
   it("imports backups sequentially in D1-safe batches", () => {
     expect(html).toContain("await importEntriesInBatches(entries");
   });
+
+  it("preserves graph recall evidence into source cards and chat context", () => {
+    expect(html).toContain("scoreDetails: m.score_details || {}");
+    expect(html).toContain("matchedEntities: m.matched_entities || []");
+    expect(html).toContain("graphFacts: m.graph_facts || []");
+    expect(html).toContain("Matched entities:");
+    expect(html).toContain("Current graph facts:");
+    expect(html).toContain("const graphContext = [");
+  });
 });

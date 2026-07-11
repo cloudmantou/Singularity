@@ -865,6 +865,144 @@ describe("GET /recall", () => {
     expect(data.results[0].graph_facts).toContain("Singularity uses SQLite");
   });
 
+  it("keeps graph-temporal facts in historical windows even when the entry was created earlier", async () => {
+    const now = Date.now();
+    const entryCreatedAt = now - 90 * 86_400_000;
+    const after = now - 30 * 86_400_000;
+    const before = now - 10 * 86_400_000;
+    db.entries.push({
+      id: "historical-graph-entry",
+      content: "The durable store remained active across the queried period.",
+      tags: "[]",
+      source: "api",
+      created_at: entryCreatedAt,
+      vector_ids: "[]",
+      recall_count: 0,
+      importance_score: 0,
+    });
+    db.memories.push({
+      id: "memory-historical-graph",
+      entry_id: "historical-graph-entry",
+      content: "The durable store remained active across the queried period.",
+      kind: "semantic",
+      memory_class: "fact",
+      importance: 4,
+      confidence: 0.9,
+      valid_from: entryCreatedAt,
+      valid_to: null,
+      invalid_at: null,
+      expired_at: null,
+      created_at: entryCreatedAt,
+    });
+    db.entities.push({
+      id: "entity-singularity",
+      name: "Singularity",
+      name_normalized: "singularity",
+      entity_type: "project",
+      mention_count: 1,
+      updated_at: now,
+    });
+    db.memoryEntities.push({
+      id: "me-historical-graph",
+      memory_id: "memory-historical-graph",
+      entity_id: "entity-singularity",
+      role: "mentions",
+      score: 0.94,
+      created_at: entryCreatedAt,
+    });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({ matches: [] }),
+      }),
+    });
+
+    const res = await worker.fetch(
+      req("GET", `/recall?query=${encodeURIComponent("Singularity historical storage")}&after=${after}&before=${before}`),
+      env,
+      ctx
+    );
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.results).toHaveLength(1);
+    expect(data.results[0].id).toBe("historical-graph-entry");
+    expect(data.results[0].score_details.temporal).toBe(1);
+    expect(data.results[0].matched_entities).toContain("Singularity");
+  });
+
+  it("continues graph-only recall when query embedding fails", async () => {
+    const now = Date.now();
+    db.entries.push({
+      id: "embedding-fallback-entry",
+      content: "The local durable store is SQLite.",
+      tags: "[]",
+      source: "api",
+      created_at: now,
+      vector_ids: "[]",
+      recall_count: 0,
+      importance_score: 0,
+    });
+    db.memories.push({
+      id: "memory-embedding-fallback",
+      entry_id: "embedding-fallback-entry",
+      content: "The local durable store is SQLite.",
+      kind: "semantic",
+      memory_class: "fact",
+      importance: 4,
+      confidence: 0.91,
+      valid_from: null,
+      valid_to: null,
+      invalid_at: null,
+      expired_at: null,
+      created_at: now,
+    });
+    db.entities.push({
+      id: "entity-singularity",
+      name: "Singularity",
+      name_normalized: "singularity",
+      entity_type: "project",
+      mention_count: 1,
+      updated_at: now,
+    });
+    db.memoryEntities.push({
+      id: "me-embedding-fallback",
+      memory_id: "memory-embedding-fallback",
+      entity_id: "entity-singularity",
+      role: "mentions",
+      score: 0.95,
+      created_at: now,
+    });
+    const vectorQuery = vi.fn().mockResolvedValue({ matches: [] });
+    const aiRun = vi.fn().mockImplementation(async (model: string) => {
+      if (model === "@cf/baai/bge-small-en-v1.5") throw new Error("embedding provider unavailable");
+      return new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode('data: {"response":""}\n\n'));
+          c.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+          c.close();
+        },
+      });
+    });
+    env = makeTestEnv(db, {
+      AI: { run: aiRun } as unknown as Ai,
+      VECTORIZE: makeVectorizeMock({ query: vectorQuery }),
+    });
+
+    const res = await worker.fetch(
+      req("GET", `/recall?query=${encodeURIComponent("Singularity storage")}`),
+      env,
+      ctx
+    );
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.results).toHaveLength(1);
+    expect(data.results[0].id).toBe("embedding-fallback-entry");
+    expect(data.results[0].score_details.semantic).toBe(0);
+    expect(data.results[0].score_details.entity).toBeGreaterThan(0);
+    expect(vectorQuery).not.toHaveBeenCalled();
+  });
+
   it("does not surface expired entity facts as current graph-only recall results", async () => {
     const now = Date.now();
     db.entries.push({
