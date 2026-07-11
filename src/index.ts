@@ -566,6 +566,7 @@ export async function initializeDatabase(env: Env): Promise<void> {
     `ALTER TABLE entries ADD COLUMN pending_vector_ids TEXT`,
     `ALTER TABLE entries ADD COLUMN pending_embedding_fingerprint TEXT`,
     `ALTER TABLE entries ADD COLUMN pending_content_hash TEXT`,
+    `ALTER TABLE entries ADD COLUMN pending_revision_id TEXT`,
   ]) {
     try {
       await env.DB.exec(alter);
@@ -1397,6 +1398,7 @@ interface VectorizeQueueRow {
 interface PreparedEntryVectorBatchItem extends PreparedEntryVectors {
   row: VectorizeQueueRow;
   contentHash?: string;
+  pendingRevisionId?: string;
 }
 
 interface VectorizeBatchResult {
@@ -1419,7 +1421,8 @@ async function prepareEntryVectors(
   now: number,
   generation?: string,
   embeddingFingerprint?: string,
-  embeddingRole: EmbeddingProfileRole = "active"
+  embeddingRole: EmbeddingProfileRole = "active",
+  pendingRevisionId?: string
 ): Promise<PreparedEntryVectors> {
   const chunks = chunkText(content);
   const vectorBaseId = generation ? `g-${generation}` : id;
@@ -1436,6 +1439,7 @@ async function prepareEntryVectors(
       created_at: now,
     };
     if (embeddingFingerprint) metadata.embedding_fingerprint = embeddingFingerprint;
+    if (pendingRevisionId) metadata.pending_revision_id = pendingRevisionId;
 
     tags.forEach(t => {
       metadata[`tag_${t}`] = true;
@@ -1515,6 +1519,7 @@ async function prepareEntryVectorBatch(
     embeddingFingerprint?: string;
     embeddingRole?: EmbeddingProfileRole;
     includeContentHash?: boolean;
+    includePendingRevisionId?: boolean;
   } = {}
 ): Promise<PreparedEntryVectorBatchItem[]> {
   if (!rows.length) return [];
@@ -1527,7 +1532,10 @@ async function prepareEntryVectorBatch(
     const contentHash = options.includeContentHash
       ? row.content_hash ?? await contentFingerprint(row.content)
       : undefined;
-    return { row, tags, chunks, vectorBaseId, contentHash };
+    const pendingRevisionId = options.includePendingRevisionId
+      ? crypto.randomUUID()
+      : undefined;
+    return { row, tags, chunks, vectorBaseId, contentHash, pendingRevisionId };
   }));
 
   const texts = plans.flatMap((plan) => plan.chunks);
@@ -1558,6 +1566,9 @@ async function prepareEntryVectorBatch(
       if (options.embeddingFingerprint) {
         metadata.embedding_fingerprint = options.embeddingFingerprint;
       }
+      if (plan.pendingRevisionId) {
+        metadata.pending_revision_id = plan.pendingRevisionId;
+      }
       plan.tags.forEach((tag) => {
         metadata[`tag_${tag}`] = true;
       });
@@ -1571,6 +1582,7 @@ async function prepareEntryVectorBatch(
     return {
       row: plan.row,
       contentHash: plan.contentHash,
+      pendingRevisionId: plan.pendingRevisionId,
       vectors,
       vectorIds: vectors.map((vector) => vector.id),
     };
@@ -1583,6 +1595,7 @@ async function storePendingEntryVectors(
   pendingFingerprint: string
 ): Promise<string[]> {
   const hash = row.content_hash ?? await contentFingerprint(row.content);
+  const pendingRevisionId = crypto.randomUUID();
   const prepared = await prepareEntryVectors(
     env,
     row.id,
@@ -1592,7 +1605,8 @@ async function storePendingEntryVectors(
     row.created_at,
     createVectorGeneration(),
     pendingFingerprint,
-    "pending"
+    "pending",
+    pendingRevisionId
   );
 
   try {
@@ -1608,6 +1622,7 @@ async function storePendingEntryVectors(
        SET pending_vector_ids = ?,
            pending_embedding_fingerprint = ?,
            pending_content_hash = ?,
+           pending_revision_id = ?,
            content_hash = COALESCE(content_hash, ?)
        WHERE id = ?
          AND pending_vector_ids = ?
@@ -1618,6 +1633,7 @@ async function storePendingEntryVectors(
       JSON.stringify(prepared.vectorIds),
       pendingFingerprint,
       hash,
+      pendingRevisionId,
       hash,
       row.id,
       "[]",
@@ -1645,6 +1661,7 @@ async function storePendingEntryVectorBatch(
     embeddingFingerprint: pendingFingerprint,
     embeddingRole: "pending",
     includeContentHash: true,
+    includePendingRevisionId: true,
   });
   const allVectorIds = prepared.flatMap((item) => item.vectorIds);
   try {
@@ -1665,6 +1682,7 @@ async function storePendingEntryVectorBatch(
          SET pending_vector_ids = ?,
              pending_embedding_fingerprint = ?,
              pending_content_hash = ?,
+             pending_revision_id = ?,
              content_hash = COALESCE(content_hash, ?)
          WHERE id = ?
            AND pending_vector_ids = ?
@@ -1675,6 +1693,7 @@ async function storePendingEntryVectorBatch(
         JSON.stringify(item.vectorIds),
         pendingFingerprint,
         hash,
+        item.pendingRevisionId ?? crypto.randomUUID(),
         hash,
         item.row.id,
         "[]",
@@ -1706,11 +1725,13 @@ async function activatePendingVectors(
          embedding_fingerprint = pending_embedding_fingerprint,
          pending_vector_ids = NULL,
          pending_embedding_fingerprint = NULL,
-         pending_content_hash = NULL
+         pending_content_hash = NULL,
+         pending_revision_id = NULL
      WHERE pending_embedding_fingerprint = ?
        AND pending_vector_ids IS NOT NULL
        AND pending_vector_ids != '[]'
        AND pending_content_hash IS NOT NULL
+       AND pending_revision_id IS NOT NULL
        AND content_hash = pending_content_hash`
   ).bind(pendingFingerprint).run();
   return Number(result.meta?.changes ?? 0);
@@ -1728,6 +1749,7 @@ async function countPendingActivationConflicts(
        AND (
          pending_content_hash IS NULL OR
          content_hash IS NULL OR
+         pending_revision_id IS NULL OR
          pending_content_hash != content_hash
        )`
   ).bind(pendingFingerprint).first() as Record<string, any> | null;
@@ -1750,6 +1772,7 @@ async function inspectPendingActivationIntegrity(
          AND pending_vector_ids IS NOT NULL
          AND pending_vector_ids != '[]'
          AND pending_content_hash IS NOT NULL
+         AND pending_revision_id IS NOT NULL
          AND content_hash = pending_content_hash`
     ).bind(pendingFingerprint).first() as Promise<Record<string, any> | null>,
     countPendingActivationConflicts(env, pendingFingerprint),
@@ -1783,7 +1806,8 @@ async function clearPendingRebuildRows(
     `UPDATE entries
      SET pending_vector_ids = NULL,
          pending_embedding_fingerprint = NULL,
-         pending_content_hash = NULL
+         pending_content_hash = NULL,
+         pending_revision_id = NULL
      WHERE pending_embedding_fingerprint = ?`
   ).bind(pendingFingerprint).run();
   return Number(result.meta?.changes ?? 0);
@@ -1827,7 +1851,8 @@ async function storeEntry(
        SET vector_ids = ?,
            pending_vector_ids = ?,
            pending_embedding_fingerprint = ?,
-           pending_content_hash = NULL
+           pending_content_hash = NULL,
+           pending_revision_id = NULL
        WHERE id = ? AND vector_ids = ? AND content = ?
          AND tags NOT LIKE '%"status:deprecated"%'`
     ).bind(
@@ -1876,7 +1901,8 @@ async function storeEntryVectorBatch(
          SET vector_ids = ?,
              pending_vector_ids = ?,
              pending_embedding_fingerprint = ?,
-             pending_content_hash = NULL
+             pending_content_hash = NULL,
+             pending_revision_id = NULL
          WHERE id = ? AND vector_ids = ? AND content = ?
            AND tags NOT LIKE '%"status:deprecated"%'`
       ).bind(
@@ -1998,6 +2024,7 @@ async function commitEntryVersion(
          SET content = ?, tags = ?, vector_ids = ?, content_hash = ?
              , pending_vector_ids = ?, pending_embedding_fingerprint = ?
              , pending_content_hash = NULL
+             , pending_revision_id = NULL
              , classification_status = 'pending', classification_error = NULL
              , classification_attempts = 0, classification_next_attempt_at = NULL
              , classification_started_at = NULL, classification_confidence = NULL
@@ -2155,6 +2182,7 @@ async function appendToEntry(
          SET content = ?, vector_ids = ?, content_hash = ?
              , pending_vector_ids = ?, pending_embedding_fingerprint = ?
              , pending_content_hash = NULL
+             , pending_revision_id = NULL
              , classification_status = 'pending', classification_error = NULL
              , classification_attempts = 0, classification_next_attempt_at = NULL
              , classification_started_at = NULL, classification_confidence = NULL
@@ -4855,7 +4883,8 @@ export async function deprecateEntry(
            vector_ids = ?,
            pending_vector_ids = NULL,
            pending_embedding_fingerprint = NULL,
-           pending_content_hash = NULL
+           pending_content_hash = NULL,
+           pending_revision_id = NULL
        WHERE id = ?`
     ).bind(JSON.stringify(nextTags), "[]", id),
     deprecateRevision.statement,
@@ -6755,7 +6784,8 @@ const defaultHandler = {
         `UPDATE entries
          SET pending_vector_ids = '[]',
              pending_embedding_fingerprint = ?,
-             pending_content_hash = NULL
+             pending_content_hash = NULL,
+             pending_revision_id = NULL
          WHERE tags NOT LIKE '%"status:deprecated"%'`
       ).bind(pending).run();
       const rows = (update as any)?.meta?.changes ?? 0;

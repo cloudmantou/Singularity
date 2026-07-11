@@ -71,6 +71,7 @@ describe("SqliteD1Database", () => {
       "classification_started_at",
       "classification_version",
       "classified_at",
+      "pending_revision_id",
     ]));
     expect(byName.get("classification_status")?.dflt_value).toContain("pending");
     expect(byName.get("classification_attempts")?.dflt_value).toBe("0");
@@ -171,14 +172,60 @@ describe("SqliteVectorizeIndex", () => {
     expect(after.matches.find((m) => m.id === "v1")).toBeUndefined();
   });
 
+  it("mirrors vectors into sqlite-vec vec0 tables when the extension is available", async () => {
+    await vec.insert([
+      { id: "d2-a", values: [1, 0], metadata: { parentId: "p2a" } },
+      { id: "d2-b", values: [0, 1], metadata: { parentId: "p2b" } },
+      { id: "d3-a", values: [1, 0, 0], metadata: { parentId: "p3a" } },
+    ]);
+
+    const details = await vec.describe() as any;
+    if (details.config.backend !== "sqlite-vec") {
+      expect(details.config.backend).toBe("json-cosine");
+      return;
+    }
+
+    const rows = raw
+      .prepare(`SELECT id, vec_rowid, vector_dim FROM sb_vectors ORDER BY id`)
+      .all() as Array<{ id: string; vec_rowid: number | null; vector_dim: number | null }>;
+    expect(rows).toEqual([
+      expect.objectContaining({ id: "d2-a", vec_rowid: expect.any(Number), vector_dim: 2 }),
+      expect.objectContaining({ id: "d2-b", vec_rowid: expect.any(Number), vector_dim: 2 }),
+      expect.objectContaining({ id: "d3-a", vec_rowid: expect.any(Number), vector_dim: 3 }),
+    ]);
+    expect(
+      raw.prepare(`SELECT name FROM sqlite_master WHERE name = 'sb_vectors_vec_2'`).get()
+    ).toBeTruthy();
+    expect(
+      raw.prepare(`SELECT name FROM sqlite_master WHERE name = 'sb_vectors_vec_3'`).get()
+    ).toBeTruthy();
+
+    const { matches } = await vec.query([1, 0], { topK: 2 });
+    expect(matches.map((match) => match.id)).toEqual(["d2-a", "d2-b"]);
+  });
+
+  it("falls back to JSON cosine when a dimension is not fully mirrored into vec0", async () => {
+    await vec.insert([
+      { id: "indexed", values: [0, 1], metadata: { parentId: "indexed" } },
+      { id: "json-only", values: [1, 0], metadata: { parentId: "json-only" } },
+    ]);
+    raw
+      .prepare(`UPDATE sb_vectors SET vec_rowid = NULL WHERE id = ?`)
+      .run("json-only");
+
+    const { matches } = await vec.query([1, 0], { topK: 1 });
+    expect(matches[0].id).toBe("json-only");
+  });
+
   it("uses queryText as an FTS candidate prefilter before cosine ranking", async () => {
     const ftsTable = raw.prepare(
-      `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sb_vector_fts'`
-    ).get();
+      `SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name = 'sb_vector_fts'`
+    ).get() as { name: string; sql: string } | undefined;
     if (!ftsTable) {
       expect(ftsTable).toBeUndefined();
       return;
     }
+    expect(ftsTable.sql).toMatch(/trigram|unicode61/i);
 
     await vec.insert([
       {
@@ -196,7 +243,7 @@ describe("SqliteVectorizeIndex", () => {
     const { matches } = await vec.query([1, 0], {
       topK: 1,
       returnMetadata: "all",
-      queryText: "sqlite vector",
+      queryText: ftsTable.sql.includes("trigram") ? "lite vec" : "sqlite vector",
     } as any);
 
     expect(matches[0].id).toBe("lexical-hit");

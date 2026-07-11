@@ -621,6 +621,7 @@ export class D1Mock {
                 row.pending_vector_ids = pending_vector_ids;
                 row.pending_embedding_fingerprint = pending_embedding_fingerprint;
                 row.pending_content_hash = null;
+                row.pending_revision_id = null;
               }
               if (s.includes("classification_status = 'pending'")) resetClassification(row);
             }
@@ -641,6 +642,7 @@ export class D1Mock {
               row.pending_vector_ids = null;
               row.pending_embedding_fingerprint = null;
               row.pending_content_hash = null;
+              row.pending_revision_id = null;
             }
           }
           return { meta: { changes: row ? 1 : 0 } };
@@ -659,6 +661,7 @@ export class D1Mock {
             row.pending_vector_ids = pending_vector_ids;
             row.pending_embedding_fingerprint = pending_embedding_fingerprint;
             row.pending_content_hash = null;
+            row.pending_revision_id = null;
           }
           return { meta: { changes: row ? 1 : 0 } };
         }
@@ -682,6 +685,7 @@ export class D1Mock {
             row.pending_vector_ids = "[]";
             row.pending_embedding_fingerprint = pending_embedding_fingerprint;
             row.pending_content_hash = null;
+            row.pending_revision_id = null;
             changes++;
           }
           return { meta: { changes } };
@@ -691,12 +695,16 @@ export class D1Mock {
             pending_vector_ids,
             pending_embedding_fingerprint,
             pending_content_hash,
-            content_hash,
+            maybe_pending_revision_id,
+            maybe_content_hash,
             id,
             expected_pending_vector_ids,
             expected_pending_embedding_fingerprint,
             expected_content,
           ] = args;
+          const hasPendingRevisionId = s.includes("pending_revision_id = ?");
+          const pending_revision_id = hasPendingRevisionId ? maybe_pending_revision_id : null;
+          const content_hash = hasPendingRevisionId ? maybe_content_hash : maybe_pending_revision_id;
           const row = db.entries.find(
             (e: any) =>
               e.id === id &&
@@ -709,6 +717,7 @@ export class D1Mock {
             row.pending_vector_ids = pending_vector_ids;
             row.pending_embedding_fingerprint = pending_embedding_fingerprint;
             row.pending_content_hash = pending_content_hash;
+            row.pending_revision_id = pending_revision_id;
             if (row.content_hash == null) row.content_hash = content_hash;
           }
           return { meta: { changes: row ? 1 : 0 } };
@@ -721,6 +730,7 @@ export class D1Mock {
             row.pending_vector_ids = null;
             row.pending_embedding_fingerprint = null;
             row.pending_content_hash = null;
+            row.pending_revision_id = null;
             changes++;
           }
           return { meta: { changes } };
@@ -734,6 +744,7 @@ export class D1Mock {
               row.pending_vector_ids != null &&
               row.pending_vector_ids !== "[]" &&
               row.pending_content_hash != null &&
+              row.pending_revision_id != null &&
               row.content_hash === row.pending_content_hash
             ) {
               row.vector_ids = row.pending_vector_ids;
@@ -741,6 +752,7 @@ export class D1Mock {
               row.pending_vector_ids = null;
               row.pending_embedding_fingerprint = null;
               row.pending_content_hash = null;
+              row.pending_revision_id = null;
               changes++;
             }
           }
@@ -952,6 +964,7 @@ export class D1Mock {
                 row.pending_vector_ids = pending_vector_ids;
                 row.pending_embedding_fingerprint = pending_embedding_fingerprint;
                 row.pending_content_hash = null;
+                row.pending_revision_id = null;
               }
               if (s.includes("classification_status = 'pending'")) resetClassification(row);
             }
@@ -1082,6 +1095,7 @@ export class D1Mock {
             e.pending_vector_ids !== "[]" &&
             (
               e.pending_content_hash == null ||
+              e.pending_revision_id == null ||
               e.content_hash == null ||
               e.pending_content_hash !== e.content_hash
             )
@@ -1095,6 +1109,7 @@ export class D1Mock {
             e.pending_vector_ids != null &&
             e.pending_vector_ids !== "[]" &&
             e.pending_content_hash != null &&
+            e.pending_revision_id != null &&
             e.content_hash === e.pending_content_hash
           ).length;
           return { count };

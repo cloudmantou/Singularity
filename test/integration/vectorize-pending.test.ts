@@ -252,6 +252,7 @@ describe("POST /vectorize-pending", () => {
     expect(activeIds[0]).not.toBe("active-old");
     expect(db.entries[0].pending_vector_ids).toBeNull();
     expect(db.entries[0].pending_embedding_fingerprint).toBeNull();
+    expect(db.entries[0].pending_revision_id).toBeNull();
     expect(db.entries[0].embedding_fingerprint).toBe(reindexData.pendingFingerprint);
   });
 
@@ -307,6 +308,7 @@ describe("POST /vectorize-pending", () => {
     expect(data.activated).toBe(0);
     expect(old.vector_ids).toBe('["old-active"]');
     expect(old.pending_vector_ids).not.toBe("[]");
+    expect(old.pending_revision_id).toBeTruthy();
     expect(recent.vector_ids).toBe('["recent-active"]');
     expect(recent.pending_vector_ids).toBe("[]");
   });
@@ -334,6 +336,7 @@ describe("POST /vectorize-pending", () => {
     const old = db.entries.find((entry: any) => entry.id === "old");
     expect(old.pending_vector_ids).not.toBe("[]");
     expect(old.pending_content_hash).toBeTruthy();
+    expect(old.pending_revision_id).toBeTruthy();
 
     old.content = "Edited after pending vector build";
     old.content_hash = "edited-content-hash";
@@ -400,6 +403,7 @@ describe("POST /vectorize-pending", () => {
     expect(deleteByIds).toHaveBeenCalledWith(pendingIds);
     expect(db.entries.every((entry: any) => entry.pending_vector_ids == null)).toBe(true);
     expect(db.entries.every((entry: any) => entry.pending_embedding_fingerprint == null)).toBe(true);
+    expect(db.entries.every((entry: any) => entry.pending_revision_id == null)).toBe(true);
     expect(db.entries[0].vector_ids).toBe('["old-active"]');
     expect(db.entries[1].vector_ids).toBe('["recent-active"]');
   });

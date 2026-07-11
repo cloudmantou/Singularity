@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS entries (
   embedding_fingerprint TEXT,
   pending_vector_ids TEXT,
   pending_embedding_fingerprint TEXT,
-  pending_content_hash TEXT
+  pending_content_hash TEXT,
+  pending_revision_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_entries_content_hash ON entries(content_hash);
