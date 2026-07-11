@@ -66,7 +66,9 @@ describe("POST /capture — similarity decision guardrails", () => {
     db = makeTestDb();
   });
 
-  it("still blocks near-exact duplicates without calling the LLM", async () => {
+  it("blocks only exact content fingerprints without calling the LLM", async () => {
+    const { contentFingerprint } = await import("../../src/index");
+    const content = "Existing duplicate";
     const run = vi.fn().mockImplementation(async (model: string) => {
       if (model === "@cf/baai/bge-small-en-v1.5") {
         return { data: [new Array(384).fill(0.1)] };
@@ -75,11 +77,12 @@ describe("POST /capture — similarity decision guardrails", () => {
     });
     db.entries.push({
       id: "duplicate",
-      content: "Existing duplicate",
+      content,
       tags: "[]",
       source: "api",
       created_at: Date.now(),
       vector_ids: '["duplicate"]',
+      content_hash: await contentFingerprint(content),
     });
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
@@ -91,7 +94,7 @@ describe("POST /capture — similarity decision guardrails", () => {
     });
 
     const response = await worker.fetch(
-      req("POST", "/capture", { body: { content: "Duplicate" } }),
+      req("POST", "/capture", { body: { content } }),
       env,
       { waitUntil() {} } as unknown as ExecutionContext
     );
@@ -99,7 +102,39 @@ describe("POST /capture — similarity decision guardrails", () => {
 
     expect(body).toMatchObject({ ok: false, duplicate: true });
     expect(db.entries).toHaveLength(1);
-    expect(run).toHaveBeenCalledOnce();
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("does not block high vector similarity when content differs", async () => {
+    db.entries.push({
+      id: "near",
+      content: "Server address is 192.168.1.10",
+      tags: "[]",
+      source: "api",
+      created_at: Date.now(),
+      vector_ids: '["near"]',
+      content_hash: "hash-a",
+    });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({
+          matches: [{ id: "near", score: 0.97, metadata: { parentId: "near" } }],
+        }),
+      }),
+      AI: makePromptAwareAI(
+        '{"action":"keep_both"}',
+        '{"importance":3,"confidence":0.8,"canonical":false,"kind":"semantic"}'
+      ),
+    });
+
+    const response = await worker.fetch(
+      req("POST", "/capture", { body: { content: "Server address is 192.168.1.11" } }),
+      env,
+      { waitUntil() {} } as unknown as ExecutionContext
+    );
+    const body = (await response.json()) as any;
+    expect(body.ok).toBe(true);
+    expect(db.entries.length).toBeGreaterThanOrEqual(2);
   });
 
   it("keeps the new D1 fact and its relation when asynchronous vectorization fails", async () => {

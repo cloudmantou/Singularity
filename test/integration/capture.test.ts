@@ -73,7 +73,7 @@ describe("POST /capture", () => {
     expect(db.entries[0].content).toBe("Test note");
   });
 
-  it("blocks a near-exact duplicate (score ≥ 0.95)", async () => {
+  it("still stores near-exact semantic matches (score ≥ 0.95) instead of hard-blocking", async () => {
     db.entries.push({
       id: "existing",
       content: "Existing duplicate note",
@@ -81,6 +81,7 @@ describe("POST /capture", () => {
       source: "api",
       created_at: Date.now(),
       vector_ids: '["existing"]',
+      content_hash: "hash-existing",
     });
     const vectorize = makeVectorizeMock({
       query: vi.fn().mockResolvedValue({
@@ -92,10 +93,9 @@ describe("POST /capture", () => {
     const { ctx } = makeCtx();
     const res = await worker.fetch(req("POST", "/capture", { body: { content: "Duplicate note" } }), env, ctx);
     const data = await res.json() as any;
-    expect(data.ok).toBe(false);
-    expect(data.duplicate).toBe(true);
-    expect(data.matchId).toBe("existing");
-    expect(db.entries).toHaveLength(1);
+    expect(data.ok).toBe(true);
+    expect(data.duplicate).not.toBe(true);
+    expect(db.entries).toHaveLength(2);
   });
 
   it("does not block capture from an orphaned stale vector", async () => {
@@ -166,25 +166,56 @@ describe("POST /capture", () => {
     expect(db.entries).toHaveLength(2);
   });
 
-  it("overfetches before filtering so an active rank-6 duplicate is not hidden by stale vectors", async () => {
+  it("blocks exact content via fingerprint without requiring a vector query", async () => {
+    const { contentFingerprint } = await import("../../src/index");
+    const content = "Active duplicate";
     db.entries.push({
       id: "existing",
-      content: "Active duplicate",
+      content,
       tags: "[]",
       source: "api",
       created_at: Date.now(),
       vector_ids: '["g-active"]',
+      content_hash: await contentFingerprint(content),
+    });
+    const queryMock = vi.fn().mockResolvedValue({ matches: [] });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({ query: queryMock }),
+    });
+
+    const { ctx } = makeCtx();
+    const response = await worker.fetch(
+      req("POST", "/capture", { body: { content } }),
+      env,
+      ctx
+    );
+    const data = await response.json() as any;
+
+    expect(data.duplicate).toBe(true);
+    expect(data.matchId).toBe("existing");
+    expect(queryMock).not.toHaveBeenCalled();
+  });
+
+  it("overfetches before filtering so high-similarity linking still sees active vectors", async () => {
+    db.entries.push({
+      id: "existing",
+      content: "Server address is 192.168.1.10",
+      tags: "[]",
+      source: "api",
+      created_at: Date.now(),
+      vector_ids: '["g-active"]',
+      content_hash: "hash-old",
     });
     const ranked = [
       ...Array.from({ length: 5 }, (_, index) => ({
         id: `g-stale-${index}`,
         score: 0.99 - index * 0.001,
-        metadata: { parentId: "existing", content: "Active duplicate" },
+        metadata: { parentId: "existing", content: "Server address is 192.168.1.10" },
       })),
       {
         id: "g-active",
         score: 0.96,
-        metadata: { parentId: "existing", content: "Active duplicate" },
+        metadata: { parentId: "existing", content: "Server address is 192.168.1.10" },
       },
     ];
     const queryMock = vi.fn().mockImplementation(
@@ -198,18 +229,20 @@ describe("POST /capture", () => {
 
     const { ctx } = makeCtx();
     const response = await worker.fetch(
-      req("POST", "/capture", { body: { content: "Active duplicate" } }),
+      req("POST", "/capture", { body: { content: "Server address is 192.168.1.11" } }),
       env,
       ctx
     );
     const data = await response.json() as any;
 
-    expect(data.duplicate).toBe(true);
-    expect(data.matchId).toBe("existing");
+    // Different content must ADD (never hard-block by vector score).
+    expect(data.duplicate).not.toBe(true);
+    expect(data.ok).toBe(true);
     expect(queryMock).toHaveBeenCalledWith(
       expect.any(Array),
       expect.objectContaining({ topK: 50 })
     );
+    expect(db.entries.length).toBe(2);
   });
 
   it("extracts hashtags from content and stores clean content with tags", async () => {

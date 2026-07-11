@@ -10,6 +10,12 @@ const VALID_MEMORY_KIND_TAGS = new Set([
 ]);
 const D1_MAX_TAG_UTF8_BYTES = 46;
 
+async function contentFingerprint(content: string): Promise<string> {
+  const bytes = new TextEncoder().encode(content.trim().replace(/\s+/g, " "));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 export interface ImportOptions {
   mode?: ImportMode;
   extraTags?: string[];
@@ -201,6 +207,7 @@ export async function importEntries(
         : null;
       const contradiction_wins = asSafeInt(r.contradiction_wins, 0);
       const contradiction_losses = asSafeInt(r.contradiction_losses, 0);
+      const content_hash = await contentFingerprint(content);
 
       const existing = await db
         .prepare(`SELECT id FROM entries WHERE id = ?`)
@@ -219,7 +226,7 @@ export async function importEntries(
              classification_status = ?, classification_error = ?, classification_attempts = ?,
              classification_next_attempt_at = ?, classification_started_at = NULL,
              classification_version = ?, classified_at = ?,
-             contradiction_wins = ?, contradiction_losses = ?
+             contradiction_wins = ?, contradiction_losses = ?, content_hash = ?
              WHERE id = ?`
           )
           .bind(
@@ -239,6 +246,7 @@ export async function importEntries(
             classified_at,
             contradiction_wins,
             contradiction_losses,
+            content_hash,
             id
           )
           .run();
@@ -252,8 +260,8 @@ export async function importEntries(
              classification_status, classification_error, classification_attempts,
              classification_next_attempt_at, classification_started_at,
              classification_version, classified_at,
-             contradiction_wins, contradiction_losses)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`
+             contradiction_wins, contradiction_losses, content_hash)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)`
           )
           .bind(
             id,
@@ -272,7 +280,8 @@ export async function importEntries(
             classification_version,
             classified_at,
             contradiction_wins,
-            contradiction_losses
+            contradiction_losses,
+            content_hash
           )
           .run();
         result.inserted++;

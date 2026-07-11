@@ -18,8 +18,11 @@ CREATE TABLE IF NOT EXISTS entries (
   classification_version         INTEGER NOT NULL DEFAULT 1,
   classified_at                  INTEGER,
   contradiction_wins   INTEGER DEFAULT 0,
-  contradiction_losses INTEGER DEFAULT 0
+  contradiction_losses INTEGER DEFAULT 0,
+  content_hash          TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_entries_content_hash ON entries(content_hash);
 
 CREATE INDEX IF NOT EXISTS idx_entries_created_at ON entries(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_entries_source ON entries(source);

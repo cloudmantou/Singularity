@@ -93,7 +93,7 @@ export class D1Mock {
               recall_count, importance_score, classification_confidence,
               classification_status, classification_error, classification_attempts,
               classification_next_attempt_at, classification_version, classified_at,
-              contradiction_wins, contradiction_losses,
+              contradiction_wins, contradiction_losses, content_hash,
             ] = args;
             db.entries.push({
               id, content, tags, source, created_at, vector_ids,
@@ -102,15 +102,26 @@ export class D1Mock {
               classification_next_attempt_at, classification_started_at: null,
               classification_version, classified_at,
               contradiction_wins, contradiction_losses,
+              content_hash: content_hash ?? null,
             });
+          } else if (s.includes("content_hash") && args.length >= 7) {
+            const [id, content, tags, source, created_at, vector_ids, content_hash] = args;
+            const row = {
+              id, content, tags, source, created_at, vector_ids,
+              recall_count: 0, importance_score: 0,
+              contradiction_wins: 0, contradiction_losses: 0,
+              content_hash,
+            };
+            resetClassification(row);
+            db.entries.push(row);
           } else if (args.length >= 10) {
             const [id, content, tags, source, created_at, vector_ids, recall_count, importance_score, contradiction_wins, contradiction_losses] = args;
-            const row = { id, content, tags, source, created_at, vector_ids, recall_count, importance_score, contradiction_wins, contradiction_losses };
+            const row = { id, content, tags, source, created_at, vector_ids, recall_count, importance_score, contradiction_wins, contradiction_losses, content_hash: null };
             resetClassification(row);
             db.entries.push(row);
           } else {
             const [id, content, tags, source, created_at, vector_ids] = args;
-            const row = { id, content, tags, source, created_at, vector_ids, recall_count: 0, importance_score: 0, contradiction_wins: 0, contradiction_losses: 0 };
+            const row = { id, content, tags, source, created_at, vector_ids, recall_count: 0, importance_score: 0, contradiction_wins: 0, contradiction_losses: 0, content_hash: null };
             resetClassification(row);
             db.entries.push(row);
           }
@@ -118,7 +129,13 @@ export class D1Mock {
         }
         if (s.startsWith("UPDATE entries SET content = ?, vector_ids")) {
           if (s.includes("AND content = ? AND tags = ? AND vector_ids = ?")) {
-            const [content, vector_ids, id, expected_content, expected_tags, expected_vector_ids] = args;
+            const hasHash = s.includes("content_hash");
+            const [content, vector_ids, a2, a3, a4, a5, a6] = args;
+            const content_hash = hasHash ? a2 : null;
+            const id = hasHash ? a3 : a2;
+            const expected_content = hasHash ? a4 : a3;
+            const expected_tags = hasHash ? a5 : a4;
+            const expected_vector_ids = hasHash ? a6 : a5;
             const row = db.entries.find(
               (e: any) =>
                 e.id === id &&
@@ -129,6 +146,7 @@ export class D1Mock {
             if (row) {
               row.content = content;
               row.vector_ids = vector_ids;
+              if (hasHash) row.content_hash = content_hash;
               if (s.includes("classification_status = 'pending'")) resetClassification(row);
             }
             return { meta: { changes: row ? 1 : 0 } };
@@ -289,12 +307,16 @@ export class D1Mock {
         }
         if (s.includes("UPDATE entries SET content = ?, tags = ?, source = ?, created_at = ?, vector_ids = ?,") && s.includes("recall_count")) {
           if (s.includes("classification_confidence")) {
+            const hasHash = s.includes("content_hash");
             const [
               content, tags, source, created_at, vector_ids, recall_count, importance_score,
               classification_confidence, classification_status, classification_error,
               classification_attempts, classification_next_attempt_at, classification_version,
-              classified_at, contradiction_wins, contradiction_losses, id,
+              classified_at, contradiction_wins, contradiction_losses,
+              maybeHashOrId, maybeId,
             ] = args;
+            const content_hash = hasHash ? maybeHashOrId : null;
+            const id = hasHash ? maybeId : maybeHashOrId;
             const row = db.entries.find((e: any) => e.id === id);
             if (row) {
               Object.assign(row, {
@@ -303,6 +325,7 @@ export class D1Mock {
                 classification_attempts, classification_next_attempt_at,
                 classification_started_at: null, classification_version, classified_at,
                 contradiction_wins, contradiction_losses,
+                ...(hasHash ? { content_hash } : {}),
               });
             }
             return { meta: { changes: row ? 1 : 0 } };
@@ -328,7 +351,15 @@ export class D1Mock {
         }
         if (s.startsWith("UPDATE entries SET content = ?, tags = ?, vector_ids = ?")) {
           if (s.includes("AND content = ? AND tags = ? AND vector_ids = ?")) {
-            const [content, tags, vector_ids, id, expected_content, expected_tags, expected_vector_ids] = args;
+            const hasHash = s.includes("content_hash");
+            const content = args[0];
+            const tags = args[1];
+            const vector_ids = args[2];
+            const content_hash = hasHash ? args[3] : null;
+            const id = hasHash ? args[4] : args[3];
+            const expected_content = hasHash ? args[5] : args[4];
+            const expected_tags = hasHash ? args[6] : args[5];
+            const expected_vector_ids = hasHash ? args[7] : args[6];
             const row = db.entries.find(
               (e: any) =>
                 e.id === id &&
@@ -340,6 +371,7 @@ export class D1Mock {
               row.content = content;
               row.tags = tags;
               row.vector_ids = vector_ids;
+              if (hasHash) row.content_hash = content_hash;
               if (s.includes("classification_status = 'pending'")) resetClassification(row);
             }
             return { meta: { changes: row ? 1 : 0 } };
@@ -501,6 +533,25 @@ export class D1Mock {
             e.classification_started_at === startedAt
           );
           return row ? { classification_attempts: row.classification_attempts } : null;
+        }
+        if (s.includes("SELECT id FROM entries") && s.includes("content_hash = ?")) {
+          const hash = String(args[0]);
+          const row = db.entries.find((e: any) =>
+            e.content_hash === hash && !String(e.tags ?? "[]").includes('"status:deprecated"')
+          );
+          return row ? { id: row.id } : null;
+        }
+        if (
+          s.includes("SELECT id FROM entries") &&
+          s.includes("content = ?") &&
+          !s.includes("content_hash") &&
+          !s.includes("AND content = ?")
+        ) {
+          const content = String(args[0]);
+          const row = db.entries.find((e: any) =>
+            e.content === content && !String(e.tags ?? "[]").includes('"status:deprecated"')
+          );
+          return row ? { id: row.id } : null;
         }
         if (s.includes("WHERE id") && !s.includes("json_each")) {
           return db.entries.find((e: any) => e.id === args[0]) ?? null;
