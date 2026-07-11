@@ -12,6 +12,9 @@ import type { Env } from "../index";
 import worker from "../index";
 import { createExecutionContext } from "./env";
 import { readPublicUrlFromProcess } from "../config/site";
+import { isBenignStreamClose } from "./process-errors";
+
+export { isBenignStreamClose } from "./process-errors";
 
 const HOP_BY_HOP = new Set([
   "transfer-encoding",
@@ -24,26 +27,6 @@ const HOP_BY_HOP = new Set([
   "trailers",
   "upgrade",
 ]);
-
-/** Client aborted / proxy cut the socket mid-stream — never crash the process. */
-export function isBenignStreamClose(err: unknown): boolean {
-  if (err == null || typeof err !== "object") return false;
-  const e = err as NodeJS.ErrnoException & { name?: string };
-  const code = e.code || "";
-  if (
-    code === "ERR_STREAM_PREMATURE_CLOSE" ||
-    code === "ECONNRESET" ||
-    code === "EPIPE" ||
-    code === "ECANCELED" ||
-    code === "ABORT_ERR" ||
-    code === "ERR_STREAM_DESTROYED"
-  ) {
-    return true;
-  }
-  if (e.name === "AbortError") return true;
-  const message = String(e.message || "").trim().toLowerCase();
-  return message === "premature close" || message === "socket hang up";
-}
 
 function buildRequestUrl(req: FastifyRequest): string {
   const configured = readPublicUrlFromProcess();

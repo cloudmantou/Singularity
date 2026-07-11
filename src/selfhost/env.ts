@@ -9,6 +9,7 @@ import type { Env } from "../index";
 import { SqliteD1Database } from "./sqlite-d1";
 import { SqliteKVNamespace } from "./sqlite-kv";
 import { SqliteVectorizeIndex } from "./sqlite-vectorize";
+import { formatUnknownReason } from "./process-errors";
 
 export interface SelfhostOptions {
   databasePath?: string;
@@ -93,7 +94,12 @@ export function createSelfhostEnv(options: SelfhostOptions = {}): {
 export function createExecutionContext(): ExecutionContext {
   return {
     waitUntil(promise: Promise<unknown>) {
-      promise.catch((err) => console.error("[waitUntil]", err));
+      void Promise.resolve(promise).catch((reason) => {
+        console.error(
+          "[waitUntil] background task rejected:",
+          formatUnknownReason(reason)
+        );
+      });
     },
     passThroughOnException() {
       /* no-op outside Workers */

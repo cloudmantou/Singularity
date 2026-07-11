@@ -18,7 +18,12 @@ import {
   createExecutionContext,
   createSelfhostEnv,
 } from "./selfhost/env";
-import { handleWithWorker, isBenignStreamClose } from "./selfhost/fetch-adapter";
+import { handleWithWorker } from "./selfhost/fetch-adapter";
+import {
+  handleUnhandledRejection,
+  isBenignStreamClose,
+  runMcpRequest,
+} from "./selfhost/process-errors";
 import { getEffectiveModelSettings } from "./settings/store";
 import { isDevLocalProvider } from "./settings/model-settings";
 import { flushTelemetry } from "./telemetry";
@@ -37,12 +42,11 @@ process.on("uncaughtException", (err) => {
   process.exit(1);
 });
 process.on("unhandledRejection", (reason) => {
-  if (isBenignStreamClose(reason)) {
-    console.warn("[stream] ignored premature close rejection (client disconnected)");
-    return;
-  }
-  console.error("[fatal] unhandledRejection:", reason);
-  process.exit(1);
+  handleUnhandledRejection(reason, {
+    warn: (message, ...details) => console.warn(message, ...details),
+    error: (message, ...details) => console.error(message, ...details),
+    exit: (code) => process.exit(code),
+  });
 });
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -221,6 +225,14 @@ async function main() {
   const forwardToWorker = async (req: FastifyRequest, reply: FastifyReply) => {
     await handleWithWorker(req, reply, env);
   };
+  const forwardMcpToWorker = async (
+    req: FastifyRequest,
+    reply: FastifyReply
+  ) => {
+    await runMcpRequest(String(req.id), () =>
+      handleWithWorker(req, reply, env)
+    );
+  };
 
   app.all(
     "/oauth/register",
@@ -249,7 +261,7 @@ async function main() {
     },
     forwardToWorker
   );
-  app.all("/mcp", { bodyLimit: 1024 * 1024 }, forwardToWorker);
+  app.all("/mcp", { bodyLimit: 1024 * 1024 }, forwardMcpToWorker);
   app.post(
     "/import",
     {
