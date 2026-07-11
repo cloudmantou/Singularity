@@ -3,6 +3,13 @@
  * Dual-writes alongside legacy `entries` so existing recall/MCP keep working.
  */
 
+import {
+  parseEntityList,
+  parseEntityRelationList,
+  type EntityDraft,
+  type EntityRelationDraft,
+} from "./entities";
+
 export const MEMORY_CLASS_VALUES = [
   "fact",
   "preference",
@@ -34,7 +41,9 @@ export interface AtomicFactDraft {
   observedAt: number | null;
   validFrom: number | null;
   validTo: number | null;
-  entities: string[];
+  referenceTime: number | null;
+  entities: EntityDraft[];
+  relations: EntityRelationDraft[];
 }
 
 export const ATOMIC_EXTRACTION_MAX_FACTS = 12;
@@ -99,14 +108,16 @@ export function buildAtomicExtractionPrompt(content: string): string {
   const sample = content.slice(0, ATOMIC_EXTRACTION_CONTENT_LIMIT);
   return (
     `Split this memory input into independent atomic facts. Respond with ONLY one JSON object.\n` +
-    `{"facts":[{"content":"...","kind":"episodic|semantic|procedural","memory_class":"fact|preference|project|task|decision|plan|event|milestone|problem|solution|document|procedure|inference|summary","importance":1-5,"confidence":0-1,"observed_at":null,"valid_from":null,"valid_to":null,"entities":["..."]}]}\n` +
+    `{"facts":[{"content":"...","kind":"episodic|semantic|procedural","memory_class":"fact|preference|project|task|decision|plan|event|milestone|problem|solution|document|procedure|inference|summary","importance":1-5,"confidence":0-1,"observed_at":null,"valid_from":null,"valid_to":null,"reference_time":null,"entities":[{"name":"...","type":"person|project|organization|place|product|concept|other"}],"relations":[{"from":"...","to":"...","type":"uses|part_of|owns|works_on|depends_on|related_to|located_in","fact":"..."}]}]}\n` +
     `Rules:\n` +
     `- One fact per object; do not merge unrelated claims.\n` +
     `- Preserve the user's language.\n` +
     `- If the input is already a single fact, return exactly one fact.\n` +
     `- Skip pure greetings / empty chatter.\n` +
     `- Max ${ATOMIC_EXTRACTION_MAX_FACTS} facts.\n` +
-    `- entities: short proper nouns / project names mentioned in that fact only.\n\n` +
+    `- entities: named things in that fact only.\n` +
+    `- relations: entity-to-entity fact edges when the fact states a relationship; omit if none.\n` +
+    `- valid_from/valid_to/reference_time: unix ms or ISO when the fact has a time window; else null.\n\n` +
     `Input:\n${sample}`
   );
 }
@@ -138,10 +149,10 @@ export function parseAtomicExtraction(text: string): AtomicFactDraft[] {
       (item as any).content ?? (item as any).text ?? (item as any).fact ?? ""
     ).trim();
     if (content.length < 2) continue;
-    const entitiesRaw = (item as any).entities;
-    const entities = Array.isArray(entitiesRaw)
-      ? entitiesRaw.map((e: unknown) => String(e).trim()).filter(Boolean).slice(0, 12)
-      : [];
+    const entities = parseEntityList((item as any).entities);
+    const relations = parseEntityRelationList(
+      (item as any).relations ?? (item as any).entity_relations
+    );
     facts.push({
       content: content.slice(0, 2_000),
       kind: normalizeAtomicKind((item as any).kind),
@@ -153,7 +164,11 @@ export function parseAtomicExtraction(text: string): AtomicFactDraft[] {
       observedAt: parseOptionalTime((item as any).observed_at ?? (item as any).observedAt),
       validFrom: parseOptionalTime((item as any).valid_from ?? (item as any).validFrom),
       validTo: parseOptionalTime((item as any).valid_to ?? (item as any).validTo),
+      referenceTime: parseOptionalTime(
+        (item as any).reference_time ?? (item as any).referenceTime
+      ),
       entities,
+      relations,
     });
     if (facts.length >= ATOMIC_EXTRACTION_MAX_FACTS) break;
   }
@@ -199,6 +214,8 @@ export function prepareAtomicMemoryInsert(
     observedAt: number | null;
     validFrom: number | null;
     validTo: number | null;
+    referenceTime: number | null;
+    invalidAt?: number | null;
     entitiesJson: string;
     createdAt: number;
   }
@@ -208,8 +225,8 @@ export function prepareAtomicMemoryInsert(
       `INSERT INTO sb_memories (
          id, content, kind, memory_class, importance, confidence,
          entry_id, content_hash, observed_at, valid_from, valid_to,
-         entities_json, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         reference_time, invalid_at, entities_json, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       input.id,
@@ -223,6 +240,8 @@ export function prepareAtomicMemoryInsert(
       input.observedAt,
       input.validFrom,
       input.validTo,
+      input.referenceTime,
+      input.invalidAt ?? null,
       input.entitiesJson,
       input.createdAt
     );
@@ -276,6 +295,8 @@ export const ATOMIC_SCHEMA_STATEMENTS = [
     observed_at INTEGER,
     valid_from INTEGER,
     valid_to INTEGER,
+    reference_time INTEGER,
+    invalid_at INTEGER,
     entities_json TEXT NOT NULL DEFAULT '[]',
     created_at INTEGER NOT NULL
   )`,

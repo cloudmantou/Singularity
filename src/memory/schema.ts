@@ -1,4 +1,5 @@
 import { ATOMIC_SCHEMA_STATEMENTS } from "./atomic";
+import { ensureEntityDataModel } from "./entities";
 
 const MEMORY_SCHEMA_STATEMENTS = [
   ...ATOMIC_SCHEMA_STATEMENTS,
@@ -36,4 +37,5 @@ export async function ensureMemoryDataModel(db: D1Database): Promise<void> {
   for (const statement of MEMORY_SCHEMA_STATEMENTS) {
     await db.exec(statement);
   }
+  await ensureEntityDataModel(db);
 }

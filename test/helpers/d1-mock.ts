@@ -7,6 +7,9 @@ export class D1Mock {
   observations: any[] = [];
   memories: any[] = [];
   memorySources: any[] = [];
+  entities: any[] = [];
+  memoryEntities: any[] = [];
+  entityRelations: any[] = [];
   statementCount = 0;
   execCount = 0;
   beforeClassificationCommit?: (row: any) => boolean | void;
@@ -40,18 +43,66 @@ export class D1Mock {
           const [
             id, content, kind, memory_class, importance, confidence,
             entry_id, content_hash, observed_at, valid_from, valid_to,
-            entities_json, created_at,
-          ] = args;
+            reference_time, invalid_at, entities_json, created_at,
+          ] = args.length >= 15
+            ? args
+            : [...args.slice(0, 11), null, null, args[11], args[12]];
           db.memories.push({
             id, content, kind, memory_class, importance, confidence,
             entry_id, content_hash, observed_at, valid_from, valid_to,
-            entities_json, created_at,
+            reference_time, invalid_at, entities_json, created_at,
           });
           return { meta: { changes: 1 } };
         }
         if (s.startsWith("INSERT INTO sb_memory_sources")) {
           const [id, memory_id, observation_id, role, score, created_at] = args;
           db.memorySources.push({ id, memory_id, observation_id, role, score, created_at });
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("UPDATE sb_entities")) {
+          const [entity_type, updated_at, id] = args;
+          const row = db.entities.find((e: any) => e.id === id);
+          if (row) {
+            row.mention_count = Number(row.mention_count ?? 0) + 1;
+            if (entity_type != null) row.entity_type = entity_type;
+            row.updated_at = updated_at;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("INSERT INTO sb_entities")) {
+          // VALUES (?, ?, ?, ?, '[]', '{}', 1, ?, ?)
+          const [id, name, name_normalized, entity_type, created_at, updated_at] = args;
+          db.entities.push({
+            id, name, name_normalized, entity_type,
+            aliases_json: '[]', metadata_json: '{}',
+            mention_count: 1,
+            created_at, updated_at,
+          });
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("INSERT INTO sb_memory_entities")) {
+          const [id, memory_id, entity_id, role, score, created_at] = args;
+          const exists = db.memoryEntities.some(
+            (row: any) => row.memory_id === memory_id && row.entity_id === entity_id && row.role === role
+          );
+          if (!exists) {
+            db.memoryEntities.push({ id, memory_id, entity_id, role, score, created_at });
+          }
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("INSERT INTO sb_entity_relations")) {
+          const [
+            id, from_entity_id, to_entity_id, relation_type, fact,
+            memory_id, observation_id, score,
+            valid_from, valid_to, invalid_at, reference_time,
+            metadata_json, created_at,
+          ] = args;
+          db.entityRelations.push({
+            id, from_entity_id, to_entity_id, relation_type, fact,
+            memory_id, observation_id, score,
+            valid_from, valid_to, invalid_at, reference_time,
+            metadata_json, created_at,
+          });
           return { meta: { changes: 1 } };
         }
 
@@ -590,6 +641,11 @@ export class D1Mock {
           );
           return row ? { classification_attempts: row.classification_attempts } : null;
         }
+        if (s.includes("FROM sb_entities WHERE name_normalized = ?")) {
+          const key = String(args[0]);
+          const row = db.entities.find((e: any) => e.name_normalized === key);
+          return row ?? null;
+        }
         if (s.includes("SELECT id FROM entries") && s.includes("content_hash = ?")) {
           const hash = String(args[0]);
           const row = db.entries.find((e: any) =>
@@ -993,5 +1049,8 @@ export class D1Mock {
     this.observations = [];
     this.memories = [];
     this.memorySources = [];
+    this.entities = [];
+    this.memoryEntities = [];
+    this.entityRelations = [];
   }
 }

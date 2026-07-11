@@ -91,6 +91,12 @@ import {
   ATOMIC_EXTRACTION_MAX_TOKENS,
   type AtomicFactDraft,
 } from "./memory/atomic";
+import {
+  attachEntitiesToMemory,
+  getEntityGraph,
+  listActiveEntityRelations,
+  listEntities,
+} from "./memory/entities";
 
 export interface Env {
   DB: D1Database;
@@ -2776,6 +2782,8 @@ async function dualWriteAtomicMemory(
         observedAt: input.atomic?.observedAt ?? input.createdAt,
         validFrom: input.atomic?.validFrom ?? null,
         validTo: input.atomic?.validTo ?? null,
+        referenceTime: input.atomic?.referenceTime ?? input.atomic?.observedAt ?? input.createdAt,
+        invalidAt: null,
         entitiesJson: JSON.stringify(input.atomic?.entities ?? []),
         createdAt: input.createdAt,
       }),
@@ -2788,6 +2796,21 @@ async function dualWriteAtomicMemory(
         createdAt: input.createdAt,
       }),
     ]);
+
+    // Entity graph dual-write (mentions + optional temporal fact edges).
+    if (input.atomic?.entities?.length || input.atomic?.relations?.length) {
+      await attachEntitiesToMemory(env.DB, {
+        memoryId,
+        observationId: input.observationId,
+        entities: input.atomic.entities ?? [],
+        relations: input.atomic.relations ?? [],
+        score: input.atomic.confidence ?? null,
+        validFrom: input.atomic.validFrom ?? null,
+        validTo: input.atomic.validTo ?? null,
+        referenceTime: input.atomic.referenceTime ?? input.atomic.observedAt ?? input.createdAt,
+        createdAt: input.createdAt,
+      });
+    }
   } catch (e) {
     console.error("Atomic memory dual-write failed (non-fatal):", e);
   }
@@ -3083,7 +3106,9 @@ export async function captureEntry(
       observedAt,
       validFrom: null,
       validTo: null,
+      referenceTime: observedAt,
       entities: [],
+      relations: [],
     }];
   }
 
@@ -3098,7 +3123,9 @@ export async function captureEntry(
       observedAt,
       validFrom: null,
       validTo: null,
+      referenceTime: observedAt,
       entities: [],
+      relations: [],
     };
     return captureSingleFact(draft.content || c, baseTags, source, env, ctx, {
       skipExtract: true,
@@ -4153,6 +4180,77 @@ const defaultHandler = {
         : 50;
       const relations = await listMemoryRelations(env.DB, id, limit);
       return json({ ok: true, id, relations });
+    }
+
+    // GET /entities — list / search knowledge entities
+    if (url.pathname === "/entities" && request.method === "GET") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+      const q = url.searchParams.get("q")?.trim() || undefined;
+      const requestedLimit = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
+      const limit = Number.isFinite(requestedLimit)
+        ? Math.max(1, Math.min(requestedLimit, 200))
+        : 50;
+      const entities = await listEntities(env.DB, { q, limit });
+      return json({ ok: true, entities, count: entities.length });
+    }
+
+    // GET /entities/:id — entity detail + one-hop fact edges + linked atomic memories
+    {
+      const entityMatch = url.pathname.match(/^\/entities\/([^/]+)$/);
+      if (entityMatch && request.method === "GET") {
+        const authErr = requireAuth(request, env);
+        if (authErr) return authErr;
+        const entityId = decodeURIComponent(entityMatch[1]);
+        const requestedLimit = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
+        const limit = Number.isFinite(requestedLimit)
+          ? Math.max(1, Math.min(requestedLimit, 100))
+          : 50;
+        const graph = await getEntityGraph(env.DB, entityId, limit);
+        if (!graph.entity) {
+          return json({ ok: false, error: `No entity found with ID: ${entityId}` }, 404);
+        }
+        return json({ ok: true, ...graph });
+      }
+    }
+
+    // GET /graph/entity/:id — alias for Memory Universe clients
+    {
+      const graphEntityMatch = url.pathname.match(/^\/graph\/entity\/([^/]+)$/);
+      if (graphEntityMatch && request.method === "GET") {
+        const authErr = requireAuth(request, env);
+        if (authErr) return authErr;
+        const entityId = decodeURIComponent(graphEntityMatch[1]);
+        const graph = await getEntityGraph(env.DB, entityId, 50);
+        if (!graph.entity) {
+          return json({ ok: false, error: `No entity found with ID: ${entityId}` }, 404);
+        }
+        return json({ ok: true, ...graph });
+      }
+    }
+
+    // GET /graph/facts — currently valid entity fact edges (time slice)
+    if (url.pathname === "/graph/facts" && request.method === "GET") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+      const entityId = url.searchParams.get("entity")?.trim() || undefined;
+      const asOfRaw = url.searchParams.get("asOf");
+      const asOf = asOfRaw ? Number(asOfRaw) : Date.now();
+      const requestedLimit = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
+      const limit = Number.isFinite(requestedLimit)
+        ? Math.max(1, Math.min(requestedLimit, 200))
+        : 50;
+      const facts = await listActiveEntityRelations(env.DB, {
+        entityId,
+        asOf: Number.isFinite(asOf) ? asOf : Date.now(),
+        limit,
+      });
+      return json({
+        ok: true,
+        asOf: Number.isFinite(asOf) ? asOf : Date.now(),
+        facts,
+        count: facts.length,
+      });
     }
 
     // POST /forget — delete-by-id, mirrors the MCP `forget` tool

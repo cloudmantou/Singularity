@@ -37,7 +37,7 @@ describe("parseAtomicExtraction", () => {
     }));
     expect(facts).toHaveLength(3);
     expect(facts[0].memoryClass).toBe("milestone");
-    expect(facts[1].entities).toContain("Graphiti");
+    expect(facts[1].entities.map((e) => e.name)).toContain("Graphiti");
     expect(facts[2].kind).toBe("procedural");
   });
 
