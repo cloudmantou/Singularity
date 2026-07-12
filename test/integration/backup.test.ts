@@ -208,6 +208,18 @@ describe("full memory backup import/export", () => {
     expect(legacyImported.schemaVersion).toBe(5);
     expect(legacyImported.graph.factSources.total).toBe(0);
 
+    const missingFormatResponse = await worker.fetch(
+      auth("/import", {
+        method: "POST",
+        body: JSON.stringify({ ...backup, backupFormat: undefined }),
+      }),
+      legacyRestored.env,
+      createExecutionContext()
+    );
+    expect(missingFormatResponse.status).toBe(400);
+    const missingFormatImported = await missingFormatResponse.json() as any;
+    expect(missingFormatImported.error).toMatch(/backupFormat/);
+
     const futureImportResponse = await worker.fetch(
       auth("/import", {
         method: "POST",

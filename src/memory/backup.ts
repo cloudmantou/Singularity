@@ -73,8 +73,11 @@ export function isMemoryBackupPayload(body: unknown): boolean {
   if (!body || typeof body !== "object" || Array.isArray(body)) return false;
   const record = body as Record<string, unknown>;
   const schemaVersion = Number(record.schemaVersion);
-  return SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS.has(schemaVersion) ||
-    GRAPH_ARRAY_KEYS.some((key) => Array.isArray(record[key]));
+  if (schemaVersion === MEMORY_BACKUP_SCHEMA_VERSION) {
+    return record.backupFormat === MEMORY_BACKUP_FORMAT;
+  }
+  if (schemaVersion === 4) return true;
+  return Number.isFinite(schemaVersion) && schemaVersion > MEMORY_BACKUP_SCHEMA_VERSION;
 }
 
 export function memoryBackupRowCount(body: unknown): number {
@@ -181,7 +184,7 @@ export async function exportMemoryBackup(
                        contradiction_wins, contradiction_losses, content_hash,
                        embedding_fingerprint, pending_vector_ids,
                        pending_embedding_fingerprint, pending_content_hash,
-                       pending_revision_id
+                       pending_revision_id, pending_rebuild_id
                 FROM entries
                 ORDER BY created_at DESC, id DESC`),
     allRows(db, `SELECT id, content, source, metadata_json, content_hash,

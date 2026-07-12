@@ -64,7 +64,7 @@ describe("applyStatus()", () => {
     expect(statusTags).toHaveLength(1);
   });
 
-  it("deprecated: deletes vectors, clears vector_ids, sets status:deprecated", async () => {
+  it("deprecated: queues vector cleanup, clears vector_ids, sets status:deprecated", async () => {
     const result = await applyStatus("entry-1", "deprecated", env);
     expect(result).toBe(true);
 
@@ -72,7 +72,8 @@ describe("applyStatus()", () => {
     const tags: string[] = JSON.parse(row.tags);
     expect(tags).toContain("status:deprecated");
     expect(row.vector_ids).toBe("[]");
-    expect(deleteByIdsMock).toHaveBeenCalledWith(["v1"]);
+    expect(deleteByIdsMock).not.toHaveBeenCalled();
+    expect(db.vectorCleanupQueue.map((item: any) => item.vector_id)).toEqual(["v1"]);
   });
 
   it("returns false for a missing id", async () => {
@@ -161,7 +162,7 @@ describe("POST /status", () => {
     expect(data.error).toBe("id is required");
   });
 
-  it("deprecated via route: deletes vectors, clears vector_ids, sets status:deprecated tag", async () => {
+  it("deprecated via route: queues vector cleanup, clears vector_ids, sets status:deprecated tag", async () => {
     const res = await worker.fetch(
       req("POST", "/status", { body: { id: "entry-1", status: "deprecated" } }),
       env,
@@ -175,6 +176,7 @@ describe("POST /status", () => {
     expect(row.vector_ids).toBe("[]");
     const tags: string[] = JSON.parse(row.tags);
     expect(tags).toContain("status:deprecated");
-    expect(deleteByIdsMock).toHaveBeenCalledWith(["v1"]);
+    expect(deleteByIdsMock).not.toHaveBeenCalled();
+    expect(db.vectorCleanupQueue.map((item: any) => item.vector_id)).toEqual(["v1"]);
   });
 });

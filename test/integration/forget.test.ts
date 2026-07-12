@@ -46,7 +46,7 @@ describe("POST /forget", () => {
     expect(data.ok).toBe(false);
   });
 
-  it("deletes an existing entry and its vectors", async () => {
+  it("deletes an existing entry and queues its vectors for cleanup", async () => {
     const deleteByIdsMock = vi.fn().mockResolvedValue({ mutationId: "m" });
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({ deleteByIds: deleteByIdsMock }),
@@ -81,7 +81,11 @@ describe("POST /forget", () => {
     expect(db.entries.find((e: any) => e.id === "entry-1")).toBeUndefined();
     expect(db.relations).toHaveLength(0);
     expect(db.revisions).toHaveLength(0);
-    expect(deleteByIdsMock).toHaveBeenCalledWith(["entry-1", "entry-1-update-111"]);
+    expect(deleteByIdsMock).not.toHaveBeenCalled();
+    expect(db.vectorCleanupQueue.map((row: any) => row.vector_id).sort()).toEqual([
+      "entry-1",
+      "entry-1-update-111",
+    ]);
   });
 
   it("trims whitespace from id before lookup", async () => {
@@ -100,10 +104,11 @@ describe("POST /forget", () => {
     expect(data.id).toBe("entry-1");
   });
 
-  it("keeps database tracking and returns 503 when Vectorize delete fails", async () => {
+  it("does not call Vectorize directly when preparing durable cleanup", async () => {
+    const deleteByIds = vi.fn().mockRejectedValue(new Error("Vectorize down"));
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
-        deleteByIds: vi.fn().mockRejectedValue(new Error("Vectorize down")),
+        deleteByIds,
       }),
     });
     db.entries.push({
@@ -116,12 +121,12 @@ describe("POST /forget", () => {
     });
 
     const res = await worker.fetch(req("POST", "/forget", { body: { id: "entry-1" } }), env, ctx);
-    expect(res.status).toBe(503);
+    expect(res.status).toBe(200);
     const data = await res.json() as any;
-    expect(data.ok).toBe(false);
-    expect(data.error).toMatch(/not completed/i);
-    expect(db.entries.find((e: any) => e.id === "entry-1")).toBeDefined();
-    expect(db.entries.find((e: any) => e.id === "entry-1")?.vector_ids).toBe('["entry-1"]');
+    expect(data.ok).toBe(true);
+    expect(db.entries.find((e: any) => e.id === "entry-1")).toBeUndefined();
+    expect(db.vectorCleanupQueue.map((row: any) => row.vector_id)).toEqual(["entry-1"]);
+    expect(deleteByIds).not.toHaveBeenCalled();
   });
 
   it("also erases derived digests and patterns that may contain the forgotten content", async () => {
@@ -207,11 +212,54 @@ describe("POST /forget", () => {
     expect(db.revisions).toContainEqual(
       expect.objectContaining({ memory_id: "other-source", event_type: "UNROLL" })
     );
-    expect(deleteByIdsMock).toHaveBeenCalledWith(
-      expect.arrayContaining(["source-vector", "digest-vector", "pattern-vector"])
+    expect(deleteByIdsMock).not.toHaveBeenCalled();
+    expect(db.vectorCleanupQueue.map((row: any) => row.vector_id).sort()).toEqual(
+      ["digest-vector", "pattern-vector", "source-vector"]
     );
-    expect(deleteByIdsMock).not.toHaveBeenCalledWith(
-      expect.arrayContaining(["other-source-vector"])
-    );
+    expect(db.vectorCleanupQueue.map((row: any) => row.vector_id)).not.toContain("other-source-vector");
+  });
+
+  it("forgets pending rebuild entries by queuing active and pending vectors and decrementing expected entries", async () => {
+    const deleteByIdsMock = vi.fn().mockResolvedValue({ mutationId: "m" });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({ deleteByIds: deleteByIdsMock }),
+    });
+    db.vectorRebuilds.push({
+      id: "rebuild-1",
+      slot: "current",
+      state: "building",
+      active_fingerprint: "active",
+      pending_fingerprint: "pending",
+      expected_entries: 1,
+      processed_entries: 0,
+      failed_entries: 0,
+      conflict_entries: 0,
+      last_error: null,
+      created_at: Date.now(),
+      updated_at: Date.now(),
+    });
+    db.entries.push({
+      id: "entry-1",
+      content: "Some content",
+      tags: "[]",
+      source: "api",
+      created_at: Date.now(),
+      vector_ids: '["active-v1"]',
+      pending_vector_ids: '["pending-v1"]',
+      pending_embedding_fingerprint: "pending",
+      pending_content_hash: "hash",
+      pending_revision_id: "revision-1",
+      pending_rebuild_id: "rebuild-1",
+    });
+
+    const res = await worker.fetch(req("POST", "/forget", { body: { id: "entry-1" } }), env, ctx);
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.ok).toBe(true);
+    expect(db.entries).toHaveLength(0);
+    expect(db.vectorRebuilds[0].expected_entries).toBe(0);
+    expect(db.vectorCleanupQueue.map((row: any) => row.vector_id).sort()).toEqual(["active-v1", "pending-v1"]);
+    expect(deleteByIdsMock).not.toHaveBeenCalled();
   });
 });

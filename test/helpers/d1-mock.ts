@@ -48,6 +48,15 @@ export class D1Mock {
       async run() {
         db.statementCount += 1;
 
+        if (s.startsWith("INSERT INTO sb_app_settings") && s.includes("SELECT 'model_settings'")) {
+          const [value, updated_at, rebuild_id] = args;
+          const rebuild = db.vectorRebuilds.find(
+            (row: any) => row.id === rebuild_id && row.state === "activating"
+          );
+          if (!rebuild) return { meta: { changes: 0 } };
+          db.appSettings.model_settings = { value: String(value), updated_at: Number(updated_at) };
+          return { meta: { changes: 1 } };
+        }
         if (s.startsWith("INSERT INTO sb_app_settings")) {
           const [key, value, updated_at] = args;
           db.appSettings[String(key)] = { value: String(value), updated_at: Number(updated_at) };
@@ -124,16 +133,50 @@ export class D1Mock {
           }
           return { meta: { changes: row ? 1 : 0 } };
         }
+        if (s.startsWith("UPDATE sb_vector_rebuilds SET expected_entries = expected_entries + 1")) {
+          const [updated_at, id] = args;
+          const row = db.vectorRebuilds.find((item: any) =>
+            item.id === id && ["queued", "building", "ready"].includes(item.state)
+          );
+          if (row) {
+            row.expected_entries = Number(row.expected_entries ?? 0) + 1;
+            row.updated_at = updated_at;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE sb_vector_rebuilds SET expected_entries = MAX(0, expected_entries - ?")) {
+          const [count, updated_at, id] = args;
+          const row = db.vectorRebuilds.find((item: any) =>
+            item.id === id && ["queued", "building", "ready"].includes(item.state)
+          );
+          if (row) {
+            row.expected_entries = Math.max(0, Number(row.expected_entries ?? 0) - Number(count ?? 0));
+            row.updated_at = updated_at;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE sb_vector_rebuilds SET expected_entries = MAX(0, expected_entries - 1")) {
+          const [updated_at, id] = args;
+          const row = db.vectorRebuilds.find((item: any) =>
+            item.id === id && ["queued", "building", "ready"].includes(item.state)
+          );
+          if (row) {
+            row.expected_entries = Math.max(0, Number(row.expected_entries ?? 0) - 1);
+            row.updated_at = updated_at;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
         if (s.startsWith("UPDATE sb_vector_rebuilds SET state = 'activating'")) {
-          const [updated_at, id, count_rebuild_id, conflict_rebuild_id] = args;
+          const [updated_at, id, conflict_rebuild_id] = args;
           const row = db.vectorRebuilds.find((item: any) =>
             item.id === id && ["queued", "building", "ready"].includes(item.state)
           );
           if (!row) return { meta: { changes: 0 } };
-          const scoped = db.entries.filter((entry: any) => entry.pending_rebuild_id === count_rebuild_id);
           const hasConflict = db.entries.some((entry: any) =>
-            entry.pending_rebuild_id === conflict_rebuild_id &&
+            !String(entry.tags ?? "[]").includes('"status:deprecated"') &&
             (
+              entry.pending_rebuild_id == null ||
+              entry.pending_rebuild_id !== conflict_rebuild_id ||
               entry.pending_vector_ids == null ||
               entry.pending_vector_ids === "[]" ||
               entry.pending_content_hash == null ||
@@ -142,9 +185,7 @@ export class D1Mock {
               entry.pending_content_hash !== entry.content_hash
             )
           );
-          if (scoped.length !== Number(row.expected_entries ?? 0) || hasConflict) {
-            return { meta: { changes: 0 } };
-          }
+          if (hasConflict) return { meta: { changes: 0 } };
           row.state = "activating";
           row.conflict_entries = 0;
           row.last_error = null;
@@ -188,6 +229,18 @@ export class D1Mock {
             }
           }
           return { meta: { changes } };
+        }
+        if (s.startsWith("UPDATE sb_vector_cleanup_batches SET vector_ids_json = ?")) {
+          const [vector_ids_json, next_attempt_at, last_error, updated_at, id] = args;
+          const row = db.vectorCleanupBatches.find((item: any) => item.id === id);
+          if (row) {
+            row.vector_ids_json = vector_ids_json;
+            row.state = "ready";
+            row.next_attempt_at = next_attempt_at;
+            row.last_error = last_error;
+            row.updated_at = updated_at;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
         }
         if (s.startsWith("UPDATE sb_vector_cleanup_batches SET state = 'completed'")) {
           const [updated_at, id] = args;
@@ -855,12 +908,14 @@ export class D1Mock {
           if (s.includes("AND content = ? AND tags = ? AND vector_ids = ?")) {
             const hasHash = s.includes("content_hash");
             const hasPending = s.includes("pending_vector_ids");
+            const hasPendingRebuildId = s.includes("pending_rebuild_id = ?");
             const content = args[0];
             const vector_ids = args[1];
             let index = 2;
             const content_hash = hasHash ? args[index++] : null;
             const pending_vector_ids = hasPending ? args[index++] : undefined;
             const pending_embedding_fingerprint = hasPending ? args[index++] : undefined;
+            const pending_rebuild_id = hasPendingRebuildId ? args[index++] : undefined;
             const id = args[index++];
             const expected_content = args[index++];
             const expected_tags = args[index++];
@@ -881,6 +936,7 @@ export class D1Mock {
                 row.pending_embedding_fingerprint = pending_embedding_fingerprint;
                 row.pending_content_hash = null;
                 row.pending_revision_id = null;
+                if (hasPendingRebuildId) row.pending_rebuild_id = pending_rebuild_id;
               }
               if (s.includes("classification_status = 'pending'")) resetClassification(row);
             }
@@ -902,11 +958,28 @@ export class D1Mock {
               row.pending_embedding_fingerprint = null;
               row.pending_content_hash = null;
               row.pending_revision_id = null;
+              row.pending_rebuild_id = null;
             }
           }
           return { meta: { changes: row ? 1 : 0 } };
         }
         if (s.startsWith("UPDATE entries SET vector_ids = ?,")) {
+          if (!s.includes("pending_vector_ids = ?")) {
+            const [vector_ids, id, expected_vector_ids, expected_content] = args;
+            const row = db.entries.find(
+              (e: any) =>
+                e.id === id &&
+                e.vector_ids === expected_vector_ids &&
+                e.content === expected_content &&
+                !String(e.tags ?? "[]").includes('"status:deprecated"')
+            );
+            if (row) {
+              row.vector_ids = vector_ids;
+              row.pending_content_hash = null;
+              row.pending_revision_id = null;
+            }
+            return { meta: { changes: row ? 1 : 0 } };
+          }
           const [vector_ids, pending_vector_ids, pending_embedding_fingerprint, id, expected_vector_ids, expected_content] = args;
           const row = db.entries.find(
             (e: any) =>
@@ -937,10 +1010,25 @@ export class D1Mock {
           return { meta: { changes: row ? 1 : 0 } };
         }
         if (s.startsWith("UPDATE entries SET pending_vector_ids = '[]'")) {
-          const [pending_embedding_fingerprint, pending_rebuild_id] = args;
+          const [pending_embedding_fingerprint, pending_rebuild_id, maybe_id, maybe_expected_rebuild_id, maybe_exists_rebuild_id] = args;
+          const scopedId = s.includes("WHERE id = ?") ? String(maybe_id) : null;
+          const expectedDifferentRebuildId = s.includes("pending_rebuild_id IS NULL OR pending_rebuild_id != ?")
+            ? String(maybe_expected_rebuild_id)
+            : null;
+          const existsRebuildId = String(
+            s.includes("pending_rebuild_id IS NULL OR pending_rebuild_id != ?")
+              ? maybe_exists_rebuild_id
+              : (scopedId ? maybe_expected_rebuild_id : pending_rebuild_id)
+          );
+          const rebuildOpen = db.vectorRebuilds.some((item: any) =>
+            item.id === existsRebuildId && ["queued", "building", "ready"].includes(item.state)
+          );
           let changes = 0;
           for (const row of db.entries) {
+            if (scopedId && row.id !== scopedId) continue;
             if (String(row.tags ?? "[]").includes('"status:deprecated"')) continue;
+            if (scopedId && !rebuildOpen) continue;
+            if (expectedDifferentRebuildId && row.pending_rebuild_id === expectedDifferentRebuildId) continue;
             row.pending_vector_ids = "[]";
             row.pending_embedding_fingerprint = pending_embedding_fingerprint;
             row.pending_content_hash = null;
@@ -1208,6 +1296,7 @@ export class D1Mock {
           if (s.includes("AND content = ? AND tags = ? AND vector_ids = ?")) {
             const hasHash = s.includes("content_hash");
             const hasPending = s.includes("pending_vector_ids");
+            const hasPendingRebuildId = s.includes("pending_rebuild_id = ?");
             const content = args[0];
             const tags = args[1];
             const vector_ids = args[2];
@@ -1215,6 +1304,7 @@ export class D1Mock {
             const content_hash = hasHash ? args[index++] : null;
             const pending_vector_ids = hasPending ? args[index++] : undefined;
             const pending_embedding_fingerprint = hasPending ? args[index++] : undefined;
+            const pending_rebuild_id = hasPendingRebuildId ? args[index++] : undefined;
             const id = args[index++];
             const expected_content = args[index++];
             const expected_tags = args[index++];
@@ -1236,6 +1326,7 @@ export class D1Mock {
                 row.pending_embedding_fingerprint = pending_embedding_fingerprint;
                 row.pending_content_hash = null;
                 row.pending_revision_id = null;
+                if (hasPendingRebuildId) row.pending_rebuild_id = pending_rebuild_id;
               }
               if (s.includes("classification_status = 'pending'")) resetClassification(row);
             }
@@ -1337,6 +1428,18 @@ export class D1Mock {
       },
       async first() {
         db.statementCount += 1;
+        if (s.includes("SELECT id, pending_fingerprint AS pendingFingerprint, state") && s.includes("FROM sb_vector_rebuilds")) {
+          const row = db.vectorRebuilds.find((item: any) =>
+            item.slot === "current" && ["queued", "building", "ready"].includes(item.state)
+          );
+          return row
+            ? {
+                id: row.id,
+                pendingFingerprint: row.pending_fingerprint,
+                state: row.state,
+              }
+            : null;
+        }
         if (s.includes("SELECT id, state, active_fingerprint") && s.includes("FROM sb_vector_rebuilds")) {
           const pendingFingerprint = args.length ? String(args[0]) : null;
           const row = db.vectorRebuilds.find((item: any) =>
@@ -1357,6 +1460,17 @@ export class D1Mock {
         if (s.includes("SELECT value FROM sb_app_settings WHERE key = ?")) {
           const row = db.appSettings[String(args[0])];
           return row ? { value: row.value } : null;
+        }
+        if (s.includes("SELECT id, vector_ids, pending_vector_ids, pending_rebuild_id FROM entries WHERE id = ?")) {
+          const row = db.entries.find((e: any) => e.id === args[0]);
+          return row
+            ? {
+                id: row.id,
+                vector_ids: row.vector_ids ?? "[]",
+                pending_vector_ids: row.pending_vector_ids ?? null,
+                pending_rebuild_id: row.pending_rebuild_id ?? null,
+              }
+            : null;
         }
         if (s.includes("SELECT vector_ids FROM entries WHERE id")) {
           const row = db.entries.find((e: any) => e.id === args[0]);
@@ -2018,18 +2132,28 @@ export class D1Mock {
             .map((entry: any) => ({
               id: entry.id,
               vector_ids: entry.vector_ids ?? "[]",
+              pending_vector_ids: entry.pending_vector_ids ?? null,
+              pending_rebuild_id: entry.pending_rebuild_id ?? null,
               tags: entry.tags ?? "[]",
             }));
           return { results };
         }
         if (
           s.includes("SELECT id, content, tags, source, created_at") &&
-          s.includes("FROM entries WHERE id IN") &&
-          !s.includes("tags NOT LIKE")
+          s.includes("FROM entries") &&
+          s.includes("WHERE id IN")
         ) {
           const ids = new Set(args.map(String));
+          const kindMatch = s.match(/kind:(episodic|semantic|procedural)/);
           const results = db.entries
-            .filter((entry: any) => ids.has(String(entry.id)))
+            .filter((entry: any) => {
+              const tags: string[] = JSON.parse(entry.tags ?? "[]");
+              if (!ids.has(String(entry.id))) return false;
+              if (s.includes('"status:deprecated"') && tags.includes("status:deprecated")) return false;
+              if (s.includes('"auto-pattern"') && tags.includes("auto-pattern")) return false;
+              if (kindMatch && !tags.includes(`kind:${kindMatch[1]}`)) return false;
+              return true;
+            })
             .map((entry: any) => ({
               id: entry.id,
               content: entry.content,
@@ -2245,13 +2369,13 @@ export class D1Mock {
           const ids = args.slice(0, idCount);
           const rest = args.slice(idCount);
           let argIdx = 0;
-          const kindMatch = s.match(/tags LIKE '%"(kind:(?:episodic|semantic))"%'/);
+          const kindMatch = s.match(/kind:(episodic|semantic|procedural)/);
           let rows = db.entries.filter((e: any) => {
             const tags: string[] = JSON.parse(e.tags ?? "[]");
             if (!ids.includes(e.id)) return false;
             if (tags.includes("auto-pattern")) return false;
             if (s.includes('"status:deprecated"') && tags.includes("status:deprecated")) return false;
-            if (kindMatch && !tags.includes(kindMatch[1])) return false;
+            if (kindMatch && !tags.includes(`kind:${kindMatch[1]}`)) return false;
             return true;
           });
           if (s.includes("created_at >= ?")) {

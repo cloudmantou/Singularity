@@ -638,7 +638,7 @@ export async function attachEntitiesToMemory(
       score: input.score ?? null,
       validFrom: input.validFrom ?? null,
       validTo: input.validTo ?? null,
-      referenceTime: input.referenceTime ?? input.createdAt,
+      referenceTime: input.referenceTime ?? null,
       createdAt: input.createdAt,
     });
     relationIds.push(relationId);
@@ -660,7 +660,7 @@ export async function attachEntitiesToMemory(
           score: Math.max(0, Math.min(1, (input.score ?? 0.5) * 0.5)),
           validFrom: input.validFrom ?? null,
           validTo: input.validTo ?? null,
-          referenceTime: input.referenceTime ?? input.createdAt,
+          referenceTime: input.referenceTime ?? null,
           metadata: { automatic: true, co_mention: true },
           createdAt: input.createdAt,
         });

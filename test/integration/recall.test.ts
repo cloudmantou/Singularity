@@ -705,6 +705,41 @@ describe("GET /recall", () => {
     expect(data.results[0].score).toBe(100);
   });
 
+  it("uses self-host lexical vector ids as a third RRF source", async () => {
+    const now = Date.now();
+    db.entries.push({
+      id: "lex-entry",
+      content: "Local FTS row surfaced by vector id",
+      tags: "[]",
+      source: "api",
+      created_at: now,
+      vector_ids: '["lex-vector"]',
+      recall_count: 0,
+      importance_score: 0,
+      contradiction_wins: 0,
+      contradiction_losses: 0,
+    });
+    const queryLexical = vi.fn().mockReturnValue(["lex-vector"]);
+    env = makeTestEnv(db, {
+      SELFHOST: "1",
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({ matches: [] }),
+        getByIds: vi.fn().mockResolvedValue([
+          { id: "lex-vector", values: SIMILAR_VEC, metadata: { parentId: "lex-entry" } },
+        ]),
+        queryLexical,
+      } as any),
+    });
+
+    const res = await worker.fetch(req("GET", "/recall?query=needle"), env, ctx);
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(queryLexical).toHaveBeenCalledWith("needle", expect.any(Number));
+    expect(data.results.map((row: any) => row.id)).toEqual(["lex-entry"]);
+    expect(data.results[0].score_details.keyword).toBeGreaterThan(0);
+  });
+
   it("re-ranks an identifier hit to the top within a tag (hybrid on the tag path)", async () => {
     const now = Date.now();
     const seed: [string, string][] = [

@@ -209,7 +209,7 @@ describe("POST /update", () => {
 
   // ── Vector orphan prevention ────────────────────────────────────────────────
 
-  it("deletes the complete old generation after the new generation is committed", async () => {
+  it("queues the complete old generation after the new generation is committed", async () => {
     const deleteByIdsMock = vi.fn().mockResolvedValue({ mutationId: "m" });
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({ deleteByIds: deleteByIdsMock }),
@@ -221,14 +221,14 @@ describe("POST /update", () => {
       env, ctx
     );
 
-    expect(deleteByIdsMock).toHaveBeenCalledOnce();
-    expect(deleteByIdsMock.mock.calls[0][0]).toEqual([
+    expect(deleteByIdsMock).not.toHaveBeenCalled();
+    expect(db.vectorCleanupQueue.map((row: any) => row.vector_id).sort()).toEqual([
       "entry-abc",
       "entry-abc-chunk-1",
     ]);
   });
 
-  it("deletes a single-vector old generation after switching to a unique new id", async () => {
+  it("queues a single-vector old generation after switching to a unique new id", async () => {
     const deleteByIdsMock = vi.fn().mockResolvedValue({ mutationId: "m" });
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({ deleteByIds: deleteByIdsMock }),
@@ -240,7 +240,8 @@ describe("POST /update", () => {
       env, ctx
     );
 
-    expect(deleteByIdsMock).toHaveBeenCalledWith(["entry-abc"]);
+    expect(deleteByIdsMock).not.toHaveBeenCalled();
+    expect(db.vectorCleanupQueue.map((row: any) => row.vector_id)).toEqual(["entry-abc"]);
   });
 
   it("does not call deleteByIds when vector_ids is empty", async () => {
@@ -300,6 +301,7 @@ describe("POST /update", () => {
     expect(res.status).toBe(200);
     const data = await res.json() as any;
     expect(data.ok).toBe(true);
+    expect(db.vectorCleanupQueue.map((row: any) => row.vector_id)).toEqual(["entry-abc"]);
   });
 
   it("clears stale pending vectors and requeues edited content during blue-green rebuild", async () => {
@@ -327,6 +329,7 @@ describe("POST /update", () => {
     expect(db.entries[0].content).toBe("Updated content");
     expect(db.entries[0].pending_vector_ids).toBe("[]");
     expect(db.entries[0].pending_embedding_fingerprint).toBe(pendingFingerprint);
+    expect(db.entries[0].pending_rebuild_id).toBe(db.vectorRebuilds[0].id);
     expect(db.entries[0].pending_content_hash).toBeNull();
     expect(deleteByIdsMock).toHaveBeenCalledWith(["pending-old"]);
   });
@@ -410,7 +413,8 @@ describe("POST /update", () => {
 
     expect(response.status).toBe(200);
     expect(db.entries[0].content).toBe("Updated content");
-    expect(deleteByIdsMock).toHaveBeenCalledWith(["background-vector"]);
+    expect(deleteByIdsMock).not.toHaveBeenCalled();
+    expect(db.vectorCleanupQueue.map((row: any) => row.vector_id)).toEqual(["background-vector"]);
   });
 
   it("does not overwrite a lifecycle status changed while vectors are prepared", async () => {
@@ -445,17 +449,14 @@ describe("POST /update", () => {
 
   // ── Safe ordering ───────────────────────────────────────────────────────────
 
-  it("inserts the new generation before changing D1 and deletes old vectors last", async () => {
+  it("inserts the new generation before changing D1 and queues old vectors last", async () => {
     // Seed entry with known vector_ids
     seedEntry(db, { vector_ids: '["old-vec-1","old-vec-2"]' });
 
     const callOrder: string[] = [];
     let contentAtInsert = "";
     let vectorIdsAtInsert = "";
-    const deleteByIdsMock = vi.fn().mockImplementation(async (ids: string[]) => {
-      callOrder.push(`delete:${ids.join(",")}`);
-      return { mutationId: "m" };
-    });
+    const deleteByIdsMock = vi.fn().mockResolvedValue({ mutationId: "m" });
     const insertMock = vi.fn().mockImplementation(async () => {
       contentAtInsert = db.entries[0].content;
       vectorIdsAtInsert = db.entries[0].vector_ids;
@@ -479,12 +480,12 @@ describe("POST /update", () => {
     expect(activeIds.every((id) => id.startsWith("g-"))).toBe(true);
     expect(activeIds.every((id) => id.length <= 64)).toBe(true);
 
-    // insert must happen before delete — new vectors before old ones removed
-    const insertIdx = callOrder.indexOf("insert");
-    const deleteIdx = callOrder.findIndex(s => s.startsWith("delete:"));
-    expect(insertIdx).toBeLessThan(deleteIdx);
-    expect(callOrder[deleteIdx]).toContain("old-vec-1");
-    expect(callOrder[deleteIdx]).toContain("old-vec-2");
+    expect(callOrder).toEqual(["insert"]);
+    expect(deleteByIdsMock).not.toHaveBeenCalled();
+    expect(db.vectorCleanupQueue.map((row: any) => row.vector_id).sort()).toEqual([
+      "old-vec-1",
+      "old-vec-2",
+    ]);
   });
 
   it("does not let delayed initial vectorization overwrite a newer update generation", async () => {

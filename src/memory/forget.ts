@@ -18,6 +18,12 @@ export type ForgetMemoryResult =
 interface EntryVectorRow {
   id: string;
   vector_ids: string;
+  pending_vector_ids: string | null;
+  pending_rebuild_id: string | null;
+}
+
+interface ForgetCleanupOptions {
+  queueVectorCleanup?: (vectorIds: string[], reason: string) => Promise<void>;
 }
 
 interface DigestSourceRow {
@@ -66,6 +72,11 @@ function parseTags(raw: string): string[] | null {
   }
 }
 
+function isMissingPendingEntryColumn(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /no such column:\s*pending_(vector_ids|rebuild_id)/i.test(message);
+}
+
 async function findDerivedClosure(db: D1Database, rootId: string): Promise<string[] | null> {
   const seen = new Set([rootId]);
   let frontier = [rootId];
@@ -102,16 +113,51 @@ async function loadTrackedEntries(
 ): Promise<EntryVectorRow[]> {
   const rows: EntryVectorRow[] = [];
   for (const batch of chunks(ids, QUERY_BATCH_SIZE)) {
-    const { results } = await db
-      .prepare(
-        `SELECT id, vector_ids FROM entries
-         WHERE id IN (${placeholders(batch.length)})`
-      )
-      .bind(...batch)
-      .all<EntryVectorRow>();
+    let results: EntryVectorRow[];
+    try {
+      ({ results } = await db
+        .prepare(
+          `SELECT id, vector_ids, pending_vector_ids, pending_rebuild_id FROM entries
+           WHERE id IN (${placeholders(batch.length)})`
+        )
+        .bind(...batch)
+        .all<EntryVectorRow>());
+    } catch (error) {
+      if (!isMissingPendingEntryColumn(error)) throw error;
+      ({ results } = await db
+        .prepare(
+          `SELECT id, vector_ids, NULL AS pending_vector_ids, NULL AS pending_rebuild_id
+           FROM entries
+           WHERE id IN (${placeholders(batch.length)})`
+        )
+        .bind(...batch)
+        .all<EntryVectorRow>());
+    }
     rows.push(...results);
   }
   return rows;
+}
+
+async function loadTrackedEntry(
+  db: D1Database,
+  id: string
+): Promise<EntryVectorRow | null> {
+  try {
+    return await db
+      .prepare(`SELECT id, vector_ids, pending_vector_ids, pending_rebuild_id FROM entries WHERE id = ?`)
+      .bind(id)
+      .first<EntryVectorRow>();
+  } catch (error) {
+    if (!isMissingPendingEntryColumn(error)) throw error;
+    return await db
+      .prepare(
+        `SELECT id, vector_ids, NULL AS pending_vector_ids, NULL AS pending_rebuild_id
+         FROM entries
+         WHERE id = ?`
+      )
+      .bind(id)
+      .first<EntryVectorRow>();
+  }
 }
 
 async function loadSurvivingDigestSources(
@@ -313,14 +359,12 @@ function prepareDatabaseErase(
 export async function forgetMemoryGraph(
   id: string,
   db: D1Database,
-  vectorize: VectorizeIndex
+  vectorize: VectorizeIndex,
+  options: ForgetCleanupOptions = {}
 ): Promise<ForgetMemoryResult> {
   const memoryId = id.trim();
   if (!memoryId) return { status: "not_found" };
-  const root = await db
-    .prepare(`SELECT id, vector_ids FROM entries WHERE id = ?`)
-    .bind(memoryId)
-    .first<EntryVectorRow>();
+  const root = await loadTrackedEntry(db, memoryId);
   if (!root) return { status: "not_found" };
 
   const closure = await findDerivedClosure(db, memoryId);
@@ -337,26 +381,51 @@ export async function forgetMemoryGraph(
   const atomicGraph = await loadAtomicGraphRows(db, [...trackedIds]);
 
   const vectorIds: string[] = [];
+  const rebuildExitCounts = new Map<string, number>();
   for (const row of rows) {
     const parsed = parseVectorIds(row.vector_ids);
     if (!parsed) return { status: "delete_failed" };
     vectorIds.push(...parsed);
+    const pending = parseVectorIds(row.pending_vector_ids ?? "[]");
+    if (!pending) return { status: "delete_failed" };
+    vectorIds.push(...pending);
+    if (row.pending_rebuild_id) {
+      rebuildExitCounts.set(
+        row.pending_rebuild_id,
+        (rebuildExitCounts.get(row.pending_rebuild_id) ?? 0) + 1
+      );
+    }
   }
   const uniqueVectorIds = [...new Set(vectorIds)];
 
   try {
-    for (const batch of chunks(uniqueVectorIds, VECTOR_DELETE_BATCH_SIZE)) {
-      await vectorize.deleteByIds(batch);
+    if (options.queueVectorCleanup) {
+      await options.queueVectorCleanup(uniqueVectorIds, "memory_forget");
+    } else {
+      for (const batch of chunks(uniqueVectorIds, VECTOR_DELETE_BATCH_SIZE)) {
+        await vectorize.deleteByIds(batch);
+      }
     }
   } catch (error) {
-    console.error("Vector deletion failed; database tracking was preserved:", error);
+    console.error("Vector cleanup preparation failed; database tracking was preserved:", error);
     return { status: "delete_failed" };
   }
 
   try {
-    await db.batch(
-      prepareDatabaseErase(db, [...trackedIds], survivingDigestSources, atomicGraph)
+    const now = Date.now();
+    const rebuildExitStatements = [...rebuildExitCounts.entries()].map(([rebuildId, count]) =>
+      db.prepare(
+        `UPDATE sb_vector_rebuilds
+         SET expected_entries = MAX(0, expected_entries - ?),
+             updated_at = ?
+         WHERE id = ?
+           AND state IN ('queued', 'building', 'ready')`
+      ).bind(count, now, rebuildId)
     );
+    await db.batch([
+      ...rebuildExitStatements,
+      ...prepareDatabaseErase(db, [...trackedIds], survivingDigestSources, atomicGraph),
+    ]);
   } catch (error) {
     console.error("Database erase failed after vector deletion; retry is safe:", error);
     return { status: "delete_failed" };

@@ -465,8 +465,17 @@ export class SqliteVectorizeIndex {
       const existing = this.db
         .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sb_vector_fts'`)
         .get() as { sql: string } | undefined;
-      if (existing?.sql && !/tokenize\s*=\s*'?trigram'?/i.test(existing.sql)) {
-        this.db.exec(`DROP TABLE IF EXISTS sb_vector_fts`);
+      if (existing?.sql) {
+        if (/tokenize\s*=\s*'?trigram'?/i.test(existing.sql)) {
+          this.ftsAvailable = true;
+          this.ftsTokenizer = "trigram";
+          return;
+        }
+        if (/tokenize\s*=\s*'?unicode61'?/i.test(existing.sql)) {
+          this.ftsAvailable = true;
+          this.ftsTokenizer = "unicode61";
+          return;
+        }
       }
       this.db.exec(`
         CREATE VIRTUAL TABLE IF NOT EXISTS sb_vector_fts

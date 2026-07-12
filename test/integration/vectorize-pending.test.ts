@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import worker from "../../src/index";
+import worker, { captureEntry } from "../../src/index";
 import { makeTestEnv, makeTestDb, makeVectorizeMock } from "../helpers/make-env";
 import { req } from "../helpers/make-request";
 import type { Env } from "../../src/index";
@@ -268,6 +268,74 @@ describe("POST /vectorize-pending", () => {
     expect(db.entries[0].embedding_fingerprint).toBe(reindexData.pendingFingerprint);
   });
 
+  it("joins newly captured memories to an open rebuild before async vectorization finishes", async () => {
+    db.entries.push({
+      ...pastGraceEntry("active"),
+      vector_ids: '["active-old"]',
+      content_hash: "active-hash",
+    });
+
+    const reindex = await worker.fetch(req("POST", "/settings/models/reindex"), env, ctx);
+    const reindexData = await reindex.json() as any;
+    const waits: Promise<any>[] = [];
+    const captureCtx = {
+      waitUntil: (promise: Promise<any>) => waits.push(promise),
+    } as any;
+
+    const result = await captureEntry(
+      "New memory created during rebuild",
+      ["work"],
+      "api",
+      env,
+      captureCtx,
+      { skipExtract: true }
+    );
+    await Promise.all(waits);
+
+    expect(result.status).toBe("stored");
+    if (result.status !== "stored") return;
+    const created = db.entries.find((entry: any) => entry.id === result.id);
+    expect(created.pending_rebuild_id).toBe(reindexData.rebuildId);
+    expect(created.pending_embedding_fingerprint).toBe(reindexData.pendingFingerprint);
+    expect(created.pending_vector_ids).toBe("[]");
+    expect(db.vectorRebuilds[0].expected_entries).toBe(2);
+  });
+
+  it("blocks activation when a current non-deprecated entry has not joined the rebuild", async () => {
+    db.entries.push({
+      ...pastGraceEntry("active"),
+      vector_ids: '["active-old"]',
+      content_hash: "active-hash",
+    });
+
+    await worker.fetch(req("POST", "/settings/models/reindex"), env, ctx);
+    db.entries.push({
+      ...pastGraceEntry("unjoined"),
+      vector_ids: '["unjoined-active"]',
+      content_hash: "unjoined-hash",
+      pending_vector_ids: null,
+      pending_embedding_fingerprint: null,
+      pending_content_hash: null,
+      pending_revision_id: null,
+      pending_rebuild_id: null,
+    });
+
+    const res = await worker.fetch(
+      req("POST", "/vectorize-pending", { body: { includeRecent: true } }),
+      env,
+      ctx
+    );
+    const data = await res.json() as any;
+
+    expect(data.mode).toBe("blue_green");
+    expect(data.processed).toBe(1);
+    expect(data.remaining).toBe(0);
+    expect(data.activated).toBe(0);
+    expect(data.activationState).toBe("blocked");
+    expect(data.activationError).toBe("vector_activation_conflict");
+    expect(db.entries.find((entry: any) => entry.id === "active").vector_ids).toBe('["active-old"]');
+  });
+
   it("deletes ready stale active vector batches during scheduled cleanup", async () => {
     const deleteByIds = vi.fn().mockResolvedValue({ mutationId: "delete" });
     env = makeTestEnv(db, {
@@ -299,6 +367,40 @@ describe("POST /vectorize-pending", () => {
 
     expect(deleteByIds).toHaveBeenCalledWith(["active-old"]);
     expect(db.vectorCleanupBatches[0].state).toBe("completed");
+  });
+
+  it("splits cleanup batches so referenced vectors retry without blocking deletable vectors", async () => {
+    const deleteByIds = vi.fn().mockResolvedValue({ mutationId: "delete" });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({ deleteByIds }),
+    });
+    db.entries.push({
+      ...pastGraceEntry("holder"),
+      vector_ids: '["still-active"]',
+    });
+    db.vectorCleanupBatches.push({
+      id: "cleanup-1",
+      rebuild_id: "rebuild-1",
+      vector_ids_json: '["still-active","orphaned"]',
+      state: "ready",
+      attempts: 0,
+      next_attempt_at: null,
+      last_error: null,
+      created_at: Date.now() - 1000,
+      updated_at: Date.now() - 1000,
+    });
+
+    const pending: Promise<any>[] = [];
+    await (worker as any).scheduled({} as any, env, {
+      waitUntil: (promise: Promise<any>) => pending.push(promise),
+    } as any);
+    await Promise.all(pending);
+
+    expect(deleteByIds).toHaveBeenCalledWith(["orphaned"]);
+    expect(db.vectorCleanupBatches[0].state).toBe("ready");
+    expect(JSON.parse(db.vectorCleanupBatches[0].vector_ids_json)).toEqual(["still-active"]);
+    expect(db.vectorCleanupBatches[0].last_error).toBe("vector_still_referenced:1");
+    expect(db.vectorCleanupBatches[0].next_attempt_at).toEqual(expect.any(Number));
   });
 
   it("batches pending blue-green rebuild embeddings across entries", async () => {

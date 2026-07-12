@@ -307,6 +307,34 @@ describe("SqliteVectorizeIndex", () => {
     expect(matches.map((match) => match.id)).not.toContain("lexical-hit");
     expect(lexicalIds).toContain("lexical-hit");
   });
+
+  it("preserves an existing unicode61 FTS table instead of dropping it on startup", () => {
+    const legacyPath = path.join(os.tmpdir(), `sb-vec-legacy-${Date.now()}-${Math.random()}.db`);
+    const legacyRaw = new Database(legacyPath);
+    try {
+      legacyRaw.exec(`
+        CREATE VIRTUAL TABLE sb_vector_fts
+        USING fts5(id UNINDEXED, content, tokenize='unicode61');
+      `);
+      legacyRaw
+        .prepare(`INSERT INTO sb_vector_fts (id, content) VALUES (?, ?)`)
+        .run("legacy-fts", "unicode legacy token");
+
+      const legacyVec = new SqliteVectorizeIndex(legacyRaw);
+      const status = legacyVec.indexStatus();
+
+      expect(status.ftsAvailable).toBe(true);
+      expect(status.ftsTokenizer).toBe("unicode61");
+      expect(legacyVec.queryLexical("unicode legacy", 10)).toContain("legacy-fts");
+    } finally {
+      legacyRaw.close();
+      try {
+        fs.unlinkSync(legacyPath);
+      } catch {
+        /* ignore */
+      }
+    }
+  });
 });
 
 describe("SqliteKVNamespace", () => {

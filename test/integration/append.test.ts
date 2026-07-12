@@ -181,9 +181,35 @@ describe("POST /append", () => {
     expect(deleteByIdsMock).not.toHaveBeenCalled();
   });
 
+  it("short append during an open rebuild keeps the entry attached by pending_rebuild_id", async () => {
+    db.entries.push({
+      id: "entry-1",
+      content: "Short original",
+      tags: "[]",
+      source: "api",
+      created_at: Date.now() - 600_000,
+      vector_ids: '["entry-1"]',
+      content_hash: "old-hash",
+    });
+    const reindex = await worker.fetch(req("POST", "/settings/models/reindex"), env, ctx);
+    const reindexData = await reindex.json() as any;
+
+    const res = await worker.fetch(
+      req("POST", "/append", { body: { id: "entry-1", addition: "Small addition" } }),
+      env,
+      ctx
+    );
+
+    expect(res.status).toBe(200);
+    expect(db.entries[0].pending_rebuild_id).toBe(reindexData.rebuildId);
+    expect(db.entries[0].pending_embedding_fingerprint).toBe(reindexData.pendingFingerprint);
+    expect(db.entries[0].pending_vector_ids).toBe("[]");
+    expect(db.vectorRebuilds[0].expected_entries).toBe(1);
+  });
+
   // ── Oversized append: full re-embed path (> CHUNK_MAX_CHARS) ────────────────
 
-  it("oversized append: triggers full re-embed and deletes old vectors", async () => {
+  it("oversized append: triggers full re-embed and queues old vectors", async () => {
     const deleteByIdsMock = vi.fn().mockResolvedValue({ mutationId: "m" });
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({ deleteByIds: deleteByIdsMock }),
@@ -217,11 +243,14 @@ describe("POST /append", () => {
     expect(vectorIds.every((id: string) => id.startsWith("g-"))).toBe(true);
     expect(vectorIds.every((id: string) => id.length <= 64)).toBe(true);
 
-    // Old vectors deleted
-    expect(deleteByIdsMock).toHaveBeenCalledWith(["entry-1", "entry-1-update-111"]);
+    expect(deleteByIdsMock).not.toHaveBeenCalled();
+    expect(db.vectorCleanupQueue.map((row: any) => row.vector_id).sort()).toEqual([
+      "entry-1",
+      "entry-1-update-111",
+    ]);
   });
 
-  it("oversized append: new vectors inserted before old ones are deleted (safe ordering)", async () => {
+  it("oversized append: new vectors inserted before old ones are queued for cleanup", async () => {
     const callOrder: string[] = [];
     let contentAtInsert = "";
     env = makeTestEnv(db, {
@@ -251,7 +280,8 @@ describe("POST /append", () => {
 
     expect(contentAtInsert).toBe(LONG_CONTENT);
     expect(db.entries[0].content).toContain("More info");
-    expect(callOrder.indexOf("insert")).toBeLessThan(callOrder.indexOf("delete"));
+    expect(callOrder).toEqual(["insert"]);
+    expect(db.vectorCleanupQueue.map((row: any) => row.vector_id)).toEqual(["entry-1"]);
   });
 
   it("oversized append: preserves old content and vectors when re-embed fails", async () => {
