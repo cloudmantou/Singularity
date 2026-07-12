@@ -645,6 +645,14 @@ async function embedManyWithProvider(
 // ─── Database initialization ──────────────────────────────────────────────────
 
 export async function initializeDatabase(env: Env): Promise<void> {
+  await env.DB.exec(
+    `CREATE TABLE IF NOT EXISTS sb_schema_migrations (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      checksum TEXT,
+      applied_at INTEGER NOT NULL
+    )`
+  );
   await env.DB.exec(`CREATE TABLE IF NOT EXISTS entries (id TEXT PRIMARY KEY, content TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '[]', source TEXT NOT NULL DEFAULT 'api', created_at INTEGER NOT NULL, vector_ids TEXT NOT NULL DEFAULT '[]')`);
   await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_entries_created_at ON entries(created_at DESC)`);
   await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_entries_source ON entries(source)`);
@@ -705,8 +713,10 @@ export async function initializeDatabase(env: Env): Promise<void> {
       entry_id TEXT,
       external_file_id TEXT,
       content_hash TEXT,
+      sync_etag TEXT,
       last_synced_content_hash TEXT,
       last_synced_revision_id TEXT,
+      last_synced_sync_etag TEXT,
       sync_direction TEXT NOT NULL DEFAULT 'bidirectional',
       sync_status TEXT NOT NULL DEFAULT 'synced',
       last_error TEXT,
@@ -769,6 +779,7 @@ export async function initializeDatabase(env: Env): Promise<void> {
   await env.DB.exec(
     `CREATE TABLE IF NOT EXISTS sb_automation_rules (
       id TEXT PRIMARY KEY,
+      vault_id TEXT,
       name TEXT NOT NULL,
       trigger_type TEXT NOT NULL,
       source_filter_json TEXT NOT NULL DEFAULT '{}',
@@ -787,8 +798,13 @@ export async function initializeDatabase(env: Env): Promise<void> {
      ON sb_automation_rules(trigger_type, enabled, updated_at DESC)`
   );
   await env.DB.exec(
+    `CREATE INDEX IF NOT EXISTS idx_automation_rules_vault
+     ON sb_automation_rules(vault_id, enabled, updated_at DESC)`
+  );
+  await env.DB.exec(
     `CREATE TABLE IF NOT EXISTS sb_knowledge_aggregates (
       id TEXT PRIMARY KEY,
+      vault_id TEXT,
       aggregate_type TEXT NOT NULL,
       title TEXT NOT NULL,
       source_memory_ids_json TEXT NOT NULL DEFAULT '[]',
@@ -805,6 +821,11 @@ export async function initializeDatabase(env: Env): Promise<void> {
     `CREATE INDEX IF NOT EXISTS idx_knowledge_aggregates_stale
      ON sb_knowledge_aggregates(stale_at, updated_at DESC)`
   );
+  await env.DB.exec(
+    `CREATE INDEX IF NOT EXISTS idx_knowledge_aggregates_vault
+     ON sb_knowledge_aggregates(vault_id, updated_at DESC)`
+  );
+  await ensureObsidianP1Schema(env.DB);
   await env.DB.exec(
     `CREATE TABLE IF NOT EXISTS sb_vector_rebuilds (
       id TEXT PRIMARY KEY,
@@ -1025,6 +1046,8 @@ async function ensureExternalLinksSchema(db: D1Database): Promise<void> {
     `ALTER TABLE sb_external_links ADD COLUMN object_type TEXT NOT NULL DEFAULT 'memory'`,
     `ALTER TABLE sb_external_links ADD COLUMN object_id TEXT`,
     `ALTER TABLE sb_external_links ADD COLUMN content_hash TEXT`,
+    `ALTER TABLE sb_external_links ADD COLUMN sync_etag TEXT`,
+    `ALTER TABLE sb_external_links ADD COLUMN last_synced_sync_etag TEXT`,
   ]) {
     try {
       await db.exec(alter);
@@ -1039,6 +1062,8 @@ async function ensureExternalLinksSchema(db: D1Database): Promise<void> {
      SET object_type = COALESCE(NULLIF(object_type, ''), 'memory'),
          object_id = COALESCE(NULLIF(object_id, ''), entry_id),
          content_hash = COALESCE(content_hash, last_synced_content_hash),
+         sync_etag = COALESCE(sync_etag, content_hash, last_synced_content_hash),
+         last_synced_sync_etag = COALESCE(last_synced_sync_etag, sync_etag, content_hash, last_synced_content_hash),
          external_block_id = COALESCE(external_block_id, '')`
   );
 
@@ -1056,8 +1081,10 @@ async function ensureExternalLinksSchema(db: D1Database): Promise<void> {
       entry_id TEXT,
       external_file_id TEXT,
       content_hash TEXT,
+      sync_etag TEXT,
       last_synced_content_hash TEXT,
       last_synced_revision_id TEXT,
+      last_synced_sync_etag TEXT,
       sync_direction TEXT NOT NULL DEFAULT 'bidirectional',
       sync_status TEXT NOT NULL DEFAULT 'synced',
       last_error TEXT,
@@ -1072,7 +1099,8 @@ async function ensureExternalLinksSchema(db: D1Database): Promise<void> {
     `INSERT OR IGNORE INTO sb_external_links_next (
        id, provider, vault_id, external_path, external_block_id, object_type,
        object_id, entry_id, external_file_id, content_hash,
-       last_synced_content_hash, last_synced_revision_id, sync_direction,
+       sync_etag, last_synced_content_hash, last_synced_revision_id,
+       last_synced_sync_etag, sync_direction,
        sync_status, last_error, created_at, updated_at
      )
      SELECT
@@ -1080,12 +1108,71 @@ async function ensureExternalLinksSchema(db: D1Database): Promise<void> {
        COALESCE(NULLIF(object_type, ''), 'memory'),
        COALESCE(NULLIF(object_id, ''), entry_id),
        entry_id, external_file_id, COALESCE(content_hash, last_synced_content_hash),
-       last_synced_content_hash, last_synced_revision_id, sync_direction,
+       COALESCE(sync_etag, content_hash, last_synced_content_hash),
+       last_synced_content_hash, last_synced_revision_id,
+       COALESCE(last_synced_sync_etag, sync_etag, content_hash, last_synced_content_hash),
+       sync_direction,
        sync_status, last_error, created_at, updated_at
      FROM sb_external_links`
   );
   await db.exec(`DROP TABLE sb_external_links`);
   await db.exec(`ALTER TABLE sb_external_links_next RENAME TO sb_external_links`);
+}
+
+async function executeIdempotentSchemaStatement(db: D1Database, statement: string): Promise<void> {
+  try {
+    await db.exec(statement);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/duplicate column name|already exists|no such index/i.test(message)) throw error;
+  }
+}
+
+async function runSchemaMigration(
+  db: D1Database,
+  migration: { id: string; name: string; checksum: string; statements: string[] }
+): Promise<void> {
+  const existing = await db.prepare(
+    `SELECT id FROM sb_schema_migrations WHERE id = ?`
+  ).bind(migration.id).first<{ id: string }>();
+  if (existing) return;
+  for (const statement of migration.statements) {
+    await executeIdempotentSchemaStatement(db, statement);
+  }
+  await db.prepare(
+    `INSERT OR IGNORE INTO sb_schema_migrations (id, name, checksum, applied_at)
+     VALUES (?, ?, ?, ?)`
+  ).bind(migration.id, migration.name, migration.checksum, Date.now()).run();
+}
+
+async function ensureObsidianP1Schema(db: D1Database): Promise<void> {
+  await db.exec(
+    `CREATE TABLE IF NOT EXISTS sb_schema_migrations (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      checksum TEXT,
+      applied_at INTEGER NOT NULL
+    )`
+  );
+  await runSchemaMigration(db, {
+    id: "20260712_obsidian_p1_sync_contract",
+    name: "Obsidian P1 sync etag, vault-scoped rules, and aggregate APIs",
+    checksum: "obsidian-p1-sync-v1",
+    statements: [
+      `ALTER TABLE sb_external_links ADD COLUMN sync_etag TEXT`,
+      `ALTER TABLE sb_external_links ADD COLUMN last_synced_sync_etag TEXT`,
+      `ALTER TABLE sb_automation_rules ADD COLUMN vault_id TEXT`,
+      `ALTER TABLE sb_knowledge_aggregates ADD COLUMN vault_id TEXT`,
+      `CREATE INDEX IF NOT EXISTS idx_automation_rules_vault
+       ON sb_automation_rules(vault_id, enabled, updated_at DESC)`,
+      `CREATE INDEX IF NOT EXISTS idx_knowledge_aggregates_vault
+       ON sb_knowledge_aggregates(vault_id, updated_at DESC)`,
+      `UPDATE sb_external_links
+       SET sync_etag = COALESCE(sync_etag, content_hash, last_synced_content_hash),
+           last_synced_sync_etag = COALESCE(last_synced_sync_etag, sync_etag, content_hash, last_synced_content_hash)
+       WHERE sync_etag IS NULL OR last_synced_sync_etag IS NULL`,
+    ],
+  });
 }
 
 interface ObsidianPushBody {
@@ -1115,12 +1202,37 @@ interface ObsidianAckBody {
   vaultId?: unknown;
   revisionId?: unknown;
   contentHash?: unknown;
+  syncEtag?: unknown;
 }
 
 interface ObsidianTokenBody {
   name?: unknown;
   vaultId?: unknown;
   expiresAt?: unknown;
+}
+
+interface ObsidianRuleBody {
+  id?: unknown;
+  vaultId?: unknown;
+  name?: unknown;
+  triggerType?: unknown;
+  sourceFilter?: unknown;
+  extractorSchema?: unknown;
+  tagRules?: unknown;
+  aggregationRule?: unknown;
+  outputTemplate?: unknown;
+  enabled?: unknown;
+}
+
+interface ObsidianAggregateGenerateBody {
+  id?: unknown;
+  vaultId?: unknown;
+  aggregateType?: unknown;
+  title?: unknown;
+  sourceMemoryIds?: unknown;
+  generationRuleId?: unknown;
+  outputPath?: unknown;
+  syncDirection?: unknown;
 }
 
 interface ExternalSourceRow {
@@ -1147,8 +1259,10 @@ interface ObsidianLinkRow {
   object_id: string | null;
   external_file_id: string | null;
   content_hash: string | null;
+  sync_etag: string | null;
   last_synced_content_hash: string | null;
   last_synced_revision_id: string | null;
+  last_synced_sync_etag: string | null;
   sync_direction: ObsidianSyncDirection;
   sync_status: ObsidianSyncStatus;
   last_error: string | null;
@@ -1167,6 +1281,43 @@ interface ObsidianLinkedEntryRow extends ObsidianLinkRow {
   content_hash: string | null;
   revision_id: string | null;
   memory_status: MemoryStatus | null;
+}
+
+interface AutomationRuleRow {
+  id: string;
+  vault_id: string | null;
+  name: string;
+  trigger_type: string;
+  source_filter_json: string;
+  extractor_schema_json: string;
+  tag_rules_json: string;
+  aggregation_rule_json: string;
+  output_template: string | null;
+  enabled: number;
+  version: number;
+  created_at: number;
+  updated_at: number;
+}
+
+interface KnowledgeAggregateRow {
+  id: string;
+  vault_id: string | null;
+  aggregate_type: string;
+  title: string;
+  source_memory_ids_json: string;
+  generation_rule_id: string | null;
+  content: string;
+  content_hash: string | null;
+  generated_at: number;
+  stale_at: number | null;
+  created_at: number;
+  updated_at: number;
+  link_id?: string | null;
+  external_path?: string | null;
+  sync_etag?: string | null;
+  last_synced_sync_etag?: string | null;
+  sync_status?: ObsidianSyncStatus | null;
+  sync_direction?: ObsidianSyncDirection | null;
 }
 
 function optionalTrimmedString(value: unknown): string | undefined {
@@ -1268,6 +1419,8 @@ const OBSIDIAN_TOKEN_SCOPES = [
   "obsidian:status",
   "obsidian:resolve-conflict",
   "obsidian:ack",
+  "obsidian:rules",
+  "obsidian:aggregates",
   "recall:read",
 ] as const;
 
@@ -1360,6 +1513,25 @@ function obsidianFrontmatter(input: {
     "",
   ];
   return lines.join("\n");
+}
+
+function obsidianSafeFileName(value: string): string {
+  return value.replace(/[\\/:*?"<>|#^[\]]+/g, "-").replace(/\s+/g, " ").trim() || "untitled";
+}
+
+function buildObsidianSyncEtag(input: {
+  objectType: ObsidianObjectType;
+  objectId: string | null | undefined;
+  revisionId?: string | number | null;
+  contentHash?: string | null;
+}): string {
+  return [
+    "obsidian-sync-v1",
+    input.objectType,
+    input.objectId ?? "",
+    input.revisionId ?? "",
+    input.contentHash ?? "",
+  ].join(":");
 }
 
 function markdownForObsidian(row: ObsidianLinkedEntryRow): string {
@@ -1553,25 +1725,35 @@ async function upsertObsidianLink(
     syncDirection: ObsidianSyncDirection;
     contentHash: string;
     revisionId: string | null;
+    syncEtag?: string | null;
     status?: ObsidianSyncStatus;
     lastError?: string | null;
   }
 ): Promise<ObsidianLinkRow> {
   const now = Date.now();
   const id = input.existingId ?? crypto.randomUUID();
+  const syncEtag = input.syncEtag ?? buildObsidianSyncEtag({
+    objectType: input.objectType,
+    objectId: input.objectId,
+    revisionId: input.revisionId,
+    contentHash: input.contentHash,
+  });
   await env.DB.prepare(
     `INSERT INTO sb_external_links (
        id, provider, vault_id, external_path, external_block_id, object_type,
        object_id, entry_id, external_file_id, content_hash,
-       last_synced_content_hash, last_synced_revision_id, sync_direction,
+       sync_etag, last_synced_content_hash, last_synced_revision_id,
+       last_synced_sync_etag, sync_direction,
        sync_status, last_error, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(provider, vault_id, external_path, external_block_id, object_type, object_id) DO UPDATE SET
        entry_id = excluded.entry_id,
        external_file_id = excluded.external_file_id,
        content_hash = excluded.content_hash,
+       sync_etag = excluded.sync_etag,
        last_synced_content_hash = excluded.last_synced_content_hash,
        last_synced_revision_id = excluded.last_synced_revision_id,
+       last_synced_sync_etag = excluded.last_synced_sync_etag,
        sync_direction = excluded.sync_direction,
        sync_status = excluded.sync_status,
        last_error = excluded.last_error,
@@ -1587,8 +1769,10 @@ async function upsertObsidianLink(
     input.entryId ?? (input.objectType === "memory" ? input.objectId : null),
     input.externalFileId ?? null,
     input.contentHash,
+    syncEtag,
     input.contentHash,
     input.revisionId,
+    syncEtag,
     input.syncDirection,
     input.status ?? "synced",
     input.lastError ?? null,
@@ -1663,8 +1847,10 @@ function serializeObsidianLink(row: ObsidianLinkRow): Record<string, unknown> {
     path: row.external_path,
     blockId: row.external_block_id || null,
     contentHash: row.content_hash,
+    syncEtag: row.sync_etag,
     lastSyncedContentHash: row.last_synced_content_hash,
     lastSyncedRevisionId: row.last_synced_revision_id,
+    lastSyncedSyncEtag: row.last_synced_sync_etag,
     syncDirection: row.sync_direction,
     syncStatus: row.sync_status,
     lastError: row.last_error,
@@ -1675,22 +1861,35 @@ function serializeObsidianLink(row: ObsidianLinkRow): Record<string, unknown> {
 
 function serializeObsidianPullRow(row: ObsidianLinkedEntryRow): Record<string, unknown> {
   const entryTags = parseEntryTagsJson(row.tags);
+  const currentSyncEtag = buildObsidianSyncEtag({
+    objectType: "memory",
+    objectId: row.entry_id,
+    revisionId: row.revision_id,
+    contentHash: row.content_hash,
+  });
   const remoteChanged =
+    currentSyncEtag !== row.last_synced_sync_etag ||
     row.revision_id !== row.last_synced_revision_id ||
     row.content_hash !== row.last_synced_content_hash;
   const syncStatus = row.sync_status === "synced" && remoteChanged
     ? "remote_changed"
     : row.sync_status;
+  const link = {
+    ...serializeObsidianLink(row),
+    syncEtag: currentSyncEtag,
+  };
   return {
-    link: serializeObsidianLink(row),
+    link,
     entryId: row.entry_id,
     path: row.external_path,
     content: row.content,
     markdown: markdownForObsidian(row),
     revisionId: row.revision_id,
     contentHash: row.content_hash,
+    syncEtag: currentSyncEtag,
     lastSyncedRevisionId: row.last_synced_revision_id,
     lastSyncedContentHash: row.last_synced_content_hash,
+    lastSyncedSyncEtag: row.last_synced_sync_etag,
     syncStatus,
     syncDirection: row.sync_direction,
     properties: {
@@ -1708,6 +1907,7 @@ async function handleObsidianAck(env: Env, body: ObsidianAckBody): Promise<Respo
   const linkId = requiredTrimmedString(body.linkId);
   const revisionId = requiredTrimmedString(body.revisionId);
   const contentHash = requiredTrimmedString(body.contentHash);
+  const requestedSyncEtag = optionalTrimmedString(body.syncEtag);
   if (!linkId) return json({ ok: false, error: "linkId is required" }, 400);
   if (!revisionId) return json({ ok: false, error: "revisionId is required" }, 400);
   if (!contentHash) return json({ ok: false, error: "contentHash is required" }, 400);
@@ -1716,16 +1916,24 @@ async function handleObsidianAck(env: Env, body: ObsidianAckBody): Promise<Respo
   if (!link || link.object_type !== "memory") {
     return json({ ok: false, error: "Obsidian memory link not found" }, 404);
   }
+  const syncEtag = requestedSyncEtag ?? buildObsidianSyncEtag({
+    objectType: "memory",
+    objectId: link.entry_id ?? link.object_id,
+    revisionId,
+    contentHash,
+  });
   await env.DB.prepare(
     `UPDATE sb_external_links
      SET last_synced_revision_id = ?,
          last_synced_content_hash = ?,
          content_hash = ?,
+         sync_etag = ?,
+         last_synced_sync_etag = ?,
          sync_status = 'synced',
          last_error = NULL,
          updated_at = ?
      WHERE id = ? AND provider = ? AND object_type = 'memory'`
-  ).bind(revisionId, contentHash, contentHash, Date.now(), linkId, OBSIDIAN_PROVIDER).run();
+  ).bind(revisionId, contentHash, contentHash, syncEtag, syncEtag, Date.now(), linkId, OBSIDIAN_PROVIDER).run();
   const updated = await loadObsidianLinkById(env, linkId);
   return json({ ok: true, link: updated ? serializeObsidianLink(updated) : null });
 }
@@ -1802,6 +2010,8 @@ async function createObsidianObservation(
     contentHash: string;
     tags: string[];
     properties: Record<string, unknown>;
+    syncDirection: ObsidianSyncDirection;
+    previousObservationId?: string | null;
     createdAt: number;
   }
 ): Promise<ObservationExtractionRow> {
@@ -1813,6 +2023,8 @@ async function createObsidianObservation(
     external_block_id: input.externalBlockId || null,
     tags: input.tags,
     properties: input.properties,
+    sync_direction: input.syncDirection,
+    previous_observation_id: input.previousObservationId ?? null,
   };
   await prepareObservationInsert(env.DB, {
     id: observationId,
@@ -1839,6 +2051,75 @@ async function createObsidianObservation(
     processed_at: null,
     needs_reprocess: 0,
   };
+}
+
+function obsidianMetadataFromObservation(row: Pick<ObservationExtractionRow, "metadata_json">): {
+  vaultId: string;
+  externalPath: string;
+  externalBlockId: string;
+  syncDirection: ObsidianSyncDirection;
+  previousObservationId: string | null;
+} | null {
+  try {
+    const metadata = JSON.parse(row.metadata_json || "{}") as Record<string, unknown>;
+    const vaultId = requiredTrimmedString(metadata.vault_id);
+    const externalPath = requiredTrimmedString(metadata.external_path);
+    if (!vaultId || !externalPath) return null;
+    return {
+      vaultId,
+      externalPath,
+      externalBlockId: optionalTrimmedString(metadata.external_block_id) ?? "",
+      syncDirection: parseObsidianSyncDirection(metadata.sync_direction),
+      previousObservationId: optionalTrimmedString(metadata.previous_observation_id) ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function finalizeObsidianObservationExtraction(
+  env: Env,
+  row: ObservationExtractionRow
+): Promise<{ memoryIds: string[]; observationLink: ObsidianLinkRow; memoryLinks: ObsidianLinkRow[] } | null> {
+  if (row.source !== OBSIDIAN_PROVIDER) return null;
+  const metadata = obsidianMetadataFromObservation(row);
+  if (!metadata) return null;
+  const contentHash = row.content_hash ?? await contentFingerprint(row.content);
+  const memoryIds = await memoryIdsForObservation(env, row.id);
+  const links = await linkObsidianObservationAndMemories(env, {
+    vaultId: metadata.vaultId,
+    externalPath: metadata.externalPath,
+    externalBlockId: metadata.externalBlockId,
+    observationId: row.id,
+    content: row.content,
+    contentHash,
+    memoryIds,
+    syncDirection: metadata.syncDirection,
+  });
+  await reconcileObsidianSourceMemories(env, metadata.previousObservationId, memoryIds);
+  return { memoryIds, ...links };
+}
+
+async function processQueuedObsidianObservation(
+  env: Env,
+  ctx: ExecutionContext,
+  observationId: string
+): Promise<void> {
+  const row = await env.DB.prepare(
+    `SELECT id, content, source, metadata_json, created_at, content_hash,
+            extraction_status, extraction_version, extraction_attempts,
+            extraction_error, next_attempt_at, processing_started_at,
+            processed_at, needs_reprocess
+     FROM sb_observations
+     WHERE id = ?`
+  ).bind(observationId).first<ObservationExtractionRow>();
+  if (!row) return;
+  const processed = await processObservationExtraction(row, env, ctx, {
+    fallbackOnError: true,
+  });
+  if (processed.status === "succeeded" || processed.status === "fallback") {
+    await finalizeObsidianObservationExtraction(env, row);
+  }
 }
 
 async function linkObsidianObservationAndMemories(
@@ -1952,6 +2233,8 @@ async function handleObsidianPush(
       contentHash,
       tags: incomingTags,
       properties,
+      syncDirection,
+      previousObservationId: existingSource?.current_observation_id ?? null,
       createdAt: now,
     });
     const source = await upsertObsidianSource(env, {
@@ -1963,38 +2246,36 @@ async function handleObsidianPush(
       observationId: observation.id,
       contentHash,
     });
-    const processed = await processObservationExtraction(observation, env, ctx, {
-      fallbackOnError: true,
-    });
-    const result = "result" in processed ? processed.result : undefined;
-    const memoryIds = result ? captureResultMemoryIds(result) : [];
-    const { observationLink, memoryLinks } = await linkObsidianObservationAndMemories(env, {
+    const { observationLink } = await linkObsidianObservationAndMemories(env, {
       vaultId,
       externalPath,
       externalBlockId,
       observationId: observation.id,
       content,
       contentHash,
-      memoryIds,
+      memoryIds: [],
       syncDirection,
     });
-    await reconcileObsidianSourceMemories(env, existingSource?.current_observation_id, memoryIds);
-    const newEntryId = memoryIds[0] ?? null;
+    ctx.waitUntil(
+      processQueuedObsidianObservation(env, ctx, observation.id)
+        .catch((error) => console.error("Obsidian async extraction failed:", error))
+    );
     return json({
       ok: true,
-      action: newEntryId ? "created" : "observed",
+      action: "queued",
+      status: "queued",
       sourceId: source.id,
       sourceRevision: Number(source.last_revision ?? 0),
       sourceHash: source.last_content_hash,
       observationId: observation.id,
-      entryId: newEntryId,
-      memoryIds,
-      extractionStatus: processed.status,
-      revisionId: newEntryId ? await latestMemoryRevisionId(env, newEntryId, true) : null,
-      link: newEntryId && memoryLinks[0] ? serializeObsidianLink(memoryLinks[0]) : null,
+      entryId: null,
+      memoryIds: [],
+      extractionStatus: "pending",
+      revisionId: null,
+      link: null,
       observationLink: serializeObsidianLink(observationLink),
-      memoryLinks: memoryLinks.map(serializeObsidianLink),
-    });
+      memoryLinks: [],
+    }, 202);
   }
 
   const row = await env.DB.prepare(
@@ -2224,6 +2505,396 @@ async function handleObsidianResolveConflict(
     ok: false,
     error: "resolution must be one of: use_singularity, use_obsidian",
   }, 400);
+}
+
+function parseJsonObject(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return { ...(value as Record<string, unknown>) };
+}
+
+function parseJsonArray(raw: string | null | undefined): string[] {
+  try {
+    const parsed = JSON.parse(raw ?? "[]");
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
+function serializeJsonObject(raw: string | null | undefined): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(raw ?? "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function parseBooleanFlag(value: unknown, fallback: boolean): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["1", "true", "yes", "enabled"].includes(normalized)) return true;
+    if (["0", "false", "no", "disabled"].includes(normalized)) return false;
+  }
+  return fallback;
+}
+
+function serializeAutomationRule(row: AutomationRuleRow): Record<string, unknown> {
+  return {
+    id: row.id,
+    vaultId: row.vault_id,
+    name: row.name,
+    triggerType: row.trigger_type,
+    sourceFilter: serializeJsonObject(row.source_filter_json),
+    extractorSchema: serializeJsonObject(row.extractor_schema_json),
+    tagRules: serializeJsonObject(row.tag_rules_json),
+    aggregationRule: serializeJsonObject(row.aggregation_rule_json),
+    outputTemplate: row.output_template,
+    enabled: Number(row.enabled ?? 0) === 1,
+    version: Number(row.version ?? 1),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+async function handleListObsidianRules(env: Env, vaultId: string): Promise<Response> {
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM sb_automation_rules
+     WHERE vault_id IS NULL OR vault_id = ?
+     ORDER BY enabled DESC, updated_at DESC
+     LIMIT 200`
+  ).bind(vaultId).all<AutomationRuleRow>();
+  return json({
+    ok: true,
+    vaultId,
+    count: (results ?? []).length,
+    results: (results ?? []).map(serializeAutomationRule),
+  });
+}
+
+async function handleUpsertObsidianRule(env: Env, body: ObsidianRuleBody): Promise<Response> {
+  const vaultId = requiredTrimmedString(body.vaultId);
+  const name = requiredTrimmedString(body.name);
+  const triggerType = requiredTrimmedString(body.triggerType);
+  if (!vaultId) return json({ ok: false, error: "vaultId is required" }, 400);
+  if (!name) return json({ ok: false, error: "name is required" }, 400);
+  if (!triggerType) return json({ ok: false, error: "triggerType is required" }, 400);
+  if (vaultId.length > 128) return json({ ok: false, error: "vaultId is too long" }, 400);
+
+  const id = optionalTrimmedString(body.id) ?? crypto.randomUUID();
+  const existing = await env.DB.prepare(
+    `SELECT * FROM sb_automation_rules WHERE id = ?`
+  ).bind(id).first<AutomationRuleRow>();
+  const now = Date.now();
+  const sourceFilter = { ...parseJsonObject(body.sourceFilter), vaultId };
+  const version = existing ? Number(existing.version ?? 1) + 1 : 1;
+  await env.DB.prepare(
+    `INSERT INTO sb_automation_rules (
+       id, vault_id, name, trigger_type, source_filter_json,
+       extractor_schema_json, tag_rules_json, aggregation_rule_json,
+       output_template, enabled, version, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       vault_id = excluded.vault_id,
+       name = excluded.name,
+       trigger_type = excluded.trigger_type,
+       source_filter_json = excluded.source_filter_json,
+       extractor_schema_json = excluded.extractor_schema_json,
+       tag_rules_json = excluded.tag_rules_json,
+       aggregation_rule_json = excluded.aggregation_rule_json,
+       output_template = excluded.output_template,
+       enabled = excluded.enabled,
+       version = excluded.version,
+       updated_at = excluded.updated_at`
+  ).bind(
+    id,
+    vaultId,
+    name,
+    triggerType,
+    JSON.stringify(sourceFilter),
+    JSON.stringify(parseJsonObject(body.extractorSchema)),
+    JSON.stringify(parseJsonObject(body.tagRules)),
+    JSON.stringify(parseJsonObject(body.aggregationRule)),
+    optionalTrimmedString(body.outputTemplate) ?? null,
+    parseBooleanFlag(body.enabled, existing ? Number(existing.enabled ?? 0) === 1 : true) ? 1 : 0,
+    version,
+    existing?.created_at ?? now,
+    now
+  ).run();
+  const row = await env.DB.prepare(
+    `SELECT * FROM sb_automation_rules WHERE id = ?`
+  ).bind(id).first<AutomationRuleRow>();
+  return json({ ok: true, rule: row ? serializeAutomationRule(row) : null }, existing ? 200 : 201);
+}
+
+function parseMemoryIdList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map(String).map((id) => id.trim()).filter(Boolean))].slice(0, 200);
+}
+
+async function loadAggregateSourceMemories(env: Env, ids: string[]): Promise<Array<{ id: string; content: string; tags: string; created_at: number }>> {
+  if (!ids.length) return [];
+  const placeholders = ids.map(() => "?").join(", ");
+  const { results } = await env.DB.prepare(
+    `SELECT id, content, tags, created_at
+     FROM entries
+     WHERE id IN (${placeholders})
+       AND tags NOT LIKE '%"status:deprecated"%'
+     ORDER BY created_at DESC`
+  ).bind(...ids).all<{ id: string; content: string; tags: string; created_at: number }>();
+  const order = new Map(ids.map((id, index) => [id, index]));
+  return [...(results ?? [])].sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
+}
+
+function renderKnowledgeAggregateContent(input: {
+  title: string;
+  aggregateType: string;
+  sourceMemories: Array<{ id: string; content: string; tags: string; created_at: number }>;
+  rule: AutomationRuleRow | null;
+}): string {
+  const lines = [`# ${input.title}`, ""];
+  lines.push(`类型: ${input.aggregateType}`);
+  if (input.rule) lines.push(`规则: ${input.rule.name}`);
+  lines.push("");
+  lines.push("## 来源记忆");
+  for (const memory of input.sourceMemories) {
+    const tags = parseEntryTagsJson(memory.tags).filter((tag) => !tag.startsWith("status:"));
+    const tagSuffix = tags.length ? ` (${tags.join(", ")})` : "";
+    lines.push(`- ${memory.content}${tagSuffix}`);
+  }
+  return lines.join("\n").trim();
+}
+
+function aggregatePath(input: { id: string; title: string }): string {
+  return `Singularity/20 知识聚合/${obsidianSafeFileName(input.title).slice(0, 64)}-${input.id.slice(0, 8)}.md`;
+}
+
+function aggregateFrontmatter(row: KnowledgeAggregateRow, link: ObsidianLinkRow | null): string {
+  const tags = ["singularity", "aggregate", `aggregate/${row.aggregate_type}`];
+  return [
+    "---",
+    `singularity_type: ${yamlScalar("knowledge-aggregate")}`,
+    `singularity_id: ${yamlScalar(row.id)}`,
+    `singularity_revision: ${yamlScalar(String(row.generated_at))}`,
+    `singularity_status: ${yamlScalar(row.stale_at ? "stale" : "canonical")}`,
+    `singularity_source: ${yamlScalar("singularity")}`,
+    `singularity_synced_at: ${yamlScalar(new Date(row.updated_at).toISOString())}`,
+    `singularity_path: ${yamlScalar(link?.external_path ?? aggregatePath({ id: row.id, title: row.title }))}`,
+    `generation_rule_id: ${yamlScalar(row.generation_rule_id ?? "")}`,
+    "managed_by: singularity",
+    "tags:",
+    ...tags.map((tag) => `- ${yamlScalar(tag)}`),
+    "---",
+    "",
+  ].join("\n");
+}
+
+function markdownForAggregate(row: KnowledgeAggregateRow, link: ObsidianLinkRow | null): string {
+  return `${aggregateFrontmatter(row, link)}${row.content}`;
+}
+
+function serializeKnowledgeAggregate(row: KnowledgeAggregateRow): Record<string, unknown> {
+  const contentHash = row.content_hash ?? "";
+  const syncEtag = buildObsidianSyncEtag({
+    objectType: "aggregate",
+    objectId: row.id,
+    revisionId: row.generated_at,
+    contentHash,
+  });
+  const link = row.link_id ? {
+    id: row.link_id,
+    path: row.external_path,
+    syncEtag,
+    lastSyncedSyncEtag: row.last_synced_sync_etag ?? null,
+    syncStatus: row.sync_status ?? "synced",
+    syncDirection: row.sync_direction ?? "singularity_to_obsidian",
+  } : null;
+  return {
+    id: row.id,
+    vaultId: row.vault_id,
+    aggregateType: row.aggregate_type,
+    title: row.title,
+    sourceMemoryIds: parseJsonArray(row.source_memory_ids_json),
+    generationRuleId: row.generation_rule_id,
+    content: row.content,
+    contentHash,
+    syncEtag,
+    generatedAt: row.generated_at,
+    staleAt: row.stale_at,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    path: row.external_path ?? aggregatePath({ id: row.id, title: row.title }),
+    markdown: markdownForAggregate(row, row.link_id ? {
+      id: row.link_id,
+      provider: OBSIDIAN_PROVIDER,
+      entry_id: null,
+      vault_id: row.vault_id ?? "",
+      external_path: row.external_path ?? aggregatePath({ id: row.id, title: row.title }),
+      external_block_id: "",
+      object_type: "aggregate",
+      object_id: row.id,
+      external_file_id: null,
+      content_hash: contentHash,
+      sync_etag: syncEtag,
+      last_synced_content_hash: contentHash,
+      last_synced_revision_id: String(row.generated_at),
+      last_synced_sync_etag: row.last_synced_sync_etag ?? null,
+      sync_direction: row.sync_direction ?? "singularity_to_obsidian",
+      sync_status: row.sync_status ?? "synced",
+      last_error: null,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    } : null),
+    link,
+  };
+}
+
+async function handleListObsidianAggregates(env: Env, vaultId: string): Promise<Response> {
+  const { results } = await env.DB.prepare(
+    `SELECT
+       a.*,
+       l.id AS link_id,
+       l.external_path,
+       l.sync_etag,
+       l.last_synced_sync_etag,
+       l.sync_status,
+       l.sync_direction
+     FROM sb_knowledge_aggregates a
+     LEFT JOIN sb_external_links l
+       ON l.provider = ?
+      AND l.object_type = 'aggregate'
+      AND l.object_id = a.id
+      AND l.vault_id = ?
+     WHERE a.vault_id IS NULL OR a.vault_id = ?
+     ORDER BY COALESCE(a.stale_at, 0) DESC, a.updated_at DESC
+     LIMIT 200`
+  ).bind(OBSIDIAN_PROVIDER, vaultId, vaultId).all<KnowledgeAggregateRow>();
+  return json({
+    ok: true,
+    vaultId,
+    count: (results ?? []).length,
+    results: (results ?? []).map(serializeKnowledgeAggregate),
+  });
+}
+
+async function handleGenerateObsidianAggregate(
+  env: Env,
+  body: ObsidianAggregateGenerateBody
+): Promise<Response> {
+  const vaultId = requiredTrimmedString(body.vaultId);
+  const title = requiredTrimmedString(body.title);
+  const aggregateType = requiredTrimmedString(body.aggregateType) ?? "topic";
+  if (!vaultId) return json({ ok: false, error: "vaultId is required" }, 400);
+  if (!title) return json({ ok: false, error: "title is required" }, 400);
+  if (vaultId.length > 128) return json({ ok: false, error: "vaultId is too long" }, 400);
+
+  const sourceMemoryIds = parseMemoryIdList(body.sourceMemoryIds);
+  if (!sourceMemoryIds.length) {
+    return json({ ok: false, error: "sourceMemoryIds must contain at least one memory id" }, 400);
+  }
+  const sourceMemories = await loadAggregateSourceMemories(env, sourceMemoryIds);
+  if (!sourceMemories.length) return json({ ok: false, error: "No active source memories found" }, 404);
+
+  const generationRuleId = optionalTrimmedString(body.generationRuleId) ?? null;
+  const rule = generationRuleId
+    ? await env.DB.prepare(
+      `SELECT * FROM sb_automation_rules WHERE id = ? AND (vault_id IS NULL OR vault_id = ?)`
+    ).bind(generationRuleId, vaultId).first<AutomationRuleRow>()
+    : null;
+  const id = optionalTrimmedString(body.id) ?? crypto.randomUUID();
+  const now = Date.now();
+  const content = renderKnowledgeAggregateContent({
+    title,
+    aggregateType,
+    sourceMemories,
+    rule,
+  });
+  const contentHash = await contentFingerprint(content);
+  await env.DB.prepare(
+    `INSERT INTO sb_knowledge_aggregates (
+       id, vault_id, aggregate_type, title, source_memory_ids_json,
+       generation_rule_id, content, content_hash, generated_at,
+       stale_at, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       vault_id = excluded.vault_id,
+       aggregate_type = excluded.aggregate_type,
+       title = excluded.title,
+       source_memory_ids_json = excluded.source_memory_ids_json,
+       generation_rule_id = excluded.generation_rule_id,
+       content = excluded.content,
+       content_hash = excluded.content_hash,
+       generated_at = excluded.generated_at,
+       stale_at = NULL,
+       updated_at = excluded.updated_at`
+  ).bind(
+    id,
+    vaultId,
+    aggregateType,
+    title,
+    JSON.stringify(sourceMemories.map((memory) => memory.id)),
+    generationRuleId,
+    content,
+    contentHash,
+    now,
+    now,
+    now
+  ).run();
+  const path = optionalTrimmedString(body.outputPath) ?? aggregatePath({ id, title });
+  const link = await upsertObsidianLink(env, {
+    objectType: "aggregate",
+    objectId: id,
+    entryId: null,
+    vaultId,
+    externalPath: path,
+    externalBlockId: "",
+    syncDirection: parseObsidianSyncDirection(body.syncDirection ?? "singularity_to_obsidian"),
+    contentHash,
+    revisionId: String(now),
+    status: "synced",
+  });
+  const aggregate = await env.DB.prepare(
+    `SELECT
+       a.*,
+       l.id AS link_id,
+       l.external_path,
+       l.sync_etag,
+       l.last_synced_sync_etag,
+       l.sync_status,
+       l.sync_direction
+     FROM sb_knowledge_aggregates a
+     LEFT JOIN sb_external_links l
+       ON l.provider = ?
+      AND l.object_type = 'aggregate'
+      AND l.object_id = a.id
+      AND l.vault_id = ?
+     WHERE a.id = ?`
+  ).bind(OBSIDIAN_PROVIDER, vaultId, id).first<KnowledgeAggregateRow>();
+  return json({
+    ok: true,
+    aggregate: aggregate ? serializeKnowledgeAggregate(aggregate) : null,
+    link: serializeObsidianLink(link),
+  }, 201);
+}
+
+async function markKnowledgeAggregatesStaleForMemoryIds(
+  env: Env,
+  memoryIds: string[],
+  staleAt = Date.now()
+): Promise<void> {
+  const uniqueIds = [...new Set(memoryIds.filter(Boolean))];
+  for (const memoryId of uniqueIds) {
+    await env.DB.prepare(
+      `UPDATE sb_knowledge_aggregates
+       SET stale_at = COALESCE(stale_at, ?),
+           updated_at = ?
+       WHERE source_memory_ids_json LIKE ?`
+    ).bind(staleAt, staleAt, `%"${memoryId}"%`).run();
+  }
 }
 
 async function findExactDuplicateId(
@@ -4908,6 +5579,7 @@ async function commitEntryVersion(
          AND state IN ('queued', 'building', 'ready')`
     ).bind(Date.now(), openRebuild.id).run();
   }
+  await markKnowledgeAggregatesStaleForMemoryIds(env, [input.id], now);
 
   return prepared.vectorIds;
 }
@@ -7299,10 +7971,17 @@ export async function processExtractionQueue(
 
   for (const row of results) {
     const result = await processObservationExtraction(row, env, ctx);
-    if (result.status === "succeeded") processed += 1;
-    else if (result.status === "failed") failed += 1;
-    else if (result.status === "fallback") fallback += 1;
-    else skipped += 1;
+    if (result.status === "succeeded") {
+      await finalizeObsidianObservationExtraction(env, row);
+      processed += 1;
+    } else if (result.status === "failed") {
+      failed += 1;
+    } else if (result.status === "fallback") {
+      await finalizeObsidianObservationExtraction(env, row);
+      fallback += 1;
+    } else {
+      skipped += 1;
+    }
   }
 
   const remaining = await env.DB.prepare(
@@ -8874,10 +9553,25 @@ const defaultHandler = {
       const limit = Number.isFinite(rawLimit)
         ? Math.min(100, Math.max(1, Math.floor(rawLimit)))
         : 50;
+      const cursor = optionalTrimmedString(url.searchParams.get("cursor"));
+      let cursorUpdatedAt: number | null = null;
+      let cursorId: string | null = null;
+      if (cursor) {
+        const [updatedAtRaw, ...idParts] = cursor.split(":");
+        cursorUpdatedAt = Number(updatedAtRaw);
+        cursorId = idParts.join(":");
+        if (!Number.isFinite(cursorUpdatedAt) || !cursorId) {
+          return json({ ok: false, error: "Invalid cursor" }, 400);
+        }
+      }
       const statusClause = status ? "AND l.sync_status = ?" : "";
-      const bindings = status
-        ? [OBSIDIAN_PROVIDER, vaultId, status, limit]
-        : [OBSIDIAN_PROVIDER, vaultId, limit];
+      const cursorClause = cursor
+        ? "AND (l.updated_at < ? OR (l.updated_at = ? AND l.id < ?))"
+        : "";
+      const bindings: unknown[] = [OBSIDIAN_PROVIDER, vaultId];
+      if (status) bindings.push(status);
+      if (cursor) bindings.push(cursorUpdatedAt, cursorUpdatedAt, cursorId);
+      bindings.push(limit + 1);
       const { results } = await env.DB.prepare(
         `SELECT
            l.*,
@@ -8898,17 +9592,28 @@ const defaultHandler = {
          WHERE l.provider = ? AND l.vault_id = ?
            AND l.object_type = 'memory'
            ${statusClause}
-         ORDER BY l.updated_at DESC
+           ${cursorClause}
+         ORDER BY l.updated_at DESC, l.id DESC
          LIMIT ?`
       ).bind(...bindings).all();
-      const items = ((results ?? []) as Record<string, any>[]).map((row) => {
+      const pageRows = ((results ?? []) as Record<string, any>[]).slice(0, limit);
+      const items = pageRows.map((row) => {
         const tags = parseEntryTagsJson(row.tags as string | null);
         return serializeObsidianPullRow({
           ...(row as ObsidianLinkedEntryRow),
           memory_status: getStatus(tags),
         });
       });
-      return json({ ok: true, vaultId, count: items.length, results: items });
+      const hasMore = (results ?? []).length > limit;
+      const last = pageRows[pageRows.length - 1];
+      return json({
+        ok: true,
+        vaultId,
+        count: items.length,
+        results: items,
+        hasMore,
+        nextCursor: hasMore && last ? `${last.updated_at}:${last.id}` : null,
+      });
     }
 
     // GET /integrations/obsidian/status
@@ -8917,7 +9622,7 @@ const defaultHandler = {
       if (!vaultId) return json({ ok: false, error: "vaultId is required" }, 400);
       const authErr = await requireScopedAuth(request, env, "obsidian:status", vaultId);
       if (authErr) return authErr;
-      const [totalRow, statusRows, errorRows] = await Promise.all([
+      const [totalRow, statusRows, errorRows, sourceRows, ruleRows, aggregateRows, migrationRows] = await Promise.all([
         env.DB.prepare(
           `SELECT COUNT(*) AS count FROM sb_external_links
            WHERE provider = ? AND vault_id = ?`
@@ -8935,6 +9640,24 @@ const defaultHandler = {
            ORDER BY updated_at DESC
            LIMIT 10`
         ).bind(OBSIDIAN_PROVIDER, vaultId).all(),
+        env.DB.prepare(
+          `SELECT COUNT(*) AS count FROM sb_external_sources
+           WHERE provider = ? AND vault_id = ?`
+        ).bind(OBSIDIAN_PROVIDER, vaultId).first<Record<string, any>>(),
+        env.DB.prepare(
+          `SELECT COUNT(*) AS count FROM sb_automation_rules
+           WHERE vault_id IS NULL OR vault_id = ?`
+        ).bind(vaultId).first<Record<string, any>>(),
+        env.DB.prepare(
+          `SELECT COUNT(*) AS count FROM sb_knowledge_aggregates
+           WHERE vault_id IS NULL OR vault_id = ?`
+        ).bind(vaultId).first<Record<string, any>>(),
+        env.DB.prepare(
+          `SELECT id, name, checksum, applied_at
+           FROM sb_schema_migrations
+           WHERE id LIKE '20260712_obsidian_%'
+           ORDER BY applied_at DESC`
+        ).all(),
       ]);
       const byStatus: Record<string, number> = {};
       for (const row of (statusRows.results ?? []) as Record<string, any>[]) {
@@ -8945,6 +9668,15 @@ const defaultHandler = {
         vaultId,
         total: Number(totalRow?.count ?? 0),
         byStatus,
+        sources: Number(sourceRows?.count ?? 0),
+        rules: Number(ruleRows?.count ?? 0),
+        aggregates: Number(aggregateRows?.count ?? 0),
+        migrations: ((migrationRows.results ?? []) as Record<string, any>[]).map((row) => ({
+          id: row.id,
+          name: row.name,
+          checksum: row.checksum,
+          appliedAt: row.applied_at,
+        })),
         errors: ((errorRows.results ?? []) as Record<string, any>[]).map((row) => ({
           id: row.id,
           entryId: row.entry_id,
@@ -8972,6 +9704,40 @@ const defaultHandler = {
       const authErr = await requireScopedAuth(request, env, "obsidian:ack", optionalTrimmedString(body.vaultId));
       if (authErr) return authErr;
       return handleObsidianAck(env, body);
+    }
+
+    // GET/POST /integrations/obsidian/rules
+    if (url.pathname === "/integrations/obsidian/rules" && request.method === "GET") {
+      const vaultId = requiredTrimmedString(url.searchParams.get("vaultId"));
+      if (!vaultId) return json({ ok: false, error: "vaultId is required" }, 400);
+      const authErr = await requireScopedAuth(request, env, "obsidian:rules", vaultId);
+      if (authErr) return authErr;
+      return handleListObsidianRules(env, vaultId);
+    }
+    if (url.pathname === "/integrations/obsidian/rules" && request.method === "POST") {
+      let body: ObsidianRuleBody;
+      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      const authErr = await requireScopedAuth(request, env, "obsidian:rules", optionalTrimmedString(body.vaultId));
+      if (authErr) return authErr;
+      return handleUpsertObsidianRule(env, body);
+    }
+
+    // GET /integrations/obsidian/aggregates
+    if (url.pathname === "/integrations/obsidian/aggregates" && request.method === "GET") {
+      const vaultId = requiredTrimmedString(url.searchParams.get("vaultId"));
+      if (!vaultId) return json({ ok: false, error: "vaultId is required" }, 400);
+      const authErr = await requireScopedAuth(request, env, "obsidian:aggregates", vaultId);
+      if (authErr) return authErr;
+      return handleListObsidianAggregates(env, vaultId);
+    }
+
+    // POST /integrations/obsidian/aggregates/generate
+    if (url.pathname === "/integrations/obsidian/aggregates/generate" && request.method === "POST") {
+      let body: ObsidianAggregateGenerateBody;
+      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      const authErr = await requireScopedAuth(request, env, "obsidian:aggregates", optionalTrimmedString(body.vaultId));
+      if (authErr) return authErr;
+      return handleGenerateObsidianAggregate(env, body);
     }
 
     // POST /integrations/obsidian/tokens

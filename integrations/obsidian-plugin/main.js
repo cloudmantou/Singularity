@@ -119,7 +119,8 @@ var SingularityClient = class {
         linkId: item.link.id,
         vaultId: this.settings.vaultId,
         revisionId: item.revisionId,
-        contentHash: item.contentHash
+        contentHash: item.contentHash,
+        syncEtag: item.syncEtag || item.link.syncEtag
       }),
       throw: false
     });
@@ -128,11 +129,16 @@ var SingularityClient = class {
       throw new Error(String(error));
     }
   }
-  async pull() {
-    var _a, _b;
+  async pullPage(cursor) {
+    var _a, _b, _c, _d;
     this.assertConfigured();
+    const params = new URLSearchParams({
+      vaultId: this.settings.vaultId,
+      limit: "100"
+    });
+    if (cursor) params.set("cursor", cursor);
     const response = await (0, import_obsidian.requestUrl)({
-      url: this.endpoint(`/integrations/obsidian/pull?vaultId=${encodeURIComponent(this.settings.vaultId)}&limit=100`),
+      url: this.endpoint(`/integrations/obsidian/pull?${params.toString()}`),
       method: "GET",
       headers: this.headers(),
       throw: false
@@ -141,7 +147,22 @@ var SingularityClient = class {
       const error = ((_a = response.json) == null ? void 0 : _a.error) || response.text || `HTTP ${response.status}`;
       throw new Error(String(error));
     }
-    return Array.isArray((_b = response.json) == null ? void 0 : _b.results) ? response.json.results : [];
+    return {
+      results: Array.isArray((_b = response.json) == null ? void 0 : _b.results) ? response.json.results : [],
+      nextCursor: typeof ((_c = response.json) == null ? void 0 : _c.nextCursor) === "string" ? response.json.nextCursor : null,
+      hasMore: ((_d = response.json) == null ? void 0 : _d.hasMore) === true
+    };
+  }
+  async pull() {
+    const all = [];
+    let cursor;
+    for (let page = 0; page < 20; page++) {
+      const result = await this.pullPage(cursor);
+      all.push(...result.results);
+      if (!result.hasMore || !result.nextCursor) break;
+      cursor = result.nextCursor;
+    }
+    return all;
   }
 };
 var SingularityPlugin = class extends import_obsidian.Plugin {
@@ -300,7 +321,7 @@ var SingularityPlugin = class extends import_obsidian.Plugin {
       const frontmatter = (_b = cache == null ? void 0 : cache.frontmatter) != null ? _b : {};
       const localRevision = stringValue(frontmatter.singularity_revision);
       const localChanged = localRevision === item.lastSyncedRevisionId && Boolean(item.lastSyncedContentHash) && localBodyHash !== item.lastSyncedContentHash;
-      const remoteChanged = item.revisionId !== item.lastSyncedRevisionId || item.contentHash !== item.lastSyncedContentHash || item.syncStatus === "remote_changed";
+      const remoteChanged = Boolean(item.syncEtag) && item.syncEtag !== item.lastSyncedSyncEtag || item.revisionId !== item.lastSyncedRevisionId || item.contentHash !== item.lastSyncedContentHash || item.syncStatus === "remote_changed";
       if (localChanged && remoteChanged) return "conflict";
       if (localChanged && !remoteChanged) return "skipped";
       if (!remoteChanged && localBodyHash === item.contentHash) return "skipped";

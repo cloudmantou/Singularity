@@ -37,13 +37,22 @@ interface PullResult {
   markdown: string;
   revisionId: string | null;
   contentHash: string | null;
+  syncEtag: string | null;
   lastSyncedRevisionId: string | null;
   lastSyncedContentHash: string | null;
+  lastSyncedSyncEtag: string | null;
   syncStatus: string;
   syncDirection: string;
   link: {
     id: string;
+    syncEtag?: string | null;
   };
+}
+
+interface PullPage {
+  results: PullResult[];
+  nextCursor: string | null;
+  hasMore: boolean;
 }
 
 const DEFAULT_SETTINGS: SingularitySettings = {
@@ -152,6 +161,7 @@ class SingularityClient {
         vaultId: this.settings.vaultId,
         revisionId: item.revisionId,
         contentHash: item.contentHash,
+        syncEtag: item.syncEtag || item.link.syncEtag,
       }),
       throw: false,
     });
@@ -161,10 +171,15 @@ class SingularityClient {
     }
   }
 
-  async pull(): Promise<PullResult[]> {
+  async pullPage(cursor?: string): Promise<PullPage> {
     this.assertConfigured();
+    const params = new URLSearchParams({
+      vaultId: this.settings.vaultId,
+      limit: "100",
+    });
+    if (cursor) params.set("cursor", cursor);
     const response = await requestUrl({
-      url: this.endpoint(`/integrations/obsidian/pull?vaultId=${encodeURIComponent(this.settings.vaultId)}&limit=100`),
+      url: this.endpoint(`/integrations/obsidian/pull?${params.toString()}`),
       method: "GET",
       headers: this.headers(),
       throw: false,
@@ -173,7 +188,23 @@ class SingularityClient {
       const error = response.json?.error || response.text || `HTTP ${response.status}`;
       throw new Error(String(error));
     }
-    return Array.isArray(response.json?.results) ? response.json.results as PullResult[] : [];
+    return {
+      results: Array.isArray(response.json?.results) ? response.json.results as PullResult[] : [],
+      nextCursor: typeof response.json?.nextCursor === "string" ? response.json.nextCursor : null,
+      hasMore: response.json?.hasMore === true,
+    };
+  }
+
+  async pull(): Promise<PullResult[]> {
+    const all: PullResult[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 20; page++) {
+      const result = await this.pullPage(cursor);
+      all.push(...result.results);
+      if (!result.hasMore || !result.nextCursor) break;
+      cursor = result.nextCursor;
+    }
+    return all;
   }
 }
 
@@ -343,6 +374,7 @@ export default class SingularityPlugin extends Plugin {
         Boolean(item.lastSyncedContentHash) &&
         localBodyHash !== item.lastSyncedContentHash;
       const remoteChanged =
+        (Boolean(item.syncEtag) && item.syncEtag !== item.lastSyncedSyncEtag) ||
         item.revisionId !== item.lastSyncedRevisionId ||
         item.contentHash !== item.lastSyncedContentHash ||
         item.syncStatus === "remote_changed";

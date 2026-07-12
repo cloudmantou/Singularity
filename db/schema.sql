@@ -1,5 +1,12 @@
 -- Run with: wrangler d1 execute second-brain-db --file=schema.sql
 
+CREATE TABLE IF NOT EXISTS sb_schema_migrations (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  checksum TEXT,
+  applied_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS entries (
   id               TEXT PRIMARY KEY,
   content          TEXT NOT NULL,
@@ -50,8 +57,10 @@ CREATE TABLE IF NOT EXISTS sb_external_links (
   entry_id TEXT,
   external_file_id TEXT,
   content_hash TEXT,
+  sync_etag TEXT,
   last_synced_content_hash TEXT,
   last_synced_revision_id TEXT,
+  last_synced_sync_etag TEXT,
   sync_direction TEXT NOT NULL DEFAULT 'bidirectional',
   sync_status TEXT NOT NULL DEFAULT 'synced',
   last_error TEXT,
@@ -100,6 +109,7 @@ CREATE INDEX IF NOT EXISTS idx_access_tokens_hash
 
 CREATE TABLE IF NOT EXISTS sb_automation_rules (
   id TEXT PRIMARY KEY,
+  vault_id TEXT,
   name TEXT NOT NULL,
   trigger_type TEXT NOT NULL,
   source_filter_json TEXT NOT NULL DEFAULT '{}',
@@ -114,9 +124,12 @@ CREATE TABLE IF NOT EXISTS sb_automation_rules (
 );
 CREATE INDEX IF NOT EXISTS idx_automation_rules_trigger
   ON sb_automation_rules(trigger_type, enabled, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_automation_rules_vault
+  ON sb_automation_rules(vault_id, enabled, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS sb_knowledge_aggregates (
   id TEXT PRIMARY KEY,
+  vault_id TEXT,
   aggregate_type TEXT NOT NULL,
   title TEXT NOT NULL,
   source_memory_ids_json TEXT NOT NULL DEFAULT '[]',
@@ -130,6 +143,8 @@ CREATE TABLE IF NOT EXISTS sb_knowledge_aggregates (
 );
 CREATE INDEX IF NOT EXISTS idx_knowledge_aggregates_stale
   ON sb_knowledge_aggregates(stale_at, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_knowledge_aggregates_vault
+  ON sb_knowledge_aggregates(vault_id, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS sb_vector_rebuilds (
   id TEXT PRIMARY KEY,
