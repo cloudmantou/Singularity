@@ -34,6 +34,26 @@ function activePredicateRequiresEvidence(sql: string): boolean {
   return sql.includes("sb_parent_versions") && !sql.includes("FROM sb_memories m_any");
 }
 
+function activePredicateRequiresSourceEvidence(sql: string): boolean {
+  return sql.includes("sb_memory_sources");
+}
+
+function activePredicateRequiresProjectionHash(sql: string): boolean {
+  return sql.includes("e_active_projection.content_hash");
+}
+
+function memoryHasEvidenceSource(db: D1Mock, memory: any): boolean {
+  return db.memorySources.some((source: any) => {
+    if (String(source.memory_id) !== String(memory.id)) return false;
+    const relation = String(source.relation ?? source.role ?? "");
+    if (!["supports", "derived_from"].includes(relation)) return false;
+    return db.observations.some((observation: any) =>
+      String(observation.id) === String(source.observation_id) &&
+      observation.content_hash != null
+    );
+  });
+}
+
 function parentVersionIsActivePointer(db: D1Mock, versionId: string | null | undefined): boolean {
   if (!versionId) return false;
   const parentVersion = db.parentVersions.find((version: any) =>
@@ -47,9 +67,15 @@ function parentVersionIsActivePointer(db: D1Mock, versionId: string | null | und
   );
 }
 
-function memoryPassesActiveParentFilter(db: D1Mock, memory: any, asOf = Date.now()): boolean {
+function memoryPassesActiveParentFilter(
+  db: D1Mock,
+  memory: any,
+  asOf = Date.now(),
+  requireSourceEvidence = false
+): boolean {
   if (!memory) return false;
   if (!isActiveAt(memory, asOf)) return false;
+  if (requireSourceEvidence && !memoryHasEvidenceSource(db, memory)) return false;
   if (!["supported", "confirmed", "contested"].includes(String(memory.claim_status ?? "supported"))) {
     return false;
   }
@@ -65,11 +91,27 @@ function entryPassesActiveParentFilter(
   db: D1Mock,
   entryId: string,
   asOf = Date.now(),
-  requireEvidence = false
+  requireEvidence = false,
+  requireSourceEvidence = false,
+  requireProjectionHash = false
 ): boolean {
+  const entry = db.entries.find((row: any) => String(row.id) === String(entryId));
   const memories = db.memories.filter((memory: any) => memory.entry_id === entryId);
   if (!memories.length) return !requireEvidence;
-  return memories.some((memory: any) => memoryPassesActiveParentFilter(db, memory, asOf));
+  return memories.some((memory: any) => {
+    if (
+      requireProjectionHash &&
+      (
+        !entry ||
+        entry.content_hash == null ||
+        memory.content_hash == null ||
+        String(entry.content_hash) !== String(memory.content_hash)
+      )
+    ) {
+      return false;
+    }
+    return memoryPassesActiveParentFilter(db, memory, asOf, requireSourceEvidence);
+  });
 }
 
 export class D1Mock {
@@ -927,6 +969,33 @@ export class D1Mock {
         }
         if (s.startsWith("UPDATE sb_entity_relations SET invalid_at")) {
           const hasExpiredAt = s.startsWith("UPDATE sb_entity_relations SET invalid_at = ?, expired_at = ?");
+          if (hasExpiredAt && s.includes("AND invalid_at = ?")) {
+            const [invalid_at, expired_at, valid_to, entry_id, excluded_id, invalidated_at, expired_match] = args;
+            const invalidatedMemoryIds = new Set(
+              db.memories
+                .filter((memory: any) =>
+                  memory.entry_id === entry_id &&
+                  memory.id !== excluded_id &&
+                  memory.invalid_at === invalidated_at &&
+                  memory.expired_at === expired_match
+                )
+                .map((memory: any) => memory.id)
+            );
+            let changes = 0;
+            for (const relation of db.entityRelations) {
+              if (
+                relation.invalid_at == null &&
+                relation.expired_at == null &&
+                invalidatedMemoryIds.has(relation.memory_id)
+              ) {
+                relation.invalid_at = invalid_at;
+                relation.expired_at = expired_at;
+                if (relation.valid_to == null) relation.valid_to = valid_to;
+                changes += 1;
+              }
+            }
+            return { meta: { changes } };
+          }
           const [invalid_at, maybe_expired_at, maybe_valid_to, maybe_entry_id] = args;
           const expired_at = hasExpiredAt ? maybe_expired_at : null;
           const valid_to = hasExpiredAt ? maybe_valid_to : maybe_expired_at;
@@ -992,9 +1061,21 @@ export class D1Mock {
           const expired_at = hasExpiredAt ? maybe_expired_at : null;
           const valid_to = hasExpiredAt ? maybe_valid_to : maybe_expired_at;
           const entry_id = hasExpiredAt ? maybe_entry_id : maybe_valid_to;
+          const excluded_id = hasExpiredAt && s.includes("AND id != ?") ? args[4] : null;
+          const keepsActiveParentSupport = (memoryId: string) =>
+            db.parentVersionClaims.some((claim: any) =>
+              String(claim.memory_id) === String(memoryId) &&
+              parentVersionIsActivePointer(db, claim.parent_version_id)
+            );
           let changes = 0;
           for (const memory of db.memories) {
-            if (memory.entry_id === entry_id && memory.invalid_at == null && memory.expired_at == null) {
+            if (
+              memory.entry_id === entry_id &&
+              memory.invalid_at == null &&
+              memory.expired_at == null &&
+              (excluded_id == null || memory.id !== excluded_id) &&
+              (!s.includes("NOT EXISTS") || !keepsActiveParentSupport(memory.id))
+            ) {
               memory.invalid_at = invalid_at;
               if (hasExpiredAt) memory.expired_at = expired_at;
               if (memory.valid_to == null) memory.valid_to = valid_to;
@@ -2295,6 +2376,23 @@ export class D1Mock {
           return { version_number: maxVersion };
         }
         if (
+          s.includes("SELECT pv.source_observation_id AS source_observation_id") &&
+          s.includes("JOIN sb_parent_units pu")
+        ) {
+          const parentId = String(args[0]);
+          const rows = db.parentVersions
+            .filter((version: any) =>
+              String(version.parent_id) === parentId &&
+              ["active", "active_degraded"].includes(String(version.state)) &&
+              db.parentUnits.some((unit: any) =>
+                String(unit.parent_id) === parentId &&
+                String(unit.active_version_id) === String(version.version_id)
+              )
+            )
+            .sort((a: any, b: any) => Number(b.version_number ?? 0) - Number(a.version_number ?? 0));
+          return rows[0] ? { source_observation_id: rows[0].source_observation_id ?? null } : null;
+        }
+        if (
           s.includes("memory_count") &&
           s.includes("FROM sb_parent_version_claims pvc")
         ) {
@@ -3164,7 +3262,7 @@ export class D1Mock {
               memory &&
               memory.entry_id &&
               isActiveAt(memory, asOf) &&
-              memoryPassesActiveParentFilter(db, memory, asOf)
+              memoryPassesActiveParentFilter(db, memory, asOf, activePredicateRequiresSourceEvidence(s))
             )
             .sort((a: any, b: any) =>
               Number(b.link.score ?? 0) - Number(a.link.score ?? 0) ||
@@ -3215,7 +3313,7 @@ export class D1Mock {
               memory.entry_id &&
               isActiveAt(relation, asOf) &&
               isActiveAt(memory, asOf) &&
-              memoryPassesActiveParentFilter(db, memory, asOf)
+              memoryPassesActiveParentFilter(db, memory, asOf, activePredicateRequiresSourceEvidence(s))
             )
             .sort((a: any, b: any) =>
               Number(b.relation.score ?? 0) - Number(a.relation.score ?? 0) ||
@@ -3290,7 +3388,9 @@ export class D1Mock {
                   db,
                   String(entry.id),
                   activePredicateAsOfFromSql(s),
-                  activePredicateRequiresEvidence(s)
+                  activePredicateRequiresEvidence(s),
+                  activePredicateRequiresSourceEvidence(s),
+                  activePredicateRequiresProjectionHash(s)
                 )
               ) return false;
               if (s.includes('"status:deprecated"') && tags.includes("status:deprecated")) return false;
@@ -3528,7 +3628,9 @@ export class D1Mock {
                 db,
                 String(e.id),
                 activePredicateAsOfFromSql(s),
-                activePredicateRequiresEvidence(s)
+                activePredicateRequiresEvidence(s),
+                activePredicateRequiresSourceEvidence(s),
+                activePredicateRequiresProjectionHash(s)
               )
             )
             .filter((e: any) =>
@@ -3553,7 +3655,9 @@ export class D1Mock {
                 db,
                 String(e.id),
                 activePredicateAsOfFromSql(s),
-                activePredicateRequiresEvidence(s)
+                activePredicateRequiresEvidence(s),
+                activePredicateRequiresSourceEvidence(s),
+                activePredicateRequiresProjectionHash(s)
               )
             )
             .filter((e: any) =>
@@ -3581,7 +3685,9 @@ export class D1Mock {
                 db,
                 String(e.id),
                 activePredicateAsOfFromSql(s),
-                activePredicateRequiresEvidence(s)
+                activePredicateRequiresEvidence(s),
+                activePredicateRequiresSourceEvidence(s),
+                activePredicateRequiresProjectionHash(s)
               )
             )
             .map((e: any) => ({
@@ -3599,7 +3705,12 @@ export class D1Mock {
                 ...db.memories
                   .filter((memory: any) =>
                     memory.entry_id === e.id &&
-                    memoryPassesActiveParentFilter(db, memory, activePredicateAsOfFromSql(s))
+                    memoryPassesActiveParentFilter(
+                      db,
+                      memory,
+                      activePredicateAsOfFromSql(s),
+                      activePredicateRequiresSourceEvidence(s)
+                    )
                   )
                   .map((memory: any) => {
                     const sourceScores = db.memorySources
@@ -3611,7 +3722,12 @@ export class D1Mock {
               parent_version_state: (() => {
                 const memory = db.memories.find((item: any) =>
                   item.entry_id === e.id &&
-                  memoryPassesActiveParentFilter(db, item, activePredicateAsOfFromSql(s))
+                  memoryPassesActiveParentFilter(
+                    db,
+                    item,
+                    activePredicateAsOfFromSql(s),
+                    activePredicateRequiresSourceEvidence(s)
+                  )
                 );
                 if (!memory) return null;
                 const claim = db.parentVersionClaims.find((item: any) =>
@@ -3662,7 +3778,9 @@ export class D1Mock {
                 db,
                 String(e.id),
                 activePredicateAsOfFromSql(s),
-                activePredicateRequiresEvidence(s)
+                activePredicateRequiresEvidence(s),
+                activePredicateRequiresSourceEvidence(s),
+                activePredicateRequiresProjectionHash(s)
               )
             ) return false;
             if (tags.includes("auto-pattern")) return false;
@@ -3709,7 +3827,9 @@ export class D1Mock {
                   db,
                   String(e.id),
                   activePredicateAsOfFromSql(s),
-                  activePredicateRequiresEvidence(s)
+                  activePredicateRequiresEvidence(s),
+                  activePredicateRequiresSourceEvidence(s),
+                  activePredicateRequiresProjectionHash(s)
                 )
               ) return false;
               return true;
@@ -3751,7 +3871,9 @@ export class D1Mock {
                 db,
                 String(e.id),
                 activePredicateAsOfFromSql(s),
-                activePredicateRequiresEvidence(s)
+                activePredicateRequiresEvidence(s),
+                activePredicateRequiresSourceEvidence(s),
+                activePredicateRequiresProjectionHash(s)
               )
             ) continue;
             for (const t of tags) {

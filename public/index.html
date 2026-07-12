@@ -4576,12 +4576,6 @@
         if (bar) bar.hidden = true
       }
 
-      function showAtomicSyncWarning(result) {
-        if (result && result.warning === 'atomic_sync_failed') {
-          showRuntimeWarning(t('warning.atomicSyncFailed'))
-        }
-      }
-
       function sendSuggestion(text) {
         document.getElementById('recall-input').value = text
         sendRecall()
@@ -5065,8 +5059,7 @@ ${metaLine}
         btn.disabled = true
         btn.textContent = t('append.saving')
         try {
-          const result = await apiAppend(pendingAppendId, addition)
-          showAtomicSyncWarning(result)
+          await apiAppend(pendingAppendId, addition)
           closeAppend()
           loadRecent()
           updateStatus()
@@ -5108,8 +5101,7 @@ ${metaLine}
         btn.disabled = true
         btn.textContent = t('edit.saving')
         try {
-          const result = await apiUpdate(pendingEditId, newContent)
-          showAtomicSyncWarning(result)
+          await apiUpdate(pendingEditId, newContent)
           closeEdit()
           loadRecent()
           updateStatus()

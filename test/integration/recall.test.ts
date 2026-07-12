@@ -42,6 +42,8 @@ function seedActiveClaimsForEntries(db: D1Mock, entryIds?: string[]) {
   for (const entry of db.entries) {
     if (wanted && !wanted.has(String(entry.id))) continue;
     if (db.memories.some((memory: any) => String(memory.entry_id) === String(entry.id))) continue;
+    entry.content_hash = entry.content_hash ?? `hash-${entry.id}`;
+    const observationId = `obs-${entry.id}`;
     db.memories.push({
       id: `claim-${entry.id}`,
       entry_id: entry.id,
@@ -55,7 +57,57 @@ function seedActiveClaimsForEntries(db: D1Mock, entryIds?: string[]) {
       valid_to: null,
       invalid_at: null,
       expired_at: null,
+      content_hash: entry.content_hash,
       created_at: entry.created_at ?? Date.now(),
+    });
+    db.observations.push({
+      id: observationId,
+      content: entry.content,
+      source: entry.source ?? "api",
+      content_hash: entry.content_hash,
+      created_at: entry.created_at ?? Date.now(),
+    });
+    db.memorySources.push({
+      id: `src-${entry.id}`,
+      memory_id: `claim-${entry.id}`,
+      observation_id: observationId,
+      role: "derived_from",
+      relation: "supports",
+      evidence_score: 0.9,
+      derivation_confidence: 0.9,
+      evidence_root_id: observationId,
+      created_at: entry.created_at ?? Date.now(),
+    });
+  }
+}
+
+function seedEvidenceForMemories(db: D1Mock, memoryIds?: string[]) {
+  const wanted = memoryIds ? new Set(memoryIds) : null;
+  for (const memory of db.memories) {
+    if (wanted && !wanted.has(String(memory.id))) continue;
+    const entry = db.entries.find((item: any) => String(item.id) === String(memory.entry_id));
+    const hash = memory.content_hash ?? entry?.content_hash ?? `hash-${memory.id}`;
+    if (entry && entry.content_hash == null) entry.content_hash = hash;
+    memory.content_hash = hash;
+    if (db.memorySources.some((source: any) => String(source.memory_id) === String(memory.id))) continue;
+    const observationId = `obs-${memory.id}`;
+    db.observations.push({
+      id: observationId,
+      content: memory.content,
+      source: entry?.source ?? "api",
+      content_hash: hash,
+      created_at: memory.created_at ?? Date.now(),
+    });
+    db.memorySources.push({
+      id: `src-${memory.id}`,
+      memory_id: memory.id,
+      observation_id: observationId,
+      role: "derived_from",
+      relation: "supports",
+      evidence_score: memory.confidence ?? 0.9,
+      derivation_confidence: memory.confidence ?? 0.9,
+      evidence_root_id: observationId,
+      created_at: memory.created_at ?? Date.now(),
     });
   }
 }
@@ -184,6 +236,77 @@ describe("GET /recall", () => {
     expect(data.results).toEqual([]);
   });
 
+  it("does not hydrate dense matches whose active claim has no provenance", async () => {
+    db.entries.push({
+      id: "claim-without-source",
+      content: "Entry has a claim but no evidence source",
+      tags: "[]",
+      source: "api",
+      created_at: Date.now(),
+      vector_ids: '["claim-without-source"]',
+      content_hash: "hash-claim-without-source",
+      recall_count: 0,
+      importance_score: 0,
+    });
+    db.memories.push({
+      id: "memory-without-source",
+      entry_id: "claim-without-source",
+      content: "Entry has a claim but no evidence source",
+      content_hash: "hash-claim-without-source",
+      claim_status: "supported",
+      invalid_at: null,
+      expired_at: null,
+      created_at: Date.now(),
+    });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({ matches: [makeMatch("claim-without-source", 0.9)] }),
+      }),
+    });
+
+    const res = await worker.fetch(req("GET", "/recall?query=evidence"), env, ctx);
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.results).toEqual([]);
+  });
+
+  it("does not hydrate entries whose active claim hash no longer matches the entry projection", async () => {
+    db.entries.push({
+      id: "stale-projection",
+      content: "New projection text",
+      tags: "[]",
+      source: "api",
+      created_at: Date.now(),
+      vector_ids: '["stale-projection"]',
+      content_hash: "hash-new",
+      recall_count: 0,
+      importance_score: 0,
+    });
+    db.memories.push({
+      id: "memory-old-projection",
+      entry_id: "stale-projection",
+      content: "Old evidence text",
+      content_hash: "hash-old",
+      claim_status: "supported",
+      invalid_at: null,
+      expired_at: null,
+      created_at: Date.now(),
+    });
+    seedEvidenceForMemories(db, ["memory-old-projection"]);
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({ matches: [makeMatch("stale-projection", 0.9)] }),
+      }),
+    });
+
+    const res = await worker.fetch(req("GET", "/recall?query=projection"), env, ctx);
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.results).toEqual([]);
+  });
+
   it("does not hydrate entries whose only parent version is superseded", async () => {
     const now = Date.now();
     db.entries.push(
@@ -265,6 +388,7 @@ describe("GET /recall", () => {
         created_at: now,
       }
     );
+    seedEvidenceForMemories(db);
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({ matches: [] }),
@@ -373,6 +497,7 @@ describe("GET /recall", () => {
         created_at: now,
       }
     );
+    seedEvidenceForMemories(db);
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({
@@ -513,6 +638,7 @@ describe("GET /recall", () => {
         created_at: now,
       }
     );
+    seedEvidenceForMemories(db);
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({ matches: [] }),
@@ -1305,6 +1431,7 @@ describe("GET /recall", () => {
       score: 0.95,
       created_at: now,
     });
+    seedEvidenceForMemories(db);
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({
@@ -1371,6 +1498,7 @@ describe("GET /recall", () => {
       score: 0.9,
       created_at: now,
     });
+    seedEvidenceForMemories(db);
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({ matches: [] }),
@@ -1431,6 +1559,7 @@ describe("GET /recall", () => {
       score: 0.93,
       created_at: now,
     });
+    seedEvidenceForMemories(db);
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({ matches: [] }),
@@ -1505,6 +1634,7 @@ describe("GET /recall", () => {
       reference_time: now,
       created_at: now,
     });
+    seedEvidenceForMemories(db);
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({ matches: [] }),
@@ -1574,6 +1704,7 @@ describe("GET /recall", () => {
       score: 0.94,
       created_at: now,
     });
+    seedEvidenceForMemories(db);
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({ matches: [] }),
@@ -1636,6 +1767,7 @@ describe("GET /recall", () => {
       score: 0.94,
       created_at: entryCreatedAt,
     });
+    seedEvidenceForMemories(db);
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({ matches: [] }),
@@ -1703,6 +1835,7 @@ describe("GET /recall", () => {
       score: 0.94,
       created_at: entryCreatedAt,
     });
+    seedEvidenceForMemories(db);
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({ matches: [] }),
@@ -1763,6 +1896,7 @@ describe("GET /recall", () => {
       score: 0.95,
       created_at: now,
     });
+    seedEvidenceForMemories(db);
     const vectorQuery = vi.fn().mockResolvedValue({ matches: [] });
     const aiRun = vi.fn().mockImplementation(async (model: string) => {
       if (model === "@cf/baai/bge-small-en-v1.5") throw new Error("embedding provider unavailable");
@@ -1838,6 +1972,7 @@ describe("GET /recall", () => {
       score: 0.95,
       created_at: now - 10_000,
     });
+    seedEvidenceForMemories(db);
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
         query: vi.fn().mockResolvedValue({ matches: [] }),

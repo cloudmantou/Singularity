@@ -111,7 +111,7 @@ describe("POST /append", () => {
     );
   });
 
-  it("returns a warning when append succeeds but atomic sync fails", async () => {
+  it("returns an error when append succeeds but atomic sync fails", async () => {
     db.entries.push({
       id: "entry-1",
       content: "Original content",
@@ -138,15 +138,171 @@ describe("POST /append", () => {
       ctx
     );
 
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(503);
     const data = await res.json() as any;
     expect(data).toMatchObject({
-      ok: true,
+      ok: false,
       id: "entry-1",
-      warning: "atomic_sync_failed",
+      error: "atomic_sync_failed",
     });
     expect(db.entries[0].content).toContain("New info");
     expect(db.memories).toHaveLength(0);
+  });
+
+  it("retries parent version allocation when another writer claims the next version", async () => {
+    const now = Date.now();
+    db.entries.push({
+      id: "entry-1",
+      content: "Original content",
+      tags: "[]",
+      source: "api",
+      created_at: now,
+      vector_ids: "[]",
+      content_hash: "hash-original",
+    });
+    const originalBatch = db.batch.bind(db);
+    let raced = false;
+    db.batch = vi.fn(async (statements: any[]) => {
+      const looksLikeAtomicReplacement =
+        statements.length >= 8 &&
+        db.entries[0]?.content.includes("New info") &&
+        db.revisions.some((revision: any) => revision.event_type === "APPEND");
+      if (looksLikeAtomicReplacement && !raced) {
+        raced = true;
+        db.parentVersions.push({
+          version_id: "racing-parent-version",
+          parent_id: "entry:entry-1",
+          version_number: 1,
+          source_observation_id: "obs-racing",
+          source_snapshot_hash: "hash-racing",
+          summary: null,
+          state: "active",
+          summary_vector_ids: "[]",
+          created_at: now,
+          updated_at: now,
+        });
+        throw new Error("UNIQUE constraint failed: sb_parent_versions.parent_id, sb_parent_versions.version_number");
+      }
+      return originalBatch(statements);
+    }) as any;
+
+    const res = await worker.fetch(
+      req("POST", "/append", { body: { id: "entry-1", addition: "New info" } }),
+      env,
+      ctx
+    );
+
+    expect(res.status).toBe(200);
+    expect(raced).toBe(true);
+    expect(db.parentVersions).toContainEqual(
+      expect.objectContaining({
+        parent_id: "entry:entry-1",
+        version_number: 2,
+        state: "active_degraded",
+      })
+    );
+  });
+
+  it("does not globally invalidate a claim still supported by another active parent", async () => {
+    const now = Date.now();
+    db.entries.push({
+      id: "entry-1",
+      content: "Shared claim content",
+      tags: "[]",
+      source: "api",
+      created_at: now,
+      vector_ids: "[]",
+      content_hash: "hash-shared-old",
+    });
+    db.parentUnits.push(
+      {
+        parent_id: "parent-entry",
+        active_version_id: "pv-entry-old",
+        scope_id: null,
+        created_at: now - 2000,
+        updated_at: now - 1000,
+      },
+      {
+        parent_id: "parent-other",
+        active_version_id: "pv-other",
+        scope_id: null,
+        created_at: now - 2000,
+        updated_at: now - 1000,
+      }
+    );
+    db.parentVersions.push(
+      {
+        version_id: "pv-entry-old",
+        parent_id: "parent-entry",
+        version_number: 2,
+        source_observation_id: "obs-entry-old",
+        source_snapshot_hash: "hash-shared-old",
+        summary: null,
+        state: "active",
+        summary_vector_ids: "[]",
+        created_at: now - 2000,
+        updated_at: now - 1000,
+      },
+      {
+        version_id: "pv-other",
+        parent_id: "parent-other",
+        version_number: 1,
+        source_observation_id: "obs-other",
+        source_snapshot_hash: "hash-shared-old",
+        summary: null,
+        state: "active",
+        summary_vector_ids: "[]",
+        created_at: now - 2000,
+        updated_at: now - 1000,
+      }
+    );
+    db.memories.push({
+      id: "shared-claim",
+      entry_id: "entry-1",
+      content: "Shared claim content",
+      content_hash: "hash-shared-old",
+      claim_status: "supported",
+      confidence: 0.9,
+      invalid_at: null,
+      expired_at: null,
+      created_at: now - 1000,
+    });
+    db.parentVersionClaims.push(
+      {
+        parent_version_id: "pv-entry-old",
+        memory_id: "shared-claim",
+        relation: "supports",
+        created_at: now - 1000,
+      },
+      {
+        parent_version_id: "pv-other",
+        memory_id: "shared-claim",
+        relation: "supports",
+        created_at: now - 1000,
+      }
+    );
+
+    const res = await worker.fetch(
+      req("POST", "/append", { body: { id: "entry-1", addition: "New local projection" } }),
+      env,
+      ctx
+    );
+
+    expect(res.status).toBe(200);
+    const sharedClaim = db.memories.find((memory: any) => memory.id === "shared-claim");
+    expect(sharedClaim.invalid_at).toBeNull();
+    expect(sharedClaim.expired_at).toBeNull();
+    expect(db.parentVersions.find((version: any) => version.version_id === "pv-other")?.state).toBe("active");
+    expect(db.parentUnits.find((unit: any) => unit.parent_id === "parent-other")?.active_version_id).toBe("pv-other");
+    expect(db.observations).toContainEqual(
+      expect.objectContaining({
+        source: "api",
+        source_channel: "api",
+        author_type: "user",
+        previous_evidence_id: "obs-entry-old",
+        revision: 3,
+      })
+    );
   });
 
   // ── Short append: append-only path (≤ CHUNK_MAX_CHARS) ──────────────────────

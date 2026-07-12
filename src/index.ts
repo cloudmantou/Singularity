@@ -2654,6 +2654,14 @@ async function handleObsidianPush(
       console.error("Obsidian atomic memory update sync failed (non-fatal):", error);
       atomicSyncWarning = "atomic_sync_failed";
     }
+    if (atomicSyncWarning === "atomic_sync_failed") {
+      if (existingLink) await markObsidianLinkStatus(env, existingLink.id, "error", "atomic memory sync failed");
+      return json({
+        ok: false,
+        error: "atomic_sync_failed",
+        message: "Obsidian push changed the entry projection, but Evidence/Claim sync failed. The entry is excluded from strict recall until repair.",
+      }, 503);
+    }
     try {
       await linkObsidianObservation(env, {
         entryId,
@@ -6403,6 +6411,19 @@ export async function compressTag(
   if (!digestId) {
     return { synthesizedId: null, entriesUsed: 0, text };
   }
+  try {
+    await replaceEntryAtomicMemory(env.DB, {
+      entryId: digestId,
+      content,
+      contentHash: await contentFingerprint(content),
+      source: "system",
+      eventType: "update",
+      createdAt: Date.now(),
+    });
+  } catch (error) {
+    console.error(`Digest evidence sync failed for tag "${tag}" (non-fatal):`, error);
+    return { synthesizedId: null, entriesUsed: 0, text };
+  }
 
   const digestRelations = rows.map(row =>
     prepareMemoryRelation(env.DB, {
@@ -6495,6 +6516,12 @@ async function runScheduledMaintenance(env: Env, ctx: ExecutionContext): Promise
     console.error("Vector cleanup queue maintenance failed (non-fatal):", e);
   }
 
+  try {
+    await processExtractionQueue(env, ctx);
+  } catch (e) {
+    console.error("Extraction queue maintenance failed (non-fatal):", e);
+  }
+
   // Drain due classification work (pending + retryable after backoff + stale version).
   // Without this, retryable_error rows only move if something calls POST /classify-pending.
   try {
@@ -6557,6 +6584,18 @@ function activeMemoryClaimPredicate(memoryRef: string, asOfExpression: string): 
     AND (${memoryRef}.valid_to IS NULL OR ${memoryRef}.valid_to > ${asOfExpression})
     AND (${memoryRef}.invalid_at IS NULL OR ${memoryRef}.invalid_at > ${asOfExpression})
     AND (${memoryRef}.expired_at IS NULL OR ${memoryRef}.expired_at > ${asOfExpression})
+    AND EXISTS (
+      SELECT 1
+      FROM sb_memory_sources ms_active
+      JOIN sb_observations o_active
+        ON o_active.id = ms_active.observation_id
+      WHERE ms_active.memory_id = ${memoryRef}.id
+        AND (
+          ms_active.relation IN ('supports', 'derived_from')
+          OR ms_active.role IN ('supports', 'derived_from')
+        )
+        AND o_active.content_hash IS NOT NULL
+    )
     AND (
       EXISTS (
         SELECT 1
@@ -6614,6 +6653,13 @@ function activeParentEntryPredicateAt(
       SELECT 1
       FROM sb_memories m_active
       WHERE m_active.entry_id = ${entryRef}
+        AND m_active.content_hash IS NOT NULL
+        AND EXISTS (
+          SELECT 1
+          FROM entries e_active_projection
+          WHERE e_active_projection.id = ${entryRef}
+            AND e_active_projection.content_hash = m_active.content_hash
+        )
         AND ${activeMemoryClaimPredicate("m_active", asOfExpression)}
     )
   )`;
@@ -10241,30 +10287,32 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
           isError: true,
         };
       }
-      let atomicSyncWarning: string | undefined;
       try {
         await replaceEntryAtomicMemory(env.DB, {
           entryId: id,
           content: appendedContent,
           contentHash: await contentFingerprint(appendedContent),
-          source,
+          source: "mcp",
           eventType: "append",
           createdAt: Date.now(),
         });
       } catch (e) {
         console.error("MCP atomic memory append sync failed (non-fatal):", e);
-        atomicSyncWarning = "atomic_sync_failed";
+        return {
+          content: [{
+            type: "text",
+            text: `Append changed entry ${id}, but Evidence/Claim sync failed. Strict recall will exclude it until extraction repair succeeds.`,
+          }],
+          isError: true,
+        };
       }
       scheduleClassifyAndTag(id, appendedContent, env, ctx);
 
       return {
         content: [{
           type: "text",
-          text: atomicSyncWarning
-            ? `Appended to entry ${id}, but atomic memory sync failed. Run extraction repair from Observatory.`
-            : `Appended to entry ${id}. The original content is preserved and your update has been added with today's date.`,
+          text: `Appended to entry ${id}. The original content is preserved and your update has been added with today's date.`,
         }],
-        isError: atomicSyncWarning === "atomic_sync_failed",
       };
     }
   );
@@ -10323,30 +10371,32 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
           isError: true,
         };
       }
-      let atomicSyncWarning: string | undefined;
       try {
         await replaceEntryAtomicMemory(env.DB, {
           entryId: id,
           content: newContent,
           contentHash: await contentFingerprint(newContent),
-          source,
+          source: "mcp",
           eventType: "update",
           createdAt: Date.now(),
         });
       } catch (e) {
         console.error("MCP atomic memory update sync failed (non-fatal):", e);
-        atomicSyncWarning = "atomic_sync_failed";
+        return {
+          content: [{
+            type: "text",
+            text: `Update changed entry ${id}, but Evidence/Claim sync failed. Strict recall will exclude it until extraction repair succeeds.`,
+          }],
+          isError: true,
+        };
       }
       scheduleClassifyAndTag(id, newContent, env, ctx);
 
       return {
         content: [{
           type: "text",
-          text: atomicSyncWarning
-            ? `Updated entry ${id}, but atomic memory sync failed. Run extraction repair from Observatory.`
-            : `Updated entry ${id}. Re-embedded as ${newVectorIds.length} vector(s).`,
+          text: `Updated entry ${id}. Re-embedded as ${newVectorIds.length} vector(s).`,
         }],
-        isError: atomicSyncWarning === "atomic_sync_failed",
       };
     }
   );
@@ -10877,19 +10927,23 @@ const defaultHandler = {
         console.error("Append failed:", e);
         return json({ ok: false, error: "Append failed. Retry later." }, 500);
       }
-      let atomicSyncWarning: string | undefined;
       try {
         await replaceEntryAtomicMemory(env.DB, {
           entryId: id,
           content: appendedContent,
           contentHash: await contentFingerprint(appendedContent),
-          source,
+          source: "api",
           eventType: "append",
           createdAt: Date.now(),
         });
       } catch (e) {
         console.error("Atomic memory append sync failed (non-fatal):", e);
-        atomicSyncWarning = "atomic_sync_failed";
+        return json({
+          ok: false,
+          id,
+          error: "atomic_sync_failed",
+          message: "Append changed the entry projection, but Evidence/Claim sync failed. The entry is excluded from strict recall until repair.",
+        }, 503);
       }
       scheduleClassifyAndTag(id, appendedContent, env, ctx);
 
@@ -10897,10 +10951,6 @@ const defaultHandler = {
         ok: true,
         id,
         message: "Update appended successfully with timestamp",
-        warning: atomicSyncWarning,
-        warning_message: atomicSyncWarning
-          ? "Append succeeded, but atomic memory sync failed. Run extraction repair from Observatory."
-          : undefined,
       });
     }
 
@@ -10950,19 +11000,23 @@ const defaultHandler = {
           error: "Update could not be indexed. Previous content remains active; retry later.",
         }, 503);
       }
-      let atomicSyncWarning: string | undefined;
       try {
         await replaceEntryAtomicMemory(env.DB, {
           entryId: id,
           content: finalContent,
           contentHash: await contentFingerprint(finalContent),
-          source,
+          source: "api",
           eventType: "update",
           createdAt: Date.now(),
         });
       } catch (e) {
         console.error("Atomic memory update sync failed (non-fatal):", e);
-        atomicSyncWarning = "atomic_sync_failed";
+        return json({
+          ok: false,
+          id,
+          error: "atomic_sync_failed",
+          message: "Update changed the entry projection, but Evidence/Claim sync failed. The entry is excluded from strict recall until repair.",
+        }, 503);
       }
       scheduleClassifyAndTag(id, finalContent, env, ctx);
 
@@ -10970,10 +11024,6 @@ const defaultHandler = {
         ok: true,
         id,
         vectors: newVectorIds.length,
-        warning: atomicSyncWarning,
-        warning_message: atomicSyncWarning
-          ? "Update succeeded, but atomic memory sync failed. Run extraction repair from Observatory."
-          : undefined,
       });
     }
 

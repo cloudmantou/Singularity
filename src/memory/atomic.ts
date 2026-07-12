@@ -541,6 +541,37 @@ export async function replaceEntryAtomicMemory(
     createdAt: number;
   }
 ): Promise<{ observationId: string; memoryId: string }> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await replaceEntryAtomicMemoryOnce(db, input);
+    } catch (error) {
+      lastError = error;
+      if (!isParentVersionNumberConflict(error)) throw error;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("parent_version_retry_failed");
+}
+
+function isParentVersionNumberConflict(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return (
+    message.includes("sb_parent_versions.parent_id, sb_parent_versions.version_number") ||
+    message.includes("UNIQUE constraint failed: sb_parent_versions")
+  );
+}
+
+async function replaceEntryAtomicMemoryOnce(
+  db: D1Database,
+  input: {
+    entryId: string;
+    content: string;
+    contentHash: string;
+    source: string;
+    eventType: "append" | "update";
+    createdAt: number;
+  }
+): Promise<{ observationId: string; memoryId: string }> {
   const observationId = crypto.randomUUID();
   const memoryId = crypto.randomUUID();
   const parentRow = await db
@@ -579,32 +610,26 @@ export async function replaceEntryAtomicMemory(
     )
     .bind(parentId)
     .first<{ version_number: number }>();
+  const previousEvidence = await db
+    .prepare(
+      `SELECT pv.source_observation_id AS source_observation_id
+       FROM sb_parent_versions pv
+       JOIN sb_parent_units pu
+         ON pu.active_version_id = pv.version_id
+        AND pu.parent_id = pv.parent_id
+       WHERE pv.parent_id = ?
+         AND pv.state IN ('active', 'active_degraded')
+       ORDER BY pv.version_number DESC
+       LIMIT 1`
+    )
+    .bind(parentId)
+    .first<{ source_observation_id: string | null }>();
   const parentVersionId = crypto.randomUUID();
   const parentVersionNumber = Math.max(1, Number(latestVersion?.version_number ?? 0) + 1);
   const evidenceRootId = parentId;
+  const authorType: EvidenceAuthorType = input.source === "system" ? "system" : "user";
 
   const statements = [
-    db
-      .prepare(
-        `UPDATE sb_entity_relations
-         SET invalid_at = ?, expired_at = ?, valid_to = COALESCE(valid_to, ?)
-         WHERE invalid_at IS NULL
-           AND expired_at IS NULL
-           AND memory_id IN (
-             SELECT id FROM sb_memories
-             WHERE entry_id = ? AND invalid_at IS NULL AND expired_at IS NULL
-           )`
-      )
-      .bind(input.createdAt, input.createdAt, input.createdAt, input.entryId),
-    db
-      .prepare(
-        `UPDATE sb_memories
-         SET invalid_at = ?, expired_at = ?, valid_to = COALESCE(valid_to, ?)
-         WHERE entry_id = ?
-           AND invalid_at IS NULL
-           AND expired_at IS NULL`
-      )
-      .bind(input.createdAt, input.createdAt, input.createdAt, input.entryId),
     prepareParentUnitInsert(db, {
       parentId,
       createdAt: input.createdAt,
@@ -634,7 +659,9 @@ export async function replaceEntryAtomicMemory(
       contentHash: input.contentHash,
       sourceChannel: input.source,
       sourceIdentity: `${input.source}:${input.entryId}:${parentVersionNumber}`,
+      authorType,
       rootEvidenceId: evidenceRootId,
+      previousEvidenceId: previousEvidence?.source_observation_id ?? null,
       revision: parentVersionNumber,
       extractionStatus: "fallback",
       processedAt: input.createdAt,
@@ -675,16 +702,57 @@ export async function replaceEntryAtomicMemory(
       relation: "supports",
       createdAt: input.createdAt,
     }),
+  ];
+  const activationStart = statements.length;
+  statements.push(
     ...prepareParentVersionActivation(db, {
       parentId,
       versionId: parentVersionId,
       state: "active_degraded",
       updatedAt: input.createdAt,
-    }),
-  ];
+    })
+  );
+  statements.push(
+    db
+      .prepare(
+        `UPDATE sb_memories
+         SET invalid_at = ?, expired_at = ?, valid_to = COALESCE(valid_to, ?)
+         WHERE entry_id = ?
+           AND id != ?
+           AND invalid_at IS NULL
+           AND expired_at IS NULL
+           AND NOT EXISTS (
+             SELECT 1
+             FROM sb_parent_version_claims pvc_keep
+             JOIN sb_parent_versions pv_keep
+               ON pv_keep.version_id = pvc_keep.parent_version_id
+             JOIN sb_parent_units pu_keep
+               ON pu_keep.active_version_id = pv_keep.version_id
+              AND pu_keep.parent_id = pv_keep.parent_id
+             WHERE pvc_keep.memory_id = sb_memories.id
+               AND pv_keep.state IN ('active', 'active_degraded')
+           )`
+      )
+      .bind(input.createdAt, input.createdAt, input.createdAt, input.entryId, memoryId),
+    db
+      .prepare(
+        `UPDATE sb_entity_relations
+         SET invalid_at = ?, expired_at = ?, valid_to = COALESCE(valid_to, ?)
+         WHERE invalid_at IS NULL
+           AND expired_at IS NULL
+           AND memory_id IN (
+             SELECT id
+             FROM sb_memories
+             WHERE entry_id = ?
+               AND id != ?
+               AND invalid_at = ?
+               AND expired_at = ?
+           )`
+      )
+      .bind(input.createdAt, input.createdAt, input.createdAt, input.entryId, memoryId, input.createdAt, input.createdAt)
+  );
 
   const results = await db.batch(statements);
-  const activationStart = statements.length - 3;
   const activated = Number(results[activationStart]?.meta?.changes ?? 0);
   const parentUnitUpdated = Number(results[activationStart + 1]?.meta?.changes ?? 0);
   if (activated !== 1 || parentUnitUpdated !== 1) {

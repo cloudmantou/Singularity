@@ -38,7 +38,7 @@ function makeCtx() {
 
 function seedEntries(db: D1Mock, tag: string, count: number, overrides: Partial<any> = {}) {
   for (let i = 0; i < count; i++) {
-    const entry = {
+    const entry: any = {
       id: `entry-${i}`,
       content: `Memory about ${tag} number ${i + 1}`,
       tags: JSON.stringify([tag]),
@@ -49,7 +49,15 @@ function seedEntries(db: D1Mock, tag: string, count: number, overrides: Partial<
       importance_score: 0,
       ...overrides,
     };
+    entry.content_hash = entry.content_hash ?? `hash-${entry.id}`;
     db.entries.push(entry);
+    db.observations.push({
+      id: `obs-${entry.id}`,
+      content: entry.content,
+      source: entry.source,
+      content_hash: entry.content_hash,
+      created_at: entry.created_at,
+    });
     db.memories.push({
       id: `claim-${entry.id}`,
       entry_id: entry.id,
@@ -63,6 +71,18 @@ function seedEntries(db: D1Mock, tag: string, count: number, overrides: Partial<
       valid_to: null,
       invalid_at: null,
       expired_at: null,
+      content_hash: entry.content_hash,
+      created_at: entry.created_at ?? Date.now(),
+    });
+    db.memorySources.push({
+      id: `src-${entry.id}`,
+      memory_id: `claim-${entry.id}`,
+      observation_id: `obs-${entry.id}`,
+      role: "derived_from",
+      relation: "supports",
+      evidence_score: 0.9,
+      derivation_confidence: 0.9,
+      evidence_root_id: `obs-${entry.id}`,
       created_at: entry.created_at ?? Date.now(),
     });
   }
@@ -141,6 +161,14 @@ describe("compressTag()", () => {
     expect(digest).toBeDefined();
     expect(digest.content).toContain("[Synthesized from 12 entries tagged \"work\"]");
     expect(digest.content).not.toContain("source_ids");
+    const digestClaim = db.memories.find((memory: any) => memory.entry_id === result.synthesizedId);
+    expect(digestClaim).toBeDefined();
+    expect(db.memorySources).toContainEqual(
+      expect.objectContaining({
+        memory_id: digestClaim?.id,
+        relation: "supports",
+      })
+    );
   });
 
   it("digest entry is tagged synthesized and with the target tag", async () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { captureEntry, inspectExtractionQueue, processExtractionQueue } from "../../src/index";
+import worker, { captureEntry, inspectExtractionQueue, processExtractionQueue } from "../../src/index";
 import { makeTestDb, makeTestEnv, makeVectorizeMock } from "../helpers/make-env";
 import type { Env } from "../../src/index";
 import type { D1Mock } from "../helpers/d1-mock";
@@ -273,6 +273,47 @@ describe("captureEntry atomic dual-write", () => {
     const activeVersion = db.parentVersions.find((version) => version.state === "active");
     expect(db.parentUnits[0].active_version_id).toBe(activeVersion?.version_id);
     expect(db.memories.slice(1).every((memory) => memory.parent_version_id === activeVersion?.version_id)).toBe(true);
+  });
+
+  it("scheduled maintenance drains due fallback extraction work", async () => {
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({ matches: [] }),
+      }),
+      AI: makeExtractionAI("not valid json at all"),
+    });
+
+    const firstCtx = makeCtx();
+    await captureEntry("定时维护应该重新提炼这条 fallback observation。", ["work"], "api", env, firstCtx.ctx);
+    await firstCtx.drain();
+    expect(db.observations[0]).toMatchObject({
+      extraction_status: "fallback",
+      needs_reprocess: 1,
+    });
+
+    env.AI = makeExtractionAI({
+      facts: [
+        {
+          content: "定时维护重新提炼 fallback observation。",
+          kind: "semantic",
+          memory_class: "fact",
+          importance: 3,
+          confidence: 0.82,
+        },
+      ],
+    });
+
+    const pending: Promise<unknown>[] = [];
+    await worker.scheduled({} as any, env, {
+      waitUntil: (promise: Promise<unknown>) => { pending.push(promise); },
+    } as any);
+    await Promise.all(pending);
+
+    expect(db.observations[0]).toMatchObject({
+      extraction_status: "succeeded",
+      needs_reprocess: 0,
+    });
+    expect(db.parentVersions.filter((version) => version.state === "active")).toHaveLength(1);
   });
 
   it("dry-runs the extraction queue with orphan and retry breakdowns", async () => {

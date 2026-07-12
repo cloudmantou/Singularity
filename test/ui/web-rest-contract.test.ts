@@ -10,8 +10,8 @@ describe("web memory mutation API contract", () => {
     expect(html).toMatch(/async function apiAppend[\s\S]*?\/append/);
     expect(html).toMatch(/async function apiUpdate[\s\S]*?\/update/);
     expect(html).toMatch(/async function apiForget[\s\S]*?\/forget/);
-    expect(html).toContain("const result = await apiAppend(pendingAppendId, addition)");
-    expect(html).toContain("const result = await apiUpdate(pendingEditId, newContent)");
+    expect(html).toContain("await apiAppend(pendingAppendId, addition)");
+    expect(html).toContain("await apiUpdate(pendingEditId, newContent)");
     expect(html).toContain("await apiForget(idToForget)");
   });
 
@@ -19,11 +19,12 @@ describe("web memory mutation API contract", () => {
     expect((html.match(/parseApiJsonResponse\(/g) ?? []).length).toBeGreaterThanOrEqual(4);
   });
 
-  it("surfaces non-fatal atomic memory sync warnings from append and update", () => {
+  it("treats atomic memory sync failures as append and update errors", () => {
     expect(html).toContain('id="runtime-warning"');
-    expect(html).toContain("function showAtomicSyncWarning(result)");
-    expect(html).toContain("result.warning === 'atomic_sync_failed'");
-    expect((html.match(/showAtomicSyncWarning\(result\)/g) ?? []).length).toBeGreaterThanOrEqual(2);
+    expect(html).not.toContain("function showAtomicSyncWarning(result)");
+    expect(html).not.toContain("result.warning === 'atomic_sync_failed'");
+    expect(html).toContain("await apiAppend(pendingAppendId, addition)");
+    expect(html).toContain("await apiUpdate(pendingEditId, newContent)");
   });
 
   it("imports backups sequentially in D1-safe batches", () => {
