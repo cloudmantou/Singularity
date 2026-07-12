@@ -507,6 +507,49 @@ describe("POST /vectorize-pending", () => {
     expect(recent.pending_vector_ids).not.toBeNull();
   });
 
+  it("blocks blue-green activation when pending vectors were built for stale metadata", async () => {
+    db.entries.push(
+      {
+        ...pastGraceEntry("old"),
+        vector_ids: '["old-active"]',
+      },
+      {
+        id: "recent",
+        content: "Recent memory",
+        tags: "[]",
+        source: "api",
+        created_at: Date.now(),
+        vector_ids: '["recent-active"]',
+        recall_count: 0,
+        importance_score: 0,
+      }
+    );
+
+    await worker.fetch(req("POST", "/settings/models/reindex"), env, ctx);
+    await worker.fetch(req("POST", "/vectorize-pending"), env, ctx);
+    const old = db.entries.find((entry: any) => entry.id === "old");
+    expect(old.pending_vector_ids).not.toBe("[]");
+    expect(old.pending_metadata_hash).toBeTruthy();
+
+    old.tags = '["work","kind:semantic"]';
+    old.metadata_hash = "metadata-changed-after-pending-build";
+
+    const res = await worker.fetch(
+      req("POST", "/vectorize-pending", { body: { includeRecent: true } }),
+      env,
+      ctx
+    );
+    const data = await res.json() as any;
+
+    expect(data.mode).toBe("blue_green");
+    expect(data.remaining).toBe(0);
+    expect(data.activated).toBe(0);
+    expect(data.activationBlocked).toBe(1);
+    expect(data.activationIntegrity).toEqual({ activatable: 1, blocked: 1 });
+    expect(old.vector_ids).toBe('["old-active"]');
+    expect(old.pending_vector_ids).not.toBeNull();
+  });
+
   it("rejects starting a second rebuild while pending vectors are still referenced", async () => {
     db.entries.push(
       {

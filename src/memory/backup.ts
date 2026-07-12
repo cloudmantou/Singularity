@@ -8,7 +8,6 @@ const MEMORY_BACKUP_FEATURES = [
   "temporal-facts",
   "fact-sources",
   "embedding-profiles",
-  "vector-rebuild-state",
 ] as const;
 
 const GRAPH_ARRAY_KEYS = [
@@ -182,9 +181,7 @@ export async function exportMemoryBackup(
                        classification_next_attempt_at, classification_started_at,
                        classification_version, classified_at,
                        contradiction_wins, contradiction_losses, content_hash,
-                       embedding_fingerprint, pending_vector_ids,
-                       pending_embedding_fingerprint, pending_content_hash,
-                       pending_revision_id, pending_rebuild_id
+                       embedding_fingerprint
                 FROM entries
                 ORDER BY created_at DESC, id DESC`),
     allRows(db, `SELECT id, content, source, metadata_json, content_hash,

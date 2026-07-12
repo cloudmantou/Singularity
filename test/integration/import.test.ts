@@ -46,6 +46,38 @@ describe("POST /import", () => {
     expect(db.entries[0].vector_ids).toBe("[]");
   });
 
+  it("blocks import while a vector rebuild is open", async () => {
+    db.entries.push({
+      id: "active-1",
+      content: "active memory",
+      tags: "[]",
+      source: "api",
+      created_at: Date.now() - 600_000,
+      vector_ids: '["active-1"]',
+      recall_count: 0,
+      importance_score: 0,
+      contradiction_wins: 0,
+      contradiction_losses: 0,
+    });
+    await worker.fetch(req("POST", "/settings/models/reindex"), env, ctx);
+
+    const res = await worker.fetch(
+      req("POST", "/import", {
+        body: [{ id: "blocked-import", content: "must wait for rebuild" }],
+      }),
+      env,
+      ctx
+    );
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      ok: false,
+      error: "import_blocked_during_vector_rebuild",
+      rebuildId: db.vectorRebuilds[0].id,
+    });
+    expect(db.entries.some((entry: any) => entry.id === "blocked-import")).toBe(false);
+  });
+
   it("rejects Cloudflare imports larger than the cold-start-safe batch", async () => {
     const body = Array.from({ length: 5 }, (_, index) => ({
       id: `imp-batch-${index}`,

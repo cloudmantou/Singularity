@@ -307,6 +307,7 @@ export class SqliteVectorizeIndex {
     }
 
     if (this.vecAvailable) {
+      this.repairDanglingVecPointers();
       const rows = this.db
         .prepare(
           `SELECT id, values_json
@@ -358,16 +359,7 @@ export class SqliteVectorizeIndex {
           .prepare(`SELECT COUNT(DISTINCT id) as count FROM sb_vector_fts`)
           .get() as { count: number }).count ?? 0)
       : vectorCount;
-    const vecIndexed = this.vecAvailable
-      ? Number((this.db
-          .prepare(
-            `SELECT COUNT(*) as count
-             FROM sb_vectors
-             WHERE vec_rowid IS NOT NULL
-               AND vector_dim IS NOT NULL`
-          )
-          .get() as { count: number }).count ?? 0)
-      : vectorCount;
+    const vecIndexed = this.vecAvailable ? this.countLiveVecRows() : vectorCount;
     const ftsRemaining = this.ftsAvailable
       ? Math.max(0, vectorCount - ftsIndexed)
       : 0;
@@ -546,6 +538,67 @@ export class SqliteVectorizeIndex {
     }
   }
 
+  private repairDanglingVecPointers(): void {
+    if (!this.vecAvailable) return;
+    const dims = this.db
+      .prepare(
+        `SELECT DISTINCT vector_dim
+         FROM sb_vectors
+         WHERE vector_dim IS NOT NULL
+           AND vec_rowid IS NOT NULL`
+      )
+      .all() as Array<{ vector_dim: number }>;
+    for (const row of dims) {
+      const dim = Number(row.vector_dim);
+      if (!Number.isFinite(dim) || dim <= 0) continue;
+      try {
+        this.ensureVecTable(dim);
+        this.db.prepare(
+          `UPDATE sb_vectors
+           SET vec_rowid = NULL
+           WHERE vector_dim = ?
+             AND vec_rowid IS NOT NULL
+             AND NOT EXISTS (
+               SELECT 1
+               FROM ${vecTableName(dim)} v
+               WHERE v.rowid = sb_vectors.vec_rowid
+             )`
+        ).run(dim);
+      } catch (error) {
+        console.warn("sqlite-vec dangling pointer repair failed:", error);
+      }
+    }
+  }
+
+  private countLiveVecRows(): number {
+    if (!this.vecAvailable) return 0;
+    this.repairDanglingVecPointers();
+    const dims = this.db
+      .prepare(
+        `SELECT DISTINCT vector_dim
+         FROM sb_vectors
+         WHERE vector_dim IS NOT NULL`
+      )
+      .all() as Array<{ vector_dim: number }>;
+    let total = 0;
+    for (const row of dims) {
+      const dim = Number(row.vector_dim);
+      if (!Number.isFinite(dim) || dim <= 0) continue;
+      try {
+        this.ensureVecTable(dim);
+        total += Number((this.db.prepare(
+          `SELECT COUNT(*) as count
+           FROM sb_vectors m
+           JOIN ${vecTableName(dim)} v ON v.rowid = m.vec_rowid
+           WHERE m.vector_dim = ?`
+        ).get(dim) as { count: number }).count ?? 0);
+      } catch (error) {
+        console.warn("sqlite-vec live row count failed:", error);
+      }
+    }
+    return total;
+  }
+
   private queryVec0(
     vector: number[],
     topK: number,
@@ -627,10 +680,20 @@ export class SqliteVectorizeIndex {
       const tokens = lexicalTokens(queryText, 3);
       if (!tokens.length) return [];
       const where = tokens.map(() => `content LIKE ?`).join(" OR ");
+      const relevance = tokens
+        .map(() => `CASE WHEN content LIKE ? THEN 1 ELSE 0 END`)
+        .join(" + ");
       try {
         const rows = this.db.prepare(
-          `SELECT id FROM sb_vector_fts WHERE ${where} LIMIT ?`
-        ).all(...tokens.map((token) => `%${token}%`), limit) as { id: string }[];
+          `SELECT id FROM sb_vector_fts
+           WHERE ${where}
+           ORDER BY (${relevance}) DESC, id ASC
+           LIMIT ?`
+        ).all(
+          ...tokens.map((token) => `%${token}%`),
+          ...tokens.map((token) => `%${token}%`),
+          limit
+        ) as { id: string }[];
         return rows.map((row) => row.id);
       } catch (error) {
         console.warn("SQLite trigram FTS prefilter failed; falling back to vector KNN:", error);
@@ -642,7 +705,10 @@ export class SqliteVectorizeIndex {
     if (!query) return [];
     try {
       const rows = this.db.prepare(
-        `SELECT id FROM sb_vector_fts WHERE sb_vector_fts MATCH ? LIMIT ?`
+        `SELECT id FROM sb_vector_fts
+         WHERE sb_vector_fts MATCH ?
+         ORDER BY bm25(sb_vector_fts), id ASC
+         LIMIT ?`
       ).all(query, limit) as { id: string }[];
       return rows.map((row) => row.id);
     } catch (error) {

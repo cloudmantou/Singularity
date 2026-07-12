@@ -265,6 +265,8 @@ describe("memory data model", () => {
       db.prepare(`INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?)`)
         .bind("other", "other fact", '["work","rolled-up"]', "api", 3, '["other-vector"]'),
     ]);
+    await db.exec(`ALTER TABLE entries ADD COLUMN metadata_hash TEXT`);
+    await db.exec(`ALTER TABLE entries ADD COLUMN pending_metadata_hash TEXT`);
     await createMemoryRelations(db, [
       {
         fromMemoryId: "digest",

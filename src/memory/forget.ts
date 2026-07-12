@@ -23,6 +23,7 @@ interface EntryVectorRow {
 }
 
 interface ForgetCleanupOptions {
+  prepareVectorCleanup?: (vectorIds: string[], reason: string) => D1PreparedStatement[];
   queueVectorCleanup?: (vectorIds: string[], reason: string) => Promise<void>;
 }
 
@@ -257,7 +258,7 @@ function prepareDatabaseErase(
       actor: "system",
     });
     return [
-      db.prepare(`UPDATE entries SET tags = ? WHERE id = ?`)
+      db.prepare(`UPDATE entries SET tags = ?, metadata_hash = NULL WHERE id = ?`)
         .bind(JSON.stringify(nextTags), row.id),
       revision.statement,
     ];
@@ -398,8 +399,11 @@ export async function forgetMemoryGraph(
   }
   const uniqueVectorIds = [...new Set(vectorIds)];
 
+  let cleanupStatements: D1PreparedStatement[] = [];
   try {
-    if (options.queueVectorCleanup) {
+    if (options.prepareVectorCleanup) {
+      cleanupStatements = options.prepareVectorCleanup(uniqueVectorIds, "memory_forget");
+    } else if (options.queueVectorCleanup) {
       await options.queueVectorCleanup(uniqueVectorIds, "memory_forget");
     } else {
       for (const batch of chunks(uniqueVectorIds, VECTOR_DELETE_BATCH_SIZE)) {
@@ -423,6 +427,7 @@ export async function forgetMemoryGraph(
       ).bind(count, now, rebuildId)
     );
     await db.batch([
+      ...cleanupStatements,
       ...rebuildExitStatements,
       ...prepareDatabaseErase(db, [...trackedIds], survivingDigestSources, atomicGraph),
     ]);

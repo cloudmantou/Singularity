@@ -4,6 +4,7 @@ import { makeTestDb, makeTestEnv, makeVectorizeMock } from "../helpers/make-env"
 import { req } from "../helpers/make-request";
 import type { Env } from "../../src/index";
 import { D1Mock } from "../helpers/d1-mock";
+import { setStoredModelSettingsCache } from "../../src/settings/store";
 
 const ctx = { waitUntil: (_: Promise<any>) => {} } as any;
 
@@ -151,6 +152,46 @@ describe("POST /update", () => {
         observation_id: db.observations[0].id,
       })
     );
+  });
+
+  it("retries update once when the active embedding fingerprint changes before commit", async () => {
+    seedEntry(db);
+    const settingsA = {
+      llm: { provider: "none", baseURL: "", apiKey: "", model: "" },
+      embedding: { provider: "none", baseURL: "", apiKey: "", model: "", dimensions: 384 },
+      embeddingFingerprint: "fp-a",
+      updatedAt: 1,
+    } as any;
+    const settingsB = {
+      ...settingsA,
+      embeddingFingerprint: "fp-b",
+      updatedAt: 2,
+    };
+    db.appSettings.model_settings = { value: JSON.stringify(settingsA), updated_at: 1 };
+    setStoredModelSettingsCache(settingsA);
+    const insertMock = vi.fn().mockImplementation(async () => {
+      if (insertMock.mock.calls.length === 1) {
+        db.appSettings.model_settings = { value: JSON.stringify(settingsB), updated_at: 2 };
+        setStoredModelSettingsCache(settingsB);
+      }
+      return { mutationId: "insert" };
+    });
+    const deleteByIdsMock = vi.fn().mockResolvedValue({ mutationId: "cleanup" });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({ insert: insertMock, deleteByIds: deleteByIdsMock }),
+    });
+
+    const res = await worker.fetch(
+      req("POST", "/update", { body: { id: "entry-abc", content: "Updated content" } }),
+      env,
+      ctx
+    );
+
+    expect(res.status).toBe(200);
+    expect(insertMock).toHaveBeenCalledTimes(2);
+    expect(deleteByIdsMock).toHaveBeenCalledTimes(1);
+    expect(db.entries[0].content).toBe("Updated content");
+    expect(db.entries[0].embedding_fingerprint).toBe("fp-b");
   });
 
   it("preserves existing tags and source after update", async () => {
@@ -331,7 +372,11 @@ describe("POST /update", () => {
     expect(db.entries[0].pending_embedding_fingerprint).toBe(pendingFingerprint);
     expect(db.entries[0].pending_rebuild_id).toBe(db.vectorRebuilds[0].id);
     expect(db.entries[0].pending_content_hash).toBeNull();
-    expect(deleteByIdsMock).toHaveBeenCalledWith(["pending-old"]);
+    expect(deleteByIdsMock).not.toHaveBeenCalled();
+    expect(db.vectorCleanupQueue.map((row: any) => row.vector_id).sort()).toEqual([
+      "active-old",
+      "pending-old",
+    ]);
   });
 
   it("removes the prepared generation when the D1 version switch fails", async () => {

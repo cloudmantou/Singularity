@@ -166,13 +166,15 @@ describe("Observatory analytics API", () => {
     db.prepare(
       `UPDATE entries
        SET content_hash = ?,
+           metadata_hash = ?,
            pending_vector_ids = ?,
            pending_embedding_fingerprint = ?,
            pending_content_hash = ?,
            pending_revision_id = ?,
+           pending_metadata_hash = ?,
            pending_rebuild_id = ?
        WHERE id = ?`
-    ).run("hash-1", JSON.stringify(["pending-vector-1"]), "pending-fp", "hash-1", "rev-1", "rebuild-1", "entry-1");
+    ).run("hash-1", "meta-1", JSON.stringify(["pending-vector-1"]), "pending-fp", "hash-1", "rev-1", "meta-1", "rebuild-1", "entry-1");
     db.prepare(
       `INSERT INTO sb_vector_rebuilds
        (id, slot, state, active_fingerprint, pending_fingerprint,
@@ -248,6 +250,21 @@ describe("Observatory analytics API", () => {
       remaining: 0,
     });
     expect(body.recent_changes.length).toBeGreaterThan(0);
+
+    const vectorRuntimeResponse = await worker.fetch(
+      new Request("http://localhost/analytics/vector-runtime", {
+        headers: { Authorization: "Bearer test-token" },
+      }),
+      env,
+      createExecutionContext()
+    );
+    expect(vectorRuntimeResponse.status).toBe(200);
+    const vectorRuntimeBody = await vectorRuntimeResponse.json() as any;
+    expect(vectorRuntimeBody.vector_runtime.rebuild).toMatchObject({
+      id: "rebuild-1",
+      state: "building",
+      ready_entries: 1,
+    });
 
     db.close();
   });

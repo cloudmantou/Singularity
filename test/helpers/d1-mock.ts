@@ -43,6 +43,17 @@ export class D1Mock {
         classified_at: null,
       });
     };
+    const activeEmbeddingMatches = (fingerprint: string | null): boolean => {
+      if (!fingerprint) return true;
+      const raw = db.appSettings.model_settings?.value;
+      if (!raw) return true;
+      try {
+        const parsed = JSON.parse(raw);
+        return String(parsed.embeddingFingerprint ?? "") === fingerprint;
+      } catch {
+        return false;
+      }
+    };
 
     const makeStmt = (args: any[]) => ({
       async run() {
@@ -182,7 +193,10 @@ export class D1Mock {
               entry.pending_content_hash == null ||
               entry.content_hash == null ||
               entry.pending_revision_id == null ||
-              entry.pending_content_hash !== entry.content_hash
+              entry.metadata_hash == null ||
+              entry.pending_metadata_hash == null ||
+              entry.pending_content_hash !== entry.content_hash ||
+              entry.pending_metadata_hash !== entry.metadata_hash
             )
           );
           if (hasConflict) return { meta: { changes: 0 } };
@@ -203,12 +217,24 @@ export class D1Mock {
           }
           return { meta: { changes: row ? 1 : 0 } };
         }
-        if (s.startsWith("INSERT INTO sb_vector_cleanup_batches")) {
-          const [id, rebuild_id, vector_ids_json, state, created_at, updated_at] = args;
+        if (s.startsWith("INSERT INTO sb_vector_cleanup_batches") || s.startsWith("INSERT OR IGNORE INTO sb_vector_cleanup_batches")) {
+          const hasHash = s.includes("vector_ids_hash");
+          const [id, rebuild_id, vector_ids_json] = args;
+          let index = 3;
+          const vector_ids_hash = hasHash ? args[index++] : null;
+          const state = args[index++];
+          const created_at = args[index++];
+          const updated_at = args[index++];
+          if (hasHash && db.vectorCleanupBatches.some((row: any) =>
+            row.rebuild_id === rebuild_id && row.vector_ids_hash === vector_ids_hash
+          )) {
+            return { meta: { changes: 0 } };
+          }
           db.vectorCleanupBatches.push({
             id,
             rebuild_id,
             vector_ids_json,
+            vector_ids_hash,
             state,
             attempts: 0,
             next_attempt_at: null,
@@ -311,10 +337,19 @@ export class D1Mock {
           return { meta: { changes: row ? 1 : 0 } };
         }
         if (s.startsWith("UPDATE sb_vector_cleanup_queue SET state = 'blocked'")) {
-          const [last_error, updated_at, vector_id] = args;
+          const hasRetry = s.includes("attempts = attempts + 1");
+          let index = 0;
+          const next_attempt_at = hasRetry ? args[index++] : null;
+          const last_error = args[index++];
+          const updated_at = args[index++];
+          const vector_id = args[index++];
           const row = db.vectorCleanupQueue.find((item: any) => item.vector_id === vector_id);
           if (row) {
             row.state = "blocked";
+            if (hasRetry) {
+              row.attempts = Number(row.attempts ?? 0) + 1;
+              row.next_attempt_at = next_attempt_at;
+            }
             row.last_error = last_error;
             row.updated_at = updated_at;
           }
@@ -874,7 +909,8 @@ export class D1Mock {
               content_hash: content_hash ?? null,
             });
           } else if (s.includes("content_hash") && args.length >= 7) {
-            const hasImportance = s.includes("importance_score") || args.length >= 8;
+            const hasMetadataHash = s.includes("metadata_hash");
+            const hasImportance = s.includes("importance_score") || args.length >= (hasMetadataHash ? 9 : 8);
             const id = args[0];
             const content = args[1];
             const tags = args[2];
@@ -882,12 +918,15 @@ export class D1Mock {
             const created_at = args[4];
             const vector_ids = args[5];
             const content_hash = args[6];
-            const importance_score = hasImportance && args.length >= 8 ? args[7] : 0;
+            let index = 7;
+            const metadata_hash = hasMetadataHash ? args[index++] : null;
+            const importance_score = hasImportance && args.length > index ? args[index] : 0;
             const row = {
               id, content, tags, source, created_at, vector_ids,
               recall_count: 0, importance_score: importance_score ?? 0,
               contradiction_wins: 0, contradiction_losses: 0,
               content_hash,
+              metadata_hash,
             };
             resetClassification(row);
             db.entries.push(row);
@@ -907,12 +946,16 @@ export class D1Mock {
         if (s.startsWith("UPDATE entries SET content = ?, vector_ids")) {
           if (s.includes("AND content = ? AND tags = ? AND vector_ids = ?")) {
             const hasHash = s.includes("content_hash");
+            const hasActiveEmbedding = s.includes("vector_ids = ?, embedding_fingerprint = ?");
+            const hasMetadataHash = s.includes("metadata_hash = ?");
             const hasPending = s.includes("pending_vector_ids");
             const hasPendingRebuildId = s.includes("pending_rebuild_id = ?");
             const content = args[0];
             const vector_ids = args[1];
             let index = 2;
+            const embedding_fingerprint = hasActiveEmbedding ? args[index++] : undefined;
             const content_hash = hasHash ? args[index++] : null;
+            const metadata_hash = hasMetadataHash ? args[index++] : null;
             const pending_vector_ids = hasPending ? args[index++] : undefined;
             const pending_embedding_fingerprint = hasPending ? args[index++] : undefined;
             const pending_rebuild_id = hasPendingRebuildId ? args[index++] : undefined;
@@ -920,22 +963,29 @@ export class D1Mock {
             const expected_content = args[index++];
             const expected_tags = args[index++];
             const expected_vector_ids = args[index++];
+            const expected_embedding_fingerprint = s.includes("json_extract(value, '$.embeddingFingerprint')")
+              ? String(args[index++])
+              : null;
             const row = db.entries.find(
               (e: any) =>
                 e.id === id &&
                 e.content === expected_content &&
                 e.tags === expected_tags &&
-                e.vector_ids === expected_vector_ids
+                e.vector_ids === expected_vector_ids &&
+                activeEmbeddingMatches(expected_embedding_fingerprint)
             );
             if (row) {
               row.content = content;
               row.vector_ids = vector_ids;
+              if (hasActiveEmbedding) row.embedding_fingerprint = embedding_fingerprint;
               if (hasHash) row.content_hash = content_hash;
+              if (hasMetadataHash) row.metadata_hash = metadata_hash;
               if (hasPending) {
                 row.pending_vector_ids = pending_vector_ids;
                 row.pending_embedding_fingerprint = pending_embedding_fingerprint;
                 row.pending_content_hash = null;
                 row.pending_revision_id = null;
+                row.pending_metadata_hash = null;
                 if (hasPendingRebuildId) row.pending_rebuild_id = pending_rebuild_id;
               }
               if (s.includes("classification_status = 'pending'")) resetClassification(row);
@@ -958,6 +1008,7 @@ export class D1Mock {
               row.pending_embedding_fingerprint = null;
               row.pending_content_hash = null;
               row.pending_revision_id = null;
+              row.pending_metadata_hash = null;
               row.pending_rebuild_id = null;
             }
           }
@@ -965,35 +1016,67 @@ export class D1Mock {
         }
         if (s.startsWith("UPDATE entries SET vector_ids = ?,")) {
           if (!s.includes("pending_vector_ids = ?")) {
-            const [vector_ids, id, expected_vector_ids, expected_content] = args;
+            const hasActiveEmbedding = s.includes("embedding_fingerprint = ?");
+            const hasMetadataHash = s.includes("metadata_hash = ?");
+            const vector_ids = args[0];
+            let index = 1;
+            const embedding_fingerprint = hasActiveEmbedding ? args[index++] : undefined;
+            const metadata_hash = hasMetadataHash ? args[index++] : undefined;
+            const id = args[index++];
+            const expected_vector_ids = args[index++];
+            const expected_content = args[index++];
+            const expected_embedding_fingerprint = s.includes("json_extract(value, '$.embeddingFingerprint')")
+              ? String(args[index++])
+              : null;
             const row = db.entries.find(
               (e: any) =>
                 e.id === id &&
                 e.vector_ids === expected_vector_ids &&
                 e.content === expected_content &&
-                !String(e.tags ?? "[]").includes('"status:deprecated"')
+                !String(e.tags ?? "[]").includes('"status:deprecated"') &&
+                activeEmbeddingMatches(expected_embedding_fingerprint)
             );
             if (row) {
               row.vector_ids = vector_ids;
+              if (hasActiveEmbedding) row.embedding_fingerprint = embedding_fingerprint;
+              if (hasMetadataHash) row.metadata_hash = metadata_hash;
               row.pending_content_hash = null;
               row.pending_revision_id = null;
+              row.pending_metadata_hash = null;
             }
             return { meta: { changes: row ? 1 : 0 } };
           }
-          const [vector_ids, pending_vector_ids, pending_embedding_fingerprint, id, expected_vector_ids, expected_content] = args;
+          const hasActiveEmbedding = s.includes("embedding_fingerprint = ?");
+          const hasMetadataHash = s.includes("metadata_hash = ?");
+          const vector_ids = args[0];
+          let index = 1;
+          const embedding_fingerprint = hasActiveEmbedding ? args[index++] : undefined;
+          const metadata_hash = hasMetadataHash ? args[index++] : undefined;
+          const pending_vector_ids = args[index++];
+          const pending_embedding_fingerprint = args[index++];
+          const id = args[index++];
+          const expected_vector_ids = args[index++];
+          const expected_content = args[index++];
+          const expected_embedding_fingerprint = s.includes("json_extract(value, '$.embeddingFingerprint')")
+            ? String(args[index++])
+            : null;
           const row = db.entries.find(
             (e: any) =>
               e.id === id &&
               e.vector_ids === expected_vector_ids &&
               e.content === expected_content &&
-              !String(e.tags ?? "[]").includes('"status:deprecated"')
+              !String(e.tags ?? "[]").includes('"status:deprecated"') &&
+              activeEmbeddingMatches(expected_embedding_fingerprint)
           );
           if (row) {
             row.vector_ids = vector_ids;
+            if (hasActiveEmbedding) row.embedding_fingerprint = embedding_fingerprint;
+            if (hasMetadataHash) row.metadata_hash = metadata_hash;
             row.pending_vector_ids = pending_vector_ids;
             row.pending_embedding_fingerprint = pending_embedding_fingerprint;
             row.pending_content_hash = null;
             row.pending_revision_id = null;
+            row.pending_metadata_hash = null;
           }
           return { meta: { changes: row ? 1 : 0 } };
         }
@@ -1033,6 +1116,7 @@ export class D1Mock {
             row.pending_embedding_fingerprint = pending_embedding_fingerprint;
             row.pending_content_hash = null;
             row.pending_revision_id = null;
+            row.pending_metadata_hash = null;
             row.pending_rebuild_id = pending_rebuild_id;
             changes++;
           }
@@ -1044,19 +1128,30 @@ export class D1Mock {
             pending_embedding_fingerprint,
             pending_content_hash,
             maybe_pending_revision_id,
+            maybe_pending_metadata_hash,
             maybe_content_hash,
+            maybe_metadata_hash,
             id,
             expected_pending_vector_ids,
             expected_pending_embedding_fingerprint,
             maybe_expected_pending_rebuild_id,
             maybe_expected_content,
+            maybe_expected_tags,
+            maybe_expected_source,
           ] = args;
           const hasPendingRevisionId = s.includes("pending_revision_id = ?");
           const pending_revision_id = hasPendingRevisionId ? maybe_pending_revision_id : null;
-          const content_hash = hasPendingRevisionId ? maybe_content_hash : maybe_pending_revision_id;
+          const hasPendingMetadataHash = s.includes("pending_metadata_hash = ?");
+          const pending_metadata_hash = hasPendingMetadataHash ? maybe_pending_metadata_hash : null;
+          const content_hash = hasPendingRevisionId
+            ? (hasPendingMetadataHash ? maybe_content_hash : maybe_pending_metadata_hash)
+            : maybe_pending_revision_id;
+          const metadata_hash = hasPendingMetadataHash ? maybe_metadata_hash : null;
           const hasPendingRebuildId = s.includes("pending_rebuild_id = ?");
           const expected_pending_rebuild_id = hasPendingRebuildId ? maybe_expected_pending_rebuild_id : undefined;
           const expected_content = hasPendingRebuildId ? maybe_expected_content : maybe_expected_pending_rebuild_id;
+          const expected_tags = hasPendingMetadataHash ? maybe_expected_tags : undefined;
+          const expected_source = hasPendingMetadataHash ? maybe_expected_source : undefined;
           const row = db.entries.find(
             (e: any) =>
               e.id === id &&
@@ -1064,6 +1159,8 @@ export class D1Mock {
               e.pending_embedding_fingerprint === expected_pending_embedding_fingerprint &&
               (!hasPendingRebuildId || e.pending_rebuild_id === expected_pending_rebuild_id) &&
               e.content === expected_content &&
+              (!hasPendingMetadataHash || e.tags === expected_tags) &&
+              (!hasPendingMetadataHash || e.source === expected_source) &&
               !String(e.tags ?? "[]").includes('"status:deprecated"')
           );
           if (row) {
@@ -1071,7 +1168,9 @@ export class D1Mock {
             row.pending_embedding_fingerprint = pending_embedding_fingerprint;
             row.pending_content_hash = pending_content_hash;
             row.pending_revision_id = pending_revision_id;
+            row.pending_metadata_hash = pending_metadata_hash;
             if (row.content_hash == null) row.content_hash = content_hash;
+            if (hasPendingMetadataHash) row.metadata_hash = metadata_hash;
           }
           return { meta: { changes: row ? 1 : 0 } };
         }
@@ -1084,6 +1183,7 @@ export class D1Mock {
             row.pending_embedding_fingerprint = null;
             row.pending_content_hash = null;
             row.pending_revision_id = null;
+            row.pending_metadata_hash = null;
             row.pending_rebuild_id = null;
             changes++;
           }
@@ -1103,14 +1203,19 @@ export class D1Mock {
               row.pending_vector_ids !== "[]" &&
               row.pending_content_hash != null &&
               row.pending_revision_id != null &&
-              row.content_hash === row.pending_content_hash
+              row.pending_metadata_hash != null &&
+              row.metadata_hash != null &&
+              row.content_hash === row.pending_content_hash &&
+              row.metadata_hash === row.pending_metadata_hash
             ) {
               row.vector_ids = row.pending_vector_ids;
               row.embedding_fingerprint = row.pending_embedding_fingerprint;
+              row.metadata_hash = row.pending_metadata_hash;
               row.pending_vector_ids = null;
               row.pending_embedding_fingerprint = null;
               row.pending_content_hash = null;
               row.pending_revision_id = null;
+              row.pending_metadata_hash = null;
               row.pending_rebuild_id = null;
               changes++;
             }
@@ -1154,18 +1259,22 @@ export class D1Mock {
           }
           return { meta: { changes: row ? 1 : 0 } };
         }
-        if (s.startsWith("UPDATE entries SET tags = ?, importance_score = ?, classification_confidence = ?")) {
-          const [
-            tags,
-            importance_score,
-            classification_confidence,
-            classification_version,
-            classified_at,
-            id,
-            content,
-            expected_tags,
-            started_at,
-          ] = args;
+        if (
+          s.startsWith("UPDATE entries SET tags = ?, importance_score = ?, classification_confidence = ?") ||
+          s.startsWith("UPDATE entries SET tags = ?, metadata_hash = ?, importance_score = ?, classification_confidence = ?")
+        ) {
+          const hasMetadataHash = s.includes("metadata_hash = ?");
+          let index = 0;
+          const tags = args[index++];
+          const metadata_hash = hasMetadataHash ? args[index++] : undefined;
+          const importance_score = args[index++];
+          const classification_confidence = args[index++];
+          const classification_version = args[index++];
+          const classified_at = args[index++];
+          const id = args[index++];
+          const content = args[index++];
+          const expected_tags = args[index++];
+          const started_at = args[index++];
           const candidate = db.entries.find((e: any) => e.id === id);
           if (candidate && db.beforeClassificationCommit) {
             const hook = db.beforeClassificationCommit;
@@ -1179,6 +1288,7 @@ export class D1Mock {
           if (row) {
             Object.assign(row, {
               tags,
+              ...(hasMetadataHash ? { metadata_hash } : {}),
               importance_score,
               classification_confidence,
               classification_status: "succeeded",
@@ -1242,10 +1352,25 @@ export class D1Mock {
           }
           return { meta: { changes: row ? 1 : 0 } };
         }
-        if (s.startsWith("UPDATE entries SET tags = ? WHERE id")) {
-          const [tags, id] = args;
+        if (
+          s.startsWith("UPDATE entries SET tags = ? WHERE id") ||
+          s.startsWith("UPDATE entries SET tags = ?, metadata_hash = ? WHERE id") ||
+          s.startsWith("UPDATE entries SET tags = ?, metadata_hash = NULL WHERE id")
+        ) {
+          let tags: any;
+          let metadata_hash: any = undefined;
+          let id: any;
+          if (s.includes("metadata_hash = ?")) {
+            [tags, metadata_hash, id] = args;
+          } else {
+            [tags, id] = args;
+          }
           const row = db.entries.find((e: any) => e.id === id);
-          if (row) row.tags = tags;
+          if (row) {
+            row.tags = tags;
+            if (s.includes("metadata_hash = ?")) row.metadata_hash = metadata_hash;
+            if (s.includes("metadata_hash = NULL")) row.metadata_hash = null;
+          }
           return { meta: { changes: row ? 1 : 0 } };
         }
         if (s.includes("UPDATE entries SET content = ?, tags = ?, source = ?, created_at = ?, vector_ids = ?,") && s.includes("recall_count")) {
@@ -1295,13 +1420,17 @@ export class D1Mock {
         if (s.startsWith("UPDATE entries SET content = ?, tags = ?, vector_ids = ?")) {
           if (s.includes("AND content = ? AND tags = ? AND vector_ids = ?")) {
             const hasHash = s.includes("content_hash");
+            const hasActiveEmbedding = s.includes("vector_ids = ?, embedding_fingerprint = ?");
+            const hasMetadataHash = s.includes("metadata_hash = ?");
             const hasPending = s.includes("pending_vector_ids");
             const hasPendingRebuildId = s.includes("pending_rebuild_id = ?");
             const content = args[0];
             const tags = args[1];
             const vector_ids = args[2];
             let index = 3;
+            const embedding_fingerprint = hasActiveEmbedding ? args[index++] : undefined;
             const content_hash = hasHash ? args[index++] : null;
+            const metadata_hash = hasMetadataHash ? args[index++] : null;
             const pending_vector_ids = hasPending ? args[index++] : undefined;
             const pending_embedding_fingerprint = hasPending ? args[index++] : undefined;
             const pending_rebuild_id = hasPendingRebuildId ? args[index++] : undefined;
@@ -1309,23 +1438,30 @@ export class D1Mock {
             const expected_content = args[index++];
             const expected_tags = args[index++];
             const expected_vector_ids = args[index++];
+            const expected_embedding_fingerprint = s.includes("json_extract(value, '$.embeddingFingerprint')")
+              ? String(args[index++])
+              : null;
             const row = db.entries.find(
               (e: any) =>
                 e.id === id &&
                 e.content === expected_content &&
                 e.tags === expected_tags &&
-                e.vector_ids === expected_vector_ids
+                e.vector_ids === expected_vector_ids &&
+                activeEmbeddingMatches(expected_embedding_fingerprint)
             );
             if (row) {
               row.content = content;
               row.tags = tags;
               row.vector_ids = vector_ids;
+              if (hasActiveEmbedding) row.embedding_fingerprint = embedding_fingerprint;
               if (hasHash) row.content_hash = content_hash;
+              if (hasMetadataHash) row.metadata_hash = metadata_hash;
               if (hasPending) {
                 row.pending_vector_ids = pending_vector_ids;
                 row.pending_embedding_fingerprint = pending_embedding_fingerprint;
                 row.pending_content_hash = null;
                 row.pending_revision_id = null;
+                row.pending_metadata_hash = null;
                 if (hasPendingRebuildId) row.pending_rebuild_id = pending_rebuild_id;
               }
               if (s.includes("classification_status = 'pending'")) resetClassification(row);
@@ -1505,7 +1641,10 @@ export class D1Mock {
               e.pending_content_hash == null ||
               e.pending_revision_id == null ||
               e.content_hash == null ||
-              e.pending_content_hash !== e.content_hash
+              e.metadata_hash == null ||
+              e.pending_metadata_hash == null ||
+              e.pending_content_hash !== e.content_hash ||
+              e.pending_metadata_hash !== e.metadata_hash
             )
           ).length;
           return { count };
@@ -1520,7 +1659,10 @@ export class D1Mock {
             e.pending_vector_ids !== "[]" &&
             e.pending_content_hash != null &&
             e.pending_revision_id != null &&
-            e.content_hash === e.pending_content_hash
+            e.pending_metadata_hash != null &&
+            e.metadata_hash != null &&
+            e.content_hash === e.pending_content_hash &&
+            e.metadata_hash === e.pending_metadata_hash
           ).length;
           return { count };
         }
@@ -1737,6 +1879,19 @@ export class D1Mock {
           );
           return row ? { id: row.id } : null;
         }
+        if (s.includes("COUNT(*) as total") && s.includes("FROM sb_app_settings")) {
+          const fingerprint = String(args[0] ?? "");
+          const raw = db.appSettings.model_settings?.value;
+          if (!raw) return { total: 0, matching: 0 };
+          let matching = 0;
+          try {
+            const parsed = JSON.parse(raw);
+            matching = String(parsed.embeddingFingerprint ?? "") === fingerprint ? 1 : 0;
+          } catch {
+            matching = 0;
+          }
+          return { total: 1, matching };
+        }
         if (s.includes("SELECT id FROM sb_entity_relations") && s.includes("from_entity_id = ?")) {
           const [fromEntityId, toEntityId, relationType, factHash, factKey] = args.map(String);
           const row = db.entityRelations.find((relation: any) =>
@@ -1858,7 +2013,10 @@ export class D1Mock {
               e.pending_vector_ids !== "[]" &&
               e.pending_content_hash != null &&
               e.pending_revision_id != null &&
-              e.content_hash === e.pending_content_hash
+              e.pending_metadata_hash != null &&
+              e.metadata_hash != null &&
+              e.content_hash === e.pending_content_hash &&
+              e.metadata_hash === e.pending_metadata_hash
             )
             .map((e: any) => ({
               id: e.id,
@@ -1876,7 +2034,10 @@ export class D1Mock {
               e.pending_vector_ids !== "[]" &&
               e.pending_content_hash != null &&
               e.pending_revision_id != null &&
-              e.content_hash === e.pending_content_hash
+              e.pending_metadata_hash != null &&
+              e.metadata_hash != null &&
+              e.content_hash === e.pending_content_hash &&
+              e.metadata_hash === e.pending_metadata_hash
             )
             .map((e: any) => ({
               id: e.id,
@@ -1905,7 +2066,12 @@ export class D1Mock {
           const limit = Number(args[1] ?? args[0] ?? 100);
           return {
             results: [...db.vectorCleanupQueue]
-              .filter((row: any) => (row.state ?? "ready") === "ready" && Number(row.next_attempt_at ?? 0) <= now)
+              .filter((row: any) =>
+                (s.includes("state IN ('ready', 'blocked')")
+                  ? ["ready", "blocked"].includes(row.state ?? "ready")
+                  : (row.state ?? "ready") === "ready") &&
+                Number(row.next_attempt_at ?? 0) <= now
+              )
               .sort((a: any, b: any) => Number(a.created_at ?? 0) - Number(b.created_at ?? 0))
               .slice(0, limit)
               .map((row: any) => ({
@@ -2160,6 +2326,7 @@ export class D1Mock {
               tags: entry.tags,
               source: entry.source,
               created_at: entry.created_at,
+              vector_ids: entry.vector_ids ?? "[]",
             }));
           return { results };
         }

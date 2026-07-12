@@ -142,9 +142,10 @@ describe("full memory backup import/export", () => {
         "temporal-facts",
         "fact-sources",
         "embedding-profiles",
-        "vector-rebuild-state",
       ])
     );
+    expect(backup.features).not.toContain("vector-rebuild-state");
+    expect(backup.entries[0]).not.toHaveProperty("pending_rebuild_id");
     expect(backup.integrity.ok).toBe(true);
     expect(backup.totals).toMatchObject({
       entries: 2,

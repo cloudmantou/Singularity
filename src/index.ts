@@ -9,7 +9,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpHandler } from "agents/mcp";
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { z } from "zod";
-import { createEmbedding, createLLM } from "./providers";
+import { createEmbedding, createEmbeddingFromResolved, createLLM, type EmbeddingProvider } from "./providers";
 import {
   applyModelSettingsPatch,
   activeEmbeddingOf,
@@ -22,6 +22,8 @@ import {
   promoteEmbeddingFingerprint,
   toPublicModelSettings,
   type ModelSettingsPatchBody,
+  type EmbeddingSettings,
+  type ModelSettings,
 } from "./settings/model-settings";
 import type { EmbeddingProfileRole } from "./settings/store";
 import {
@@ -526,6 +528,61 @@ async function embed(
   return (await createEmbedding(env)).embed(text, { purpose });
 }
 
+interface ActiveEmbeddingSnapshot {
+  fingerprint: string;
+  settingsUpdatedAt: number;
+  embedding: EmbeddingSettings;
+  provider: EmbeddingProvider;
+}
+
+async function loadActiveEmbeddingSnapshot(env: Env): Promise<ActiveEmbeddingSnapshot> {
+  const { effective } = await getEffectiveModelSettings(env);
+  const embedding = activeEmbeddingOf(effective);
+  const fingerprint = effective.embeddingFingerprint ?? embeddingFingerprintOf(embedding);
+  const snapshotSettings: ModelSettings = {
+    ...effective,
+    embedding: cloneEmbeddingSettings(embedding),
+    activeEmbedding: cloneEmbeddingSettings(embedding),
+    embeddingFingerprint: fingerprint,
+    pendingEmbedding: undefined,
+    pendingEmbeddingFingerprint: undefined,
+  };
+  return {
+    fingerprint,
+    settingsUpdatedAt: effective.updatedAt ?? 0,
+    embedding,
+    provider: createEmbeddingFromResolved(
+      overlayProviderEnvFromSettings(env, snapshotSettings)
+    ),
+  };
+}
+
+async function isActiveEmbeddingSnapshotCurrent(
+  env: Env,
+  snapshot: ActiveEmbeddingSnapshot
+): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) as total,
+            SUM(CASE
+              WHEN COALESCE(json_extract(value, '$.embeddingFingerprint'), '') = ?
+              THEN 1 ELSE 0
+            END) as matching
+     FROM sb_app_settings
+     WHERE key = 'model_settings'`
+  ).bind(snapshot.fingerprint).first<Record<string, unknown>>();
+  const total = Number(row?.total ?? 0);
+  if (total === 0) return true;
+  return Number(row?.matching ?? 0) > 0;
+}
+
+async function embedWithProvider(
+  provider: EmbeddingProvider,
+  text: string,
+  purpose: "document" | "query" = "document"
+): Promise<number[]> {
+  return provider.embed(text, { purpose });
+}
+
 async function embedMany(
   texts: string[],
   env: Env,
@@ -534,6 +591,15 @@ async function embedMany(
 ): Promise<number[][]> {
   if (!texts.length) return [];
   const provider = await createEmbedding(env, embeddingRole);
+  return embedManyWithProvider(provider, texts, purpose);
+}
+
+async function embedManyWithProvider(
+  provider: EmbeddingProvider,
+  texts: string[],
+  purpose: "document" | "query" = "document"
+): Promise<number[][]> {
+  if (!texts.length) return [];
   const out: number[][] = [];
   for (let i = 0; i < texts.length; i += EMBEDDING_INPUT_BATCH_SIZE) {
     const slice = texts.slice(i, i + EMBEDDING_INPUT_BATCH_SIZE);
@@ -571,6 +637,8 @@ export async function initializeDatabase(env: Env): Promise<void> {
     `ALTER TABLE entries ADD COLUMN pending_embedding_fingerprint TEXT`,
     `ALTER TABLE entries ADD COLUMN pending_content_hash TEXT`,
     `ALTER TABLE entries ADD COLUMN pending_revision_id TEXT`,
+    `ALTER TABLE entries ADD COLUMN metadata_hash TEXT`,
+    `ALTER TABLE entries ADD COLUMN pending_metadata_hash TEXT`,
     `ALTER TABLE entries ADD COLUMN pending_rebuild_id TEXT`,
   ]) {
     try {
@@ -664,6 +732,7 @@ export async function initializeDatabase(env: Env): Promise<void> {
       id TEXT PRIMARY KEY,
       rebuild_id TEXT NOT NULL,
       vector_ids_json TEXT NOT NULL,
+      vector_ids_hash TEXT,
       state TEXT NOT NULL DEFAULT 'prepared',
       attempts INTEGER NOT NULL DEFAULT 0,
       next_attempt_at INTEGER,
@@ -673,9 +742,20 @@ export async function initializeDatabase(env: Env): Promise<void> {
       CHECK (state IN ('prepared', 'ready', 'processing', 'failed', 'completed', 'blocked'))
     )`
   );
+  try {
+    await env.DB.exec(`ALTER TABLE sb_vector_cleanup_batches ADD COLUMN vector_ids_hash TEXT`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/duplicate column name|already exists/i.test(message)) throw error;
+  }
   await env.DB.exec(
     `CREATE INDEX IF NOT EXISTS idx_vector_cleanup_batches_due
      ON sb_vector_cleanup_batches(state, next_attempt_at, created_at)`
+  );
+  await env.DB.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_cleanup_batch_identity
+     ON sb_vector_cleanup_batches(rebuild_id, vector_ids_hash)
+     WHERE vector_ids_hash IS NOT NULL`
   );
   // Before durable classification fields existed, kind:* tags were the only
   // successful-classification marker. Preserve that work during upgrade with
@@ -749,6 +829,20 @@ export async function contentFingerprint(content: string): Promise<string> {
   const bytes = new TextEncoder().encode(normalizeContentForDedup(content));
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function normalizeTagsForMetadata(tags: string[]): string[] {
+  return [...new Set(tags.map(tag => String(tag).trim()).filter(Boolean))].sort();
+}
+
+async function entryMetadataFingerprint(input: {
+  source: string;
+  tags: string[];
+}): Promise<string> {
+  return contentFingerprint(JSON.stringify({
+    source: input.source,
+    tags: normalizeTagsForMetadata(input.tags),
+  }));
 }
 
 async function findExactDuplicateId(
@@ -860,7 +954,8 @@ export async function checkDuplicateAndContradiction(content: string, env: Env):
   mergeAction: MergeAction | null;
 }> {
   const sample = getDuplicateCheckSample(content);
-  const values = await embed(sample, env);
+  const snapshot = await loadActiveEmbeddingSnapshot(env);
+  const values = await embedWithProvider(snapshot.provider, sample, "query");
   const queried = env.SELFHOST === "1"
     ? await (env.VECTORIZE as any).query(values, { topK: 50, returnMetadata: "all", queryText: sample })
     : await env.VECTORIZE.query(values, { topK: 50, returnMetadata: "all" });
@@ -1490,6 +1585,7 @@ interface VectorizeQueueRow {
 interface PreparedEntryVectorBatchItem extends PreparedEntryVectors {
   row: VectorizeQueueRow;
   contentHash?: string;
+  metadataHash?: string;
   pendingRevisionId?: string;
 }
 
@@ -1514,11 +1610,14 @@ async function prepareEntryVectors(
   generation?: string,
   embeddingFingerprint?: string,
   embeddingRole: EmbeddingProfileRole = "active",
-  pendingRevisionId?: string
+  pendingRevisionId?: string,
+  embeddingProvider?: EmbeddingProvider
 ): Promise<PreparedEntryVectors> {
   const chunks = chunkText(content);
   const vectorBaseId = generation ? `g-${generation}` : id;
-  const embeddings = await embedMany(chunks, env, "document", embeddingRole);
+  const embeddings = embeddingProvider
+    ? await embedManyWithProvider(embeddingProvider, chunks, "document")
+    : await embedMany(chunks, env, "document", embeddingRole);
 
   const vectors = chunks.map((chunk, i) => {
     const metadata: Record<string, any> = {
@@ -1610,6 +1709,7 @@ async function prepareEntryVectorBatch(
   options: {
     embeddingFingerprint?: string;
     embeddingRole?: EmbeddingProfileRole;
+    embeddingProvider?: EmbeddingProvider;
     includeContentHash?: boolean;
     includePendingRevisionId?: boolean;
   } = {}
@@ -1624,19 +1724,24 @@ async function prepareEntryVectorBatch(
     const contentHash = options.includeContentHash
       ? row.content_hash ?? await contentFingerprint(row.content)
       : undefined;
+    const metadataHash = options.includeContentHash
+      ? await entryMetadataFingerprint({ source: row.source, tags })
+      : undefined;
     const pendingRevisionId = options.includePendingRevisionId
       ? crypto.randomUUID()
       : undefined;
-    return { row, tags, chunks, vectorBaseId, contentHash, pendingRevisionId };
+    return { row, tags, chunks, vectorBaseId, contentHash, metadataHash, pendingRevisionId };
   }));
 
   const texts = plans.flatMap((plan) => plan.chunks);
-  const embeddings = await embedMany(
-    texts,
-    env,
-    "document",
-    options.embeddingRole ?? "active"
-  );
+  const embeddings = options.embeddingProvider
+    ? await embedManyWithProvider(options.embeddingProvider, texts, "document")
+    : await embedMany(
+        texts,
+        env,
+        "document",
+        options.embeddingRole ?? "active"
+      );
   if (embeddings.length !== texts.length) {
     throw new Error(
       `Embedding batch size mismatch: expected ${texts.length}, got ${embeddings.length}`
@@ -1674,6 +1779,7 @@ async function prepareEntryVectorBatch(
     return {
       row: plan.row,
       contentHash: plan.contentHash,
+      metadataHash: plan.metadataHash,
       pendingRevisionId: plan.pendingRevisionId,
       vectors,
       vectorIds: vectors.map((vector) => vector.id),
@@ -1688,12 +1794,14 @@ async function storePendingEntryVectors(
   rebuildId: string
 ): Promise<string[]> {
   const hash = row.content_hash ?? await contentFingerprint(row.content);
+  const tags = JSON.parse(row.tags) as string[];
+  const metadataHash = await entryMetadataFingerprint({ source: row.source, tags });
   const pendingRevisionId = crypto.randomUUID();
   const prepared = await prepareEntryVectors(
     env,
     row.id,
     row.content,
-    JSON.parse(row.tags),
+    tags,
     row.source,
     row.created_at,
     createVectorGeneration(),
@@ -1716,24 +1824,32 @@ async function storePendingEntryVectors(
            pending_embedding_fingerprint = ?,
            pending_content_hash = ?,
            pending_revision_id = ?,
-           content_hash = COALESCE(content_hash, ?)
+           pending_metadata_hash = ?,
+           content_hash = COALESCE(content_hash, ?),
+           metadata_hash = ?
        WHERE id = ?
          AND pending_vector_ids = ?
          AND pending_embedding_fingerprint = ?
          AND pending_rebuild_id = ?
          AND content = ?
+         AND tags = ?
+         AND source = ?
          AND tags NOT LIKE '%"status:deprecated"%'`
     ).bind(
       JSON.stringify(prepared.vectorIds),
       pendingFingerprint,
       hash,
       pendingRevisionId,
+      metadataHash,
       hash,
+      metadataHash,
       row.id,
       "[]",
       pendingFingerprint,
       rebuildId,
-      row.content
+      row.content,
+      row.tags,
+      row.source
     ).run();
     if (result.meta?.changes === 0) {
       await cleanupPreparedVectors(env, prepared.vectorIds, "Stale pending vector write");
@@ -1772,6 +1888,10 @@ async function storePendingEntryVectorBatch(
   let skipped = 0;
   for (const item of prepared) {
     const hash = item.contentHash ?? await contentFingerprint(item.row.content);
+    const metadataHash = item.metadataHash ?? await entryMetadataFingerprint({
+      source: item.row.source,
+      tags: JSON.parse(item.row.tags) as string[],
+    });
     try {
       const result = await env.DB.prepare(
         `UPDATE entries
@@ -1779,24 +1899,32 @@ async function storePendingEntryVectorBatch(
              pending_embedding_fingerprint = ?,
              pending_content_hash = ?,
              pending_revision_id = ?,
-             content_hash = COALESCE(content_hash, ?)
+             pending_metadata_hash = ?,
+             content_hash = COALESCE(content_hash, ?),
+             metadata_hash = ?
          WHERE id = ?
            AND pending_vector_ids = ?
            AND pending_embedding_fingerprint = ?
            AND pending_rebuild_id = ?
            AND content = ?
+           AND tags = ?
+           AND source = ?
            AND tags NOT LIKE '%"status:deprecated"%'`
       ).bind(
         JSON.stringify(item.vectorIds),
         pendingFingerprint,
         hash,
         item.pendingRevisionId ?? crypto.randomUUID(),
+        metadataHash,
         hash,
+        metadataHash,
         item.row.id,
         "[]",
         pendingFingerprint,
         rebuildId,
-        item.row.content
+        item.row.content,
+        item.row.tags,
+        item.row.source
       ).run();
       if (result.meta?.changes === 0) {
         await cleanupPreparedVectors(env, item.vectorIds, "Stale pending vector batch write");
@@ -1828,7 +1956,10 @@ async function countPendingActivationConflicts(
          pending_content_hash IS NULL OR
          content_hash IS NULL OR
          pending_revision_id IS NULL OR
-         pending_content_hash != content_hash
+         metadata_hash IS NULL OR
+         pending_metadata_hash IS NULL OR
+         pending_content_hash != content_hash OR
+         pending_metadata_hash != metadata_hash
        )`
   ).bind(pendingFingerprint, rebuildId).first() as Record<string, any> | null;
   return Number(row?.count ?? 0);
@@ -1920,6 +2051,10 @@ function cleanupRetryDelayMs(attempts: number): number {
   return Math.min(24 * 60 * 60 * 1000, 60_000 * 2 ** Math.max(0, attempts));
 }
 
+function referencedVectorRetryDelayMs(attempts: number): number {
+  return Math.min(24 * 60 * 60 * 1000, 5 * 60_000 * 2 ** Math.max(0, Math.min(attempts, 8)));
+}
+
 async function loadCurrentVectorRebuild(
   env: Env,
   pendingFingerprint?: string | null
@@ -1988,6 +2123,7 @@ async function attachEntryToOpenVectorRebuild(
          pending_embedding_fingerprint = ?,
          pending_content_hash = NULL,
          pending_revision_id = NULL,
+         pending_metadata_hash = NULL,
          pending_rebuild_id = ?
      WHERE id = ?
        AND tags NOT LIKE '%"status:deprecated"%'
@@ -2030,7 +2166,10 @@ async function inspectPendingActivationIntegrity(
          AND pending_vector_ids != '[]'
          AND pending_content_hash IS NOT NULL
          AND pending_revision_id IS NOT NULL
-         AND content_hash = pending_content_hash`
+         AND pending_metadata_hash IS NOT NULL
+         AND metadata_hash IS NOT NULL
+         AND content_hash = pending_content_hash
+         AND metadata_hash = pending_metadata_hash`
     ).bind(pendingFingerprint, rebuildId).first() as Promise<Record<string, any> | null>,
     countPendingActivationConflicts(env, pendingFingerprint, rebuildId),
   ]);
@@ -2054,7 +2193,10 @@ async function listPendingActivationRows(
        AND pending_vector_ids != '[]'
        AND pending_content_hash IS NOT NULL
        AND pending_revision_id IS NOT NULL
-       AND content_hash = pending_content_hash`
+       AND pending_metadata_hash IS NOT NULL
+       AND metadata_hash IS NOT NULL
+       AND content_hash = pending_content_hash
+       AND metadata_hash = pending_metadata_hash`
   ).bind(pendingFingerprint, rebuildId).all<PendingActivationRow>();
   return (results ?? []) as PendingActivationRow[];
 }
@@ -2169,19 +2311,22 @@ async function prepareVectorCleanupBatches(
   const now = Date.now();
   let batches = 0;
   for (const chunk of chunkArray(ids, VECTOR_CLEANUP_BATCH_SIZE)) {
-    await env.DB.prepare(
-      `INSERT INTO sb_vector_cleanup_batches (
-         id, rebuild_id, vector_ids_json, state, attempts, next_attempt_at, last_error, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, 0, NULL, NULL, ?, ?)`
+    const normalized = [...new Set(chunk)].sort();
+    const hash = await contentFingerprint(`${rebuildId}\n${normalized.join("\n")}`);
+    const result = await env.DB.prepare(
+      `INSERT OR IGNORE INTO sb_vector_cleanup_batches (
+         id, rebuild_id, vector_ids_json, vector_ids_hash, state, attempts, next_attempt_at, last_error, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?)`
     ).bind(
-      crypto.randomUUID(),
+      `cleanup-${rebuildId}-${hash}`,
       rebuildId,
-      JSON.stringify(chunk),
+      JSON.stringify(normalized),
+      hash,
       state,
       now,
       now
     ).run();
-    batches++;
+    batches += Number(result.meta?.changes ?? 0);
   }
   return { batches, vectors: ids.length };
 }
@@ -2284,7 +2429,7 @@ async function processVectorCleanupQueue(
   const { results } = await env.DB.prepare(
     `SELECT vector_id, attempts
      FROM sb_vector_cleanup_queue
-     WHERE state = 'ready'
+     WHERE state IN ('ready', 'blocked')
        AND COALESCE(next_attempt_at, 0) <= ?
      ORDER BY created_at ASC
      LIMIT ?`
@@ -2307,15 +2452,24 @@ async function processVectorCleanupQueue(
     if (referenced.length) {
       blocked += referenced.length;
       const updatedAt = Date.now();
-      await env.DB.batch(referenced.map(id =>
-        env.DB.prepare(
+      const attemptsById = new Map(batch.map(row => [row.vector_id, Number(row.attempts ?? 0)]));
+      await env.DB.batch(referenced.map(id => {
+        const attempts = attemptsById.get(id) ?? 0;
+        return env.DB.prepare(
           `UPDATE sb_vector_cleanup_queue
            SET state = 'blocked',
+               attempts = attempts + 1,
+               next_attempt_at = ?,
                last_error = ?,
                updated_at = ?
            WHERE vector_id = ?`
-        ).bind("vector_still_referenced", updatedAt, id)
-      ));
+        ).bind(
+          updatedAt + referencedVectorRetryDelayMs(attempts),
+          "vector_still_referenced",
+          updatedAt,
+          id
+        );
+      }));
     }
     if (!deletable.length) continue;
     try {
@@ -2398,7 +2552,10 @@ async function activatePendingVectorsAndSettings(
                OR pending_content_hash IS NULL
                OR content_hash IS NULL
                OR pending_revision_id IS NULL
+               OR metadata_hash IS NULL
+               OR pending_metadata_hash IS NULL
                OR pending_content_hash != content_hash
+               OR pending_metadata_hash != metadata_hash
              )
          )`
     ).bind(now, rebuildId, rebuildId),
@@ -2406,10 +2563,12 @@ async function activatePendingVectorsAndSettings(
       `UPDATE entries
        SET vector_ids = pending_vector_ids,
            embedding_fingerprint = pending_embedding_fingerprint,
+           metadata_hash = pending_metadata_hash,
            pending_vector_ids = NULL,
            pending_embedding_fingerprint = NULL,
            pending_content_hash = NULL,
            pending_revision_id = NULL,
+           pending_metadata_hash = NULL,
            pending_rebuild_id = NULL
        WHERE pending_rebuild_id = ?
          AND EXISTS (
@@ -2569,6 +2728,7 @@ async function cancelVectorRebuild(
            pending_embedding_fingerprint = NULL,
            pending_content_hash = NULL,
            pending_revision_id = NULL,
+           pending_metadata_hash = NULL,
            pending_rebuild_id = NULL
        WHERE pending_embedding_fingerprint = ?`
     ).bind(pendingFingerprint),
@@ -2605,6 +2765,149 @@ async function cancelVectorRebuild(
   };
 }
 
+function summarizeVectorRuntimeStates(
+  rows: Record<string, unknown>[],
+  states: string[]
+): Record<string, number> {
+  const summary: Record<string, number> = { total: 0 };
+  for (const state of states) summary[state] = 0;
+  for (const row of rows) {
+    const state = String(row.state ?? "unknown");
+    const count = Number(row.count ?? 0);
+    summary[state] = (summary[state] ?? 0) + count;
+    summary.total += count;
+  }
+  return summary;
+}
+
+async function loadVectorRuntimeSnapshot(env: Env, now = Date.now()) {
+  const [
+    vectorRebuild,
+    vectorCleanupQueueRows,
+    vectorCleanupBatchRows,
+    vectorCleanupQueueDue,
+    vectorCleanupBatchDue,
+  ] = await Promise.all([
+    env.DB.prepare(
+      `SELECT r.id, r.state, r.active_fingerprint, r.pending_fingerprint,
+              r.expected_entries, r.processed_entries, r.failed_entries,
+              r.conflict_entries, r.last_error, r.created_at, r.updated_at,
+              (SELECT COUNT(*) FROM entries e
+               WHERE e.pending_rebuild_id = r.id
+                 AND e.tags NOT LIKE '%"status:deprecated"%') as joined_entries,
+              (SELECT COUNT(*) FROM entries e
+               WHERE e.pending_rebuild_id = r.id
+                 AND e.pending_vector_ids IS NOT NULL
+                 AND e.pending_vector_ids != '[]'
+                 AND e.pending_content_hash IS NOT NULL
+                 AND e.pending_revision_id IS NOT NULL
+                 AND e.pending_metadata_hash IS NOT NULL
+                 AND e.content_hash = e.pending_content_hash
+                 AND e.metadata_hash = e.pending_metadata_hash
+                 AND e.tags NOT LIKE '%"status:deprecated"%') as ready_entries,
+              (SELECT COUNT(*) FROM entries e
+               WHERE e.pending_rebuild_id = r.id
+                 AND (e.pending_vector_ids IS NULL OR e.pending_vector_ids = '[]')
+                 AND e.tags NOT LIKE '%"status:deprecated"%') as missing_entries,
+              (SELECT COUNT(*) FROM entries e
+               WHERE e.pending_rebuild_id = r.id
+                 AND e.pending_vector_ids IS NOT NULL
+                 AND e.pending_vector_ids != '[]'
+                 AND (
+                   e.pending_content_hash IS NULL
+                   OR e.pending_revision_id IS NULL
+                   OR e.pending_metadata_hash IS NULL
+                   OR e.content_hash IS NULL
+                   OR e.metadata_hash IS NULL
+                   OR e.content_hash != e.pending_content_hash
+                   OR e.metadata_hash != e.pending_metadata_hash
+                 )
+                 AND e.tags NOT LIKE '%"status:deprecated"%') as live_conflict_entries
+       FROM sb_vector_rebuilds r
+       WHERE r.slot = 'current'
+       LIMIT 1`
+    ).first<Record<string, unknown>>(),
+    env.DB.prepare(
+      `SELECT state, COUNT(*) as count
+       FROM sb_vector_cleanup_queue
+       GROUP BY state`
+    ).all(),
+    env.DB.prepare(
+      `SELECT state, COUNT(*) as count
+       FROM sb_vector_cleanup_batches
+       GROUP BY state`
+    ).all(),
+    env.DB.prepare(
+      `SELECT COUNT(*) as count
+       FROM sb_vector_cleanup_queue
+       WHERE state = 'ready'
+         AND COALESCE(next_attempt_at, 0) <= ?`
+    ).bind(now).first<{ count: number }>(),
+    env.DB.prepare(
+      `SELECT COUNT(*) as count
+       FROM sb_vector_cleanup_batches
+       WHERE state = 'ready'
+         AND COALESCE(next_attempt_at, 0) <= ?`
+    ).bind(now).first<{ count: number }>(),
+  ]);
+
+  const serializeVectorRebuild = (row: Record<string, unknown>) => ({
+    id: String(row.id),
+    state: String(row.state),
+    active_fingerprint: String(row.active_fingerprint ?? ""),
+    pending_fingerprint: String(row.pending_fingerprint ?? ""),
+    expected_entries: Number(row.expected_entries ?? 0),
+    processed_entries: Number(row.processed_entries ?? 0),
+    failed_entries: Number(row.failed_entries ?? 0),
+    conflict_entries: Number(row.conflict_entries ?? 0),
+    live_conflict_entries: Number(row.live_conflict_entries ?? 0),
+    joined_entries: Number(row.joined_entries ?? 0),
+    ready_entries: Number(row.ready_entries ?? 0),
+    missing_entries: Number(row.missing_entries ?? 0),
+    last_error: row.last_error ? String(row.last_error) : null,
+    created_at: Number(row.created_at ?? 0),
+    updated_at: Number(row.updated_at ?? 0),
+  });
+  const serializedVectorRebuild = vectorRebuild
+    ? serializeVectorRebuild(vectorRebuild)
+    : null;
+  const activeVectorRebuild = serializedVectorRebuild &&
+    !["active", "cancelled", "failed"].includes(serializedVectorRebuild.state)
+    ? serializedVectorRebuild
+    : null;
+  const localIndexStatus = (env.VECTORIZE as any).indexStatus?.();
+
+  return {
+    rebuild: activeVectorRebuild,
+    last_rebuild: serializedVectorRebuild,
+    cleanup: {
+      queue: {
+        ...summarizeVectorRuntimeStates(
+          (vectorCleanupQueueRows.results ?? []) as Record<string, unknown>[],
+          ["ready", "blocked", "failed", "completed"]
+        ),
+        due: Number(vectorCleanupQueueDue?.count ?? 0),
+      },
+      batches: {
+        ...summarizeVectorRuntimeStates(
+          (vectorCleanupBatchRows.results ?? []) as Record<string, unknown>[],
+          ["prepared", "ready", "processing", "blocked", "failed", "completed"]
+        ),
+        due: Number(vectorCleanupBatchDue?.count ?? 0),
+      },
+    },
+    local_index: localIndexStatus ? {
+      vectorCount: Number(localIndexStatus.vectorCount ?? 0),
+      ftsAvailable: Boolean(localIndexStatus.ftsAvailable),
+      ftsTokenizer: localIndexStatus.ftsTokenizer ?? null,
+      ftsIndexed: Number(localIndexStatus.ftsIndexed ?? 0),
+      vecAvailable: Boolean(localIndexStatus.vecAvailable),
+      vecIndexed: Number(localIndexStatus.vecIndexed ?? 0),
+      remaining: Number(localIndexStatus.remaining ?? 0),
+    } : null,
+  };
+}
+
 // ─── Store entry (full embed + chunk) ────────────────────────────────────────
 // Returns the list of vector IDs inserted so forget() can clean up exactly.
 
@@ -2616,6 +2919,7 @@ async function storeEntry(
   source: string,
   now: number
 ): Promise<string[]> {
+  const snapshot = await loadActiveEmbeddingSnapshot(env);
   const prepared = await prepareEntryVectors(
     env,
     id,
@@ -2623,7 +2927,11 @@ async function storeEntry(
     tags,
     source,
     now,
-    createVectorGeneration()
+    createVectorGeneration(),
+    snapshot.fingerprint,
+    "active",
+    undefined,
+    snapshot.provider
   );
   try {
     await insertPreparedVectors(env, prepared);
@@ -2633,6 +2941,7 @@ async function storeEntry(
   }
 
   try {
+    const metadataHash = await entryMetadataFingerprint({ source, tags });
     // Initial vectorization runs in waitUntil() and can finish after a manual
     // update has already activated a newer generation. Commit only while the
     // entry still points at the empty generation; a stale writer must never
@@ -2640,15 +2949,29 @@ async function storeEntry(
     const result = await env.DB.prepare(
       `UPDATE entries
        SET vector_ids = ?,
+           embedding_fingerprint = ?,
+           metadata_hash = ?,
            pending_content_hash = NULL,
-           pending_revision_id = NULL
+           pending_revision_id = NULL,
+           pending_metadata_hash = NULL
        WHERE id = ? AND vector_ids = ? AND content = ?
-         AND tags NOT LIKE '%"status:deprecated"%'`
+         AND tags NOT LIKE '%"status:deprecated"%'
+         AND (
+           NOT EXISTS (SELECT 1 FROM sb_app_settings WHERE key = 'model_settings')
+           OR EXISTS (
+             SELECT 1 FROM sb_app_settings
+             WHERE key = 'model_settings'
+               AND COALESCE(json_extract(value, '$.embeddingFingerprint'), '') = ?
+           )
+         )`
     ).bind(
       JSON.stringify(prepared.vectorIds),
+      snapshot.fingerprint,
+      metadataHash,
       id,
       "[]",
-      content
+      content,
+      snapshot.fingerprint
     ).run();
     if (result.meta?.changes === 0) {
       await cleanupPreparedVectors(env, prepared.vectorIds, "Stale initial vector write");
@@ -2668,8 +2991,11 @@ async function storeEntryVectorBatch(
   rows: VectorizeQueueRow[],
   _pendingFingerprint: string | null
 ): Promise<VectorizeBatchResult> {
+  const snapshot = await loadActiveEmbeddingSnapshot(env);
   const prepared = await prepareEntryVectorBatch(env, rows, {
     embeddingRole: "active",
+    embeddingFingerprint: snapshot.fingerprint,
+    embeddingProvider: snapshot.provider,
   });
   const allVectorIds = prepared.flatMap((item) => item.vectorIds);
   try {
@@ -2684,18 +3010,36 @@ async function storeEntryVectorBatch(
   let skipped = 0;
   for (const item of prepared) {
     try {
+      const metadataHash = await entryMetadataFingerprint({
+        source: item.row.source,
+        tags: JSON.parse(item.row.tags) as string[],
+      });
       const result = await env.DB.prepare(
         `UPDATE entries
          SET vector_ids = ?,
+             embedding_fingerprint = ?,
+             metadata_hash = ?,
              pending_content_hash = NULL,
-             pending_revision_id = NULL
+             pending_revision_id = NULL,
+             pending_metadata_hash = NULL
          WHERE id = ? AND vector_ids = ? AND content = ?
-           AND tags NOT LIKE '%"status:deprecated"%'`
+           AND tags NOT LIKE '%"status:deprecated"%'
+           AND (
+             NOT EXISTS (SELECT 1 FROM sb_app_settings WHERE key = 'model_settings')
+             OR EXISTS (
+               SELECT 1 FROM sb_app_settings
+               WHERE key = 'model_settings'
+                 AND COALESCE(json_extract(value, '$.embeddingFingerprint'), '') = ?
+             )
+           )`
       ).bind(
         JSON.stringify(item.vectorIds),
+        snapshot.fingerprint,
+        metadataHash,
         item.row.id,
         "[]",
-        item.row.content
+        item.row.content,
+        snapshot.fingerprint
       ).run();
       if (result.meta?.changes === 0) {
         await cleanupPreparedVectors(env, item.vectorIds, "Stale initial vector batch write");
@@ -2742,9 +3086,11 @@ interface CommitEntryVersionInput {
  */
 async function commitEntryVersion(
   env: Env,
-  input: CommitEntryVersionInput
+  input: CommitEntryVersionInput,
+  attempt = 0
 ): Promise<string[]> {
   const now = Date.now();
+  const snapshot = await loadActiveEmbeddingSnapshot(env);
   const prepared = await prepareEntryVectors(
     env,
     input.id,
@@ -2752,7 +3098,11 @@ async function commitEntryVersion(
     input.newTags,
     input.source,
     now,
-    createVectorGeneration()
+    createVectorGeneration(),
+    snapshot.fingerprint,
+    "active",
+    undefined,
+    snapshot.provider
   );
 
   try {
@@ -2807,33 +3157,65 @@ async function commitEntryVersion(
   let switchResult: D1Result;
   try {
     const newHash = await contentFingerprint(input.newContent);
+    const metadataHash = await entryMetadataFingerprint({
+      source: input.source,
+      tags: input.newTags,
+    });
+    const staleIds = [...new Set([
+      ...activeOldVectorIds.filter((id) => !prepared.vectorIds.includes(id)),
+      ...oldPendingVectorIds,
+    ])];
+    const cleanupStatements = staleIds.map((vectorId) =>
+      prepareVectorCleanupQueueInsert(env, {
+        id: crypto.randomUUID(),
+        vectorId,
+        reason: "entry_version_switch",
+        state: "ready",
+        rebuildId: openRebuild?.id ?? null,
+        now,
+      })
+    );
     const results = await env.DB.batch([
       env.DB.prepare(
         `UPDATE entries
-         SET content = ?, tags = ?, vector_ids = ?, content_hash = ?
+         SET content = ?, tags = ?, vector_ids = ?, embedding_fingerprint = ?, content_hash = ?
+             , metadata_hash = ?
              , pending_vector_ids = ?, pending_embedding_fingerprint = ?
              , pending_content_hash = NULL
              , pending_revision_id = NULL
+             , pending_metadata_hash = NULL
              , pending_rebuild_id = ?
              , classification_status = 'pending', classification_error = NULL
              , classification_attempts = 0, classification_next_attempt_at = NULL
              , classification_started_at = NULL, classification_confidence = NULL
              , classified_at = NULL
-         WHERE id = ? AND content = ? AND tags = ? AND vector_ids = ?`
+         WHERE id = ? AND content = ? AND tags = ? AND vector_ids = ?
+           AND (
+             NOT EXISTS (SELECT 1 FROM sb_app_settings WHERE key = 'model_settings')
+             OR EXISTS (
+               SELECT 1 FROM sb_app_settings
+               WHERE key = 'model_settings'
+                 AND COALESCE(json_extract(value, '$.embeddingFingerprint'), '') = ?
+             )
+           )`
       ).bind(
         input.newContent,
         JSON.stringify(input.newTags),
         JSON.stringify(prepared.vectorIds),
+        snapshot.fingerprint,
         newHash,
+        metadataHash,
         openRebuild ? "[]" : null,
         openRebuild?.pendingFingerprint ?? null,
         openRebuild?.id ?? null,
         input.id,
         input.oldContent,
         activeTagsJson,
-        JSON.stringify(activeOldVectorIds)
+        JSON.stringify(activeOldVectorIds),
+        snapshot.fingerprint
       ),
       revision.statement,
+      ...cleanupStatements,
     ]);
     switchResult = results[0];
   } catch (error) {
@@ -2842,6 +3224,9 @@ async function commitEntryVersion(
   }
   if (switchResult.meta?.changes === 0) {
     await cleanupPreparedVectors(env, prepared.vectorIds, "Stale version switch");
+    if (attempt < 1 && !(await isActiveEmbeddingSnapshotCurrent(env, snapshot))) {
+      return commitEntryVersion(env, input, attempt + 1);
+    }
     throw new Error("Entry changed while the new vector generation was being prepared");
   }
   if (openRebuild && !wasInOpenRebuild) {
@@ -2852,18 +3237,6 @@ async function commitEntryVersion(
        WHERE id = ?
          AND state IN ('queued', 'building', 'ready')`
     ).bind(Date.now(), openRebuild.id).run();
-  }
-
-  try {
-    await deleteStaleVectors(env, activeOldVectorIds, prepared.vectorIds);
-    if (oldPendingVectorIds.length) {
-      await cleanupPreparedVectors(env, oldPendingVectorIds, "Old pending vector cleanup");
-    }
-  } catch (error) {
-    // The new generation is already active. Retrieval validates every dense
-    // match against D1 vector_ids, so these old vectors become excluded cleanup
-    // debt; never roll back the committed fact merely to hide that debt.
-    console.error("Old vector cleanup failed (non-fatal):", error);
   }
 
   return prepared.vectorIds;
@@ -2882,7 +3255,8 @@ async function appendToEntry(
   existingContent: string,
   addition: string,
   tags: string[],
-  source: string
+  source: string,
+  attempt = 0
 ): Promise<string> {
   if (getStatus(tags) === "deprecated") {
     throw new Error("Cannot append to a deprecated memory");
@@ -2913,7 +3287,8 @@ async function appendToEntry(
   // ── Normal append-only path (combined content ≤ CHUNK_MAX_CHARS) ────────────
   const newChunkId = `u-${createVectorGeneration()}`;
 
-  const values = await embed(addition, env);
+  const snapshot = await loadActiveEmbeddingSnapshot(env);
+  const values = await embedWithProvider(snapshot.provider, addition, "document");
 
   const metadata: Record<string, any> = {
     content: addition,
@@ -2922,6 +3297,7 @@ async function appendToEntry(
     tags,
     source,
     created_at: Date.now(),
+    embedding_fingerprint: snapshot.fingerprint,
   };
 
   tags.forEach(t => {
@@ -2978,32 +3354,57 @@ async function appendToEntry(
   let switchResult: D1Result;
   try {
     const newHash = await contentFingerprint(newContent);
+    const metadataHash = await entryMetadataFingerprint({ source, tags });
+    const cleanupStatements = [...new Set(oldPendingVectorIds)].map((vectorId) =>
+      prepareVectorCleanupQueueInsert(env, {
+        id: crypto.randomUUID(),
+        vectorId,
+        reason: "entry_version_switch",
+        state: "ready",
+        rebuildId: openRebuild?.id ?? null,
+        now: Date.now(),
+      })
+    );
     const results = await env.DB.batch([
       env.DB.prepare(
         `UPDATE entries
-         SET content = ?, vector_ids = ?, content_hash = ?
+         SET content = ?, vector_ids = ?, embedding_fingerprint = ?, content_hash = ?
+             , metadata_hash = ?
              , pending_vector_ids = ?, pending_embedding_fingerprint = ?
              , pending_content_hash = NULL
              , pending_revision_id = NULL
+             , pending_metadata_hash = NULL
              , pending_rebuild_id = ?
              , classification_status = 'pending', classification_error = NULL
              , classification_attempts = 0, classification_next_attempt_at = NULL
              , classification_started_at = NULL, classification_confidence = NULL
              , classified_at = NULL
-         WHERE id = ? AND content = ? AND tags = ? AND vector_ids = ?`
+         WHERE id = ? AND content = ? AND tags = ? AND vector_ids = ?
+           AND (
+             NOT EXISTS (SELECT 1 FROM sb_app_settings WHERE key = 'model_settings')
+             OR EXISTS (
+               SELECT 1 FROM sb_app_settings
+               WHERE key = 'model_settings'
+                 AND COALESCE(json_extract(value, '$.embeddingFingerprint'), '') = ?
+             )
+           )`
       ).bind(
         newContent,
         JSON.stringify([...activeVectorIds, newChunkId]),
+        snapshot.fingerprint,
         newHash,
+        metadataHash,
         openRebuild ? "[]" : null,
         openRebuild?.pendingFingerprint ?? null,
         openRebuild?.id ?? null,
         id,
         existingContent,
         activeTagsJson,
-        JSON.stringify(activeVectorIds)
+        JSON.stringify(activeVectorIds),
+        snapshot.fingerprint
       ),
       appendRevision.statement,
+      ...cleanupStatements,
     ]);
     switchResult = results[0];
   } catch (error) {
@@ -3012,6 +3413,9 @@ async function appendToEntry(
   }
   if (switchResult.meta?.changes === 0) {
     await cleanupPreparedVectors(env, [newChunkId], "Stale append");
+    if (attempt < 1 && !(await isActiveEmbeddingSnapshotCurrent(env, snapshot))) {
+      return appendToEntry(env, id, existingContent, addition, tags, source, attempt + 1);
+    }
     throw new Error("Entry changed while the append vector was being prepared");
   }
   if (openRebuild && !wasInOpenRebuild) {
@@ -3022,9 +3426,6 @@ async function appendToEntry(
        WHERE id = ?
          AND state IN ('queued', 'building', 'ready')`
     ).bind(Date.now(), openRebuild.id).run();
-  }
-  if (oldPendingVectorIds.length) {
-    await cleanupPreparedVectors(env, oldPendingVectorIds, "Old pending append vector cleanup");
   }
   return newContent;
 }
@@ -3258,7 +3659,7 @@ export async function compressTag(
   await env.DB.batch([
     ...digestRelations.map(item => item.statement),
     ...rollups.map(({ row, nextTags }) =>
-      env.DB.prepare(`UPDATE entries SET tags = ? WHERE id = ?`)
+      env.DB.prepare(`UPDATE entries SET tags = ?, metadata_hash = NULL WHERE id = ?`)
         .bind(JSON.stringify(nextTags), row.id)
     ),
     ...rollupRevisions.map(item => item.statement),
@@ -3654,26 +4055,40 @@ async function lexicalVectorRows(
   for (let i = 0; i < vectorIds.length; i += VECTORIZE_GET_BY_IDS_BATCH) {
     vectors.push(...await env.VECTORIZE.getByIds(vectorIds.slice(i, i + VECTORIZE_GET_BY_IDS_BATCH)));
   }
-  const orderedParentIds = [...new Set(
-    vectors.map((vector) => String((vector.metadata as any)?.parentId ?? vector.id))
-  )].filter(Boolean);
+  const orderedPairs = vectors.map((vector) => ({
+    vectorId: vector.id,
+    parentId: String((vector.metadata as any)?.parentId ?? vector.id),
+  })).filter((pair) => pair.vectorId && pair.parentId);
+  const orderedParentIds = [...new Set(orderedPairs.map((pair) => pair.parentId))];
   if (!orderedParentIds.length) return [];
-  const rows: KeywordRow[] = [];
+  const byId = new Map<string, KeywordRow & { vector_ids?: string }>();
   for (let i = 0; i < orderedParentIds.length; i += D1_MAX_BOUND_PARAMS) {
     const batch = orderedParentIds.slice(i, i + D1_MAX_BOUND_PARAMS);
     const placeholders = batch.map(() => "?").join(", ");
     const { results } = await env.DB.prepare(
-      `SELECT id, content, tags, source, created_at
+      `SELECT id, content, tags, source, created_at, vector_ids
        FROM entries
        WHERE id IN (${placeholders})
          AND tags NOT LIKE '%"status:deprecated"%'
          AND tags NOT LIKE '%"auto-pattern"%'`
-    ).bind(...batch).all<KeywordRow>();
-    const byId = new Map((results ?? []).map((row) => [row.id, row]));
-    for (const id of batch) {
-      const row = byId.get(id);
-      if (row) rows.push(row);
-    }
+    ).bind(...batch).all<KeywordRow & { vector_ids?: string }>();
+    for (const row of results ?? []) byId.set(row.id, row);
+  }
+  const rows: KeywordRow[] = [];
+  const seenParents = new Set<string>();
+  for (const pair of orderedPairs) {
+    if (seenParents.has(pair.parentId)) continue;
+    const row = byId.get(pair.parentId);
+    if (!row) continue;
+    if (!parseVectorIds(row.vector_ids).includes(pair.vectorId)) continue;
+    seenParents.add(pair.parentId);
+    rows.push({
+      id: row.id,
+      content: row.content,
+      tags: row.tags,
+      source: row.source,
+      created_at: row.created_at,
+    });
   }
   return rows;
 }
@@ -4003,7 +4418,9 @@ export async function recallEntries(
   let embeddingFailed = false;
   let lexicalRows: KeywordRow[] = [];
   const [values, queryTags, graphSignals] = await Promise.all([
-    embed(embedQuery, env, "query").catch((error) => {
+    loadActiveEmbeddingSnapshot(env).then((snapshot) =>
+      embedWithProvider(snapshot.provider, embedQuery, "query")
+    ).catch((error) => {
       embeddingFailed = true;
       console.error("Recall embedding failed; continuing with keyword/graph recall:", error);
       return null;
@@ -4394,11 +4811,11 @@ async function classifyAndPersistEntry(
     const { importance, confidence, canonical, kind } = await classifyEntry(candidate.content, env);
     for (let tagCommitAttempt = 0; tagCommitAttempt < 2; tagCommitAttempt++) {
       const current = await env.DB.prepare(
-        `SELECT tags FROM entries
+        `SELECT tags, source FROM entries
          WHERE id = ? AND content = ?
            AND classification_status = 'processing'
            AND classification_started_at = ?`
-      ).bind(candidate.id, candidate.content, startedAt).first<{ tags: string }>();
+      ).bind(candidate.id, candidate.content, startedAt).first<{ tags: string; source: string }>();
       if (!current) return "skipped";
       const currentTagsJson = current.tags || "[]";
       const previousTags: string[] = JSON.parse(currentTagsJson);
@@ -4407,9 +4824,13 @@ async function classifyAndPersistEntry(
       tags = applyClassificationLifecycleTags(tags, canonical, confidence);
       const classifiedAt = Date.now();
       const nextTagsJson = JSON.stringify(tags);
+      const metadataHash = await entryMetadataFingerprint({
+        source: current.source,
+        tags,
+      });
       const updateResult = await env.DB.prepare(
         `UPDATE entries
-         SET tags = ?, importance_score = ?, classification_confidence = ?,
+         SET tags = ?, metadata_hash = ?, importance_score = ?, classification_confidence = ?,
              classification_status = 'succeeded', classification_error = NULL,
              classification_next_attempt_at = NULL, classification_started_at = NULL,
              classification_version = ?, classified_at = ?
@@ -4418,6 +4839,7 @@ async function classifyAndPersistEntry(
            AND classification_started_at = ?`
       ).bind(
         nextTagsJson,
+        metadataHash,
         importance,
         confidence,
         CURRENT_CLASSIFICATION_VERSION,
@@ -5414,11 +5836,12 @@ async function captureSingleFact(
   // Prefer extractor scores when present so scheduleClassify can still refine later.
   const importanceSeed = options.atomic?.importance ?? 0;
   const openRebuild = await loadOpenVectorRebuild(env);
+  const metadataHash = await entryMetadataFingerprint({ source, tags: finalTags });
 
   const insertStatement = env.DB.prepare(
-    `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, content_hash, importance_score)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  ).bind(id, c, JSON.stringify(finalTags), source, now, "[]", contentHash, importanceSeed);
+    `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, content_hash, metadata_hash, importance_score)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(id, c, JSON.stringify(finalTags), source, now, "[]", contentHash, metadataHash, importanceSeed);
   const revision = prepareMemoryRevision(env.DB, {
     memoryId: id,
     eventType: "ADD",
@@ -5451,6 +5874,7 @@ async function captureSingleFact(
              pending_embedding_fingerprint = ?,
              pending_content_hash = NULL,
              pending_revision_id = NULL,
+             pending_metadata_hash = NULL,
              pending_rebuild_id = ?
          WHERE id = ?
            AND tags NOT LIKE '%"status:deprecated"%'
@@ -5590,9 +6014,10 @@ async function captureSingleFact(
         reason: `Conflicts with canonical memory ${conflictId}`,
         actor: "system",
       });
+      const metadataHash = await entryMetadataFingerprint({ source, tags: nextTags });
       await env.DB.batch([
-        env.DB.prepare(`UPDATE entries SET tags = ? WHERE id = ?`)
-          .bind(JSON.stringify(nextTags), id),
+        env.DB.prepare(`UPDATE entries SET tags = ?, metadata_hash = ? WHERE id = ?`)
+          .bind(JSON.stringify(nextTags), metadataHash, id),
         statusRevision.statement,
       ]);
       try {
@@ -5768,8 +6193,17 @@ export type ForgetResult = ForgetMemoryResult;
 
 export async function forgetEntry(id: string, env: Env): Promise<ForgetResult> {
   return forgetMemoryGraph(id, env.DB, env.VECTORIZE, {
-    queueVectorCleanup: async (vectorIds, reason) => {
-      await enqueueVectorCleanup(env, vectorIds, reason, undefined, { state: "ready" });
+    prepareVectorCleanup: (vectorIds, reason) => {
+      const now = Date.now();
+      return [...new Set(vectorIds)].filter(Boolean).map((vectorId) =>
+        prepareVectorCleanupQueueInsert(env, {
+          id: crypto.randomUUID(),
+          vectorId,
+          reason,
+          state: "ready",
+          now,
+        })
+      );
     },
   });
 }
@@ -5828,6 +6262,7 @@ export async function deprecateEntry(
            pending_embedding_fingerprint = NULL,
            pending_content_hash = NULL,
            pending_revision_id = NULL,
+           pending_metadata_hash = NULL,
            pending_rebuild_id = NULL
        WHERE id = ?`
     ).bind(JSON.stringify(nextTags), "[]", id),
@@ -5862,6 +6297,10 @@ export async function applyStatus(id: string, status: MemoryStatus, env: Env): P
   let nextTags = withStatus(tags, status);
   nextTags = withStatusSource(nextTags, "user");
   nextTags = nextTags.filter(t => t !== CANONICAL_CANDIDATE_TAG);
+  const metadataHash = await entryMetadataFingerprint({
+    source: String(row.source ?? "api"),
+    tags: nextTags,
+  });
   const statusRevision = prepareMemoryRevision(env.DB, {
     memoryId: id,
     eventType: "STATUS",
@@ -5873,7 +6312,8 @@ export async function applyStatus(id: string, status: MemoryStatus, env: Env): P
     actor: "system",
   });
   await env.DB.batch([
-    env.DB.prepare(`UPDATE entries SET tags = ? WHERE id = ?`).bind(JSON.stringify(nextTags), id),
+    env.DB.prepare(`UPDATE entries SET tags = ?, metadata_hash = ? WHERE id = ?`)
+      .bind(JSON.stringify(nextTags), metadataHash, id),
     statusRevision.statement,
   ]);
   return true;
@@ -7393,6 +7833,15 @@ const defaultHandler = {
     if (url.pathname === "/import" && request.method === "POST") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const openRebuild = await loadOpenVectorRebuild(env);
+      if (openRebuild) {
+        return json({
+          ok: false,
+          error: "import_blocked_during_vector_rebuild",
+          rebuildId: openRebuild.id,
+          next: "等待向量重建完成或取消重建后再导入。",
+        }, 409);
+      }
 
       let body: unknown;
       try {
@@ -7909,6 +8358,7 @@ const defaultHandler = {
                pending_embedding_fingerprint = ?,
                pending_content_hash = NULL,
                pending_revision_id = NULL,
+               pending_metadata_hash = NULL,
                pending_rebuild_id = ?
            WHERE tags NOT LIKE '%"status:deprecated"%'`
         ).bind(pending, rebuildId),
@@ -7961,6 +8411,17 @@ const defaultHandler = {
       });
       await saveTelemetryConfig(env, config);
       return json({ ok: true, telemetry: config });
+    }
+
+    // GET /analytics/vector-runtime — lightweight vector rebuild / cleanup / local index status.
+    if (url.pathname === "/analytics/vector-runtime" && request.method === "GET") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+      return json({
+        ok: true,
+        generated_at: Date.now(),
+        vector_runtime: await loadVectorRuntimeSnapshot(env),
+      });
     }
 
     // GET /analytics/memory-overview — four-layer memory health and composition.
@@ -8100,7 +8561,9 @@ const defaultHandler = {
                      AND e.pending_vector_ids != '[]'
                      AND e.pending_content_hash IS NOT NULL
                      AND e.pending_revision_id IS NOT NULL
+                     AND e.pending_metadata_hash IS NOT NULL
                      AND e.content_hash = e.pending_content_hash
+                     AND e.metadata_hash = e.pending_metadata_hash
                      AND e.tags NOT LIKE '%"status:deprecated"%') as ready_entries,
                   (SELECT COUNT(*) FROM entries e
                    WHERE e.pending_rebuild_id = r.id
@@ -8113,8 +8576,11 @@ const defaultHandler = {
                      AND (
                        e.pending_content_hash IS NULL
                        OR e.pending_revision_id IS NULL
+                       OR e.pending_metadata_hash IS NULL
                        OR e.content_hash IS NULL
+                       OR e.metadata_hash IS NULL
                        OR e.content_hash != e.pending_content_hash
+                       OR e.metadata_hash != e.pending_metadata_hash
                      )
                      AND e.tags NOT LIKE '%"status:deprecated"%') as live_conflict_entries
            FROM sb_vector_rebuilds r
@@ -8191,6 +8657,31 @@ const defaultHandler = {
         .sort((a, b) => Number(b.created_at ?? 0) - Number(a.created_at ?? 0))
         .slice(0, 12);
 
+      const serializeVectorRebuild = (row: Record<string, unknown>) => ({
+        id: String(row.id),
+        state: String(row.state),
+        active_fingerprint: String(row.active_fingerprint ?? ""),
+        pending_fingerprint: String(row.pending_fingerprint ?? ""),
+        expected_entries: Number(row.expected_entries ?? 0),
+        processed_entries: Number(row.processed_entries ?? 0),
+        failed_entries: Number(row.failed_entries ?? 0),
+        conflict_entries: Number(row.conflict_entries ?? 0),
+        live_conflict_entries: Number(row.live_conflict_entries ?? 0),
+        joined_entries: Number(row.joined_entries ?? 0),
+        ready_entries: Number(row.ready_entries ?? 0),
+        missing_entries: Number(row.missing_entries ?? 0),
+        last_error: row.last_error ? String(row.last_error) : null,
+        created_at: Number(row.created_at ?? 0),
+        updated_at: Number(row.updated_at ?? 0),
+      });
+      const serializedVectorRebuild = vectorRebuild
+        ? serializeVectorRebuild(vectorRebuild)
+        : null;
+      const activeVectorRebuild = serializedVectorRebuild &&
+        !["active", "cancelled", "failed"].includes(serializedVectorRebuild.state)
+        ? serializedVectorRebuild
+        : null;
+
       return json({
         ok: true,
         generated_at: now,
@@ -8233,23 +8724,8 @@ const defaultHandler = {
           count: Number(row.count ?? 0),
         })),
         vector_runtime: {
-          rebuild: vectorRebuild ? {
-            id: String(vectorRebuild.id),
-            state: String(vectorRebuild.state),
-            active_fingerprint: String(vectorRebuild.active_fingerprint ?? ""),
-            pending_fingerprint: String(vectorRebuild.pending_fingerprint ?? ""),
-            expected_entries: Number(vectorRebuild.expected_entries ?? 0),
-            processed_entries: Number(vectorRebuild.processed_entries ?? 0),
-            failed_entries: Number(vectorRebuild.failed_entries ?? 0),
-            conflict_entries: Number(vectorRebuild.conflict_entries ?? 0),
-            live_conflict_entries: Number(vectorRebuild.live_conflict_entries ?? 0),
-            joined_entries: Number(vectorRebuild.joined_entries ?? 0),
-            ready_entries: Number(vectorRebuild.ready_entries ?? 0),
-            missing_entries: Number(vectorRebuild.missing_entries ?? 0),
-            last_error: vectorRebuild.last_error ? String(vectorRebuild.last_error) : null,
-            created_at: Number(vectorRebuild.created_at ?? 0),
-            updated_at: Number(vectorRebuild.updated_at ?? 0),
-          } : null,
+          rebuild: activeVectorRebuild,
+          last_rebuild: serializedVectorRebuild,
           cleanup: {
             queue: {
               ...summarizeStates(

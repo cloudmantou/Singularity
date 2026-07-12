@@ -3399,7 +3399,7 @@
                 <div class="obs-kpi-row" id="obs-kpi-row"></div>
                 <div class="obs-section" id="obs-vector-runtime-section">
                   <div class="obs-section-head">
-                    <h2>向量运行态</h2>
+                    <h2 data-i18n="obs.vector.title">向量运行态</h2>
                     <span class="sub" id="obs-vector-runtime-meta" style="font-size: 12px; color: var(--text-tertiary)">—</span>
                   </div>
                   <div class="obs-health-grid" id="obs-vector-runtime-grid"></div>
@@ -4026,6 +4026,7 @@
         document.getElementById('obs-tab-system')?.classList.toggle('active', _obsMode === 'system')
         document.getElementById('obs-view-memory')?.classList.toggle('active', _obsMode === 'memory')
         document.getElementById('obs-view-system')?.classList.toggle('active', _obsMode === 'system')
+        if (AUTH_TOKEN) obsRefresh()
       }
 
       async function obsApi(path) {
@@ -4051,22 +4052,29 @@
         const status = document.getElementById('obs-status-line')
         if (status) status.textContent = t('obs.refreshing')
         try {
-          const [data, timeseries, memoryOverview] = await Promise.all([
-            obsApi('/analytics/overview?hours=' + hours),
-            obsApi('/analytics/timeseries?hours=' + hours),
-            obsApi('/analytics/memory-overview'),
-          ])
-          obsRenderMemoryOverview(memoryOverview)
-          obsRenderKpi(data)
-          obsRenderCharts(timeseries.points || [])
-          obsRenderOps(data.top_operations || [])
-          await obsLoadLogs()
+          let data = null
+          if (_obsMode === 'memory') {
+            const memoryOverview = await obsApi('/analytics/memory-overview')
+            obsRenderMemoryOverview(memoryOverview)
+          } else {
+            const [overview, timeseries, vectorRuntime] = await Promise.all([
+              obsApi('/analytics/overview?hours=' + hours),
+              obsApi('/analytics/timeseries?hours=' + hours),
+              obsApi('/analytics/vector-runtime'),
+            ])
+            data = overview
+            obsRenderKpi(overview)
+            obsRenderCharts(timeseries.points || [])
+            obsRenderOps(overview.top_operations || [])
+            obsRenderVectorRuntime(vectorRuntime.vector_runtime || {})
+            await obsLoadLogs()
+          }
           if (status) {
             const updated = t('obs.updated', {
               hours,
               time: new Date().toLocaleTimeString(getLang() === 'zh' ? 'zh-CN' : 'en-US'),
             })
-            const q = data.telemetry_queue
+            const q = data?.telemetry_queue
             status.textContent = q
               ? updated + ' · ' + t('obs.queueStatus', {
                   queued: q.queueLength ?? 0,
@@ -4157,6 +4165,7 @@
         const queue = cleanup.queue || {}
         const batches = cleanup.batches || {}
         const index = runtime.local_index || null
+        const lastRebuild = runtime.last_rebuild || null
         const vectorCount = index ? Number(index.vectorCount || 0) : 0
         const ftsText = index
           ? `${obsFmtNum(index.ftsIndexed)}/${obsFmtNum(vectorCount)}`
@@ -4166,42 +4175,42 @@
           : '—'
         const cards = [
           {
-            label: '重建状态',
+            label: t('obs.vector.rebuildState'),
             value: rebuild ? rebuild.state : 'idle',
             hint: rebuild
-              ? `${obsFmtNum(rebuild.processed_entries)}/${obsFmtNum(rebuild.expected_entries)} · joined ${obsFmtNum(rebuild.joined_entries)}`
-              : '无进行中的蓝绿重建',
+              ? `${obsFmtNum(rebuild.processed_entries)}/${obsFmtNum(rebuild.expected_entries)} · ${t('obs.vector.joined')} ${obsFmtNum(rebuild.joined_entries)}`
+              : (lastRebuild ? `last ${lastRebuild.state} · ${obsFmtTime(lastRebuild.updated_at)}` : t('obs.vector.noRebuild')),
           },
           {
-            label: '重建缺口',
+            label: t('obs.vector.rebuildGap'),
             value: obsFmtNum((rebuild?.missing_entries || 0) + (rebuild?.live_conflict_entries || 0)),
             hint: rebuild
               ? `ready ${obsFmtNum(rebuild.ready_entries)} · failed ${obsFmtNum(rebuild.failed_entries)}`
-              : '无 pending_revision 冲突',
+              : t('obs.vector.noPendingConflict'),
           },
           {
-            label: '清理队列',
+            label: t('obs.vector.cleanupQueue'),
             value: obsFmtNum(queue.total || 0),
             hint: `due ${obsFmtNum(queue.due || 0)} · blocked ${obsFmtNum(queue.blocked || 0)} · failed ${obsFmtNum(queue.failed || 0)}`,
           },
           {
-            label: '清理批次',
+            label: t('obs.vector.cleanupBatches'),
             value: obsFmtNum(batches.total || 0),
             hint: `due ${obsFmtNum(batches.due || 0)} · ready ${obsFmtNum(batches.ready || 0)} · blocked ${obsFmtNum(batches.blocked || 0)}`,
           },
           {
-            label: 'FTS 索引',
+            label: t('obs.vector.ftsIndex'),
             value: ftsText,
             hint: index
               ? `${index.ftsAvailable ? (index.ftsTokenizer || 'enabled') : 'unavailable'} · remaining ${obsFmtNum(index.remaining || 0)}`
-              : '当前环境未暴露本地索引状态',
+              : t('obs.vector.noLocalIndex'),
           },
           {
-            label: 'ANN 索引',
+            label: t('obs.vector.annIndex'),
             value: annText,
             hint: index
               ? `${index.vecAvailable ? 'sqlite-vec' : 'json-cosine'} · remaining ${obsFmtNum(index.remaining || 0)}`
-              : 'Cloudflare Vectorize 环境不需要本地进度',
+              : t('obs.vector.noCloudflareIndex'),
           },
         ]
         grid.innerHTML = cards.map((c) =>
@@ -4212,7 +4221,7 @@
         if (meta) {
           meta.textContent = rebuild
             ? `rebuild ${String(rebuild.id || '').slice(0, 8)} · ${obsFmtTime(rebuild.updated_at)}`
-            : (index ? `local index · remaining ${obsFmtNum(index.remaining || 0)}` : 'no local index')
+            : (lastRebuild ? `last rebuild ${String(lastRebuild.id || '').slice(0, 8)} · ${lastRebuild.state}` : (index ? `local index · remaining ${obsFmtNum(index.remaining || 0)}` : 'no local index'))
         }
       }
 

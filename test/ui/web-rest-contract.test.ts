@@ -52,9 +52,10 @@ describe("web memory mutation API contract", () => {
     expect(html).toContain('id="obs-vector-runtime-grid"');
     expect(html).toContain("function obsRenderVectorRuntime(runtime)");
     expect(html).toContain("data.vector_runtime || {}");
-    expect(html).toContain("重建状态");
-    expect(html).toContain("清理队列");
-    expect(html).toContain("FTS 索引");
-    expect(html).toContain("ANN 索引");
+    expect(html).toContain("obsApi('/analytics/vector-runtime')");
+    expect(html).toContain("t('obs.vector.rebuildState')");
+    expect(html).toContain("t('obs.vector.cleanupQueue')");
+    expect(html).toContain("t('obs.vector.ftsIndex')");
+    expect(html).toContain("t('obs.vector.annIndex')");
   });
 });
