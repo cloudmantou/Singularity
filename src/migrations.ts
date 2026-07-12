@@ -352,6 +352,22 @@ const OBSIDIAN_V2_STATEMENTS = [
 
 const MEMORY_QUALITY_REVIEW_STATEMENTS = [...MEMORY_QUALITY_SCHEMA_STATEMENTS];
 
+// ── Parent version claim links ───────────────────────────────────────────────
+
+const PARENT_VERSION_CLAIMS_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS sb_parent_version_claims (
+    parent_version_id TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    relation TEXT NOT NULL DEFAULT 'supports',
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (parent_version_id, memory_id, relation)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_parent_version_claims_memory
+    ON sb_parent_version_claims(memory_id, parent_version_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_parent_version_claims_parent
+    ON sb_parent_version_claims(parent_version_id, relation, created_at DESC)`,
+];
+
 // ── Parent version state expansion ───────────────────────────────────────────
 
 async function parentVersionsActiveDegradedPrecheck(
@@ -455,5 +471,11 @@ export const MIGRATIONS: Migration[] = [
     statements: [],
     precheck: parentVersionsActiveDegradedPrecheck,
     execute: parentVersionsActiveDegradedExecute,
+  },
+  {
+    id: "20260713_parent_version_claim_links",
+    name: "Add many-to-many Parent Version to Claim links",
+    checksum: "parent-version-claim-links-v1",
+    statements: PARENT_VERSION_CLAIMS_STATEMENTS,
   },
 ];

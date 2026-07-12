@@ -230,6 +230,255 @@ describe("GET /recall", () => {
     expect(data.results.map((row: any) => row.id)).toEqual(["entry-active-parent"]);
   });
 
+  it("filters invalid dense parent candidates before topK slicing", async () => {
+    const now = Date.now();
+    db.entries.push(
+      {
+        id: "entry-superseded-dense",
+        content: "dense parent superseded claim",
+        tags: "[]",
+        source: "api",
+        created_at: now - 1000,
+        vector_ids: '["vec-superseded"]',
+        recall_count: 0,
+        importance_score: 0,
+      },
+      {
+        id: "entry-active-dense",
+        content: "dense parent active claim",
+        tags: "[]",
+        source: "api",
+        created_at: now,
+        vector_ids: '["vec-active"]',
+        recall_count: 0,
+        importance_score: 0,
+      }
+    );
+    db.parentUnits.push({
+      parent_id: "parent-dense",
+      active_version_id: "pv-dense-active",
+      scope_id: null,
+      created_at: now - 2000,
+      updated_at: now,
+    });
+    db.parentVersions.push(
+      {
+        version_id: "pv-dense-old",
+        parent_id: "parent-dense",
+        version_number: 1,
+        source_observation_id: "obs-dense-old",
+        source_snapshot_hash: "hash-dense-old",
+        summary: null,
+        state: "superseded",
+        summary_vector_ids: "[]",
+        created_at: now - 2000,
+        updated_at: now - 1000,
+      },
+      {
+        version_id: "pv-dense-active",
+        parent_id: "parent-dense",
+        version_number: 2,
+        source_observation_id: "obs-dense-active",
+        source_snapshot_hash: "hash-dense-active",
+        summary: null,
+        state: "active",
+        summary_vector_ids: "[]",
+        created_at: now - 1000,
+        updated_at: now,
+      }
+    );
+    db.memories.push(
+      {
+        id: "mem-dense-old",
+        entry_id: "entry-superseded-dense",
+        content: "dense parent superseded claim",
+        parent_version_id: "pv-dense-old",
+        claim_status: "supported",
+        confidence: 0.99,
+        invalid_at: null,
+        expired_at: null,
+        created_at: now - 1000,
+      },
+      {
+        id: "mem-dense-active",
+        entry_id: "entry-active-dense",
+        content: "dense parent active claim",
+        parent_version_id: "pv-dense-active",
+        claim_status: "supported",
+        confidence: 0.8,
+        invalid_at: null,
+        expired_at: null,
+        created_at: now,
+      }
+    );
+    db.parentVersionClaims.push(
+      {
+        parent_version_id: "pv-dense-old",
+        memory_id: "mem-dense-old",
+        relation: "supports",
+        created_at: now - 1000,
+      },
+      {
+        parent_version_id: "pv-dense-active",
+        memory_id: "mem-dense-active",
+        relation: "supports",
+        created_at: now,
+      }
+    );
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({
+          matches: [
+            makeMatch("vec-superseded", 0.99, { parentId: "entry-superseded-dense" }),
+            makeMatch("vec-active", 0.8, { parentId: "entry-active-dense" }),
+          ],
+        }),
+      }),
+    });
+
+    const res = await worker.fetch(req("GET", "/recall?query=dense%20parent&topK=1"), env, ctx);
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.results.map((row: any) => row.id)).toEqual(["entry-active-dense"]);
+  });
+
+  it("filters graph recall signals through active parent claim links", async () => {
+    const now = Date.now();
+    db.entries.push(
+      {
+        id: "entry-graph-old",
+        content: "old graph-only fact",
+        tags: "[]",
+        source: "api",
+        created_at: now - 1000,
+        vector_ids: "[]",
+        recall_count: 0,
+        importance_score: 0,
+      },
+      {
+        id: "entry-graph-active",
+        content: "active graph-only fact",
+        tags: "[]",
+        source: "api",
+        created_at: now,
+        vector_ids: "[]",
+        recall_count: 0,
+        importance_score: 0,
+      }
+    );
+    db.parentUnits.push({
+      parent_id: "parent-graph",
+      active_version_id: "pv-graph-active",
+      scope_id: null,
+      created_at: now - 2000,
+      updated_at: now,
+    });
+    db.parentVersions.push(
+      {
+        version_id: "pv-graph-old",
+        parent_id: "parent-graph",
+        version_number: 1,
+        source_observation_id: "obs-graph-old",
+        source_snapshot_hash: "hash-graph-old",
+        summary: null,
+        state: "superseded",
+        summary_vector_ids: "[]",
+        created_at: now - 2000,
+        updated_at: now - 1000,
+      },
+      {
+        version_id: "pv-graph-active",
+        parent_id: "parent-graph",
+        version_number: 2,
+        source_observation_id: "obs-graph-active",
+        source_snapshot_hash: "hash-graph-active",
+        summary: null,
+        state: "active",
+        summary_vector_ids: "[]",
+        created_at: now - 1000,
+        updated_at: now,
+      }
+    );
+    db.memories.push(
+      {
+        id: "mem-graph-old",
+        entry_id: "entry-graph-old",
+        content: "old graph-only fact",
+        parent_version_id: "pv-graph-old",
+        claim_status: "supported",
+        confidence: 0.9,
+        invalid_at: null,
+        expired_at: null,
+        created_at: now - 1000,
+      },
+      {
+        id: "mem-graph-active",
+        entry_id: "entry-graph-active",
+        content: "active graph-only fact",
+        parent_version_id: "pv-graph-active",
+        claim_status: "supported",
+        confidence: 0.9,
+        invalid_at: null,
+        expired_at: null,
+        created_at: now,
+      }
+    );
+    db.parentVersionClaims.push(
+      {
+        parent_version_id: "pv-graph-old",
+        memory_id: "mem-graph-old",
+        relation: "supports",
+        created_at: now - 1000,
+      },
+      {
+        parent_version_id: "pv-graph-active",
+        memory_id: "mem-graph-active",
+        relation: "supports",
+        created_at: now,
+      }
+    );
+    db.entities.push({
+      id: "entity-graph-scope",
+      name: "GraphScopeEntity",
+      name_normalized: "graphscopeentity",
+      entity_type: "concept",
+      aliases_json: "[]",
+      mention_count: 2,
+      updated_at: now,
+    });
+    db.memoryEntities.push(
+      {
+        id: "me-graph-old",
+        memory_id: "mem-graph-old",
+        entity_id: "entity-graph-scope",
+        role: "mentions",
+        score: 0.99,
+        created_at: now - 1000,
+      },
+      {
+        id: "me-graph-active",
+        memory_id: "mem-graph-active",
+        entity_id: "entity-graph-scope",
+        role: "mentions",
+        score: 0.8,
+        created_at: now,
+      }
+    );
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({ matches: [] }),
+      }),
+    });
+
+    const res = await worker.fetch(req("GET", "/recall?query=GraphScopeEntity&topK=2"), env, ctx);
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.results.map((row: any) => row.id)).toEqual(["entry-graph-active"]);
+    expect(data.results[0].matched_entities).toEqual(["GraphScopeEntity"]);
+  });
+
   it("uses current D1 tags for rerank instead of stale vector metadata", async () => {
     const now = Date.now();
     db.entries.push(

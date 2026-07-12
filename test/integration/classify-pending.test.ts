@@ -203,9 +203,9 @@ describe("POST /classify-pending", () => {
     // ledger rows, migration checksum verification, vault-bound Obsidian
     // prechecks, unified sync2 etags, quality review queues, and compliance
     // audit event indexes, evidence/claim/provenance contracts, and parent
-    // version snapshots;
+    // version snapshots plus parent-version claim links;
     // keep a bounded D1 headroom check instead of letting init grow unnoticed.
-    expect(db.statementCount).toBeLessThanOrEqual(185);
+    expect(db.statementCount).toBeLessThanOrEqual(190);
   });
 
   it("skips entries whose durable classification status is already succeeded", async () => {

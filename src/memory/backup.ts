@@ -1,8 +1,8 @@
 import { importEntries, type ImportMode, type ImportOptions, type ImportResult } from "../import-entries";
 
-export const MEMORY_BACKUP_SCHEMA_VERSION = 6;
+export const MEMORY_BACKUP_SCHEMA_VERSION = 7;
 const MEMORY_BACKUP_FORMAT = "singularity-memory-backup";
-const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6]);
+const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7]);
 const MEMORY_BACKUP_FEATURES = [
   "atomic-memory",
   "temporal-facts",
@@ -12,12 +12,14 @@ const MEMORY_BACKUP_FEATURES = [
   "compliance-audit",
   "evidence-claim-provenance",
   "parent-versions",
+  "parent-version-claims",
 ] as const;
 
 const GRAPH_ARRAY_KEYS = [
   "scopes",
   "parentUnits",
   "parentVersions",
+  "parentVersionClaims",
   "observations",
   "memories",
   "memorySources",
@@ -49,7 +51,7 @@ export interface BackupIntegrityReport {
 
 export interface MemoryBackup {
   backupFormat: typeof MEMORY_BACKUP_FORMAT;
-  schemaVersion: 6;
+  schemaVersion: 7;
   features: Array<(typeof MEMORY_BACKUP_FEATURES)[number]>;
   exportedAt: string;
   source: string;
@@ -58,6 +60,7 @@ export interface MemoryBackup {
   scopes: BackupRow[];
   parentUnits: BackupRow[];
   parentVersions: BackupRow[];
+  parentVersionClaims: BackupRow[];
   entries: BackupRow[];
   observations: BackupRow[];
   memories: BackupRow[];
@@ -74,7 +77,7 @@ export interface MemoryBackup {
 }
 
 export interface MemoryBackupImportResult extends ImportResult {
-  schemaVersion: 6;
+  schemaVersion: 7;
   graph: Record<GraphArrayKey, TableImportStats>;
   integrity: BackupIntegrityReport;
 }
@@ -139,6 +142,12 @@ export async function inspectMemoryBackupIntegrity(db: D1Database): Promise<Back
        (SELECT COUNT(*) FROM sb_memories m
         LEFT JOIN sb_parent_versions pv ON pv.version_id = m.parent_version_id
         WHERE m.parent_version_id IS NOT NULL AND pv.version_id IS NULL) as memories_missing_parent_version,
+       (SELECT COUNT(*) FROM sb_parent_version_claims pvc
+        LEFT JOIN sb_parent_versions pv ON pv.version_id = pvc.parent_version_id
+        WHERE pv.version_id IS NULL) as parent_version_claims_missing_parent_version,
+       (SELECT COUNT(*) FROM sb_parent_version_claims pvc
+        LEFT JOIN sb_memories m ON m.id = pvc.memory_id
+        WHERE m.id IS NULL) as parent_version_claims_missing_memory,
        (SELECT COUNT(*) FROM sb_memory_entities me
         LEFT JOIN sb_memories m ON m.id = me.memory_id
         WHERE m.id IS NULL) as memory_entities_missing_memory,
@@ -206,6 +215,7 @@ export async function exportMemoryBackup(
     scopes,
     parentUnits,
     parentVersions,
+    parentVersionClaims,
     entries,
     observations,
     memories,
@@ -232,6 +242,9 @@ export async function exportMemoryBackup(
                        created_at, updated_at
                 FROM sb_parent_versions
                 ORDER BY created_at DESC, version_id DESC`),
+    allRows(db, `SELECT parent_version_id, memory_id, relation, created_at
+                FROM sb_parent_version_claims
+                ORDER BY created_at DESC, parent_version_id DESC, memory_id DESC`),
     allRows(db, `SELECT id, content, tags, source, created_at, vector_ids,
                        recall_count, importance_score, classification_confidence,
                        classification_status, classification_error, classification_attempts,
@@ -312,6 +325,7 @@ export async function exportMemoryBackup(
       scopes: countRows(scopes),
       parentUnits: countRows(parentUnits),
       parentVersions: countRows(parentVersions),
+      parentVersionClaims: countRows(parentVersionClaims),
       entries: countRows(entries),
       observations: countRows(observations),
       memories: countRows(memories),
@@ -330,6 +344,7 @@ export async function exportMemoryBackup(
     scopes,
     parentUnits,
     parentVersions,
+    parentVersionClaims,
     entries,
     observations,
     memories,
@@ -577,6 +592,19 @@ export async function importMemoryBackup(
       numberOrNull(row, "invalid_at"),
       numberOrNull(row, "expired_at"),
       jsonText(row, "entities_json", "[]"),
+      intOrDefault(row, "created_at", Date.now())
+    )
+  );
+
+  graph.parentVersionClaims = await importTable(db, rowsFor(body, "parentVersionClaims"), (row) =>
+    db.prepare(
+      `${insertVerb(mode)} INTO sb_parent_version_claims (
+         parent_version_id, memory_id, relation, created_at
+       ) VALUES (?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "parent_version_id"),
+      requiredText(row, "memory_id"),
+      textOrDefault(row, "relation", "supports"),
       intOrDefault(row, "created_at", Date.now())
     )
   );

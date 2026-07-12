@@ -68,6 +68,18 @@ export const EVIDENCE_CONTRACT_SCHEMA_STATEMENTS = [
     ON sb_parent_versions(source_observation_id)`,
   `CREATE INDEX IF NOT EXISTS idx_parent_versions_state
     ON sb_parent_versions(state, updated_at DESC)`,
+
+  `CREATE TABLE IF NOT EXISTS sb_parent_version_claims (
+    parent_version_id TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    relation TEXT NOT NULL DEFAULT 'supports',
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (parent_version_id, memory_id, relation)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_parent_version_claims_memory
+    ON sb_parent_version_claims(memory_id, parent_version_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_parent_version_claims_parent
+    ON sb_parent_version_claims(parent_version_id, relation, created_at DESC)`,
 ] as const;
 
 export const OBSERVATION_EVIDENCE_MIGRATIONS = [
@@ -231,6 +243,27 @@ export function prepareParentVersionInsert(
   );
 }
 
+export function prepareParentVersionClaimInsert(
+  db: D1Database,
+  input: {
+    parentVersionId: string;
+    memoryId: string;
+    relation?: ProvenanceRelation | string | null;
+    createdAt: number;
+  }
+): D1PreparedStatement {
+  return db.prepare(
+    `INSERT OR IGNORE INTO sb_parent_version_claims (
+       parent_version_id, memory_id, relation, created_at
+     ) VALUES (?, ?, ?, ?)`
+  ).bind(
+    input.parentVersionId,
+    input.memoryId,
+    normalizeProvenanceRelation(input.relation ?? "supports"),
+    input.createdAt
+  );
+}
+
 export function prepareParentVersionActivation(
   db: D1Database,
   input: {
@@ -244,22 +277,36 @@ export function prepareParentVersionActivation(
   return [
     db.prepare(
       `UPDATE sb_parent_versions
-       SET state = 'superseded', updated_at = ?
-       WHERE parent_id = ?
-         AND state IN ('active', 'active_degraded')
-         AND version_id <> ?`
-    ).bind(input.updatedAt, input.parentId, input.versionId),
-    db.prepare(
-      `UPDATE sb_parent_versions
        SET state = ?, updated_at = ?
        WHERE parent_id = ?
-         AND version_id = ?`
+         AND version_id = ?
+         AND state = 'building'`
     ).bind(nextState, input.updatedAt, input.parentId, input.versionId),
     db.prepare(
       `UPDATE sb_parent_units
        SET active_version_id = ?, updated_at = ?
-       WHERE parent_id = ?`
-    ).bind(input.versionId, input.updatedAt, input.parentId),
+       WHERE parent_id = ?
+         AND EXISTS (
+           SELECT 1
+           FROM sb_parent_versions
+           WHERE version_id = ?
+             AND parent_id = ?
+             AND state IN ('active', 'active_degraded')
+         )`
+    ).bind(input.versionId, input.updatedAt, input.parentId, input.versionId, input.parentId),
+    db.prepare(
+      `UPDATE sb_parent_versions
+       SET state = 'superseded', updated_at = ?
+       WHERE parent_id = ?
+         AND state IN ('active', 'active_degraded')
+         AND version_id <> ?
+         AND EXISTS (
+           SELECT 1
+           FROM sb_parent_units
+           WHERE parent_id = ?
+             AND active_version_id = ?
+         )`
+    ).bind(input.updatedAt, input.parentId, input.versionId, input.parentId, input.versionId),
   ];
 }
 

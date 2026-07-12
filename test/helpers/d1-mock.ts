@@ -25,25 +25,36 @@ function isActiveAt(row: any, asOf: number): boolean {
   return (validFrom == null || validFrom <= asOf) && (validTo == null || validTo > asOf);
 }
 
-function entryPassesActiveParentFilter(db: D1Mock, entryId: string): boolean {
-  const versioned = db.memories.filter((memory: any) =>
-    memory.entry_id === entryId && memory.parent_version_id != null
+function parentVersionIsActivePointer(db: D1Mock, versionId: string | null | undefined): boolean {
+  if (!versionId) return false;
+  const parentVersion = db.parentVersions.find((version: any) =>
+    version.version_id === versionId &&
+    (version.state === "active" || version.state === "active_degraded")
   );
-  if (!versioned.length) return true;
-  return versioned.some((memory: any) => {
-    const parentVersion = db.parentVersions.find((version: any) =>
-      version.version_id === memory.parent_version_id &&
-      (version.state === "active" || version.state === "active_degraded")
-    );
-    if (!parentVersion) return false;
-    const parentUnit = db.parentUnits.find((unit: any) =>
-      unit.parent_id === parentVersion.parent_id &&
-      unit.active_version_id === parentVersion.version_id
-    );
-    return Boolean(parentUnit) && ["supported", "confirmed", "contested"].includes(
-      String(memory.claim_status ?? "supported")
-    );
-  });
+  if (!parentVersion) return false;
+  return db.parentUnits.some((unit: any) =>
+    unit.parent_id === parentVersion.parent_id &&
+    unit.active_version_id === parentVersion.version_id
+  );
+}
+
+function memoryPassesActiveParentFilter(db: D1Mock, memory: any): boolean {
+  if (!memory) return false;
+  if (!["supported", "confirmed", "contested"].includes(String(memory.claim_status ?? "supported"))) {
+    return false;
+  }
+  const links = db.parentVersionClaims.filter((claim: any) => claim.memory_id === memory.id);
+  if (links.length) {
+    return links.some((claim: any) => parentVersionIsActivePointer(db, claim.parent_version_id));
+  }
+  if (memory.parent_version_id == null) return true;
+  return parentVersionIsActivePointer(db, memory.parent_version_id);
+}
+
+function entryPassesActiveParentFilter(db: D1Mock, entryId: string): boolean {
+  const memories = db.memories.filter((memory: any) => memory.entry_id === entryId);
+  if (!memories.length) return true;
+  return memories.some((memory: any) => memoryPassesActiveParentFilter(db, memory));
 }
 
 export class D1Mock {
@@ -53,6 +64,7 @@ export class D1Mock {
   scopes: any[] = [];
   parentUnits: any[] = [];
   parentVersions: any[] = [];
+  parentVersionClaims: any[] = [];
   observations: any[] = [];
   memories: any[] = [];
   memorySources: any[] = [];
@@ -495,7 +507,16 @@ export class D1Mock {
           return { meta: { changes: 1 } };
         }
         if (s.startsWith("UPDATE sb_parent_versions SET state = 'superseded'")) {
-          const [updated_at, parent_id, version_id] = args;
+          const [updated_at, parent_id, version_id, guard_parent_id, guard_version_id] = args;
+          if (
+            s.includes("EXISTS") &&
+            !db.parentUnits.some((unit: any) =>
+              unit.parent_id === guard_parent_id &&
+              unit.active_version_id === guard_version_id
+            )
+          ) {
+            return { meta: { changes: 0 } };
+          }
           let changes = 0;
           for (const row of db.parentVersions) {
             if (
@@ -513,7 +534,9 @@ export class D1Mock {
         if (s.startsWith("UPDATE sb_parent_versions SET state = ?")) {
           const [state, updated_at, parent_id, version_id] = args;
           const row = db.parentVersions.find((item: any) =>
-            item.parent_id === parent_id && item.version_id === version_id
+            item.parent_id === parent_id &&
+            item.version_id === version_id &&
+            (!s.includes("state = 'building'") || item.state === "building")
           );
           if (row) {
             row.state = state;
@@ -543,8 +566,37 @@ export class D1Mock {
           }
           return { meta: { changes: row ? 1 : 0 } };
         }
+        if (
+          s.startsWith("INSERT INTO sb_parent_version_claims") ||
+          s.startsWith("INSERT OR IGNORE INTO sb_parent_version_claims") ||
+          s.startsWith("INSERT OR REPLACE INTO sb_parent_version_claims")
+        ) {
+          const [parent_version_id, memory_id, relation, created_at] = args;
+          const existing = db.parentVersionClaims.find((row: any) =>
+            row.parent_version_id === parent_version_id &&
+            row.memory_id === memory_id &&
+            row.relation === relation
+          );
+          if (existing) {
+            if (s.startsWith("INSERT OR IGNORE")) return { meta: { changes: 0 } };
+            Object.assign(existing, { parent_version_id, memory_id, relation, created_at });
+          } else {
+            db.parentVersionClaims.push({ parent_version_id, memory_id, relation, created_at });
+          }
+          return { meta: { changes: 1 } };
+        }
         if (s.startsWith("UPDATE sb_parent_units SET active_version_id")) {
-          const [active_version_id, updated_at, parent_id] = args;
+          const [active_version_id, updated_at, parent_id, guard_version_id, guard_parent_id] = args;
+          if (
+            s.includes("EXISTS") &&
+            !db.parentVersions.some((version: any) =>
+              version.version_id === guard_version_id &&
+              version.parent_id === guard_parent_id &&
+              (version.state === "active" || version.state === "active_degraded")
+            )
+          ) {
+            return { meta: { changes: 0 } };
+          }
           const row = db.parentUnits.find((item: any) => item.parent_id === parent_id);
           if (row) {
             row.active_version_id = active_version_id;
@@ -2103,13 +2155,21 @@ export class D1Mock {
       async first() {
         db.statementCount += 1;
         if (
-          s.includes("COUNT(*) AS memory_count") &&
-          s.includes("FROM sb_memories m") &&
-          s.includes("m.parent_version_id = ?")
+          s.includes("memory_count") &&
+          s.includes("FROM sb_parent_version_claims pvc")
         ) {
           const versionId = String(args[0]);
+          const memoryIds = new Set(
+            db.parentVersionClaims
+              .filter((claim: any) =>
+                claim.parent_version_id === versionId &&
+                ["supports", "derived_from"].includes(String(claim.relation ?? "supports"))
+              )
+              .map((claim: any) => String(claim.memory_id))
+          );
           const memories = db.memories.filter((memory: any) =>
-            memory.parent_version_id === versionId &&
+            memoryIds.has(String(memory.id)) &&
+            ["supported", "confirmed", "contested"].includes(String(memory.claim_status ?? "supported")) &&
             memory.invalid_at == null &&
             memory.expired_at == null
           );
@@ -2186,6 +2246,12 @@ export class D1Mock {
             ).length,
             memories_missing_parent_version: db.memories.filter((memory: any) =>
               memory.parent_version_id != null && !has(db.parentVersions, "version_id", memory.parent_version_id)
+            ).length,
+            parent_version_claims_missing_parent_version: db.parentVersionClaims.filter((claim: any) =>
+              !has(db.parentVersions, "version_id", claim.parent_version_id)
+            ).length,
+            parent_version_claims_missing_memory: db.parentVersionClaims.filter((claim: any) =>
+              !has(db.memories, "id", claim.memory_id)
             ).length,
             memory_entities_missing_memory: db.memoryEntities.filter((link: any) => !has(db.memories, "id", link.memory_id)).length,
             memory_entities_missing_entity: db.memoryEntities.filter((link: any) => !has(db.entities, "id", link.entity_id)).length,
@@ -2654,6 +2720,7 @@ export class D1Mock {
           if (s.includes("FROM sb_scopes")) return { results: [...db.scopes] };
           if (s.includes("FROM sb_parent_units")) return { results: [...db.parentUnits] };
           if (s.includes("FROM sb_parent_versions")) return { results: [...db.parentVersions] };
+          if (s.includes("FROM sb_parent_version_claims")) return { results: [...db.parentVersionClaims] };
           if (s.includes("FROM entries")) return { results: [...db.entries] };
           if (s.includes("FROM sb_observations")) return { results: [...db.observations] };
           if (s.includes("FROM sb_memories")) return { results: [...db.memories] };
@@ -2956,7 +3023,8 @@ export class D1Mock {
             .filter(({ memory }: any) =>
               memory &&
               memory.entry_id &&
-              isActiveAt(memory, asOf)
+              isActiveAt(memory, asOf) &&
+              memoryPassesActiveParentFilter(db, memory)
             )
             .sort((a: any, b: any) =>
               Number(b.link.score ?? 0) - Number(a.link.score ?? 0) ||
@@ -3006,7 +3074,8 @@ export class D1Mock {
               memory &&
               memory.entry_id &&
               isActiveAt(relation, asOf) &&
-              isActiveAt(memory, asOf)
+              isActiveAt(memory, asOf) &&
+              memoryPassesActiveParentFilter(db, memory)
             )
             .sort((a: any, b: any) =>
               Number(b.relation.score ?? 0) - Number(a.relation.score ?? 0) ||
@@ -3345,7 +3414,7 @@ export class D1Mock {
                 ...db.memories
                   .filter((memory: any) =>
                     memory.entry_id === e.id &&
-                    ["supported", "confirmed", "contested"].includes(String(memory.claim_status ?? "supported"))
+                    memoryPassesActiveParentFilter(db, memory)
                   )
                   .map((memory: any) => {
                     const sourceScores = db.memorySources
@@ -3355,21 +3424,16 @@ export class D1Mock {
                   })
               ),
               parent_version_state: (() => {
-                const memory = db.memories.find((item: any) => {
-                  if (item.entry_id !== e.id || item.parent_version_id == null) return false;
-                  const version = db.parentVersions.find((parentVersion: any) =>
-                    parentVersion.version_id === item.parent_version_id &&
-                    (parentVersion.state === "active" || parentVersion.state === "active_degraded")
-                  );
-                  if (!version) return false;
-                  return db.parentUnits.some((unit: any) =>
-                    unit.parent_id === version.parent_id &&
-                    unit.active_version_id === version.version_id
-                  );
-                });
+                const memory = db.memories.find((item: any) =>
+                  item.entry_id === e.id && memoryPassesActiveParentFilter(db, item)
+                );
                 if (!memory) return null;
+                const claim = db.parentVersionClaims.find((item: any) =>
+                  item.memory_id === memory.id && parentVersionIsActivePointer(db, item.parent_version_id)
+                );
+                const versionId = claim?.parent_version_id ?? memory.parent_version_id;
                 const version = db.parentVersions.find((parentVersion: any) =>
-                  parentVersion.version_id === memory.parent_version_id
+                  parentVersion.version_id === versionId
                 );
                 return version?.state ?? null;
               })(),
@@ -3606,6 +3670,7 @@ export class D1Mock {
     this.scopes = [];
     this.parentUnits = [];
     this.parentVersions = [];
+    this.parentVersionClaims = [];
     this.observations = [];
     this.memories = [];
     this.memorySources = [];

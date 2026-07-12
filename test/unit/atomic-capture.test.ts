@@ -436,7 +436,7 @@ describe("captureEntry atomic dual-write", () => {
     const originalBatch = db.batch.bind(db);
     let failedAtomicBatch = false;
     db.batch = vi.fn(async (statements: any[]) => {
-      if (!failedAtomicBatch && db.entries.length > 0 && db.memories.length === 0 && statements.length === 2) {
+      if (!failedAtomicBatch && db.entries.length > 0 && db.memories.length === 0 && statements.length >= 2) {
         failedAtomicBatch = true;
         throw new Error("atomic batch exploded");
       }
@@ -507,6 +507,7 @@ describe("captureEntry atomic dual-write", () => {
     expect(db.observations).toHaveLength(1);
     expect(db.memories).toHaveLength(1);
     expect(db.memorySources).toHaveLength(1);
+    expect(db.parentVersionClaims).toHaveLength(1);
 
     const secondCtx = makeCtx();
     const second = await captureEntry(
@@ -523,7 +524,17 @@ describe("captureEntry atomic dual-write", () => {
     expect(db.observations).toHaveLength(2);
     expect(db.memories).toHaveLength(1);
     expect(db.memorySources).toHaveLength(2);
+    expect(db.parentVersionClaims).toHaveLength(2);
     expect(new Set(db.memorySources.map((source) => source.memory_id)).size).toBe(1);
     expect(new Set(db.memorySources.map((source) => source.observation_id)).size).toBe(2);
+    expect(new Set(db.parentVersionClaims.map((claim) => claim.memory_id)).size).toBe(1);
+    expect(new Set(db.parentVersionClaims.map((claim) => claim.parent_version_id)).size).toBe(2);
+    expect(
+      db.parentVersions
+        .filter((version) => version.state === "active_degraded")
+        .every((version) =>
+          db.parentVersionClaims.some((claim) => claim.parent_version_id === version.version_id)
+        )
+    ).toBe(true);
   });
 });

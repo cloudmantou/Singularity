@@ -401,6 +401,18 @@ CREATE INDEX IF NOT EXISTS idx_parent_versions_source
 CREATE INDEX IF NOT EXISTS idx_parent_versions_state
   ON sb_parent_versions(state, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS sb_parent_version_claims (
+  parent_version_id TEXT NOT NULL,
+  memory_id TEXT NOT NULL,
+  relation TEXT NOT NULL DEFAULT 'supports',
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (parent_version_id, memory_id, relation)
+);
+CREATE INDEX IF NOT EXISTS idx_parent_version_claims_memory
+  ON sb_parent_version_claims(memory_id, parent_version_id);
+CREATE INDEX IF NOT EXISTS idx_parent_version_claims_parent
+  ON sb_parent_version_claims(parent_version_id, relation, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS sb_memories (
   id TEXT PRIMARY KEY,
   content TEXT NOT NULL,

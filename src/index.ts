@@ -121,6 +121,7 @@ import {
 import {
   prepareParentUnitInsert,
   prepareParentVersionActivation,
+  prepareParentVersionClaimInsert,
   prepareParentVersionFailure,
   prepareParentVersionInsert,
   type EvidenceAuthorType,
@@ -1922,7 +1923,6 @@ async function linkObsidianObservation(
   });
   await activateObservationParentVersion(env, { metadata_json: JSON.stringify(metadata) }, {
     state: "active_degraded",
-    requireComplete: false,
   });
 }
 
@@ -6536,25 +6536,56 @@ export interface RecallSearchResult {
 
 interface KeywordRow { id: string; content: string; tags: string; source: string; created_at: number; }
 
+function activeMemoryClaimPredicate(memoryRef: string): string {
+  return `(
+    ${memoryRef}.claim_status IN ('supported', 'confirmed', 'contested')
+    AND (
+      EXISTS (
+        SELECT 1
+        FROM sb_parent_version_claims pvc_active
+        JOIN sb_parent_versions pv_active
+          ON pv_active.version_id = pvc_active.parent_version_id
+        JOIN sb_parent_units pu_active
+          ON pu_active.active_version_id = pv_active.version_id
+         AND pu_active.parent_id = pv_active.parent_id
+        WHERE pvc_active.memory_id = ${memoryRef}.id
+          AND pv_active.state IN ('active', 'active_degraded')
+      )
+      OR (
+        NOT EXISTS (
+          SELECT 1
+          FROM sb_parent_version_claims pvc_any
+          WHERE pvc_any.memory_id = ${memoryRef}.id
+        )
+        AND (
+          ${memoryRef}.parent_version_id IS NULL
+          OR EXISTS (
+            SELECT 1
+            FROM sb_parent_versions pv_legacy
+            JOIN sb_parent_units pu_legacy
+              ON pu_legacy.active_version_id = pv_legacy.version_id
+             AND pu_legacy.parent_id = pv_legacy.parent_id
+            WHERE pv_legacy.version_id = ${memoryRef}.parent_version_id
+              AND pv_legacy.state IN ('active', 'active_degraded')
+          )
+        )
+      )
+    )
+  )`;
+}
+
 function activeParentEntryPredicate(entryRef: string): string {
   return `AND (
     NOT EXISTS (
       SELECT 1
       FROM sb_memories m_any
       WHERE m_any.entry_id = ${entryRef}
-        AND m_any.parent_version_id IS NOT NULL
     )
     OR EXISTS (
       SELECT 1
       FROM sb_memories m_active
-      JOIN sb_parent_versions pv_active
-        ON pv_active.version_id = m_active.parent_version_id
-      JOIN sb_parent_units pu_active
-        ON pu_active.active_version_id = pv_active.version_id
-       AND pu_active.parent_id = pv_active.parent_id
       WHERE m_active.entry_id = ${entryRef}
-        AND pv_active.state IN ('active', 'active_degraded')
-        AND m_active.claim_status IN ('supported', 'confirmed', 'contested')
+        AND ${activeMemoryClaimPredicate("m_active")}
     )
   )`;
 }
@@ -6974,6 +7005,7 @@ async function buildGraphRecallSignals(
        AND (m.expired_at IS NULL OR m.expired_at > ?)
        AND (m.valid_from IS NULL OR m.valid_from <= ?)
        AND (m.valid_to IS NULL OR m.valid_to > ?)
+       AND ${activeMemoryClaimPredicate("m")}
      ORDER BY COALESCE(me.score, 0) DESC, m.created_at DESC
      LIMIT ?`
   ).bind(...entityIds, asOf, asOf, asOf, asOf, GRAPH_DIRECT_MEMORY_LIMIT).all() as {
@@ -7018,6 +7050,7 @@ async function buildGraphRecallSignals(
        AND m.entry_id IS NOT NULL
        AND (m.invalid_at IS NULL OR m.invalid_at > ?)
        AND (m.expired_at IS NULL OR m.expired_at > ?)
+       AND ${activeMemoryClaimPredicate("m")}
      ORDER BY COALESCE(r.score, 0) DESC, r.created_at DESC
      LIMIT ?`
   ).bind(
@@ -7411,17 +7444,37 @@ export async function recallEntries(
                FROM sb_memories m
                LEFT JOIN sb_memory_sources ms ON ms.memory_id = m.id
                WHERE m.entry_id = entries.id
-                 AND m.claim_status IN ('supported', 'confirmed', 'contested')) AS evidence_score,
-              (SELECT pv.state
-               FROM sb_memories m
-               JOIN sb_parent_versions pv ON pv.version_id = m.parent_version_id
-               JOIN sb_parent_units pu
-                 ON pu.active_version_id = pv.version_id
-                AND pu.parent_id = pv.parent_id
-               WHERE m.entry_id = entries.id
-                 AND pv.state IN ('active', 'active_degraded')
-               ORDER BY CASE pv.state WHEN 'active' THEN 0 ELSE 1 END
-               LIMIT 1) AS parent_version_state
+                 AND ${activeMemoryClaimPredicate("m")}) AS evidence_score,
+              COALESCE(
+                (SELECT pv.state
+                 FROM sb_memories m
+                 JOIN sb_parent_version_claims pvc ON pvc.memory_id = m.id
+                 JOIN sb_parent_versions pv ON pv.version_id = pvc.parent_version_id
+                 JOIN sb_parent_units pu
+                   ON pu.active_version_id = pv.version_id
+                  AND pu.parent_id = pv.parent_id
+                 WHERE m.entry_id = entries.id
+                   AND pv.state IN ('active', 'active_degraded')
+                   AND m.claim_status IN ('supported', 'confirmed', 'contested')
+                 ORDER BY CASE pv.state WHEN 'active' THEN 0 ELSE 1 END
+                 LIMIT 1),
+                (SELECT pv.state
+                 FROM sb_memories m
+                 JOIN sb_parent_versions pv ON pv.version_id = m.parent_version_id
+                 JOIN sb_parent_units pu
+                   ON pu.active_version_id = pv.version_id
+                  AND pu.parent_id = pv.parent_id
+                 WHERE m.entry_id = entries.id
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM sb_parent_version_claims pvc_any
+                     WHERE pvc_any.memory_id = m.id
+                   )
+                   AND pv.state IN ('active', 'active_degraded')
+                   AND m.claim_status IN ('supported', 'confirmed', 'contested')
+                 ORDER BY CASE pv.state WHEN 'active' THEN 0 ELSE 1 END
+                 LIMIT 1)
+              ) AS parent_version_state
        FROM entries WHERE id IN (${rcPlaceholders})
        ${activeParentEntryPredicate("entries.id")}`
     ).bind(...batch).all() as {
@@ -7475,11 +7528,24 @@ export async function recallEntries(
       created_at: Number(row.created_at ?? Date.now()),
     }];
   }));
+  const eligibleCandidateIds = new Set(rcRows.map((row) => row.id));
+  fusedMatches = fusedMatches.filter((match) => {
+    const parentId = String(((match.metadata ?? {}) as Record<string, unknown>).parentId ?? match.id);
+    return eligibleCandidateIds.has(parentId);
+  });
+  if (!fusedMatches.length) return {
+    matches: [],
+    insight: "",
+    degraded: embeddingFailed || vectorQueryDegraded,
+    degradedReason: embeddingFailed
+      ? "embedding_failed"
+      : vectorQueryDegradedReason,
+  };
+
   const rerankInput = fusedMatches.map((match) => {
     const meta = (match.metadata ?? {}) as Record<string, unknown>;
     const parentId = String(meta.parentId ?? match.id);
-    const current = currentEntryMetadata.get(parentId);
-    if (!current) return match;
+    const current = currentEntryMetadata.get(parentId)!;
     return {
       ...match,
       metadata: {
@@ -7620,13 +7686,18 @@ export async function recallEntries(
     }, "recall");
   }
 
-  const insight = d1Rows.length > 1
-    ? await synthesizeInsight(embedQuery, d1Rows as { id: string; content: string }[], env)
+  const insightRows = matches.map((match) => ({
+    id: match.id,
+    content: match.content,
+  }));
+
+  const insight = insightRows.length > 1
+    ? await synthesizeInsight(embedQuery, insightRows, env)
     : "";
 
-  if (d1Rows.length >= 5) {
+  if (insightRows.length >= 5) {
     ctx.waitUntil(
-      derivePattern(d1Rows as { id: string; content: string }[], env, ctx)
+      derivePattern(insightRows, env, ctx)
         .catch(e => console.error("derivePattern failed (non-fatal):", e))
     );
   }
@@ -8657,15 +8728,18 @@ async function assertParentVersionReadyForActivation(
 ): Promise<void> {
   if (!requireComplete) return;
   const counts = await env.DB.prepare(
-    `SELECT
-       COUNT(*) AS memory_count,
-       SUM(CASE WHEN EXISTS (
+     `SELECT
+       COUNT(DISTINCT m.id) AS memory_count,
+       COUNT(DISTINCT CASE WHEN EXISTS (
          SELECT 1
          FROM sb_memory_sources s
          WHERE s.memory_id = m.id
-       ) THEN 1 ELSE 0 END) AS sourced_memory_count
-     FROM sb_memories m
-     WHERE m.parent_version_id = ?
+       ) THEN m.id ELSE NULL END) AS sourced_memory_count
+     FROM sb_parent_version_claims pvc
+     JOIN sb_memories m ON m.id = pvc.memory_id
+     WHERE pvc.parent_version_id = ?
+       AND pvc.relation IN ('supports', 'derived_from')
+       AND m.claim_status IN ('supported', 'confirmed', 'contested')
        AND m.invalid_at IS NULL
        AND m.expired_at IS NULL`
   ).bind(versionId).first<{ memory_count: number; sourced_memory_count: number | null }>();
@@ -8693,8 +8767,8 @@ async function activateObservationParentVersion(
     state: options.state ?? "active",
     updatedAt: Date.now(),
   }));
-  const activated = Number(results[1]?.meta?.changes ?? 0);
-  const parentUnitUpdated = Number(results[2]?.meta?.changes ?? 0);
+  const activated = Number(results[0]?.meta?.changes ?? 0);
+  const parentUnitUpdated = Number(results[1]?.meta?.changes ?? 0);
   if (activated !== 1 || parentUnitUpdated !== 1) {
     throw new Error(`parent_version_activation_failed:${parent.versionId}`);
   }
@@ -9211,7 +9285,7 @@ async function dualWriteAtomicMemory(
 ): Promise<AtomicWriteResult> {
   const memoryId = crypto.randomUUID();
   try {
-    await env.DB.batch([
+    const statements = [
       prepareAtomicMemoryInsert(env.DB, {
         id: memoryId,
         content: input.content,
@@ -9249,7 +9323,18 @@ async function dualWriteAtomicMemory(
         evidenceRootId: input.evidenceRootId ?? input.observationId,
         createdAt: input.createdAt,
       }),
-    ]);
+    ];
+    if (input.parentVersionId) {
+      statements.push(
+        prepareParentVersionClaimInsert(env.DB, {
+          parentVersionId: input.parentVersionId,
+          memoryId,
+          relation: "supports",
+          createdAt: input.createdAt,
+        })
+      );
+    }
+    await env.DB.batch(statements);
 
     // Entity graph dual-write (mentions + optional temporal fact edges).
     if (input.atomic?.entities?.length || input.atomic?.relations?.length) {
@@ -9723,7 +9808,6 @@ export async function captureEntry(
           });
           await activateObservationParentVersion(env, { metadata_json: JSON.stringify(metadata) }, {
             state: "active_degraded",
-            requireComplete: false,
           });
           return {
             status: "sourced",
@@ -10027,11 +10111,11 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
       inputSchema: {
         content: z.string().describe("The idea, task, or note to store"),
         tags: z.array(z.string()).optional().describe("Optional tags for filtering"),
-        source: z.string().optional().describe("Origin: phone, browser, voice, claude"),
+        source: z.string().optional().describe("Ignored compatibility field; server records MCP writes as source=mcp"),
       },
     },
-    async ({ content, tags, source }) => {
-      const result = await captureEntry(content, tags ?? [], source ?? "claude", env, ctx);
+    async ({ content, tags }) => {
+      const result = await captureEntry(content, tags ?? [], "mcp", env, ctx);
       return { content: [{ type: "text", text: formatCaptureResultMessage(result) }] };
     }
   );

@@ -16,6 +16,7 @@ import {
   normalizeClaimStatus,
   normalizeEvidenceAuthorType,
   normalizeProvenanceRelation,
+  prepareParentVersionClaimInsert,
   type ClaimModality,
   type ClaimPolarity,
   type ClaimStatus,
@@ -510,6 +511,17 @@ export async function linkObservationToAtomicMemory(
         input.createdAt
       )
   );
+
+  if (input.parentVersionId) {
+    statements.push(
+      prepareParentVersionClaimInsert(db, {
+        parentVersionId: input.parentVersionId,
+        memoryId,
+        relation: "supports",
+        createdAt: input.createdAt,
+      })
+    );
+  }
 
   await db.batch(statements);
   return { memoryId, created: !existing };
