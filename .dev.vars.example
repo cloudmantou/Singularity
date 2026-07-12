@@ -12,6 +12,8 @@ AUTH_TOKEN=change-me
 # LLM_MODEL=deepseek-v4-flash
 
 # Embedding — keep dimensions=384 when using Cloudflare Vectorize
+# VECTORIZE_DIMENSIONS must match the bound Cloudflare Vectorize index.
+VECTORIZE_DIMENSIONS=384
 # EMBEDDING_BASE_URL=https://api.openai.com/v1
 # EMBEDDING_API_KEY=sk-...
 # EMBEDDING_MODEL=text-embedding-3-small

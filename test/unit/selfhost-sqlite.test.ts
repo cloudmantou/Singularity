@@ -189,8 +189,8 @@ describe("SqliteVectorizeIndex", () => {
 
   it("uses sqlite-vec KNN for embedding_fingerprint filters before JSON fallback", async () => {
     await vec.insert([
-      { id: "active-a", values: [1, 0], metadata: { parentId: "active", embedding_fingerprint: "emb2_active" } },
-      { id: "pending-a", values: [0.99, 0.01], metadata: { parentId: "pending", embedding_fingerprint: "emb2_pending" } },
+      { id: "active-a", values: [1, 0], metadata: { parentId: "active", embedding_fingerprint: "ep2_active" } },
+      { id: "pending-a", values: [0.99, 0.01], metadata: { parentId: "pending", embedding_fingerprint: "ep2_pending" } },
     ]);
     const details = await vec.describe() as any;
     if (details.config.backend !== "sqlite-vec") {
@@ -204,7 +204,7 @@ describe("SqliteVectorizeIndex", () => {
 
     const { matches } = await vec.query([1, 0], {
       topK: 1,
-      filter: { embedding_fingerprint: "emb2_active" },
+      filter: { embedding_fingerprint: "ep2_active" },
     } as any);
 
     expect(matches.map((match) => match.id)).toEqual(["active-a"]);
@@ -282,7 +282,7 @@ describe("SqliteVectorizeIndex", () => {
         JSON.stringify({
           parentId: "legacy",
           content: "sqlite vector legacy row",
-          embedding_fingerprint: "emb2_11111111111111111111111111111111",
+          embedding_fingerprint: "ep2_11111111111111111111111111111111",
         })
       );
 

@@ -134,7 +134,7 @@ function fnv1a64Hex(input: string): string {
 }
 
 function profileTableSuffix(profileId: string): string {
-  if (/^emb2_[0-9a-f]{32}$/i.test(profileId)) return profileId;
+  if (/^(?:ep2|emb2)_[0-9a-f]{32}$/i.test(profileId)) return profileId;
   return `fp_${fnv1a64Hex(profileId)}`;
 }
 

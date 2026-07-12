@@ -130,6 +130,8 @@ export interface Env {
   AUTH_TOKEN: string;
   OAUTH_KV: KVNamespace;
   VECTORIZE_GRACE_MS?: string;
+  /** Cloudflare Vectorize index dimensions; Vectorize indexes cannot change dimension after creation. */
+  VECTORIZE_DIMENSIONS?: string;
   /** Set on Node self-host (`1`). */
   SELFHOST?: string;
   /** Required with EMBEDDING_PROVIDER=local-hash-dev for smoke tests only. */
@@ -167,6 +169,34 @@ const CORS_HEADERS = {
 
 function graceMs(env: Env): number {
   return parseInt(env.VECTORIZE_GRACE_MS ?? "300000", 10) || 300000;
+}
+
+function cloudflareVectorIndexDimensions(env: Env): number {
+  return parseInt(env.VECTORIZE_DIMENSIONS ?? "384", 10) || 384;
+}
+
+function validateCloudflareVectorDimensions(
+  env: Env,
+  dimensions: number
+): null | {
+  ok: false;
+  error: "vector_index_dimension_mismatch";
+  indexDimensions: number;
+  embeddingDimensions: number;
+  next: string;
+} {
+  if (env.SELFHOST === "1") return null;
+  const indexDimensions = cloudflareVectorIndexDimensions(env);
+  const embeddingDimensions = Number(dimensions || 0);
+  if (embeddingDimensions === indexDimensions) return null;
+  return {
+    ok: false,
+    error: "vector_index_dimension_mismatch",
+    indexDimensions,
+    embeddingDimensions,
+    next:
+      "Cloudflare Vectorize 索引维度固定。请使用匹配当前索引维度的 embedding 模型，或创建并绑定对应维度的新 Vectorize 索引。",
+  };
 }
 
 // ─── Thresholds ───────────────────────────────────────────────────────────────
@@ -7999,6 +8029,27 @@ const defaultHandler = {
 
       const storedSettings = await loadStoredModelSettings(env.DB).catch(() => null);
       const pendingFingerprint = storedSettings?.pendingEmbeddingFingerprint ?? null;
+      const vectorSettings = storedSettings ?? mergeFromEnvOnly(env);
+      if (vectorSettings) {
+        const vectorEmbedding = pendingFingerprint
+          ? pendingEmbeddingOf(vectorSettings)
+          : activeEmbeddingOf(vectorSettings);
+        const dimensionMismatch = validateCloudflareVectorDimensions(
+          env,
+          vectorEmbedding.dimensions
+        );
+        if (dimensionMismatch) {
+          return json({
+            ...dimensionMismatch,
+            processed: 0,
+            failed: 0,
+            skipped: 0,
+            remaining: 0,
+            limit,
+            retryable: false,
+          }, 400);
+        }
+      }
       const activeRebuild = pendingFingerprint
         ? await loadCurrentVectorRebuild(env, pendingFingerprint)
         : null;
@@ -8497,6 +8548,12 @@ const defaultHandler = {
       }
 
       if (body.embedding) {
+        const dimensionMismatch = validateCloudflareVectorDimensions(
+          env,
+          next.embedding.dimensions
+        );
+        if (dimensionMismatch) return json(dimensionMismatch, 400);
+
         const nextFp = embeddingFingerprintOf(next.embedding);
         const previousActiveEmbedding = activeEmbeddingOf(previous);
         const previousActiveFp =
@@ -8733,6 +8790,11 @@ const defaultHandler = {
 
       const activeEmbedding = activeEmbeddingOf(effective);
       const pendingEmbedding = pendingEmbeddingOf(effective);
+      const dimensionMismatch = validateCloudflareVectorDimensions(
+        env,
+        pendingEmbedding.dimensions
+      );
+      if (dimensionMismatch) return json(dimensionMismatch, 400);
       const pending = embeddingFingerprintOf(pendingEmbedding);
       const settingsForQueue = structuredClone(stored ?? mergeFromEnvOnly(env));
       const now = Date.now();

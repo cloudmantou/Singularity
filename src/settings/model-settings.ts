@@ -369,8 +369,8 @@ function fnv1a64Hex(input: string, seed: bigint): string {
 export function embeddingFingerprintOf(emb: EmbeddingSettings): string {
   const signature = embeddingConfigSignatureOf(emb);
   const high = fnv1a64Hex(signature, 0xcbf29ce484222325n);
-  const low = fnv1a64Hex(`emb2:${signature}`, 0x84222325cbf29ce4n);
-  return `emb2_${high}${low}`;
+  const low = fnv1a64Hex(`ep2:${signature}`, 0x84222325cbf29ce4n);
+  return `ep2_${high}${low}`;
 }
 
 export function cloneEmbeddingSettings(embedding: EmbeddingSettings): EmbeddingSettings {

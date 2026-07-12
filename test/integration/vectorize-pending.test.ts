@@ -4,6 +4,8 @@ import { makeTestEnv, makeTestDb, makeVectorizeMock } from "../helpers/make-env"
 import { req } from "../helpers/make-request";
 import type { Env } from "../../src/index";
 import { D1Mock } from "../helpers/d1-mock";
+import { emptyModelSettings, embeddingFingerprintOf } from "../../src/settings/model-settings";
+import { setStoredModelSettingsCache } from "../../src/settings/store";
 
 const ctx = { waitUntil: (_: Promise<any>) => {} } as any;
 
@@ -201,6 +203,7 @@ describe("POST /vectorize-pending", () => {
       ...pastGraceEntry("active"),
       vector_ids: '["active-old"]',
     });
+    env = makeTestEnv(db, { VECTORIZE_DIMENSIONS: "768" });
 
     const res = await worker.fetch(
       req("PUT", "/settings/models", {
@@ -227,6 +230,118 @@ describe("POST /vectorize-pending", () => {
     expect(data.settings.activeEmbedding.provider).toBe("none");
     expect(data.settings.embeddingFingerprint).not.toBe(data.settings.pendingEmbeddingFingerprint);
     expect(db.entries[0].vector_ids).toBe('["active-old"]');
+  });
+
+  it("rejects saving a Cloudflare embedding profile whose dimensions do not match the Vectorize index", async () => {
+    db.entries.push({
+      ...pastGraceEntry("active"),
+      vector_ids: '["active-old"]',
+    });
+    env = makeTestEnv(db, { VECTORIZE_DIMENSIONS: "384" });
+
+    const res = await worker.fetch(
+      req("PUT", "/settings/models", {
+        body: {
+          embedding: {
+            provider: "custom",
+            baseURL: "https://embed-new.example/v1",
+            apiKey: "new-key",
+            model: "new-embedding-1536",
+            dimensions: 1536,
+            supportsDimensionsParameter: false,
+          },
+        },
+      }),
+      env,
+      ctx
+    );
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(400);
+    expect(data).toMatchObject({
+      ok: false,
+      error: "vector_index_dimension_mismatch",
+      indexDimensions: 384,
+      embeddingDimensions: 1536,
+    });
+    expect(data.next).toContain("Cloudflare Vectorize");
+    expect(db.appSettings.model_settings).toBeUndefined();
+  });
+
+  it("rejects starting a Cloudflare rebuild when the pending embedding dimensions do not match the Vectorize index", async () => {
+    const settings = emptyModelSettings();
+    settings.embedding = {
+      provider: "custom",
+      baseURL: "https://embed.example/v1",
+      apiKey: "embedding-key",
+      model: "embedding-1536",
+      dimensions: 1536,
+      supportsDimensionsParameter: false,
+    };
+    settings.activeEmbedding = { ...settings.embedding };
+    settings.embeddingFingerprint = embeddingFingerprintOf(settings.embedding);
+    db.appSettings.model_settings = {
+      value: JSON.stringify(settings),
+      updated_at: Date.now(),
+    };
+    setStoredModelSettingsCache(settings);
+    env = makeTestEnv(db, { VECTORIZE_DIMENSIONS: "384" });
+
+    const res = await worker.fetch(req("POST", "/settings/models/reindex"), env, ctx);
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(400);
+    expect(data).toMatchObject({
+      ok: false,
+      error: "vector_index_dimension_mismatch",
+      indexDimensions: 384,
+      embeddingDimensions: 1536,
+    });
+    expect(db.vectorRebuilds).toHaveLength(0);
+  });
+
+  it("rejects vectorizing an existing Cloudflare pending profile whose dimensions do not match the Vectorize index", async () => {
+    const settings = emptyModelSettings();
+    settings.embedding = {
+      provider: "custom",
+      baseURL: "https://embed.example/v1",
+      apiKey: "embedding-key",
+      model: "embedding-1536",
+      dimensions: 1536,
+      supportsDimensionsParameter: false,
+    };
+    settings.activeEmbedding = {
+      provider: "custom",
+      baseURL: "https://embed.example/v1",
+      apiKey: "embedding-key",
+      model: "embedding-384",
+      dimensions: 384,
+      supportsDimensionsParameter: false,
+    };
+    settings.pendingEmbedding = { ...settings.embedding };
+    settings.embeddingFingerprint = embeddingFingerprintOf(settings.activeEmbedding);
+    settings.pendingEmbeddingFingerprint = embeddingFingerprintOf(settings.pendingEmbedding);
+    db.appSettings.model_settings = {
+      value: JSON.stringify(settings),
+      updated_at: Date.now(),
+    };
+    setStoredModelSettingsCache(settings);
+    env = makeTestEnv(db, { VECTORIZE_DIMENSIONS: "384" });
+
+    const res = await worker.fetch(req("POST", "/vectorize-pending"), env, ctx);
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(400);
+    expect(data).toMatchObject({
+      ok: false,
+      error: "vector_index_dimension_mismatch",
+      indexDimensions: 384,
+      embeddingDimensions: 1536,
+      processed: 0,
+      failed: 0,
+      remaining: 0,
+      retryable: false,
+    });
   });
 
   it("activates pending vectors only after the blue-green queue is complete", async () => {

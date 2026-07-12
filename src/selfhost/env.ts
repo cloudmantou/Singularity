@@ -66,6 +66,7 @@ export function createSelfhostEnv(options: SelfhostOptions = {}): {
     SELFHOST: "1",
     ALLOW_DEV_EMBEDDING: process.env.ALLOW_DEV_EMBEDDING,
     VECTORIZE_GRACE_MS: process.env.VECTORIZE_GRACE_MS,
+    VECTORIZE_DIMENSIONS: process.env.VECTORIZE_DIMENSIONS,
     // Global site domain — single source for OAuth / MCP absolute URLs
     PUBLIC_URL:
       process.env.PUBLIC_URL ||

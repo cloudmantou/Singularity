@@ -27,7 +27,8 @@
 		}
 	],
 	"vars": {
-		"VECTORIZE_GRACE_MS": "300000"
+		"VECTORIZE_GRACE_MS": "300000",
+		"VECTORIZE_DIMENSIONS": "384"
 	},
 	"secrets": {
 		"required": ["AUTH_TOKEN"]

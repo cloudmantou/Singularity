@@ -128,7 +128,7 @@ describe("model-settings helpers", () => {
 
     const fingerprint = embeddingFingerprintOf(embedding);
 
-    expect(fingerprint).toMatch(/^emb2_[0-9a-f]{32}$/);
+    expect(fingerprint).toMatch(/^ep2_[0-9a-f]{32}$/);
     expect(new TextEncoder().encode(fingerprint).byteLength).toBeLessThanOrEqual(64);
     expect(embeddingConfigSignatureOf(embedding)).toContain("very-long-gateway");
     expect(fingerprint).not.toContain("very-long-gateway");
