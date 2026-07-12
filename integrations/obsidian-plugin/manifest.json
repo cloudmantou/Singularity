@@ -1,0 +1,9 @@
+{
+  "id": "singularity-obsidian",
+  "name": "Singularity",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Save notes to Singularity, search recall, and export managed memories as Markdown.",
+  "author": "Singularity",
+  "isDesktopOnly": false
+}

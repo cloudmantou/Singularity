@@ -39,6 +39,29 @@ CREATE INDEX IF NOT EXISTS idx_entries_pending_vectors
 CREATE INDEX IF NOT EXISTS idx_entries_pending_rebuild
   ON entries(pending_rebuild_id, pending_vector_ids, created_at);
 
+CREATE TABLE IF NOT EXISTS sb_external_links (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  entry_id TEXT NOT NULL,
+  vault_id TEXT NOT NULL,
+  external_path TEXT NOT NULL,
+  external_file_id TEXT,
+  last_synced_content_hash TEXT,
+  last_synced_revision_id TEXT,
+  sync_direction TEXT NOT NULL DEFAULT 'bidirectional',
+  sync_status TEXT NOT NULL DEFAULT 'synced',
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(provider, vault_id, external_path),
+  CHECK (sync_direction IN ('bidirectional', 'obsidian_to_singularity', 'singularity_to_obsidian')),
+  CHECK (sync_status IN ('synced', 'local_changed', 'remote_changed', 'conflict', 'deleted_local', 'deleted_remote', 'error'))
+);
+CREATE INDEX IF NOT EXISTS idx_external_links_entry
+  ON sb_external_links(entry_id);
+CREATE INDEX IF NOT EXISTS idx_external_links_provider_vault
+  ON sb_external_links(provider, vault_id, sync_status, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS sb_vector_rebuilds (
   id TEXT PRIMARY KEY,
   slot TEXT NOT NULL UNIQUE DEFAULT 'current',

@@ -694,6 +694,34 @@ export async function initializeDatabase(env: Env): Promise<void> {
      ON entries(pending_rebuild_id, pending_vector_ids, created_at)`
   );
   await env.DB.exec(
+    `CREATE TABLE IF NOT EXISTS sb_external_links (
+      id TEXT PRIMARY KEY,
+      provider TEXT NOT NULL,
+      entry_id TEXT NOT NULL,
+      vault_id TEXT NOT NULL,
+      external_path TEXT NOT NULL,
+      external_file_id TEXT,
+      last_synced_content_hash TEXT,
+      last_synced_revision_id TEXT,
+      sync_direction TEXT NOT NULL DEFAULT 'bidirectional',
+      sync_status TEXT NOT NULL DEFAULT 'synced',
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(provider, vault_id, external_path),
+      CHECK (sync_direction IN ('bidirectional', 'obsidian_to_singularity', 'singularity_to_obsidian')),
+      CHECK (sync_status IN ('synced', 'local_changed', 'remote_changed', 'conflict', 'deleted_local', 'deleted_remote', 'error'))
+    )`
+  );
+  await env.DB.exec(
+    `CREATE INDEX IF NOT EXISTS idx_external_links_entry
+     ON sb_external_links(entry_id)`
+  );
+  await env.DB.exec(
+    `CREATE INDEX IF NOT EXISTS idx_external_links_provider_vault
+     ON sb_external_links(provider, vault_id, sync_status, updated_at DESC)`
+  );
+  await env.DB.exec(
     `CREATE TABLE IF NOT EXISTS sb_vector_rebuilds (
       id TEXT PRIMARY KEY,
       slot TEXT NOT NULL UNIQUE DEFAULT 'current',
@@ -873,6 +901,640 @@ async function entryMetadataFingerprint(input: {
     source: input.source,
     tags: normalizeTagsForMetadata(input.tags),
   }));
+}
+
+const OBSIDIAN_PROVIDER = "obsidian";
+const OBSIDIAN_SYNC_STATUSES = [
+  "synced",
+  "local_changed",
+  "remote_changed",
+  "conflict",
+  "deleted_local",
+  "deleted_remote",
+  "error",
+] as const;
+const OBSIDIAN_SYNC_DIRECTIONS = [
+  "bidirectional",
+  "obsidian_to_singularity",
+  "singularity_to_obsidian",
+] as const;
+
+type ObsidianSyncStatus = (typeof OBSIDIAN_SYNC_STATUSES)[number];
+type ObsidianSyncDirection = (typeof OBSIDIAN_SYNC_DIRECTIONS)[number];
+
+interface ObsidianPushBody {
+  vaultId?: unknown;
+  path?: unknown;
+  content?: unknown;
+  properties?: unknown;
+  entryId?: unknown;
+  baseRevisionId?: unknown;
+  syncDirection?: unknown;
+}
+
+interface ObsidianResolveConflictBody {
+  linkId?: unknown;
+  vaultId?: unknown;
+  path?: unknown;
+  resolution?: unknown;
+  content?: unknown;
+  properties?: unknown;
+  baseRevisionId?: unknown;
+}
+
+interface ObsidianLinkRow {
+  id: string;
+  provider: string;
+  entry_id: string;
+  vault_id: string;
+  external_path: string;
+  external_file_id: string | null;
+  last_synced_content_hash: string | null;
+  last_synced_revision_id: string | null;
+  sync_direction: ObsidianSyncDirection;
+  sync_status: ObsidianSyncStatus;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+interface ObsidianLinkedEntryRow extends ObsidianLinkRow {
+  content: string;
+  tags: string;
+  source: string;
+  entry_created_at: number;
+  content_hash: string | null;
+  revision_id: string | null;
+  memory_status: MemoryStatus | null;
+}
+
+function optionalTrimmedString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function requiredTrimmedString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function parseObsidianProperties(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return { ...(value as Record<string, unknown>) };
+}
+
+function parseObsidianSyncDirection(value: unknown): ObsidianSyncDirection {
+  if (typeof value === "string" && (OBSIDIAN_SYNC_DIRECTIONS as readonly string[]).includes(value)) {
+    return value as ObsidianSyncDirection;
+  }
+  return "bidirectional";
+}
+
+function parseObsidianTags(properties: Record<string, unknown>): string[] {
+  const rawTags = properties.tags;
+  const values = Array.isArray(rawTags)
+    ? rawTags
+    : typeof rawTags === "string"
+      ? rawTags.split(/[,\s]+/)
+      : [];
+  return values
+    .map((tag) => String(tag).trim().replace(/^#/, "").toLowerCase())
+    .filter((tag) => tag.length > 0 && isD1SafeTag(tag));
+}
+
+function obsidianTagsForEntry(properties: Record<string, unknown>): string[] {
+  const tags = new Set<string>(["obsidian"]);
+  for (const tag of parseObsidianTags(properties)) tags.add(tag);
+  const rawStatus = properties.status;
+  if (typeof rawStatus === "string" && (STATUS_VALUES as readonly string[]).includes(rawStatus)) {
+    tags.add(`status:${rawStatus}`);
+  }
+  return [...tags];
+}
+
+function mergeEntryTags(existing: string[], incoming: string[]): string[] {
+  const incomingStatus = getStatus(incoming);
+  const base = incomingStatus
+    ? existing.filter((tag) => !tag.startsWith(STATUS_PREFIX))
+    : existing;
+  const next = new Set<string>(base.filter(isD1SafeTag));
+  for (const tag of incoming) {
+    const normalized = tag.toLowerCase();
+    if (isD1SafeTag(normalized)) next.add(normalized);
+  }
+  return [...next];
+}
+
+function parseEntryTagsJson(tagsJson: string | null | undefined): string[] {
+  try {
+    const parsed = JSON.parse(tagsJson ?? "[]");
+    return Array.isArray(parsed) ? parsed.map(String).filter(isD1SafeTag) : [];
+  } catch {
+    return [];
+  }
+}
+
+function yamlScalar(value: unknown): string {
+  return JSON.stringify(String(value ?? ""));
+}
+
+function obsidianFrontmatter(input: {
+  entryId: string;
+  revisionId: string | null;
+  status: MemoryStatus | null;
+  source: string;
+  syncedAt: string;
+  tags: string[];
+  path: string;
+}): string {
+  const lines = [
+    "---",
+    `singularity_id: ${yamlScalar(input.entryId)}`,
+    `singularity_revision: ${yamlScalar(input.revisionId ?? "")}`,
+    `singularity_status: ${yamlScalar(input.status ?? "draft")}`,
+    "singularity_kind: semantic",
+    `singularity_source: ${yamlScalar(input.source)}`,
+    `singularity_synced_at: ${yamlScalar(input.syncedAt)}`,
+    `singularity_path: ${yamlScalar(input.path)}`,
+    "tags:",
+    ...input.tags.map((tag) => `- ${yamlScalar(tag)}`),
+    "---",
+    "",
+  ];
+  return lines.join("\n");
+}
+
+function markdownForObsidian(row: ObsidianLinkedEntryRow): string {
+  const tags = parseEntryTagsJson(row.tags)
+    .filter((tag) => tag !== "obsidian" && !tag.startsWith("status:"));
+  const frontmatter = obsidianFrontmatter({
+    entryId: row.entry_id,
+    revisionId: row.revision_id,
+    status: row.memory_status,
+    source: row.source,
+    syncedAt: new Date(row.updated_at).toISOString(),
+    tags: ["singularity", ...tags],
+    path: row.external_path,
+  });
+  return `${frontmatter}${row.content}`;
+}
+
+async function latestMemoryRevisionId(
+  env: Env,
+  entryId: string,
+  contentOnly = false
+): Promise<string | null> {
+  const eventFilter = contentOnly
+    ? `AND event_type IN ('ADD', 'UPDATE', 'APPEND', 'DEPRECATE', 'ROLLUP', 'UNROLL')`
+    : "";
+  const row = await env.DB.prepare(
+    `SELECT id FROM sb_memory_revisions
+     WHERE memory_id = ?
+       ${eventFilter}
+     ORDER BY created_at DESC
+     LIMIT 1`
+  ).bind(entryId).first<{ id: string }>();
+  return row?.id ?? null;
+}
+
+async function loadObsidianLinkByVaultPath(
+  env: Env,
+  vaultId: string,
+  externalPath: string
+): Promise<ObsidianLinkRow | null> {
+  return await env.DB.prepare(
+    `SELECT * FROM sb_external_links
+     WHERE provider = ? AND vault_id = ? AND external_path = ?
+     LIMIT 1`
+  ).bind(OBSIDIAN_PROVIDER, vaultId, externalPath).first<ObsidianLinkRow>();
+}
+
+async function loadObsidianLinkById(env: Env, linkId: string): Promise<ObsidianLinkRow | null> {
+  return await env.DB.prepare(
+    `SELECT * FROM sb_external_links
+     WHERE id = ? AND provider = ?
+     LIMIT 1`
+  ).bind(linkId, OBSIDIAN_PROVIDER).first<ObsidianLinkRow>();
+}
+
+async function markObsidianLinkStatus(
+  env: Env,
+  linkId: string,
+  status: ObsidianSyncStatus,
+  lastError: string | null = null
+): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE sb_external_links
+     SET sync_status = ?, last_error = ?, updated_at = ?
+     WHERE id = ? AND provider = ?`
+  ).bind(status, lastError, Date.now(), linkId, OBSIDIAN_PROVIDER).run();
+}
+
+async function upsertObsidianLink(
+  env: Env,
+  input: {
+    existingId?: string;
+    entryId: string;
+    vaultId: string;
+    externalPath: string;
+    syncDirection: ObsidianSyncDirection;
+    contentHash: string;
+    revisionId: string | null;
+    status?: ObsidianSyncStatus;
+    lastError?: string | null;
+  }
+): Promise<ObsidianLinkRow> {
+  const now = Date.now();
+  const id = input.existingId ?? crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT INTO sb_external_links (
+       id, provider, entry_id, vault_id, external_path, external_file_id,
+       last_synced_content_hash, last_synced_revision_id, sync_direction,
+       sync_status, last_error, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(provider, vault_id, external_path) DO UPDATE SET
+       entry_id = excluded.entry_id,
+       last_synced_content_hash = excluded.last_synced_content_hash,
+       last_synced_revision_id = excluded.last_synced_revision_id,
+       sync_direction = excluded.sync_direction,
+       sync_status = excluded.sync_status,
+       last_error = excluded.last_error,
+       updated_at = excluded.updated_at`
+  ).bind(
+    id,
+    OBSIDIAN_PROVIDER,
+    input.entryId,
+    input.vaultId,
+    input.externalPath,
+    input.contentHash,
+    input.revisionId,
+    input.syncDirection,
+    input.status ?? "synced",
+    input.lastError ?? null,
+    now,
+    now
+  ).run();
+
+  const row = await loadObsidianLinkByVaultPath(env, input.vaultId, input.externalPath);
+  if (!row) throw new Error("Obsidian link upsert failed");
+  return row;
+}
+
+async function linkObsidianObservation(
+  env: Env,
+  input: {
+    entryId: string;
+    vaultId: string;
+    externalPath: string;
+    content: string;
+    contentHash: string;
+    properties: Record<string, unknown>;
+    createdAt: number;
+  }
+): Promise<void> {
+  const observationId = crypto.randomUUID();
+  await prepareObservationInsert(env.DB, {
+    id: observationId,
+    content: input.content,
+    source: OBSIDIAN_PROVIDER,
+    metadata: {
+      provider: OBSIDIAN_PROVIDER,
+      vault_id: input.vaultId,
+      external_path: input.externalPath,
+      properties: input.properties,
+      needs_reprocess: true,
+    },
+    contentHash: input.contentHash,
+    extractionStatus: "fallback",
+    processedAt: input.createdAt,
+    needsReprocess: true,
+    createdAt: input.createdAt,
+  }).run();
+  await linkObservationToAtomicMemory(env.DB, {
+    entryId: input.entryId,
+    content: input.content,
+    contentHash: input.contentHash,
+    observationId,
+    createdAt: input.createdAt,
+  });
+}
+
+function serializeObsidianLink(row: ObsidianLinkRow): Record<string, unknown> {
+  return {
+    id: row.id,
+    provider: row.provider,
+    entryId: row.entry_id,
+    vaultId: row.vault_id,
+    path: row.external_path,
+    lastSyncedContentHash: row.last_synced_content_hash,
+    lastSyncedRevisionId: row.last_synced_revision_id,
+    syncDirection: row.sync_direction,
+    syncStatus: row.sync_status,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function serializeObsidianPullRow(row: ObsidianLinkedEntryRow): Record<string, unknown> {
+  const entryTags = parseEntryTagsJson(row.tags);
+  return {
+    link: serializeObsidianLink(row),
+    entryId: row.entry_id,
+    path: row.external_path,
+    content: row.content,
+    markdown: markdownForObsidian(row),
+    revisionId: row.revision_id,
+    contentHash: row.content_hash,
+    properties: {
+      singularity_id: row.entry_id,
+      singularity_revision: row.revision_id,
+      singularity_status: row.memory_status ?? "draft",
+      singularity_source: row.source,
+      singularity_synced_at: new Date(row.updated_at).toISOString(),
+      tags: entryTags,
+    },
+  };
+}
+
+async function handleObsidianPush(
+  env: Env,
+  ctx: ExecutionContext,
+  body: ObsidianPushBody,
+  options: { force?: boolean } = {}
+): Promise<Response> {
+  const vaultId = requiredTrimmedString(body.vaultId);
+  const externalPath = requiredTrimmedString(body.path);
+  const content = requiredTrimmedString(body.content);
+  if (!vaultId) return json({ ok: false, error: "vaultId is required" }, 400);
+  if (!externalPath) return json({ ok: false, error: "path is required" }, 400);
+  if (!content) return json({ ok: false, error: "content is required" }, 400);
+  if (vaultId.length > 128) return json({ ok: false, error: "vaultId is too long" }, 400);
+  if (externalPath.length > 1024) return json({ ok: false, error: "path is too long" }, 400);
+
+  const properties = parseObsidianProperties(body.properties);
+  const syncDirection = parseObsidianSyncDirection(body.syncDirection);
+  const requestedEntryId = optionalTrimmedString(body.entryId);
+  const baseRevisionId = optionalTrimmedString(body.baseRevisionId);
+  const incomingTags = obsidianTagsForEntry(properties);
+  const existingLink = await loadObsidianLinkByVaultPath(env, vaultId, externalPath);
+  if (existingLink && requestedEntryId && requestedEntryId !== existingLink.entry_id) {
+    return json({
+      ok: false,
+      error: "obsidian_path_already_linked",
+      link: serializeObsidianLink(existingLink),
+    }, 409);
+  }
+
+  const entryId = requestedEntryId ?? existingLink?.entry_id;
+  if (!entryId) {
+    const result = await captureEntry(content, incomingTags, OBSIDIAN_PROVIDER, env, ctx, {
+      skipExtract: true,
+    });
+    const ids = captureResultEntryIds(result);
+    const newEntryId = result.status === "blocked" ? result.matchId : ids[0];
+    if (!newEntryId) {
+      return json({ ok: false, error: "obsidian_push_stored_no_entry" }, 500);
+    }
+    const row = await env.DB.prepare(
+      `SELECT id, content, tags, source, content_hash FROM entries WHERE id = ?`
+    ).bind(newEntryId).first<Record<string, any>>();
+    if (!row) return json({ ok: false, error: "obsidian_push_entry_missing" }, 500);
+    const contentHash = (row.content_hash as string | null) ?? await contentFingerprint(row.content as string);
+    const revisionId = await latestMemoryRevisionId(env, newEntryId, true);
+    try {
+      await linkObsidianObservation(env, {
+        entryId: newEntryId,
+        vaultId,
+        externalPath,
+        content: row.content as string,
+        contentHash,
+        properties,
+        createdAt: Date.now(),
+      });
+    } catch (error) {
+      console.error("Obsidian atomic source sync failed (non-fatal):", error);
+    }
+    const link = await upsertObsidianLink(env, {
+      existingId: existingLink?.id,
+      entryId: newEntryId,
+      vaultId,
+      externalPath,
+      syncDirection,
+      contentHash,
+      revisionId,
+      status: "synced",
+    });
+    return json({
+      ok: true,
+      action: result.status === "blocked" ? "linked_duplicate" : "created",
+      entryId: newEntryId,
+      revisionId,
+      link: serializeObsidianLink(link),
+    });
+  }
+
+  const row = await env.DB.prepare(
+    `SELECT id, content, tags, source, content_hash FROM entries WHERE id = ?`
+  ).bind(entryId).first<Record<string, any>>();
+  if (!row) {
+    if (existingLink) await markObsidianLinkStatus(env, existingLink.id, "deleted_remote", "linked memory is missing");
+    return json({ ok: false, error: `No entry found with ID: ${entryId}` }, 404);
+  }
+
+  const oldContent = row.content as string;
+  const oldTags = parseEntryTagsJson(row.tags as string | null);
+  const newTags = mergeEntryTags(oldTags, incomingTags);
+  const source = row.source as string;
+  const latestRevisionId = await latestMemoryRevisionId(env, entryId, true);
+  const effectiveBaseRevisionId = baseRevisionId ?? existingLink?.last_synced_revision_id ?? undefined;
+  const tagsChanged = JSON.stringify(oldTags) !== JSON.stringify(newTags);
+  const contentChanged = oldContent !== content;
+  if (
+    !options.force &&
+    effectiveBaseRevisionId &&
+    latestRevisionId &&
+    effectiveBaseRevisionId !== latestRevisionId &&
+    (contentChanged || tagsChanged)
+  ) {
+    if (existingLink) await markObsidianLinkStatus(env, existingLink.id, "conflict", "remote memory changed since Obsidian base revision");
+    return json({
+      ok: false,
+      error: "obsidian_sync_conflict",
+      entryId,
+      baseRevisionId: effectiveBaseRevisionId,
+      currentRevisionId: latestRevisionId,
+      link: existingLink ? serializeObsidianLink({
+        ...existingLink,
+        sync_status: "conflict",
+        last_error: "remote memory changed since Obsidian base revision",
+        updated_at: Date.now(),
+      }) : null,
+    }, 409);
+  }
+
+  let finalRevisionId = latestRevisionId;
+  let contentHash = (row.content_hash as string | null) ?? await contentFingerprint(oldContent);
+  let vectors = 0;
+  let atomicSyncWarning: string | undefined;
+  if (contentChanged || tagsChanged) {
+    let newVectorIds: string[];
+    try {
+      newVectorIds = await commitEntryVersion(env, {
+        id: entryId,
+        oldContent,
+        newContent: content,
+        oldTags,
+        newTags,
+        source,
+        eventType: "UPDATE",
+        reason: `Obsidian push from ${vaultId}:${externalPath}`,
+        actor: OBSIDIAN_PROVIDER,
+      });
+    } catch (error) {
+      console.error("Obsidian update vector switch failed:", error);
+      if (existingLink) await markObsidianLinkStatus(env, existingLink.id, "error", "vector switch failed");
+      return json({
+        ok: false,
+        error: "Obsidian push could not be indexed. Previous content remains active; retry later.",
+      }, 503);
+    }
+    vectors = newVectorIds.length;
+    contentHash = await contentFingerprint(content);
+    finalRevisionId = await latestMemoryRevisionId(env, entryId, true);
+    try {
+      await replaceEntryAtomicMemory(env.DB, {
+        entryId,
+        content,
+        contentHash,
+        source: OBSIDIAN_PROVIDER,
+        eventType: "update",
+        createdAt: Date.now(),
+      });
+    } catch (error) {
+      console.error("Obsidian atomic memory update sync failed (non-fatal):", error);
+      atomicSyncWarning = "atomic_sync_failed";
+    }
+    scheduleClassifyAndTag(entryId, content, env, ctx);
+  }
+
+  const link = await upsertObsidianLink(env, {
+    existingId: existingLink?.id,
+    entryId,
+    vaultId,
+    externalPath,
+    syncDirection,
+    contentHash,
+    revisionId: finalRevisionId,
+    status: "synced",
+  });
+
+  return json({
+    ok: true,
+    action: contentChanged || tagsChanged ? "updated" : "unchanged",
+    entryId,
+    revisionId: finalRevisionId,
+    vectors,
+    warning: atomicSyncWarning,
+    link: serializeObsidianLink(link),
+  });
+}
+
+async function loadObsidianLinkedEntryByLink(
+  env: Env,
+  link: ObsidianLinkRow
+): Promise<ObsidianLinkedEntryRow | null> {
+  const row = await env.DB.prepare(
+    `SELECT
+       l.*,
+       e.content,
+       e.tags,
+       e.source,
+       e.created_at AS entry_created_at,
+       e.content_hash,
+       (
+         SELECT id FROM sb_memory_revisions r
+         WHERE r.memory_id = e.id
+           AND r.event_type IN ('ADD', 'UPDATE', 'APPEND', 'DEPRECATE', 'ROLLUP', 'UNROLL')
+         ORDER BY r.created_at DESC
+         LIMIT 1
+       ) AS revision_id
+     FROM sb_external_links l
+     JOIN entries e ON e.id = l.entry_id
+     WHERE l.id = ? AND l.provider = ?
+     LIMIT 1`
+  ).bind(link.id, OBSIDIAN_PROVIDER).first<Record<string, any>>();
+  if (!row) return null;
+  const tags = parseEntryTagsJson(row.tags as string | null);
+  return {
+    ...(row as ObsidianLinkedEntryRow),
+    memory_status: getStatus(tags),
+  };
+}
+
+async function handleObsidianResolveConflict(
+  env: Env,
+  ctx: ExecutionContext,
+  body: ObsidianResolveConflictBody
+): Promise<Response> {
+  const linkId = optionalTrimmedString(body.linkId);
+  const vaultId = optionalTrimmedString(body.vaultId);
+  const externalPath = optionalTrimmedString(body.path);
+  const resolution = optionalTrimmedString(body.resolution);
+  if (!resolution) return json({ ok: false, error: "resolution is required" }, 400);
+
+  const link = linkId
+    ? await loadObsidianLinkById(env, linkId)
+    : vaultId && externalPath
+      ? await loadObsidianLinkByVaultPath(env, vaultId, externalPath)
+      : null;
+  if (!link) return json({ ok: false, error: "Obsidian link not found" }, 404);
+
+  const normalizedResolution = resolution.toLowerCase();
+  if (["use_singularity", "singularity", "remote"].includes(normalizedResolution)) {
+    const row = await loadObsidianLinkedEntryByLink(env, link);
+    if (!row) {
+      await markObsidianLinkStatus(env, link.id, "deleted_remote", "linked memory is missing");
+      return json({ ok: false, error: "Linked memory is missing" }, 404);
+    }
+    const contentHash = row.content_hash ?? await contentFingerprint(row.content);
+    const revisionId = row.revision_id ?? await latestMemoryRevisionId(env, row.entry_id, true);
+    const synced = await upsertObsidianLink(env, {
+      existingId: link.id,
+      entryId: row.entry_id,
+      vaultId: row.vault_id,
+      externalPath: row.external_path,
+      syncDirection: row.sync_direction,
+      contentHash,
+      revisionId,
+      status: "synced",
+    });
+    return json({
+      ok: true,
+      resolution: "use_singularity",
+      entryId: row.entry_id,
+      revisionId,
+      markdown: markdownForObsidian({ ...row, revision_id: revisionId }),
+      link: serializeObsidianLink(synced),
+    });
+  }
+
+  if (["use_obsidian", "obsidian", "local"].includes(normalizedResolution)) {
+    const content = requiredTrimmedString(body.content);
+    if (!content) return json({ ok: false, error: "content is required when resolving with Obsidian" }, 400);
+    return handleObsidianPush(env, ctx, {
+      vaultId: link.vault_id,
+      path: link.external_path,
+      content,
+      properties: body.properties,
+      entryId: link.entry_id,
+      baseRevisionId: body.baseRevisionId,
+      syncDirection: link.sync_direction,
+    }, { force: true });
+  }
+
+  return json({
+    ok: false,
+    error: "resolution must be one of: use_singularity, use_obsidian",
+  }, 400);
 }
 
 async function findExactDuplicateId(
@@ -7497,6 +8159,123 @@ const defaultHandler = {
           ? "Update succeeded, but atomic memory sync failed. Run extraction repair from Observatory."
           : undefined,
       });
+    }
+
+    // POST /integrations/obsidian/push
+    if (url.pathname === "/integrations/obsidian/push" && request.method === "POST") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      let body: ObsidianPushBody;
+      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      return handleObsidianPush(env, ctx, body);
+    }
+
+    // GET /integrations/obsidian/pull
+    if (url.pathname === "/integrations/obsidian/pull" && request.method === "GET") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      const vaultId = requiredTrimmedString(url.searchParams.get("vaultId"));
+      if (!vaultId) return json({ ok: false, error: "vaultId is required" }, 400);
+      const status = optionalTrimmedString(url.searchParams.get("status"));
+      if (status && !(OBSIDIAN_SYNC_STATUSES as readonly string[]).includes(status)) {
+        return json({ ok: false, error: `status must be one of: ${OBSIDIAN_SYNC_STATUSES.join(", ")}` }, 400);
+      }
+      const rawLimit = Number(url.searchParams.get("limit") ?? 50);
+      const limit = Number.isFinite(rawLimit)
+        ? Math.min(100, Math.max(1, Math.floor(rawLimit)))
+        : 50;
+      const statusClause = status ? "AND l.sync_status = ?" : "";
+      const bindings = status
+        ? [OBSIDIAN_PROVIDER, vaultId, status, limit]
+        : [OBSIDIAN_PROVIDER, vaultId, limit];
+      const { results } = await env.DB.prepare(
+        `SELECT
+           l.*,
+           e.content,
+           e.tags,
+           e.source,
+           e.created_at AS entry_created_at,
+           e.content_hash,
+           (
+             SELECT id FROM sb_memory_revisions r
+             WHERE r.memory_id = e.id
+               AND r.event_type IN ('ADD', 'UPDATE', 'APPEND', 'DEPRECATE', 'ROLLUP', 'UNROLL')
+             ORDER BY r.created_at DESC
+             LIMIT 1
+           ) AS revision_id
+         FROM sb_external_links l
+         JOIN entries e ON e.id = l.entry_id
+         WHERE l.provider = ? AND l.vault_id = ?
+           ${statusClause}
+         ORDER BY l.updated_at DESC
+         LIMIT ?`
+      ).bind(...bindings).all();
+      const items = ((results ?? []) as Record<string, any>[]).map((row) => {
+        const tags = parseEntryTagsJson(row.tags as string | null);
+        return serializeObsidianPullRow({
+          ...(row as ObsidianLinkedEntryRow),
+          memory_status: getStatus(tags),
+        });
+      });
+      return json({ ok: true, vaultId, count: items.length, results: items });
+    }
+
+    // GET /integrations/obsidian/status
+    if (url.pathname === "/integrations/obsidian/status" && request.method === "GET") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      const vaultId = requiredTrimmedString(url.searchParams.get("vaultId"));
+      if (!vaultId) return json({ ok: false, error: "vaultId is required" }, 400);
+      const [totalRow, statusRows, errorRows] = await Promise.all([
+        env.DB.prepare(
+          `SELECT COUNT(*) AS count FROM sb_external_links
+           WHERE provider = ? AND vault_id = ?`
+        ).bind(OBSIDIAN_PROVIDER, vaultId).first<Record<string, any>>(),
+        env.DB.prepare(
+          `SELECT sync_status, COUNT(*) AS count FROM sb_external_links
+           WHERE provider = ? AND vault_id = ?
+           GROUP BY sync_status`
+        ).bind(OBSIDIAN_PROVIDER, vaultId).all(),
+        env.DB.prepare(
+          `SELECT id, entry_id, external_path, sync_status, last_error, updated_at
+           FROM sb_external_links
+           WHERE provider = ? AND vault_id = ?
+             AND last_error IS NOT NULL
+           ORDER BY updated_at DESC
+           LIMIT 10`
+        ).bind(OBSIDIAN_PROVIDER, vaultId).all(),
+      ]);
+      const byStatus: Record<string, number> = {};
+      for (const row of (statusRows.results ?? []) as Record<string, any>[]) {
+        byStatus[String(row.sync_status)] = Number(row.count ?? 0);
+      }
+      return json({
+        ok: true,
+        vaultId,
+        total: Number(totalRow?.count ?? 0),
+        byStatus,
+        errors: ((errorRows.results ?? []) as Record<string, any>[]).map((row) => ({
+          id: row.id,
+          entryId: row.entry_id,
+          path: row.external_path,
+          syncStatus: row.sync_status,
+          lastError: row.last_error,
+          updatedAt: row.updated_at,
+        })),
+      });
+    }
+
+    // POST /integrations/obsidian/resolve-conflict
+    if (url.pathname === "/integrations/obsidian/resolve-conflict" && request.method === "POST") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      let body: ObsidianResolveConflictBody;
+      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      return handleObsidianResolveConflict(env, ctx, body);
     }
 
     // GET /count
