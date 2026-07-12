@@ -200,9 +200,10 @@ describe("POST /classify-pending", () => {
     // vector rebuild state, durable cleanup outboxes, metadata guards,
     // fact-source provenance, external object/source links, scoped access tokens,
     // automation rules, regenerable aggregate state, formal schema migration
-    // ledger rows, and unified Obsidian sync etags;
+    // ledger rows, migration checksum verification, vault-bound Obsidian
+    // prechecks, and unified sync2 etags;
     // keep a bounded D1 headroom check instead of letting init grow unnoticed.
-    expect(db.statementCount).toBeLessThanOrEqual(140);
+    expect(db.statementCount).toBeLessThanOrEqual(145);
   });
 
   it("skips entries whose durable classification status is already succeeded", async () => {

@@ -3,8 +3,9 @@
 CREATE TABLE IF NOT EXISTS sb_schema_migrations (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
-  checksum TEXT,
-  applied_at INTEGER NOT NULL
+  checksum TEXT NOT NULL,
+  applied_at INTEGER NOT NULL,
+  last_verified_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS entries (
@@ -61,6 +62,7 @@ CREATE TABLE IF NOT EXISTS sb_external_links (
   last_synced_content_hash TEXT,
   last_synced_revision_id TEXT,
   last_synced_sync_etag TEXT,
+  last_status TEXT,
   sync_direction TEXT NOT NULL DEFAULT 'bidirectional',
   sync_status TEXT NOT NULL DEFAULT 'synced',
   last_error TEXT,

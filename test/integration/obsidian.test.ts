@@ -174,10 +174,12 @@ describe("Obsidian integration", () => {
         entryId: pushedEntryId,
       });
       expect(pulled.results[0].syncEtag).toEqual(expect.any(String));
+      expect(pulled.results[0].syncEtag).toMatch(/^sync2_/);
       expect(pulled.results[0].lastSyncedSyncEtag).toBe(pulled.results[0].syncEtag);
       expect(pulled.results[0].path).toContain("Singularity/10 提炼知识/");
       expect(pulled.results[0].markdown).toContain("singularity_id:");
       expect(pulled.results[0].markdown).toContain("singularity_type:");
+      expect(pulled.results[0].markdown).toContain("singularity_sync_etag:");
       expect(pulled.results[0].markdown).toContain("managed_by: singularity");
       expect(pulled.results[0].markdown).toContain("source_file: \"Singularity/Projects/mtzs.md\"");
       expect(pulled.results[0].markdown).toContain("project/mtzs");
@@ -260,6 +262,64 @@ describe("Obsidian integration", () => {
         `SELECT COUNT(*) AS count FROM sb_observations WHERE source = 'obsidian'`
       ).get() as any;
       expect(changedObservationCount.count).toBe(2);
+
+      const renamedResponse = await fetchAndDrainWaitUntil(
+        auth("/integrations/obsidian/push", {
+          method: "POST",
+          body: JSON.stringify({
+            vaultId: "work-vault",
+            path: "Singularity/Projects/mtzs-renamed.md",
+            sourceId: changed.sourceId,
+            content: "mtzs currently uses installation_proxy and AFC for the durable install path.",
+            properties: {
+              singularity_type: "raw-material",
+              tags: ["project/mtzs"],
+            },
+          }),
+        }),
+        env
+      );
+      expect(renamedResponse.status).toBe(200);
+      const renamed = await json(renamedResponse);
+      expect(renamed).toMatchObject({
+        ok: true,
+        action: "unchanged",
+        sourceId: changed.sourceId,
+      });
+      expect(renamed.sourceRevision).toBe(3);
+      const sourceAfterRename = db.prepare(
+        `SELECT external_path FROM sb_external_sources WHERE id = ?`
+      ).get(changed.sourceId) as any;
+      expect(sourceAfterRename.external_path).toBe("Singularity/Projects/mtzs-renamed.md");
+
+      const otherPush = await json(await fetchAndDrainWaitUntil(
+        auth("/integrations/obsidian/push", {
+          method: "POST",
+          body: JSON.stringify({
+            vaultId: "work-vault",
+            path: "Singularity/Projects/occupied.md",
+            content: "Another raw source occupies this path.",
+            properties: { tags: ["project/mtzs"] },
+          }),
+        }),
+        env
+      ));
+      expect(otherPush.sourceId).toEqual(expect.any(String));
+      const sourceConflict = await fetchAndDrainWaitUntil(
+        auth("/integrations/obsidian/push", {
+          method: "POST",
+          body: JSON.stringify({
+            vaultId: "work-vault",
+            path: "Singularity/Projects/occupied.md",
+            sourceId: changed.sourceId,
+            content: "mtzs currently uses installation_proxy and AFC for the durable install path.",
+            properties: { tags: ["project/mtzs"] },
+          }),
+        }),
+        env
+      );
+      expect(sourceConflict.status).toBe(409);
+      expect(await json(sourceConflict)).toMatchObject({ error: "source_path_conflict" });
     } finally {
       db.close();
     }
@@ -362,9 +422,10 @@ describe("Obsidian integration", () => {
           method: "POST",
           body: JSON.stringify({
             vaultId: "work-vault",
-            path: "Singularity/Decisions/vector-v2.md",
+            path: firstItem.path,
             entryId: firstEntryId,
             baseRevisionId: firstItem.revisionId,
+            baseSyncEtag: firstItem.syncEtag,
             content: "Vector V2 uses sqlite-vec for local ANN recall and FTS trigram fallback.",
             properties: { tags: ["project/singularity"] },
           }),
@@ -385,9 +446,9 @@ describe("Obsidian integration", () => {
          FROM sb_external_links
          WHERE provider = 'obsidian'
            AND vault_id = 'work-vault'
-           AND external_path = 'Singularity/Decisions/vector-v2.md'
+           AND external_path = ?
            AND object_type = 'memory'`
-      ).get() as any;
+      ).get(firstItem.path) as any;
       expect(linkRow.sync_status).toBe("conflict");
       expect(linkRow.last_error).toContain("remote memory changed");
 
@@ -396,7 +457,7 @@ describe("Obsidian integration", () => {
           method: "POST",
           body: JSON.stringify({
             vaultId: "work-vault",
-            path: "Singularity/Decisions/vector-v2.md",
+            path: firstItem.path,
             resolution: "use_singularity",
           }),
         }),
@@ -694,6 +755,322 @@ describe("Obsidian integration", () => {
       expect(link.last_synced_content_hash).toBe(item.contentHash);
       expect(link.sync_status).toBe("synced");
       expect(link.last_synced_sync_etag).toBe(item.syncEtag);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("detects status-only remote changes with base sync etags", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      const pushed = await json(await fetchAndDrainWaitUntil(
+        auth("/integrations/obsidian/push", {
+          method: "POST",
+          body: JSON.stringify({
+            vaultId: "work-vault",
+            path: "Singularity/Inbox/status-etag.md",
+            content: "Status-only changes must be protected by sync etags.",
+            properties: { tags: ["project/singularity"] },
+          }),
+        }),
+        env
+      ));
+      const entryId = entryIdForObservation(db, pushed.observationId);
+      const pulled = await json(await fetchAndDrainWaitUntil(
+        auth("/integrations/obsidian/pull?vaultId=work-vault"),
+        env
+      ));
+      const item = pulled.results.find((result: any) => result.entryId === entryId);
+      expect(item.syncEtag).toMatch(/^sync2_/);
+
+      const statusResponse = await fetchAndDrainWaitUntil(
+        auth("/status", {
+          method: "POST",
+          body: JSON.stringify({ id: entryId, status: "canonical" }),
+        }),
+        env
+      );
+      expect(statusResponse.status).toBe(200);
+
+      const conflictResponse = await fetchAndDrainWaitUntil(
+        auth("/integrations/obsidian/push", {
+          method: "POST",
+          body: JSON.stringify({
+            vaultId: "work-vault",
+            path: item.path,
+            entryId,
+            baseRevisionId: item.revisionId,
+            baseSyncEtag: item.syncEtag,
+            content: item.content,
+            properties: {
+              tags: ["project/singularity"],
+              status: "draft",
+            },
+          }),
+        }),
+        env
+      );
+      expect(conflictResponse.status).toBe(409);
+      const conflict = await json(conflictResponse);
+      expect(conflict).toMatchObject({
+        ok: false,
+        error: "obsidian_sync_conflict",
+        entryId,
+        baseSyncEtag: item.syncEtag,
+      });
+      expect(conflict.currentSyncEtag).toMatch(/^sync2_/);
+      expect(conflict.currentSyncEtag).not.toBe(item.syncEtag);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("enforces stored sync direction on the server", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      const pushed = await json(await fetchAndDrainWaitUntil(
+        auth("/integrations/obsidian/push", {
+          method: "POST",
+          body: JSON.stringify({
+            vaultId: "work-vault",
+            path: "Singularity/Inbox/direction.md",
+            content: "Stored sync direction must be authoritative.",
+            properties: { tags: ["project/singularity"] },
+          }),
+        }),
+        env
+      ));
+      const entryId = entryIdForObservation(db, pushed.observationId);
+      const pulled = await json(await fetchAndDrainWaitUntil(
+        auth("/integrations/obsidian/pull?vaultId=work-vault"),
+        env
+      ));
+      const item = pulled.results.find((result: any) => result.entryId === entryId);
+
+      db.prepare(
+        `UPDATE sb_external_links
+         SET sync_direction = 'singularity_to_obsidian'
+         WHERE provider = 'obsidian'
+           AND object_type = 'memory'
+           AND entry_id = ?`
+      ).run(entryId);
+
+      const readOnlyResponse = await fetchAndDrainWaitUntil(
+        auth("/integrations/obsidian/push", {
+          method: "POST",
+          body: JSON.stringify({
+            vaultId: "work-vault",
+            path: item.path,
+            entryId,
+            baseSyncEtag: item.syncEtag,
+            syncDirection: "bidirectional",
+            content: "Client must not overwrite singularity-to-obsidian links.",
+            properties: { tags: ["project/singularity"] },
+          }),
+        }),
+        env
+      );
+      expect(readOnlyResponse.status).toBe(403);
+      expect(await json(readOnlyResponse)).toMatchObject({ error: "read_only_link" });
+
+      db.prepare(
+        `UPDATE sb_external_links
+         SET sync_direction = 'obsidian_to_singularity'
+         WHERE provider = 'obsidian'
+           AND object_type = 'memory'
+           AND entry_id = ?`
+      ).run(entryId);
+
+      const inboundPull = await json(await fetchAndDrainWaitUntil(
+        auth("/integrations/obsidian/pull?vaultId=work-vault"),
+        env
+      ));
+      expect(inboundPull.results.find((result: any) => result.entryId === entryId)).toBeUndefined();
+
+      const inboundPush = await fetchAndDrainWaitUntil(
+        auth("/integrations/obsidian/push", {
+          method: "POST",
+          body: JSON.stringify({
+            vaultId: "work-vault",
+            path: item.path,
+            entryId,
+            baseSyncEtag: item.syncEtag,
+            syncDirection: "bidirectional",
+            content: "Obsidian-to-Singularity links still accept inbound pushes.",
+            properties: { tags: ["project/singularity"] },
+          }),
+        }),
+        env
+      );
+      expect(inboundPush.status).toBe(200);
+      const link = db.prepare(
+        `SELECT sync_direction FROM sb_external_links
+         WHERE provider = 'obsidian'
+           AND object_type = 'memory'
+           AND entry_id = ?`
+      ).get(entryId) as any;
+      expect(link.sync_direction).toBe("obsidian_to_singularity");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("prevents scoped tokens from reading or mutating another vault", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      const tokenA = await json(await fetchAndDrainWaitUntil(
+        auth("/integrations/obsidian/tokens", {
+          method: "POST",
+          body: JSON.stringify({ name: "Vault A", vaultId: "vault-a" }),
+        }),
+        env
+      ));
+      const tokenB = await json(await fetchAndDrainWaitUntil(
+        auth("/integrations/obsidian/tokens", {
+          method: "POST",
+          body: JSON.stringify({ name: "Vault B", vaultId: "vault-b" }),
+        }),
+        env
+      ));
+
+      const pushA = await json(await fetchAndDrainWaitUntil(
+        authWithToken("/integrations/obsidian/push", tokenA.token, {
+          method: "POST",
+          body: JSON.stringify({
+            vaultId: "vault-a",
+            path: "Singularity/Inbox/a.md",
+            content: "Vault A scoped memory must remain private to vault A.",
+            properties: { tags: ["vault/a"] },
+          }),
+        }),
+        env
+      ));
+      const entryA = entryIdForObservation(db, pushA.observationId);
+
+      const pushB = await json(await fetchAndDrainWaitUntil(
+        authWithToken("/integrations/obsidian/push", tokenB.token, {
+          method: "POST",
+          body: JSON.stringify({
+            vaultId: "vault-b",
+            path: "Singularity/Inbox/b.md",
+            content: "Vault B secret memory must not leak to vault A scoped recall.",
+            properties: { tags: ["vault/b"] },
+          }),
+        }),
+        env
+      ));
+      const entryB = entryIdForObservation(db, pushB.observationId);
+      const pullB = await json(await fetchAndDrainWaitUntil(
+        authWithToken("/integrations/obsidian/pull?vaultId=vault-b", tokenB.token),
+        env
+      ));
+      const itemB = pullB.results.find((result: any) => result.entryId === entryB);
+      expect(itemB).toBeTruthy();
+
+      const recallA = await json(await fetchAndDrainWaitUntil(
+        authWithToken("/recall?query=Vault%20B%20secret%20memory&topK=10&vaultId=vault-a", tokenA.token),
+        env
+      ));
+      expect((recallA.results ?? []).map((result: any) => result.id)).not.toContain(entryB);
+
+      const crossPush = await fetchAndDrainWaitUntil(
+        authWithToken("/integrations/obsidian/push", tokenA.token, {
+          method: "POST",
+          body: JSON.stringify({
+            vaultId: "vault-a",
+            path: itemB.path,
+            entryId: entryB,
+            baseSyncEtag: itemB.syncEtag,
+            content: "Vault A must not update Vault B by borrowed entry id.",
+            properties: { tags: ["vault/a"] },
+          }),
+        }),
+        env
+      );
+      expect(crossPush.status).toBe(403);
+
+      const crossAck = await fetchAndDrainWaitUntil(
+        authWithToken("/integrations/obsidian/ack", tokenA.token, {
+          method: "POST",
+          body: JSON.stringify({
+            vaultId: "vault-a",
+            linkId: itemB.link.id,
+            revisionId: itemB.revisionId,
+            contentHash: itemB.contentHash,
+            syncEtag: itemB.syncEtag,
+          }),
+        }),
+        env
+      );
+      expect(crossAck.status).toBe(404);
+
+      const crossResolve = await fetchAndDrainWaitUntil(
+        authWithToken("/integrations/obsidian/resolve-conflict", tokenA.token, {
+          method: "POST",
+          body: JSON.stringify({
+            vaultId: "vault-a",
+            linkId: itemB.link.id,
+            resolution: "use_singularity",
+          }),
+        }),
+        env
+      );
+      expect(crossResolve.status).toBe(404);
+
+      const ruleB = await json(await fetchAndDrainWaitUntil(
+        authWithToken("/integrations/obsidian/rules", tokenB.token, {
+          method: "POST",
+          body: JSON.stringify({
+            vaultId: "vault-b",
+            name: "Vault B rule",
+            triggerType: "manual",
+          }),
+        }),
+        env
+      ));
+      const crossRule = await fetchAndDrainWaitUntil(
+        authWithToken("/integrations/obsidian/rules", tokenA.token, {
+          method: "POST",
+          body: JSON.stringify({
+            id: ruleB.rule.id,
+            vaultId: "vault-a",
+            name: "Take over Vault B rule",
+            triggerType: "manual",
+          }),
+        }),
+        env
+      );
+      expect(crossRule.status).toBe(404);
+
+      const aggregateB = await json(await fetchAndDrainWaitUntil(
+        authWithToken("/integrations/obsidian/aggregates/generate", tokenB.token, {
+          method: "POST",
+          body: JSON.stringify({
+            vaultId: "vault-b",
+            aggregateType: "project-status",
+            title: "Vault B aggregate",
+            sourceMemoryIds: [entryB],
+          }),
+        }),
+        env
+      ));
+      const crossAggregate = await fetchAndDrainWaitUntil(
+        authWithToken("/integrations/obsidian/aggregates/generate", tokenA.token, {
+          method: "POST",
+          body: JSON.stringify({
+            id: aggregateB.aggregate.id,
+            vaultId: "vault-a",
+            aggregateType: "project-status",
+            title: "Take over Vault B aggregate",
+            sourceMemoryIds: [entryA],
+          }),
+        }),
+        env
+      );
+      expect(crossAggregate.status).toBe(404);
     } finally {
       db.close();
     }

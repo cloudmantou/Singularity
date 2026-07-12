@@ -60,6 +60,13 @@ async function sha256Hex(content) {
 function stringValue(value) {
   return typeof value === "string" && value.trim() ? value.trim() : void 0;
 }
+function normalizedTagsKey(tags) {
+  const values = Array.isArray(tags) ? tags : typeof tags === "string" ? tags.split(/[,\s]+/) : [];
+  return [...new Set(values.map((tag) => String(tag).trim().replace(/^#/, "").toLowerCase()).filter(Boolean))].sort().join("\n");
+}
+function objectValue(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
 var SingularityClient = class {
   constructor(settings) {
     this.settings = settings;
@@ -82,6 +89,22 @@ var SingularityClient = class {
     this.assertConfigured();
     const response = await (0, import_obsidian.requestUrl)({
       url: this.endpoint("/integrations/obsidian/push"),
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify(body),
+      throw: false
+    });
+    if (response.status >= 400) {
+      const error = ((_a = response.json) == null ? void 0 : _a.error) || response.text || `HTTP ${response.status}`;
+      throw new Error(String(error));
+    }
+    return response.json;
+  }
+  async upsertRule(body) {
+    var _a;
+    this.assertConfigured();
+    const response = await (0, import_obsidian.requestUrl)({
+      url: this.endpoint("/integrations/obsidian/rules"),
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify(body),
@@ -164,6 +187,54 @@ var SingularityClient = class {
     }
     return all;
   }
+  async pullAggregates() {
+    var _a, _b;
+    this.assertConfigured();
+    const params = new URLSearchParams({ vaultId: this.settings.vaultId });
+    const response = await (0, import_obsidian.requestUrl)({
+      url: this.endpoint(`/integrations/obsidian/aggregates?${params.toString()}`),
+      method: "GET",
+      headers: this.headers(),
+      throw: false
+    });
+    if (response.status >= 400) {
+      const error = ((_a = response.json) == null ? void 0 : _a.error) || response.text || `HTTP ${response.status}`;
+      throw new Error(String(error));
+    }
+    const aggregates = Array.isArray((_b = response.json) == null ? void 0 : _b.results) ? response.json.results : [];
+    return aggregates.map((item) => {
+      var _a2, _b2, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p;
+      return {
+        objectType: "aggregate",
+        entryId: item.id,
+        path: item.path,
+        markdown: item.markdown,
+        revisionId: item.generatedAt == null ? null : String(item.generatedAt),
+        contentHash: item.contentHash,
+        syncEtag: item.syncEtag,
+        lastSyncedRevisionId: item.generatedAt == null ? null : String(item.generatedAt),
+        lastSyncedContentHash: item.contentHash,
+        lastSyncedSyncEtag: (_b2 = (_a2 = item.link) == null ? void 0 : _a2.lastSyncedSyncEtag) != null ? _b2 : null,
+        syncStatus: (_d = (_c = item.link) == null ? void 0 : _c.syncStatus) != null ? _d : item.staleAt ? "remote_changed" : "synced",
+        syncDirection: (_f = (_e = item.link) == null ? void 0 : _e.syncDirection) != null ? _f : "singularity_to_obsidian",
+        link: {
+          id: (_h = (_g = item.link) == null ? void 0 : _g.id) != null ? _h : item.id,
+          syncEtag: (_j = (_i = item.link) == null ? void 0 : _i.syncEtag) != null ? _j : item.syncEtag,
+          lastSyncedSyncEtag: (_l = (_k = item.link) == null ? void 0 : _k.lastSyncedSyncEtag) != null ? _l : null,
+          syncStatus: (_n = (_m = item.link) == null ? void 0 : _m.syncStatus) != null ? _n : null,
+          syncDirection: (_p = (_o = item.link) == null ? void 0 : _o.syncDirection) != null ? _p : null
+        },
+        properties: {
+          singularity_type: "knowledge-aggregate",
+          singularity_id: item.id,
+          singularity_revision: item.generatedAt == null ? "" : String(item.generatedAt),
+          singularity_sync_etag: item.syncEtag,
+          singularity_status: item.staleAt ? "stale" : "canonical",
+          tags: ["singularity", "aggregate"]
+        }
+      };
+    });
+  }
 };
 var SingularityPlugin = class extends import_obsidian.Plugin {
   constructor() {
@@ -220,6 +291,14 @@ var SingularityPlugin = class extends import_obsidian.Plugin {
     const frontmatter = cache == null ? void 0 : cache.frontmatter;
     const content = extractMarkdownBody(raw, (_a = cache == null ? void 0 : cache.frontmatterPosition) == null ? void 0 : _a.end.offset);
     const singularityType = stringValue(frontmatter == null ? void 0 : frontmatter.singularity_type);
+    if (singularityType === "knowledge-aggregate") {
+      new import_obsidian.Notice("Singularity aggregate pages are read-only. Pull/export to refresh them.");
+      return;
+    }
+    if (singularityType === "rule-template") {
+      await this.saveRuleTemplate(file, frontmatter, content);
+      return;
+    }
     const pushed = await this.client().push({
       vaultId: this.settings.vaultId,
       path: file.path,
@@ -232,9 +311,18 @@ var SingularityPlugin = class extends import_obsidian.Plugin {
         obsidianLinks: (_c = (_b = cache == null ? void 0 : cache.links) == null ? void 0 : _b.map((link) => link.link)) != null ? _c : []
       },
       entryId: singularityType === "atomic-memory" ? frontmatter == null ? void 0 : frontmatter.singularity_id : void 0,
-      baseRevisionId: singularityType === "atomic-memory" ? frontmatter == null ? void 0 : frontmatter.singularity_revision : void 0
+      baseRevisionId: singularityType === "atomic-memory" ? frontmatter == null ? void 0 : frontmatter.singularity_revision : void 0,
+      baseSyncEtag: singularityType === "atomic-memory" ? frontmatter == null ? void 0 : frontmatter.singularity_sync_etag : void 0,
+      sourceId: singularityType === "atomic-memory" ? void 0 : frontmatter == null ? void 0 : frontmatter.singularity_source_id
     });
-    if (singularityType !== "atomic-memory" && pushed.sourceId) {
+    if (singularityType === "atomic-memory") {
+      await this.app.fileManager.processFrontMatter(file, (data) => {
+        if (pushed.revisionId) data.singularity_revision = pushed.revisionId;
+        if (pushed.link && typeof pushed.link === "object" && "syncEtag" in pushed.link) {
+          data.singularity_sync_etag = pushed.link.syncEtag;
+        }
+      });
+    } else if (pushed.sourceId) {
       await this.app.fileManager.processFrontMatter(file, (data) => {
         data.singularity_type = "raw-material";
         data.singularity_source_id = pushed.sourceId;
@@ -245,6 +333,32 @@ var SingularityPlugin = class extends import_obsidian.Plugin {
       });
     }
     new import_obsidian.Notice("Saved note to Singularity.");
+  }
+  async saveRuleTemplate(file, frontmatter, content) {
+    var _a, _b;
+    const rule = await this.client().upsertRule({
+      id: frontmatter == null ? void 0 : frontmatter.singularity_id,
+      vaultId: this.settings.vaultId,
+      name: (_a = stringValue(frontmatter == null ? void 0 : frontmatter.name)) != null ? _a : file.basename,
+      triggerType: (_b = stringValue(frontmatter == null ? void 0 : frontmatter.trigger_type)) != null ? _b : "manual",
+      sourceFilter: objectValue(frontmatter == null ? void 0 : frontmatter.source_filter),
+      extractorSchema: objectValue(frontmatter == null ? void 0 : frontmatter.extractor_schema),
+      tagRules: objectValue(frontmatter == null ? void 0 : frontmatter.tag_rules),
+      aggregationRule: objectValue(frontmatter == null ? void 0 : frontmatter.aggregation_rule),
+      outputTemplate: content,
+      enabled: (frontmatter == null ? void 0 : frontmatter.enabled) !== false
+    });
+    const savedRule = objectValue(rule.rule);
+    await this.app.fileManager.processFrontMatter(file, (data) => {
+      var _a2, _b2;
+      data.singularity_type = "rule-template";
+      data.singularity_id = savedRule.id;
+      data.singularity_status = (_a2 = data.singularity_status) != null ? _a2 : "canonical";
+      data.singularity_source = "obsidian";
+      data.singularity_synced_at = (/* @__PURE__ */ new Date()).toISOString();
+      data.managed_by = (_b2 = data.managed_by) != null ? _b2 : "user";
+    });
+    new import_obsidian.Notice("Saved rule template to Singularity.");
   }
   async saveSelection(selection) {
     var _a, _b;
@@ -280,7 +394,11 @@ var SingularityPlugin = class extends import_obsidian.Plugin {
     await (leaf == null ? void 0 : leaf.setViewState({ type: VIEW_TYPE_SINGULARITY_SEARCH, active: true }));
   }
   async exportManagedMemories() {
-    const results = await this.client().pull();
+    const [memories, aggregates] = await Promise.all([
+      this.client().pull(),
+      this.client().pullAggregates()
+    ]);
+    const results = [...memories, ...aggregates];
     let written = 0;
     let skipped = 0;
     let conflicts = 0;
@@ -291,7 +409,7 @@ var SingularityPlugin = class extends import_obsidian.Plugin {
       else if (outcome === "conflict") conflicts++;
       else skipped++;
     }
-    new import_obsidian.Notice(`Exported ${written} Singularity memories. Skipped ${skipped}; conflicts ${conflicts}.`);
+    new import_obsidian.Notice(`Exported ${written} Singularity items. Skipped ${skipped}; conflicts ${conflicts}.`);
   }
   localManagedPath(item) {
     const folder = (0, import_obsidian.normalizePath)(this.settings.managedFolder || "Singularity");
@@ -310,7 +428,7 @@ var SingularityPlugin = class extends import_obsidian.Plugin {
     await this.app.vault.create(path, content);
   }
   async writeManagedMarkdownSafely(path, item) {
-    var _a, _b;
+    var _a, _b, _c, _d, _e, _f, _g;
     if (item.syncDirection === "obsidian_to_singularity") return "skipped";
     const existing = this.app.vault.getAbstractFileByPath(path);
     if (existing instanceof import_obsidian.TFile) {
@@ -320,18 +438,24 @@ var SingularityPlugin = class extends import_obsidian.Plugin {
       const localBodyHash = await sha256Hex(localBody);
       const frontmatter = (_b = cache == null ? void 0 : cache.frontmatter) != null ? _b : {};
       const localRevision = stringValue(frontmatter.singularity_revision);
-      const localChanged = localRevision === item.lastSyncedRevisionId && Boolean(item.lastSyncedContentHash) && localBodyHash !== item.lastSyncedContentHash;
+      const remoteProperties = (_c = item.properties) != null ? _c : {};
+      const localStatus = (_d = stringValue(frontmatter.singularity_status)) != null ? _d : "draft";
+      const remoteStatus = (_e = stringValue(remoteProperties.singularity_status)) != null ? _e : "draft";
+      const localKind = (_f = stringValue(frontmatter.singularity_kind)) != null ? _f : "semantic";
+      const remoteKind = (_g = stringValue(remoteProperties.singularity_kind)) != null ? _g : "semantic";
+      const frontmatterChanged = localStatus !== remoteStatus || localKind !== remoteKind || normalizedTagsKey(frontmatterTags(frontmatter)) !== normalizedTagsKey(remoteProperties.tags);
+      const localChanged = localRevision === item.lastSyncedRevisionId && (Boolean(item.lastSyncedContentHash) || Boolean(item.lastSyncedSyncEtag)) && (localBodyHash !== item.lastSyncedContentHash || frontmatterChanged);
       const remoteChanged = Boolean(item.syncEtag) && item.syncEtag !== item.lastSyncedSyncEtag || item.revisionId !== item.lastSyncedRevisionId || item.contentHash !== item.lastSyncedContentHash || item.syncStatus === "remote_changed";
       if (localChanged && remoteChanged) return "conflict";
       if (localChanged && !remoteChanged) return "skipped";
       if (!remoteChanged && localBodyHash === item.contentHash) return "skipped";
       await this.app.vault.modify(existing, item.markdown);
-      await this.client().ack(item);
+      if (item.objectType !== "aggregate") await this.client().ack(item);
       return "written";
     }
     if (existing) throw new Error(`${path} exists but is not a file.`);
     await this.writeMarkdown(path, item.markdown);
-    await this.client().ack(item);
+    if (item.objectType !== "aggregate") await this.client().ack(item);
     return "written";
   }
   async ensureParentFolder(path) {

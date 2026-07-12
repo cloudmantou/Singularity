@@ -118,6 +118,7 @@ import {
   normalizeEntityFactKey,
   normalizeEntityName,
 } from "./memory/entities";
+import { runMigrations, MIGRATIONS } from "./migrations";
 
 export interface Env {
   DB: D1Database;
@@ -396,11 +397,26 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
-// Returns a 401 Response if the request lacks a valid token, otherwise null —
-// lets routes early-return with `const authErr = requireAuth(...); if (authErr) return authErr;`
-function requireAuth(request: Request, env: Env): Response | null {
-  if (isAuthorized(request, env)) return null;
-  return json({ ok: false, error: "Unauthorized" }, 401);
+// AuthPrincipal enforces that routes use the server-resolved vault_id
+// rather than trusting the request body. Owner tokens bypass vault binding;
+// scoped tokens always carry a vault_id.
+
+interface AuthPrincipal {
+  owner: boolean;          // true ⇒ AUTH_TOKEN hit; bypass vault binding
+  tokenId: string | null;   // sb_access_tokens.id when scoped
+  vaultId: string | null;   // null only when principal.owner === true
+  scopes: string[];
+}
+
+type AuthResult =
+  | { ok: true; principal: AuthPrincipal }
+  | { ok: false; response: Response };
+
+function requireAuth(request: Request, env: Env): AuthResult {
+  if (isAuthorized(request, env)) {
+    return { ok: true, principal: { owner: true, tokenId: null, vaultId: null, scopes: [] } };
+  }
+  return { ok: false, response: json({ ok: false, error: "Unauthorized" }, 401) };
 }
 
 interface OAuthLoginDetails {
@@ -645,14 +661,6 @@ async function embedManyWithProvider(
 // ─── Database initialization ──────────────────────────────────────────────────
 
 export async function initializeDatabase(env: Env): Promise<void> {
-  await env.DB.exec(
-    `CREATE TABLE IF NOT EXISTS sb_schema_migrations (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      checksum TEXT,
-      applied_at INTEGER NOT NULL
-    )`
-  );
   await env.DB.exec(`CREATE TABLE IF NOT EXISTS entries (id TEXT PRIMARY KEY, content TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '[]', source TEXT NOT NULL DEFAULT 'api', created_at INTEGER NOT NULL, vector_ids TEXT NOT NULL DEFAULT '[]')`);
   await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_entries_created_at ON entries(created_at DESC)`);
   await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_entries_source ON entries(source)`);
@@ -717,6 +725,7 @@ export async function initializeDatabase(env: Env): Promise<void> {
       last_synced_content_hash TEXT,
       last_synced_revision_id TEXT,
       last_synced_sync_etag TEXT,
+      last_status TEXT,
       sync_direction TEXT NOT NULL DEFAULT 'bidirectional',
       sync_status TEXT NOT NULL DEFAULT 'synced',
       last_error TEXT,
@@ -726,19 +735,6 @@ export async function initializeDatabase(env: Env): Promise<void> {
       CHECK (sync_status IN ('synced', 'local_changed', 'remote_changed', 'conflict', 'deleted_local', 'deleted_remote', 'error')),
       CHECK (object_type IN ('observation', 'memory', 'aggregate', 'rule'))
     )`
-  );
-  await ensureExternalLinksSchema(env.DB);
-  await env.DB.exec(
-    `CREATE UNIQUE INDEX IF NOT EXISTS idx_external_links_identity
-     ON sb_external_links(provider, vault_id, external_path, external_block_id, object_type, object_id)`
-  );
-  await env.DB.exec(
-    `CREATE INDEX IF NOT EXISTS idx_external_links_entry
-     ON sb_external_links(entry_id)`
-  );
-  await env.DB.exec(
-    `CREATE INDEX IF NOT EXISTS idx_external_links_provider_vault
-     ON sb_external_links(provider, vault_id, sync_status, updated_at DESC)`
   );
   await env.DB.exec(
     `CREATE TABLE IF NOT EXISTS sb_external_sources (
@@ -825,7 +821,21 @@ export async function initializeDatabase(env: Env): Promise<void> {
     `CREATE INDEX IF NOT EXISTS idx_knowledge_aggregates_vault
      ON sb_knowledge_aggregates(vault_id, updated_at DESC)`
   );
-  await ensureObsidianP1Schema(env.DB);
+  // Centralised migration runner (replaces ensureExternalLinksSchema
+  // and ensureObsidianP1Schema). Run only after the Obsidian base tables exist.
+  await runMigrations(env, MIGRATIONS);
+  await env.DB.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_external_links_identity
+     ON sb_external_links(provider, vault_id, external_path, external_block_id, object_type, object_id)`
+  );
+  await env.DB.exec(
+    `CREATE INDEX IF NOT EXISTS idx_external_links_entry
+     ON sb_external_links(entry_id)`
+  );
+  await env.DB.exec(
+    `CREATE INDEX IF NOT EXISTS idx_external_links_provider_vault
+     ON sb_external_links(provider, vault_id, sync_status, updated_at DESC)`
+  );
   await env.DB.exec(
     `CREATE TABLE IF NOT EXISTS sb_vector_rebuilds (
       id TEXT PRIMARY KEY,
@@ -1034,147 +1044,6 @@ type ObsidianSyncStatus = (typeof OBSIDIAN_SYNC_STATUSES)[number];
 type ObsidianSyncDirection = (typeof OBSIDIAN_SYNC_DIRECTIONS)[number];
 type ObsidianObjectType = (typeof OBSIDIAN_OBJECT_TYPES)[number];
 
-async function ensureExternalLinksSchema(db: D1Database): Promise<void> {
-  const table = await db.prepare(
-    `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sb_external_links'`
-  ).first<{ sql: string }>();
-  const sql = table?.sql ?? "";
-  const legacyUnique = sql.includes("UNIQUE(provider, vault_id, external_path)");
-
-  for (const alter of [
-    `ALTER TABLE sb_external_links ADD COLUMN external_block_id TEXT NOT NULL DEFAULT ''`,
-    `ALTER TABLE sb_external_links ADD COLUMN object_type TEXT NOT NULL DEFAULT 'memory'`,
-    `ALTER TABLE sb_external_links ADD COLUMN object_id TEXT`,
-    `ALTER TABLE sb_external_links ADD COLUMN content_hash TEXT`,
-    `ALTER TABLE sb_external_links ADD COLUMN sync_etag TEXT`,
-    `ALTER TABLE sb_external_links ADD COLUMN last_synced_sync_etag TEXT`,
-  ]) {
-    try {
-      await db.exec(alter);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!/duplicate column name|already exists/i.test(message)) throw error;
-    }
-  }
-
-  await db.exec(
-    `UPDATE sb_external_links
-     SET object_type = COALESCE(NULLIF(object_type, ''), 'memory'),
-         object_id = COALESCE(NULLIF(object_id, ''), entry_id),
-         content_hash = COALESCE(content_hash, last_synced_content_hash),
-         sync_etag = COALESCE(sync_etag, content_hash, last_synced_content_hash),
-         last_synced_sync_etag = COALESCE(last_synced_sync_etag, sync_etag, content_hash, last_synced_content_hash),
-         external_block_id = COALESCE(external_block_id, '')`
-  );
-
-  if (!legacyUnique) return;
-
-  await db.exec(
-    `CREATE TABLE IF NOT EXISTS sb_external_links_next (
-      id TEXT PRIMARY KEY,
-      provider TEXT NOT NULL,
-      vault_id TEXT NOT NULL,
-      external_path TEXT NOT NULL,
-      external_block_id TEXT NOT NULL DEFAULT '',
-      object_type TEXT NOT NULL DEFAULT 'memory',
-      object_id TEXT,
-      entry_id TEXT,
-      external_file_id TEXT,
-      content_hash TEXT,
-      sync_etag TEXT,
-      last_synced_content_hash TEXT,
-      last_synced_revision_id TEXT,
-      last_synced_sync_etag TEXT,
-      sync_direction TEXT NOT NULL DEFAULT 'bidirectional',
-      sync_status TEXT NOT NULL DEFAULT 'synced',
-      last_error TEXT,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      CHECK (sync_direction IN ('bidirectional', 'obsidian_to_singularity', 'singularity_to_obsidian')),
-      CHECK (sync_status IN ('synced', 'local_changed', 'remote_changed', 'conflict', 'deleted_local', 'deleted_remote', 'error')),
-      CHECK (object_type IN ('observation', 'memory', 'aggregate', 'rule'))
-    )`
-  );
-  await db.exec(
-    `INSERT OR IGNORE INTO sb_external_links_next (
-       id, provider, vault_id, external_path, external_block_id, object_type,
-       object_id, entry_id, external_file_id, content_hash,
-       sync_etag, last_synced_content_hash, last_synced_revision_id,
-       last_synced_sync_etag, sync_direction,
-       sync_status, last_error, created_at, updated_at
-     )
-     SELECT
-       id, provider, vault_id, external_path, COALESCE(external_block_id, ''),
-       COALESCE(NULLIF(object_type, ''), 'memory'),
-       COALESCE(NULLIF(object_id, ''), entry_id),
-       entry_id, external_file_id, COALESCE(content_hash, last_synced_content_hash),
-       COALESCE(sync_etag, content_hash, last_synced_content_hash),
-       last_synced_content_hash, last_synced_revision_id,
-       COALESCE(last_synced_sync_etag, sync_etag, content_hash, last_synced_content_hash),
-       sync_direction,
-       sync_status, last_error, created_at, updated_at
-     FROM sb_external_links`
-  );
-  await db.exec(`DROP TABLE sb_external_links`);
-  await db.exec(`ALTER TABLE sb_external_links_next RENAME TO sb_external_links`);
-}
-
-async function executeIdempotentSchemaStatement(db: D1Database, statement: string): Promise<void> {
-  try {
-    await db.exec(statement);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!/duplicate column name|already exists|no such index/i.test(message)) throw error;
-  }
-}
-
-async function runSchemaMigration(
-  db: D1Database,
-  migration: { id: string; name: string; checksum: string; statements: string[] }
-): Promise<void> {
-  const existing = await db.prepare(
-    `SELECT id FROM sb_schema_migrations WHERE id = ?`
-  ).bind(migration.id).first<{ id: string }>();
-  if (existing) return;
-  for (const statement of migration.statements) {
-    await executeIdempotentSchemaStatement(db, statement);
-  }
-  await db.prepare(
-    `INSERT OR IGNORE INTO sb_schema_migrations (id, name, checksum, applied_at)
-     VALUES (?, ?, ?, ?)`
-  ).bind(migration.id, migration.name, migration.checksum, Date.now()).run();
-}
-
-async function ensureObsidianP1Schema(db: D1Database): Promise<void> {
-  await db.exec(
-    `CREATE TABLE IF NOT EXISTS sb_schema_migrations (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      checksum TEXT,
-      applied_at INTEGER NOT NULL
-    )`
-  );
-  await runSchemaMigration(db, {
-    id: "20260712_obsidian_p1_sync_contract",
-    name: "Obsidian P1 sync etag, vault-scoped rules, and aggregate APIs",
-    checksum: "obsidian-p1-sync-v1",
-    statements: [
-      `ALTER TABLE sb_external_links ADD COLUMN sync_etag TEXT`,
-      `ALTER TABLE sb_external_links ADD COLUMN last_synced_sync_etag TEXT`,
-      `ALTER TABLE sb_automation_rules ADD COLUMN vault_id TEXT`,
-      `ALTER TABLE sb_knowledge_aggregates ADD COLUMN vault_id TEXT`,
-      `CREATE INDEX IF NOT EXISTS idx_automation_rules_vault
-       ON sb_automation_rules(vault_id, enabled, updated_at DESC)`,
-      `CREATE INDEX IF NOT EXISTS idx_knowledge_aggregates_vault
-       ON sb_knowledge_aggregates(vault_id, updated_at DESC)`,
-      `UPDATE sb_external_links
-       SET sync_etag = COALESCE(sync_etag, content_hash, last_synced_content_hash),
-           last_synced_sync_etag = COALESCE(last_synced_sync_etag, sync_etag, content_hash, last_synced_content_hash)
-       WHERE sync_etag IS NULL OR last_synced_sync_etag IS NULL`,
-    ],
-  });
-}
-
 interface ObsidianPushBody {
   vaultId?: unknown;
   path?: unknown;
@@ -1183,6 +1052,8 @@ interface ObsidianPushBody {
   properties?: unknown;
   entryId?: unknown;
   baseRevisionId?: unknown;
+  baseSyncEtag?: unknown;
+  sourceId?: unknown;
   syncDirection?: unknown;
 }
 
@@ -1195,6 +1066,7 @@ interface ObsidianResolveConflictBody {
   content?: unknown;
   properties?: unknown;
   baseRevisionId?: unknown;
+  baseSyncEtag?: unknown;
 }
 
 interface ObsidianAckBody {
@@ -1279,6 +1151,8 @@ interface ObsidianLinkedEntryRow extends ObsidianLinkRow {
   source: string;
   entry_created_at: number;
   content_hash: string | null;
+  metadata_hash: string | null;
+  classification_version: number | null;
   revision_id: string | null;
   memory_status: MemoryStatus | null;
 }
@@ -1369,11 +1243,13 @@ async function requireScopedAuth(
   env: Env,
   scope: string,
   vaultId?: string | null
-): Promise<Response | null> {
-  if (isAuthorized(request, env)) return null;
+): Promise<AuthResult> {
+  if (isAuthorized(request, env)) {
+    return { ok: true, principal: { owner: true, tokenId: null, vaultId: null, scopes: [] } };
+  }
   const authorization = request.headers.get("Authorization") ?? "";
   const token = authorization.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : "";
-  if (!token) return json({ ok: false, error: "Unauthorized" }, 401);
+  if (!token) return { ok: false, response: json({ ok: false, error: "Unauthorized" }, 401) };
 
   const tokenHash = await contentFingerprint(token);
   const row = await env.DB.prepare(
@@ -1384,22 +1260,64 @@ async function requireScopedAuth(
   ).bind(tokenHash).first<Record<string, any>>();
   const now = Date.now();
   if (!row || row.revoked_at != null || (row.expires_at != null && Number(row.expires_at) <= now)) {
-    return json({ ok: false, error: "Unauthorized" }, 401);
+    return { ok: false, response: json({ ok: false, error: "Unauthorized" }, 401) };
   }
   const scopes = parseScopesJson(row.scopes_json as string | null);
   if (!scopes.includes(scope)) {
-    return json({ ok: false, error: "Forbidden" }, 403);
+    return { ok: false, response: json({ ok: false, error: "Forbidden" }, 403) };
   }
   const tokenVaultId = typeof row.vault_id === "string" && row.vault_id.trim()
     ? row.vault_id.trim()
     : null;
-  if (tokenVaultId && (!vaultId || vaultId !== tokenVaultId)) {
-    return json({ ok: false, error: "Forbidden" }, 403);
+  // Obsidian-scoped tokens must always carry a vault_id; reject tokens without one.
+  if (!tokenVaultId) {
+    return { ok: false, response: json({ ok: false, error: "vault_id_missing_on_token" }, 403) };
+  }
+  // Require vaultId to be a non-empty trimmed string ≤128 chars.
+  const suppliedVaultId = typeof vaultId === "string" && vaultId.trim()
+    ? vaultId.trim()
+    : null;
+  if (!suppliedVaultId) {
+    return { ok: false, response: json({ ok: false, error: "vaultId is required" }, 400) };
+  }
+  if (suppliedVaultId.length > 128) {
+    return { ok: false, response: json({ ok: false, error: "vaultId is too long" }, 400) };
+  }
+  if (suppliedVaultId !== tokenVaultId) {
+    return { ok: false, response: json({ ok: false, error: "Forbidden" }, 403) };
   }
   ctxWaitUntilNoop(env.DB.prepare(
     `UPDATE sb_access_tokens SET last_used_at = ? WHERE id = ?`
   ).bind(now, row.id as string).run());
-  return null;
+  return {
+    ok: true,
+    principal: {
+      owner: false,
+      tokenId: row.id as string,
+      vaultId: tokenVaultId,
+      scopes,
+    },
+  };
+}
+
+function resolveObsidianVaultId(
+  principal: AuthPrincipal,
+  requestedVaultId?: string | null
+): { ok: true; vaultId: string } | { ok: false; response: Response } {
+  if (!principal.owner) {
+    if (!principal.vaultId) {
+      return { ok: false, response: json({ ok: false, error: "vault_id_missing_on_token" }, 403) };
+    }
+    if (requestedVaultId && requestedVaultId !== principal.vaultId) {
+      return { ok: false, response: json({ ok: false, error: "Forbidden" }, 403) };
+    }
+    return { ok: true, vaultId: principal.vaultId };
+  }
+
+  const vaultId = requiredTrimmedString(requestedVaultId);
+  if (!vaultId) return { ok: false, response: json({ ok: false, error: "vaultId is required" }, 400) };
+  if (vaultId.length > 128) return { ok: false, response: json({ ok: false, error: "vaultId is too long" }, 400) };
+  return { ok: true, vaultId };
 }
 
 function ctxWaitUntilNoop(promise: Promise<unknown>): void {
@@ -1488,6 +1406,7 @@ function obsidianFrontmatter(input: {
   type: string;
   entryId: string;
   revisionId: string | null;
+  syncEtag?: string | null;
   status: MemoryStatus | null;
   source: string;
   syncedAt: string;
@@ -1500,6 +1419,7 @@ function obsidianFrontmatter(input: {
     `singularity_type: ${yamlScalar(input.type)}`,
     `singularity_id: ${yamlScalar(input.entryId)}`,
     `singularity_revision: ${yamlScalar(input.revisionId ?? "")}`,
+    `singularity_sync_etag: ${yamlScalar(input.syncEtag ?? "")}`,
     `singularity_status: ${yamlScalar(input.status ?? "draft")}`,
     "singularity_kind: semantic",
     `singularity_source: ${yamlScalar(input.source)}`,
@@ -1519,28 +1439,35 @@ function obsidianSafeFileName(value: string): string {
   return value.replace(/[\\/:*?"<>|#^[\]]+/g, "-").replace(/\s+/g, " ").trim() || "untitled";
 }
 
-function buildObsidianSyncEtag(input: {
+async function buildObsidianSyncEtag(input: {
   objectType: ObsidianObjectType;
   objectId: string | null | undefined;
   revisionId?: string | number | null;
   contentHash?: string | null;
-}): string {
-  return [
-    "obsidian-sync-v1",
-    input.objectType,
-    input.objectId ?? "",
-    input.revisionId ?? "",
-    input.contentHash ?? "",
-  ].join(":");
+  metadataHash?: string | null;
+  status?: MemoryStatus | null;
+  classificationVersion?: number | null;
+}): Promise<string> {
+  const payload = JSON.stringify({
+    objectType: input.objectType,
+    objectId: input.objectId ?? "",
+    revisionId: input.revisionId == null ? "" : String(input.revisionId),
+    contentHash: input.contentHash ?? "",
+    metadataHash: input.metadataHash ?? "",
+    status: input.status ?? "",
+    classificationVersion: input.classificationVersion ?? "",
+  });
+  return `sync2_${await contentFingerprint(payload)}`;
 }
 
-function markdownForObsidian(row: ObsidianLinkedEntryRow): string {
+function markdownForObsidian(row: ObsidianLinkedEntryRow, syncEtag?: string | null): string {
   const tags = parseEntryTagsJson(row.tags)
     .filter((tag) => tag !== "obsidian" && !tag.startsWith("status:"));
   const frontmatter = obsidianFrontmatter({
     type: "atomic-memory",
     entryId: row.entry_id,
     revisionId: row.revision_id,
+    syncEtag: syncEtag ?? row.sync_etag,
     status: row.memory_status,
     source: row.source,
     syncedAt: new Date(row.updated_at).toISOString(),
@@ -1567,6 +1494,29 @@ async function latestMemoryRevisionId(
      LIMIT 1`
   ).bind(entryId).first<{ id: string }>();
   return row?.id ?? null;
+}
+
+async function memorySyncEtagFromRow(row: {
+  entry_id?: string | null;
+  id?: string | null;
+  content_hash?: string | null;
+  metadata_hash?: string | null;
+  revision_id?: string | number | null;
+  memory_status?: MemoryStatus | null;
+  status?: MemoryStatus | null;
+  classification_version?: string | number | null;
+}): Promise<string> {
+  const classificationVersion =
+    row.classification_version == null ? null : Number(row.classification_version);
+  return buildObsidianSyncEtag({
+    objectType: "memory",
+    objectId: row.entry_id ?? row.id,
+    revisionId: row.revision_id,
+    contentHash: row.content_hash ?? null,
+    metadataHash: row.metadata_hash ?? null,
+    status: row.memory_status ?? row.status ?? null,
+    classificationVersion: Number.isFinite(classificationVersion) ? classificationVersion : null,
+  });
 }
 
 async function loadObsidianLinkByVaultPath(
@@ -1606,6 +1556,41 @@ async function loadObsidianSource(
   ).bind(OBSIDIAN_PROVIDER, vaultId, externalPath, externalBlockId).first<ExternalSourceRow>();
 }
 
+async function loadObsidianSourceById(
+  env: Env,
+  vaultId: string,
+  sourceId: string
+): Promise<ExternalSourceRow | null> {
+  return await env.DB.prepare(
+    `SELECT * FROM sb_external_sources
+     WHERE provider = ? AND vault_id = ? AND id = ?
+     LIMIT 1`
+  ).bind(OBSIDIAN_PROVIDER, vaultId, sourceId).first<ExternalSourceRow>();
+}
+
+async function loadConflictingObsidianSourcePath(
+  env: Env,
+  input: {
+    vaultId: string;
+    externalPath: string;
+    externalBlockId: string;
+    sourceId: string;
+  }
+): Promise<ExternalSourceRow | null> {
+  return await env.DB.prepare(
+    `SELECT * FROM sb_external_sources
+     WHERE provider = ? AND vault_id = ? AND external_path = ?
+       AND external_block_id = ? AND id <> ?
+     LIMIT 1`
+  ).bind(
+    OBSIDIAN_PROVIDER,
+    input.vaultId,
+    input.externalPath,
+    input.externalBlockId,
+    input.sourceId
+  ).first<ExternalSourceRow>();
+}
+
 async function upsertObsidianSource(
   env: Env,
   input: {
@@ -1621,6 +1606,31 @@ async function upsertObsidianSource(
   const now = Date.now();
   const id = input.existing?.id ?? input.sourceId ?? crypto.randomUUID();
   const revision = input.existing ? Number(input.existing.last_revision ?? 0) + 1 : 1;
+  if (input.existing) {
+    await env.DB.prepare(
+      `UPDATE sb_external_sources
+       SET external_path = ?,
+           external_block_id = ?,
+           current_observation_id = ?,
+           last_content_hash = ?,
+           last_revision = ?,
+           updated_at = ?
+       WHERE id = ? AND provider = ? AND vault_id = ?`
+    ).bind(
+      input.externalPath,
+      input.externalBlockId,
+      input.observationId,
+      input.contentHash,
+      revision,
+      now,
+      id,
+      OBSIDIAN_PROVIDER,
+      input.vaultId
+    ).run();
+    const row = await loadObsidianSourceById(env, input.vaultId, id);
+    if (!row) throw new Error("Obsidian source update failed");
+    return row;
+  }
   await env.DB.prepare(
     `INSERT INTO sb_external_sources (
        id, provider, vault_id, external_path, external_block_id,
@@ -1640,7 +1650,7 @@ async function upsertObsidianSource(
     input.observationId,
     input.contentHash,
     revision,
-    input.existing?.created_at ?? now,
+    now,
     now
   ).run();
   const row = await loadObsidianSource(env, input.vaultId, input.externalPath, input.externalBlockId);
@@ -1732,7 +1742,7 @@ async function upsertObsidianLink(
 ): Promise<ObsidianLinkRow> {
   const now = Date.now();
   const id = input.existingId ?? crypto.randomUUID();
-  const syncEtag = input.syncEtag ?? buildObsidianSyncEtag({
+  const syncEtag = input.syncEtag ?? await buildObsidianSyncEtag({
     objectType: input.objectType,
     objectId: input.objectId,
     revisionId: input.revisionId,
@@ -1859,14 +1869,9 @@ function serializeObsidianLink(row: ObsidianLinkRow): Record<string, unknown> {
   };
 }
 
-function serializeObsidianPullRow(row: ObsidianLinkedEntryRow): Record<string, unknown> {
+async function serializeObsidianPullRow(row: ObsidianLinkedEntryRow): Promise<Record<string, unknown>> {
   const entryTags = parseEntryTagsJson(row.tags);
-  const currentSyncEtag = buildObsidianSyncEtag({
-    objectType: "memory",
-    objectId: row.entry_id,
-    revisionId: row.revision_id,
-    contentHash: row.content_hash,
-  });
+  const currentSyncEtag = await memorySyncEtagFromRow(row);
   const remoteChanged =
     currentSyncEtag !== row.last_synced_sync_etag ||
     row.revision_id !== row.last_synced_revision_id ||
@@ -1883,7 +1888,7 @@ function serializeObsidianPullRow(row: ObsidianLinkedEntryRow): Record<string, u
     entryId: row.entry_id,
     path: row.external_path,
     content: row.content,
-    markdown: markdownForObsidian(row),
+    markdown: markdownForObsidian(row, currentSyncEtag),
     revisionId: row.revision_id,
     contentHash: row.content_hash,
     syncEtag: currentSyncEtag,
@@ -1895,7 +1900,9 @@ function serializeObsidianPullRow(row: ObsidianLinkedEntryRow): Record<string, u
     properties: {
       singularity_id: row.entry_id,
       singularity_revision: row.revision_id,
+      singularity_sync_etag: currentSyncEtag,
       singularity_status: row.memory_status ?? "draft",
+      singularity_kind: "semantic",
       singularity_source: row.source,
       singularity_synced_at: new Date(row.updated_at).toISOString(),
       tags: entryTags,
@@ -1908,20 +1915,33 @@ async function handleObsidianAck(env: Env, body: ObsidianAckBody): Promise<Respo
   const revisionId = requiredTrimmedString(body.revisionId);
   const contentHash = requiredTrimmedString(body.contentHash);
   const requestedSyncEtag = optionalTrimmedString(body.syncEtag);
+  const vaultId = requiredTrimmedString(body.vaultId); // server-set by route handler
   if (!linkId) return json({ ok: false, error: "linkId is required" }, 400);
   if (!revisionId) return json({ ok: false, error: "revisionId is required" }, 400);
   if (!contentHash) return json({ ok: false, error: "contentHash is required" }, 400);
+  if (!vaultId) return json({ ok: false, error: "vaultId is required" }, 400);
 
   const link = await loadObsidianLinkById(env, linkId);
   if (!link || link.object_type !== "memory") {
     return json({ ok: false, error: "Obsidian memory link not found" }, 404);
   }
-  const syncEtag = requestedSyncEtag ?? buildObsidianSyncEtag({
-    objectType: "memory",
-    objectId: link.entry_id ?? link.object_id,
-    revisionId,
-    contentHash,
-  });
+  // Vault binding: the link must belong to the authenticated vault.
+  if (link.vault_id !== vaultId) {
+    return json({ ok: false, error: "Link not found in this vault" }, 404);
+  }
+  const linkedRow = requestedSyncEtag ? null : await loadObsidianLinkedEntryByLink(env, link);
+  const syncEtag = requestedSyncEtag ?? (linkedRow
+    ? await memorySyncEtagFromRow({
+      ...linkedRow,
+      revision_id: revisionId,
+      content_hash: contentHash,
+    })
+    : await buildObsidianSyncEtag({
+      objectType: "memory",
+      objectId: link.entry_id ?? link.object_id,
+      revisionId,
+      contentHash,
+    }));
   await env.DB.prepare(
     `UPDATE sb_external_links
      SET last_synced_revision_id = ?,
@@ -1932,8 +1952,8 @@ async function handleObsidianAck(env: Env, body: ObsidianAckBody): Promise<Respo
          sync_status = 'synced',
          last_error = NULL,
          updated_at = ?
-     WHERE id = ? AND provider = ? AND object_type = 'memory'`
-  ).bind(revisionId, contentHash, contentHash, syncEtag, syncEtag, Date.now(), linkId, OBSIDIAN_PROVIDER).run();
+     WHERE id = ? AND provider = ? AND object_type = 'memory' AND vault_id = ?`
+  ).bind(revisionId, contentHash, contentHash, syncEtag, syncEtag, Date.now(), linkId, OBSIDIAN_PROVIDER, vaultId).run();
   const updated = await loadObsidianLinkById(env, linkId);
   return json({ ok: true, link: updated ? serializeObsidianLink(updated) : null });
 }
@@ -2152,10 +2172,28 @@ async function linkObsidianObservationAndMemories(
   const memoryLinks: ObsidianLinkRow[] = [];
   for (const memoryId of input.memoryIds) {
     const row = await env.DB.prepare(
-      `SELECT id, content, content_hash FROM entries WHERE id = ?`
-    ).bind(memoryId).first<{ id: string; content: string; content_hash: string | null }>();
+      `SELECT id, content, tags, content_hash, metadata_hash, classification_version
+       FROM entries
+       WHERE id = ?`
+    ).bind(memoryId).first<{
+      id: string;
+      content: string;
+      tags: string;
+      content_hash: string | null;
+      metadata_hash: string | null;
+      classification_version: number | null;
+    }>();
     if (!row) continue;
     const memoryContentHash = row.content_hash ?? await contentFingerprint(row.content);
+    const revisionId = await latestMemoryRevisionId(env, memoryId, false);
+    const syncEtag = await memorySyncEtagFromRow({
+      entry_id: memoryId,
+      content_hash: memoryContentHash,
+      metadata_hash: row.metadata_hash,
+      revision_id: revisionId,
+      memory_status: getStatus(parseEntryTagsJson(row.tags)),
+      classification_version: row.classification_version,
+    });
     memoryLinks.push(await upsertObsidianLink(env, {
       objectType: "memory",
       objectId: memoryId,
@@ -2166,7 +2204,8 @@ async function linkObsidianObservationAndMemories(
       externalFileId: input.externalPath,
       syncDirection: input.syncDirection,
       contentHash: memoryContentHash,
-      revisionId: await latestMemoryRevisionId(env, memoryId, true),
+      revisionId,
+      syncEtag,
       status: "synced",
     }));
   }
@@ -2195,8 +2234,23 @@ async function handleObsidianPush(
   const syncDirection = parseObsidianSyncDirection(body.syncDirection);
   const requestedEntryId = optionalTrimmedString(body.entryId);
   const baseRevisionId = optionalTrimmedString(body.baseRevisionId);
+  const baseSyncEtag = optionalTrimmedString(body.baseSyncEtag);
+  const requestedSourceId = optionalTrimmedString(body.sourceId) ??
+    optionalTrimmedString(properties.singularity_source_id);
   const incomingTags = obsidianTagsForEntry(properties);
   const existingLink = await loadObsidianLinkByVaultPath(env, vaultId, externalPath, "memory", externalBlockId);
+  // Enforce stored sync_direction — server is authoritative.
+  // The client-supplied direction is only used for new links.
+  const effectiveDirection = existingLink?.sync_direction ?? syncDirection;
+  if (existingLink) {
+    if (existingLink.sync_direction === "singularity_to_obsidian") {
+      return json({
+        ok: false,
+        error: "read_only_link",
+        message: "This memory link is read-only (singularity → obsidian). Push is rejected.",
+      }, 403);
+    }
+  }
   if (existingLink && requestedEntryId && requestedEntryId !== existingLink.entry_id) {
     return json({
       ok: false,
@@ -2206,20 +2260,71 @@ async function handleObsidianPush(
   }
 
   const entryId = requestedEntryId ?? existingLink?.entry_id;
+  // When a scoped token provides an entryId without an existing link for this
+  // vault+path, the update must be anchored to an existing link in this vault.
+  // Reject cross-vault entryId injection.
+  if (requestedEntryId && !existingLink) {
+    return json({
+      ok: false,
+      error: "entry_not_in_vault",
+      message: "Entry must be first linked to this vault before it can be updated",
+    }, 403);
+  }
   if (!entryId) {
     const now = Date.now();
     const contentHash = await contentFingerprint(content);
-    const existingSource = await loadObsidianSource(env, vaultId, externalPath, externalBlockId);
+    const sourceById = requestedSourceId
+      ? await loadObsidianSourceById(env, vaultId, requestedSourceId)
+      : null;
+    if (requestedSourceId && !sourceById) {
+      return json({
+        ok: false,
+        error: "source_not_found",
+        message: "Obsidian source id is not linked to this vault",
+      }, 404);
+    }
+    if (sourceById) {
+      const conflict = await loadConflictingObsidianSourcePath(env, {
+        vaultId,
+        externalPath,
+        externalBlockId,
+        sourceId: sourceById.id,
+      });
+      if (conflict) {
+        return json({
+          ok: false,
+          error: "source_path_conflict",
+          message: "Another Obsidian source already owns this path",
+          sourceId: sourceById.id,
+          conflictingSourceId: conflict.id,
+        }, 409);
+      }
+    }
+    const existingSource = sourceById ?? await loadObsidianSource(env, vaultId, externalPath, externalBlockId);
     if (existingSource?.last_content_hash === contentHash && existingSource.current_observation_id) {
-      const memoryIds = await memoryIdsForObservation(env, existingSource.current_observation_id);
+      const currentObservationId = existingSource.current_observation_id;
+      const sourceMoved = Boolean(sourceById) &&
+        (sourceById!.external_path !== externalPath || sourceById!.external_block_id !== externalBlockId);
+      const source = sourceById && sourceMoved
+        ? await upsertObsidianSource(env, {
+          sourceId: sourceById.id,
+          existing: sourceById,
+          vaultId,
+          externalPath,
+          externalBlockId,
+          observationId: currentObservationId,
+          contentHash,
+        })
+        : existingSource;
+      const memoryIds = await memoryIdsForObservation(env, currentObservationId);
       return json({
         ok: true,
         action: "unchanged",
         status: "unchanged",
-        sourceId: existingSource.id,
-        sourceRevision: Number(existingSource.last_revision ?? 0),
-        sourceHash: existingSource.last_content_hash,
-        observationId: existingSource.current_observation_id,
+        sourceId: source.id,
+        sourceRevision: Number(source.last_revision ?? 0),
+        sourceHash: source.last_content_hash,
+        observationId: currentObservationId,
         entryId: memoryIds[0] ?? null,
         memoryIds,
       });
@@ -2279,21 +2384,65 @@ async function handleObsidianPush(
   }
 
   const row = await env.DB.prepare(
-    `SELECT id, content, tags, source, content_hash FROM entries WHERE id = ?`
-  ).bind(entryId).first<Record<string, any>>();
+    `SELECT e.id, e.content, e.tags, e.source, e.content_hash, e.metadata_hash, e.classification_version
+     FROM entries e
+     JOIN sb_external_links l ON l.entry_id = e.id
+     WHERE e.id = ?
+       AND l.provider = ?
+       AND l.object_type = 'memory'
+       AND l.vault_id = ?
+       AND l.external_path = ?
+       AND l.external_block_id = ?
+     LIMIT 1`
+  ).bind(entryId, OBSIDIAN_PROVIDER, vaultId, externalPath, externalBlockId).first<Record<string, any>>();
   if (!row) {
     if (existingLink) await markObsidianLinkStatus(env, existingLink.id, "deleted_remote", "linked memory is missing");
-    return json({ ok: false, error: `No entry found with ID: ${entryId}` }, 404);
+    return json({ ok: false, error: `Entry not found or not linked to this vault: ${entryId}` }, 403);
   }
 
   const oldContent = row.content as string;
   const oldTags = parseEntryTagsJson(row.tags as string | null);
   const newTags = mergeEntryTags(oldTags, incomingTags);
   const source = row.source as string;
-  const latestRevisionId = await latestMemoryRevisionId(env, entryId, true);
+  const latestRevisionId = await latestMemoryRevisionId(env, entryId, false);
   const effectiveBaseRevisionId = baseRevisionId ?? existingLink?.last_synced_revision_id ?? undefined;
   const tagsChanged = JSON.stringify(oldTags) !== JSON.stringify(newTags);
   const contentChanged = oldContent !== content;
+  const memoryStatus = getStatus(oldTags);
+  const currentSyncEtag = await memorySyncEtagFromRow({
+    entry_id: entryId,
+    content_hash: row.content_hash as string | null,
+    metadata_hash: row.metadata_hash as string | null,
+    revision_id: latestRevisionId,
+    memory_status: memoryStatus,
+    classification_version: row.classification_version as string | number | null,
+  });
+  const effectiveBaseSyncEtag = baseSyncEtag ?? existingLink?.last_synced_sync_etag ?? undefined;
+  if (
+    !options.force &&
+    effectiveBaseSyncEtag &&
+    currentSyncEtag !== effectiveBaseSyncEtag &&
+    (contentChanged || tagsChanged)
+  ) {
+    if (existingLink) {
+      await markObsidianLinkStatus(env, existingLink.id, "conflict", "remote memory changed since Obsidian sync etag");
+    }
+    return json({
+      ok: false,
+      error: "obsidian_sync_conflict",
+      entryId,
+      baseRevisionId: effectiveBaseRevisionId ?? null,
+      currentRevisionId: latestRevisionId,
+      baseSyncEtag: effectiveBaseSyncEtag,
+      currentSyncEtag,
+      link: existingLink ? serializeObsidianLink({
+        ...existingLink,
+        sync_status: "conflict",
+        last_error: "remote memory changed since Obsidian sync etag",
+        updated_at: Date.now(),
+      }) : null,
+    }, 409);
+  }
   if (
     !options.force &&
     effectiveBaseRevisionId &&
@@ -2304,6 +2453,7 @@ async function handleObsidianPush(
     if (existingLink) {
       await markObsidianLinkStatus(env, existingLink.id, "conflict", "remote memory changed since Obsidian base revision");
     } else {
+      // This branch only fires for owner tokens or legacy links with no vault binding.
       await upsertObsidianLink(env, {
         objectType: "memory",
         objectId: entryId,
@@ -2311,7 +2461,7 @@ async function handleObsidianPush(
         vaultId,
         externalPath,
         externalBlockId,
-        syncDirection,
+        syncDirection: effectiveDirection, // use stored direction, not client-supplied
         contentHash: (row.content_hash as string | null) ?? await contentFingerprint(oldContent),
         revisionId: latestRevisionId,
         status: "conflict",
@@ -2361,7 +2511,7 @@ async function handleObsidianPush(
     }
     vectors = newVectorIds.length;
     contentHash = await contentFingerprint(content);
-    finalRevisionId = await latestMemoryRevisionId(env, entryId, true);
+    finalRevisionId = await latestMemoryRevisionId(env, entryId, false);
     try {
       await replaceEntryAtomicMemory(env.DB, {
         entryId,
@@ -2386,9 +2536,19 @@ async function handleObsidianPush(
     vaultId,
     externalPath,
     externalBlockId,
-    syncDirection,
+    syncDirection: effectiveDirection,
     contentHash,
     revisionId: finalRevisionId,
+    syncEtag: await memorySyncEtagFromRow({
+      entry_id: entryId,
+      content_hash: contentHash,
+      metadata_hash: contentChanged || tagsChanged
+        ? await entryMetadataFingerprint({ source, tags: newTags })
+        : row.metadata_hash as string | null,
+      revision_id: finalRevisionId,
+      memory_status: getStatus(newTags),
+      classification_version: row.classification_version as string | number | null,
+    }),
     status: "synced",
   });
 
@@ -2415,10 +2575,11 @@ async function loadObsidianLinkedEntryByLink(
        e.source,
        e.created_at AS entry_created_at,
        e.content_hash,
+       e.metadata_hash,
+       e.classification_version,
        (
          SELECT id FROM sb_memory_revisions r
          WHERE r.memory_id = e.id
-           AND r.event_type IN ('ADD', 'UPDATE', 'APPEND', 'DEPRECATE', 'ROLLUP', 'UNROLL')
          ORDER BY r.created_at DESC
          LIMIT 1
        ) AS revision_id
@@ -2442,10 +2603,11 @@ async function handleObsidianResolveConflict(
   body: ObsidianResolveConflictBody
 ): Promise<Response> {
   const linkId = optionalTrimmedString(body.linkId);
-  const vaultId = optionalTrimmedString(body.vaultId);
+  const vaultId = requiredTrimmedString(body.vaultId); // server-set by route handler
   const externalPath = optionalTrimmedString(body.path);
   const resolution = optionalTrimmedString(body.resolution);
   if (!resolution) return json({ ok: false, error: "resolution is required" }, 400);
+  if (!vaultId) return json({ ok: false, error: "vaultId is required" }, 400);
 
   const link = linkId
     ? await loadObsidianLinkById(env, linkId)
@@ -2453,6 +2615,10 @@ async function handleObsidianResolveConflict(
       ? await loadObsidianLinkByVaultPath(env, vaultId, externalPath)
       : null;
   if (!link) return json({ ok: false, error: "Obsidian link not found" }, 404);
+  // Vault binding: the link must belong to the authenticated vault.
+  if (link.vault_id !== vaultId) {
+    return json({ ok: false, error: "Link not found in this vault" }, 404);
+  }
 
   const normalizedResolution = resolution.toLowerCase();
   if (["use_singularity", "singularity", "remote"].includes(normalizedResolution)) {
@@ -2462,7 +2628,12 @@ async function handleObsidianResolveConflict(
       return json({ ok: false, error: "Linked memory is missing" }, 404);
     }
     const contentHash = row.content_hash ?? await contentFingerprint(row.content);
-    const revisionId = row.revision_id ?? await latestMemoryRevisionId(env, row.entry_id, true);
+    const revisionId = row.revision_id ?? await latestMemoryRevisionId(env, row.entry_id, false);
+    const syncEtag = await memorySyncEtagFromRow({
+      ...row,
+      revision_id: revisionId,
+      content_hash: contentHash,
+    });
     const synced = await upsertObsidianLink(env, {
       existingId: link.id,
       objectType: "memory",
@@ -2475,6 +2646,7 @@ async function handleObsidianResolveConflict(
       syncDirection: row.sync_direction,
       contentHash,
       revisionId,
+      syncEtag,
       status: "synced",
     });
     return json({
@@ -2482,7 +2654,7 @@ async function handleObsidianResolveConflict(
       resolution: "use_singularity",
       entryId: row.entry_id,
       revisionId,
-      markdown: markdownForObsidian({ ...row, revision_id: revisionId }),
+      markdown: markdownForObsidian({ ...row, revision_id: revisionId }, syncEtag),
       link: serializeObsidianLink(synced),
     });
   }
@@ -2497,6 +2669,7 @@ async function handleObsidianResolveConflict(
       properties: body.properties,
       entryId: link.entry_id,
       baseRevisionId: body.baseRevisionId,
+      baseSyncEtag: body.baseSyncEtag,
       syncDirection: link.sync_direction,
     }, { force: true });
   }
@@ -2577,7 +2750,7 @@ async function handleListObsidianRules(env: Env, vaultId: string): Promise<Respo
 }
 
 async function handleUpsertObsidianRule(env: Env, body: ObsidianRuleBody): Promise<Response> {
-  const vaultId = requiredTrimmedString(body.vaultId);
+  const vaultId = requiredTrimmedString(body.vaultId); // server-set by route handler
   const name = requiredTrimmedString(body.name);
   const triggerType = requiredTrimmedString(body.triggerType);
   if (!vaultId) return json({ ok: false, error: "vaultId is required" }, 400);
@@ -2587,8 +2760,13 @@ async function handleUpsertObsidianRule(env: Env, body: ObsidianRuleBody): Promi
 
   const id = optionalTrimmedString(body.id) ?? crypto.randomUUID();
   const existing = await env.DB.prepare(
-    `SELECT * FROM sb_automation_rules WHERE id = ?`
-  ).bind(id).first<AutomationRuleRow>();
+    `SELECT * FROM sb_automation_rules WHERE id = ? AND vault_id = ?`
+  ).bind(id, vaultId).first<AutomationRuleRow>();
+  // If client supplied an id but no row exists for this vault, create fresh —
+  // never allow a scoped token to take over a rule from another vault.
+  if (optionalTrimmedString(body.id) && !existing) {
+    return json({ ok: false, error: "Rule not found in this vault" }, 404);
+  }
   const now = Date.now();
   const sourceFilter = { ...parseJsonObject(body.sourceFilter), vaultId };
   const version = existing ? Number(existing.version ?? 1) + 1 : 1;
@@ -2626,8 +2804,8 @@ async function handleUpsertObsidianRule(env: Env, body: ObsidianRuleBody): Promi
     now
   ).run();
   const row = await env.DB.prepare(
-    `SELECT * FROM sb_automation_rules WHERE id = ?`
-  ).bind(id).first<AutomationRuleRow>();
+    `SELECT * FROM sb_automation_rules WHERE id = ? AND vault_id = ?`
+  ).bind(id, vaultId).first<AutomationRuleRow>();
   return json({ ok: true, rule: row ? serializeAutomationRule(row) : null }, existing ? 200 : 201);
 }
 
@@ -2636,7 +2814,11 @@ function parseMemoryIdList(value: unknown): string[] {
   return [...new Set(value.map(String).map((id) => id.trim()).filter(Boolean))].slice(0, 200);
 }
 
-async function loadAggregateSourceMemories(env: Env, ids: string[]): Promise<Array<{ id: string; content: string; tags: string; created_at: number }>> {
+async function loadAggregateSourceMemories(
+  env: Env,
+  ids: string[],
+  vaultId: string
+): Promise<Array<{ id: string; content: string; tags: string; created_at: number }>> {
   if (!ids.length) return [];
   const placeholders = ids.map(() => "?").join(", ");
   const { results } = await env.DB.prepare(
@@ -2644,8 +2826,16 @@ async function loadAggregateSourceMemories(env: Env, ids: string[]): Promise<Arr
      FROM entries
      WHERE id IN (${placeholders})
        AND tags NOT LIKE '%"status:deprecated"%'
+       AND EXISTS (
+         SELECT 1
+         FROM sb_external_links l
+         WHERE l.entry_id = entries.id
+           AND l.provider = ?
+           AND l.object_type = 'memory'
+           AND l.vault_id = ?
+       )
      ORDER BY created_at DESC`
-  ).bind(...ids).all<{ id: string; content: string; tags: string; created_at: number }>();
+  ).bind(...ids, OBSIDIAN_PROVIDER, vaultId).all<{ id: string; content: string; tags: string; created_at: number }>();
   const order = new Map(ids.map((id, index) => [id, index]));
   return [...(results ?? [])].sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
 }
@@ -2673,13 +2863,14 @@ function aggregatePath(input: { id: string; title: string }): string {
   return `Singularity/20 知识聚合/${obsidianSafeFileName(input.title).slice(0, 64)}-${input.id.slice(0, 8)}.md`;
 }
 
-function aggregateFrontmatter(row: KnowledgeAggregateRow, link: ObsidianLinkRow | null): string {
+function aggregateFrontmatter(row: KnowledgeAggregateRow, link: ObsidianLinkRow | null, syncEtag?: string | null): string {
   const tags = ["singularity", "aggregate", `aggregate/${row.aggregate_type}`];
   return [
     "---",
     `singularity_type: ${yamlScalar("knowledge-aggregate")}`,
     `singularity_id: ${yamlScalar(row.id)}`,
     `singularity_revision: ${yamlScalar(String(row.generated_at))}`,
+    `singularity_sync_etag: ${yamlScalar(syncEtag ?? link?.sync_etag ?? row.sync_etag ?? "")}`,
     `singularity_status: ${yamlScalar(row.stale_at ? "stale" : "canonical")}`,
     `singularity_source: ${yamlScalar("singularity")}`,
     `singularity_synced_at: ${yamlScalar(new Date(row.updated_at).toISOString())}`,
@@ -2693,18 +2884,23 @@ function aggregateFrontmatter(row: KnowledgeAggregateRow, link: ObsidianLinkRow 
   ].join("\n");
 }
 
-function markdownForAggregate(row: KnowledgeAggregateRow, link: ObsidianLinkRow | null): string {
-  return `${aggregateFrontmatter(row, link)}${row.content}`;
+function markdownForAggregate(row: KnowledgeAggregateRow, link: ObsidianLinkRow | null, syncEtag?: string | null): string {
+  return `${aggregateFrontmatter(row, link, syncEtag)}${row.content}`;
 }
 
-function serializeKnowledgeAggregate(row: KnowledgeAggregateRow): Record<string, unknown> {
-  const contentHash = row.content_hash ?? "";
-  const syncEtag = buildObsidianSyncEtag({
+async function aggregateSyncEtag(row: Pick<KnowledgeAggregateRow, "id" | "generated_at" | "content_hash" | "stale_at">): Promise<string> {
+  return buildObsidianSyncEtag({
     objectType: "aggregate",
     objectId: row.id,
     revisionId: row.generated_at,
-    contentHash,
+    contentHash: row.content_hash ?? "",
+    status: row.stale_at ? "draft" : "canonical",
   });
+}
+
+async function serializeKnowledgeAggregate(row: KnowledgeAggregateRow): Promise<Record<string, unknown>> {
+  const contentHash = row.content_hash ?? "";
+  const syncEtag = await aggregateSyncEtag({ ...row, content_hash: contentHash });
   const link = row.link_id ? {
     id: row.link_id,
     path: row.external_path,
@@ -2748,7 +2944,7 @@ function serializeKnowledgeAggregate(row: KnowledgeAggregateRow): Record<string,
       last_error: null,
       created_at: row.created_at,
       updated_at: row.updated_at,
-    } : null),
+    } : null, syncEtag),
     link,
   };
 }
@@ -2773,11 +2969,12 @@ async function handleListObsidianAggregates(env: Env, vaultId: string): Promise<
      ORDER BY COALESCE(a.stale_at, 0) DESC, a.updated_at DESC
      LIMIT 200`
   ).bind(OBSIDIAN_PROVIDER, vaultId, vaultId).all<KnowledgeAggregateRow>();
+  const serialized = await Promise.all((results ?? []).map(serializeKnowledgeAggregate));
   return json({
     ok: true,
     vaultId,
     count: (results ?? []).length,
-    results: (results ?? []).map(serializeKnowledgeAggregate),
+    results: serialized,
   });
 }
 
@@ -2785,7 +2982,7 @@ async function handleGenerateObsidianAggregate(
   env: Env,
   body: ObsidianAggregateGenerateBody
 ): Promise<Response> {
-  const vaultId = requiredTrimmedString(body.vaultId);
+  const vaultId = requiredTrimmedString(body.vaultId); // server-set by route handler
   const title = requiredTrimmedString(body.title);
   const aggregateType = requiredTrimmedString(body.aggregateType) ?? "topic";
   if (!vaultId) return json({ ok: false, error: "vaultId is required" }, 400);
@@ -2796,7 +2993,7 @@ async function handleGenerateObsidianAggregate(
   if (!sourceMemoryIds.length) {
     return json({ ok: false, error: "sourceMemoryIds must contain at least one memory id" }, 400);
   }
-  const sourceMemories = await loadAggregateSourceMemories(env, sourceMemoryIds);
+  const sourceMemories = await loadAggregateSourceMemories(env, sourceMemoryIds, vaultId);
   if (!sourceMemories.length) return json({ ok: false, error: "No active source memories found" }, 404);
 
   const generationRuleId = optionalTrimmedString(body.generationRuleId) ?? null;
@@ -2805,7 +3002,17 @@ async function handleGenerateObsidianAggregate(
       `SELECT * FROM sb_automation_rules WHERE id = ? AND (vault_id IS NULL OR vault_id = ?)`
     ).bind(generationRuleId, vaultId).first<AutomationRuleRow>()
     : null;
-  const id = optionalTrimmedString(body.id) ?? crypto.randomUUID();
+  const incomingId = optionalTrimmedString(body.id);
+  // Vault binding: if client supplied an id, verify it belongs to this vault.
+  if (incomingId) {
+    const existing = await env.DB.prepare(
+      `SELECT id FROM sb_knowledge_aggregates WHERE id = ? AND vault_id = ?`
+    ).bind(incomingId, vaultId).first<{ id: string }>();
+    if (!existing) {
+      return json({ ok: false, error: "Aggregate not found in this vault" }, 404);
+    }
+  }
+  const id = incomingId ?? crypto.randomUUID();
   const now = Date.now();
   const content = renderKnowledgeAggregateContent({
     title,
@@ -2855,6 +3062,13 @@ async function handleGenerateObsidianAggregate(
     syncDirection: parseObsidianSyncDirection(body.syncDirection ?? "singularity_to_obsidian"),
     contentHash,
     revisionId: String(now),
+    syncEtag: await buildObsidianSyncEtag({
+      objectType: "aggregate",
+      objectId: id,
+      revisionId: now,
+      contentHash,
+      status: "canonical",
+    }),
     status: "synced",
   });
   const aggregate = await env.DB.prepare(
@@ -2876,7 +3090,7 @@ async function handleGenerateObsidianAggregate(
   ).bind(OBSIDIAN_PROVIDER, vaultId, id).first<KnowledgeAggregateRow>();
   return json({
     ok: true,
-    aggregate: aggregate ? serializeKnowledgeAggregate(aggregate) : null,
+    aggregate: aggregate ? await serializeKnowledgeAggregate(aggregate) : null,
     link: serializeObsidianLink(link),
   }, 201);
 }
@@ -2894,6 +3108,18 @@ async function markKnowledgeAggregatesStaleForMemoryIds(
            updated_at = ?
        WHERE source_memory_ids_json LIKE ?`
     ).bind(staleAt, staleAt, `%"${memoryId}"%`).run();
+  }
+}
+
+async function notifyMemoryChanged(
+  env: Env,
+  entryId: string,
+  changeType: "content" | "metadata" | "status" | "classification" | "deleted"
+): Promise<void> {
+  try {
+    await markKnowledgeAggregatesStaleForMemoryIds(env, [entryId], Date.now());
+  } catch (error) {
+    console.error(`Knowledge aggregate stale notification failed (${changeType})`, error);
   }
 }
 
@@ -3566,6 +3792,7 @@ export function buildEntryFilterQuery(params: {
   tag?: string;
   after?: number;
   before?: number;
+  vaultFilter?: string | null;
 }): { sql: string; bindings: (string | number)[] } {
   const conds: string[] = [];
   const bindings: (string | number)[] = [];
@@ -3579,6 +3806,10 @@ export function buildEntryFilterQuery(params: {
   }
   if (params.after !== undefined) { conds.push(`created_at >= ?`); bindings.push(params.after); }
   if (params.before !== undefined) { conds.push(`created_at <= ?`); bindings.push(params.before); }
+  if (params.vaultFilter) {
+    conds.push(`EXISTS (SELECT 1 FROM sb_external_links l WHERE l.entry_id = entries.id AND l.provider = 'obsidian' AND l.object_type = 'memory' AND l.vault_id = ?)`);
+    bindings.push(params.vaultFilter);
+  }
 
   let sql = `SELECT id, content, tags, source, created_at, vector_ids,
                     recall_count, importance_score, classification_confidence,
@@ -3636,7 +3867,8 @@ function parseStoredTags(raw: unknown): string[] {
 async function listRecentActivity(
   plan: RecallRequestPlan,
   tag: string | undefined,
-  env: Env
+  env: Env,
+  vaultFilter: string | null = null
 ): Promise<RecallMatch[]> {
   const fetchLimit = Math.min(plan.limit * 3, 100);
   const { sql, bindings } = buildEntryFilterQuery({
@@ -3644,6 +3876,7 @@ async function listRecentActivity(
     tag,
     after: plan.after,
     before: plan.before,
+    vaultFilter,
   });
   const { results } = await env.DB.prepare(sql).bind(...bindings).all();
 
@@ -5579,7 +5812,7 @@ async function commitEntryVersion(
          AND state IN ('queued', 'building', 'ready')`
     ).bind(Date.now(), openRebuild.id).run();
   }
-  await markKnowledgeAggregatesStaleForMemoryIds(env, [input.id], now);
+  await notifyMemoryChanged(env, input.id, "content");
 
   return prepared.vectorIds;
 }
@@ -5769,6 +6002,7 @@ async function appendToEntry(
          AND state IN ('queued', 'building', 'ready')`
     ).bind(Date.now(), openRebuild.id).run();
   }
+  await notifyMemoryChanged(env, id, "content");
   return newContent;
 }
 
@@ -6759,7 +6993,8 @@ function fuseDenseAndKeyword(
 export async function recallEntries(
   params: { query: string; topK: number; tag?: string; after?: number; before?: number; kind?: MemoryKind },
   env: Env,
-  ctx: ExecutionContext
+  ctx: ExecutionContext,
+  vaultFilter: string | null = null
 ): Promise<RecallSearchResult> {
   const { query, topK } = params;
   let { tag, after, before, kind } = params;
@@ -7035,6 +7270,10 @@ export async function recallEntries(
   const placeholders = parentIds.map(() => "?").join(", ");
   const d1Bindings: (string | number)[] = [...parentIds];
   let d1Sql = `SELECT id, content, tags, source, created_at FROM entries WHERE id IN (${placeholders}) AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"status:deprecated"%'`;
+  if (vaultFilter) {
+    d1Sql += ` AND EXISTS (SELECT 1 FROM sb_external_links l WHERE l.entry_id = entries.id AND l.provider = 'obsidian' AND l.object_type = 'memory' AND l.vault_id = ?)`;
+    d1Bindings.push(vaultFilter);
+  }
   if (kind && (KIND_VALUES as readonly string[]).includes(kind)) {
     // Safe to interpolate: `kind` is validated against the KIND_VALUES enum just above,
     // so only "episodic"/"semantic" can reach the string.
@@ -7306,6 +7545,7 @@ async function classifyAndPersistEntry(
       } catch (e) {
         console.error("CLASSIFY revision write failed (non-fatal):", e);
       }
+      await notifyMemoryChanged(env, candidate.id, "classification");
       return "succeeded";
     }
     throw new Error("classification_conflict");
@@ -8722,6 +8962,7 @@ export async function deprecateEntry(
       : []),
   ]);
   await deprecateEntryAtomicMemory(env.DB, { entryId: id, invalidAt: now });
+  await notifyMemoryChanged(env, id, "status");
   return true;
 }
 
@@ -8771,6 +9012,7 @@ export async function applyStatus(id: string, status: MemoryStatus, env: Env): P
     ...cleanupStatements,
     statusRevision.statement,
   ]);
+  await notifyMemoryChanged(env, id, "status");
   return true;
 }
 
@@ -9306,8 +9548,8 @@ const defaultHandler = {
 
     // POST /capture
     if (url.pathname === "/capture" && request.method === "POST") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
 
       let body: { content?: string; tags?: string[]; source?: string };
       try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
@@ -9399,8 +9641,8 @@ const defaultHandler = {
 
     // POST /append
     if (url.pathname === "/append" && request.method === "POST") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
 
       let body: { id?: string; addition?: string };
       try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
@@ -9458,8 +9700,8 @@ const defaultHandler = {
 
     // POST /update
     if (url.pathname === "/update" && request.method === "POST") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
 
       let body: { id?: string; content?: string };
       try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
@@ -9533,18 +9775,24 @@ const defaultHandler = {
     if (url.pathname === "/integrations/obsidian/push" && request.method === "POST") {
       let body: ObsidianPushBody;
       try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
-      const vaultId = optionalTrimmedString(body.vaultId);
-      const authErr = await requireScopedAuth(request, env, "obsidian:push", vaultId);
-      if (authErr) return authErr;
+      const requestedVaultId = optionalTrimmedString(body.vaultId);
+      const auth = await requireScopedAuth(request, env, "obsidian:push", requestedVaultId);
+      if (!auth.ok) return auth.response;
+      const vault = resolveObsidianVaultId(auth.principal, requestedVaultId);
+      if (!vault.ok) return vault.response;
+      body.vaultId = vault.vaultId;
       return handleObsidianPush(env, ctx, body);
     }
 
     // GET /integrations/obsidian/pull
     if (url.pathname === "/integrations/obsidian/pull" && request.method === "GET") {
-      const vaultId = requiredTrimmedString(url.searchParams.get("vaultId"));
-      if (!vaultId) return json({ ok: false, error: "vaultId is required" }, 400);
-      const authErr = await requireScopedAuth(request, env, "obsidian:pull", vaultId);
-      if (authErr) return authErr;
+      const urlVaultId = requiredTrimmedString(url.searchParams.get("vaultId"));
+      if (!urlVaultId) return json({ ok: false, error: "vaultId is required" }, 400);
+      const auth = await requireScopedAuth(request, env, "obsidian:pull", urlVaultId);
+      if (!auth.ok) return auth.response;
+      const vault = resolveObsidianVaultId(auth.principal, urlVaultId);
+      if (!vault.ok) return vault.response;
+      const vaultId = vault.vaultId;
       const status = optionalTrimmedString(url.searchParams.get("status"));
       if (status && !(OBSIDIAN_SYNC_STATUSES as readonly string[]).includes(status)) {
         return json({ ok: false, error: `status must be one of: ${OBSIDIAN_SYNC_STATUSES.join(", ")}` }, 400);
@@ -9580,10 +9828,11 @@ const defaultHandler = {
            e.source,
            e.created_at AS entry_created_at,
            e.content_hash,
+           e.metadata_hash,
+           e.classification_version,
            (
              SELECT id FROM sb_memory_revisions r
              WHERE r.memory_id = e.id
-               AND r.event_type IN ('ADD', 'UPDATE', 'APPEND', 'DEPRECATE', 'ROLLUP', 'UNROLL')
              ORDER BY r.created_at DESC
              LIMIT 1
            ) AS revision_id
@@ -9591,19 +9840,20 @@ const defaultHandler = {
          JOIN entries e ON e.id = l.entry_id
          WHERE l.provider = ? AND l.vault_id = ?
            AND l.object_type = 'memory'
+           AND l.sync_direction != 'obsidian_to_singularity'
            ${statusClause}
            ${cursorClause}
          ORDER BY l.updated_at DESC, l.id DESC
          LIMIT ?`
       ).bind(...bindings).all();
       const pageRows = ((results ?? []) as Record<string, any>[]).slice(0, limit);
-      const items = pageRows.map((row) => {
+      const items = await Promise.all(pageRows.map((row) => {
         const tags = parseEntryTagsJson(row.tags as string | null);
         return serializeObsidianPullRow({
           ...(row as ObsidianLinkedEntryRow),
           memory_status: getStatus(tags),
         });
-      });
+      }));
       const hasMore = (results ?? []).length > limit;
       const last = pageRows[pageRows.length - 1];
       return json({
@@ -9618,10 +9868,13 @@ const defaultHandler = {
 
     // GET /integrations/obsidian/status
     if (url.pathname === "/integrations/obsidian/status" && request.method === "GET") {
-      const vaultId = requiredTrimmedString(url.searchParams.get("vaultId"));
-      if (!vaultId) return json({ ok: false, error: "vaultId is required" }, 400);
-      const authErr = await requireScopedAuth(request, env, "obsidian:status", vaultId);
-      if (authErr) return authErr;
+      const urlVaultId = requiredTrimmedString(url.searchParams.get("vaultId"));
+      if (!urlVaultId) return json({ ok: false, error: "vaultId is required" }, 400);
+      const auth = await requireScopedAuth(request, env, "obsidian:status", urlVaultId);
+      if (!auth.ok) return auth.response;
+      const vault = resolveObsidianVaultId(auth.principal, urlVaultId);
+      if (!vault.ok) return vault.response;
+      const vaultId = vault.vaultId;
       const [totalRow, statusRows, errorRows, sourceRows, ruleRows, aggregateRows, migrationRows] = await Promise.all([
         env.DB.prepare(
           `SELECT COUNT(*) AS count FROM sb_external_links
@@ -9655,7 +9908,8 @@ const defaultHandler = {
         env.DB.prepare(
           `SELECT id, name, checksum, applied_at
            FROM sb_schema_migrations
-           WHERE id LIKE '20260712_obsidian_%'
+           WHERE id LIKE '%obsidian%'
+              OR id LIKE '%external_links%'
            ORDER BY applied_at DESC`
         ).all(),
       ]);
@@ -9692,8 +9946,12 @@ const defaultHandler = {
     if (url.pathname === "/integrations/obsidian/resolve-conflict" && request.method === "POST") {
       let body: ObsidianResolveConflictBody;
       try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
-      const authErr = await requireScopedAuth(request, env, "obsidian:resolve-conflict", optionalTrimmedString(body.vaultId));
-      if (authErr) return authErr;
+      const requestedVaultId = optionalTrimmedString(body.vaultId);
+      const auth = await requireScopedAuth(request, env, "obsidian:resolve-conflict", requestedVaultId);
+      if (!auth.ok) return auth.response;
+      const vault = resolveObsidianVaultId(auth.principal, requestedVaultId);
+      if (!vault.ok) return vault.response;
+      body.vaultId = vault.vaultId;
       return handleObsidianResolveConflict(env, ctx, body);
     }
 
@@ -9701,49 +9959,65 @@ const defaultHandler = {
     if (url.pathname === "/integrations/obsidian/ack" && request.method === "POST") {
       let body: ObsidianAckBody;
       try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
-      const authErr = await requireScopedAuth(request, env, "obsidian:ack", optionalTrimmedString(body.vaultId));
-      if (authErr) return authErr;
+      const requestedVaultId = optionalTrimmedString(body.vaultId);
+      const auth = await requireScopedAuth(request, env, "obsidian:ack", requestedVaultId);
+      if (!auth.ok) return auth.response;
+      const vault = resolveObsidianVaultId(auth.principal, requestedVaultId);
+      if (!vault.ok) return vault.response;
+      body.vaultId = vault.vaultId;
       return handleObsidianAck(env, body);
     }
 
     // GET/POST /integrations/obsidian/rules
     if (url.pathname === "/integrations/obsidian/rules" && request.method === "GET") {
-      const vaultId = requiredTrimmedString(url.searchParams.get("vaultId"));
-      if (!vaultId) return json({ ok: false, error: "vaultId is required" }, 400);
-      const authErr = await requireScopedAuth(request, env, "obsidian:rules", vaultId);
-      if (authErr) return authErr;
-      return handleListObsidianRules(env, vaultId);
+      const urlVaultId = requiredTrimmedString(url.searchParams.get("vaultId"));
+      if (!urlVaultId) return json({ ok: false, error: "vaultId is required" }, 400);
+      const auth = await requireScopedAuth(request, env, "obsidian:rules", urlVaultId);
+      if (!auth.ok) return auth.response;
+      const vault = resolveObsidianVaultId(auth.principal, urlVaultId);
+      if (!vault.ok) return vault.response;
+      return handleListObsidianRules(env, vault.vaultId);
     }
     if (url.pathname === "/integrations/obsidian/rules" && request.method === "POST") {
       let body: ObsidianRuleBody;
       try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
-      const authErr = await requireScopedAuth(request, env, "obsidian:rules", optionalTrimmedString(body.vaultId));
-      if (authErr) return authErr;
+      const requestedVaultId = optionalTrimmedString(body.vaultId);
+      const auth = await requireScopedAuth(request, env, "obsidian:rules", requestedVaultId);
+      if (!auth.ok) return auth.response;
+      const vault = resolveObsidianVaultId(auth.principal, requestedVaultId);
+      if (!vault.ok) return vault.response;
+      body.vaultId = vault.vaultId;
       return handleUpsertObsidianRule(env, body);
     }
 
     // GET /integrations/obsidian/aggregates
     if (url.pathname === "/integrations/obsidian/aggregates" && request.method === "GET") {
-      const vaultId = requiredTrimmedString(url.searchParams.get("vaultId"));
-      if (!vaultId) return json({ ok: false, error: "vaultId is required" }, 400);
-      const authErr = await requireScopedAuth(request, env, "obsidian:aggregates", vaultId);
-      if (authErr) return authErr;
-      return handleListObsidianAggregates(env, vaultId);
+      const urlVaultId = requiredTrimmedString(url.searchParams.get("vaultId"));
+      if (!urlVaultId) return json({ ok: false, error: "vaultId is required" }, 400);
+      const auth = await requireScopedAuth(request, env, "obsidian:aggregates", urlVaultId);
+      if (!auth.ok) return auth.response;
+      const vault = resolveObsidianVaultId(auth.principal, urlVaultId);
+      if (!vault.ok) return vault.response;
+      return handleListObsidianAggregates(env, vault.vaultId);
     }
 
     // POST /integrations/obsidian/aggregates/generate
     if (url.pathname === "/integrations/obsidian/aggregates/generate" && request.method === "POST") {
       let body: ObsidianAggregateGenerateBody;
       try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
-      const authErr = await requireScopedAuth(request, env, "obsidian:aggregates", optionalTrimmedString(body.vaultId));
-      if (authErr) return authErr;
+      const requestedVaultId = optionalTrimmedString(body.vaultId);
+      const auth = await requireScopedAuth(request, env, "obsidian:aggregates", requestedVaultId);
+      if (!auth.ok) return auth.response;
+      const vault = resolveObsidianVaultId(auth.principal, requestedVaultId);
+      if (!vault.ok) return vault.response;
+      body.vaultId = vault.vaultId;
       return handleGenerateObsidianAggregate(env, body);
     }
 
     // POST /integrations/obsidian/tokens
     if (url.pathname === "/integrations/obsidian/tokens" && request.method === "POST") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
 
       let body: ObsidianTokenBody;
       try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
@@ -9752,16 +10026,16 @@ const defaultHandler = {
 
     // GET /count
     if (url.pathname === "/count" && request.method === "GET") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
       const row = await env.DB.prepare(`SELECT COUNT(*) as count FROM entries`).first() as Record<string, any> | null;
       return json({ count: (row?.count as number) ?? 0 });
     }
 
     // GET /tags
     if (url.pathname === "/tags" && request.method === "GET") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
       const { results } = await env.DB.prepare(
         `SELECT DISTINCT value FROM entries, json_each(entries.tags) ORDER BY value`
       ).all();
@@ -9770,8 +10044,8 @@ const defaultHandler = {
 
     // GET /stats
     if (url.pathname === "/stats" && request.method === "GET") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
       const graceCutoff = Date.now() - graceMs(env);
       const [summary, tagRows, candidateRows] = await Promise.all([
         env.DB.prepare(
@@ -9823,8 +10097,8 @@ const defaultHandler = {
 
     // GET /list
     if (url.pathname === "/list" && request.method === "GET") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
       const n = Math.min(parseInt(url.searchParams.get("n") ?? "20", 10), 100);
       const tag = url.searchParams.get("tag")?.trim() || undefined;
       const after = url.searchParams.has("after") ? parseInt(url.searchParams.get("after")!, 10) : undefined;
@@ -9838,8 +10112,8 @@ const defaultHandler = {
     // GET /export — paginated full backup (not capped at list's 100)
     // Query: limit (1–500, default 200), cursor = `${created_at}:${id}` of last row
     if (url.pathname === "/export" && request.method === "GET") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
 
       const fullExport =
         url.searchParams.get("full") === "1" ||
@@ -9918,13 +10192,15 @@ const defaultHandler = {
 
     // GET /recall — semantic search, mirrors the MCP `recall` tool
     if (url.pathname === "/recall" && request.method === "GET") {
-      const authErr = await requireScopedAuth(
+      const auth = await requireScopedAuth(
         request,
         env,
         "recall:read",
         optionalTrimmedString(url.searchParams.get("vaultId"))
       );
-      if (authErr) return authErr;
+      if (!auth.ok) return auth.response;
+      const requestedVaultId = optionalTrimmedString(url.searchParams.get("vaultId"));
+      const vaultId = auth.principal.owner ? (requestedVaultId ?? null) : auth.principal.vaultId;
 
       const query = url.searchParams.get("query")?.trim();
       if (!query) return json({ ok: false, error: "query is required" }, 400);
@@ -9942,7 +10218,7 @@ const defaultHandler = {
           after: after ?? requestPlan.after,
           before: before ?? requestPlan.before,
         };
-        const matches = await listRecentActivity(activityPlan, tag, env);
+        const matches = await listRecentActivity(activityPlan, tag, env, vaultId);
 
         if (!matches.length) {
           return json({
@@ -9973,7 +10249,7 @@ const defaultHandler = {
 
       const topK = Math.min(Math.max(parseInt(url.searchParams.get("topK") ?? "5", 10), 1), 20);
 
-      const { matches, insight, degraded, degradedReason } = await recallEntries({ query, topK, tag, after, before, kind }, env, ctx);
+      const { matches, insight, degraded, degradedReason } = await recallEntries({ query, topK, tag, after, before, kind }, env, ctx, vaultId);
 
       if (!matches.length) {
         return json({
@@ -10011,8 +10287,8 @@ const defaultHandler = {
 
     // GET /relations — inspect evidence and evolution links for one memory
     if (url.pathname === "/relations" && request.method === "GET") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
       const id = url.searchParams.get("id")?.trim();
       if (!id) return json({ ok: false, error: "id is required" }, 400);
       const requestedLimit = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
@@ -10025,8 +10301,8 @@ const defaultHandler = {
 
     // GET /entities — list / search knowledge entities
     if (url.pathname === "/entities" && request.method === "GET") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
       const q = url.searchParams.get("q")?.trim() || undefined;
       const requestedLimit = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
       const limit = Number.isFinite(requestedLimit)
@@ -10040,8 +10316,8 @@ const defaultHandler = {
     {
       const entityMatch = url.pathname.match(/^\/entities\/([^/]+)$/);
       if (entityMatch && request.method === "GET") {
-        const authErr = requireAuth(request, env);
-        if (authErr) return authErr;
+        const auth = requireAuth(request, env);
+        if (!auth.ok) return auth.response;
         const entityId = decodeURIComponent(entityMatch[1]);
         const requestedLimit = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
         const limit = Number.isFinite(requestedLimit)
@@ -10059,8 +10335,8 @@ const defaultHandler = {
     {
       const graphEntityMatch = url.pathname.match(/^\/graph\/entity\/([^/]+)$/);
       if (graphEntityMatch && request.method === "GET") {
-        const authErr = requireAuth(request, env);
-        if (authErr) return authErr;
+        const auth = requireAuth(request, env);
+        if (!auth.ok) return auth.response;
         const entityId = decodeURIComponent(graphEntityMatch[1]);
         const graph = await getEntityGraph(env.DB, entityId, 50);
         if (!graph.entity) {
@@ -10072,8 +10348,8 @@ const defaultHandler = {
 
     // GET /graph/facts — currently valid entity fact edges (time slice)
     if (url.pathname === "/graph/facts" && request.method === "GET") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
       const entityId = url.searchParams.get("entity")?.trim() || undefined;
       const asOfRaw = url.searchParams.get("asOf");
       const asOf = asOfRaw ? Number(asOfRaw) : Date.now();
@@ -10096,8 +10372,8 @@ const defaultHandler = {
 
     // POST /forget — delete-by-id, mirrors the MCP `forget` tool
     if (url.pathname === "/forget" && request.method === "POST") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
 
       let body: { id?: string };
       try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
@@ -10120,6 +10396,7 @@ const defaultHandler = {
         vector_count: result.vectorCount,
         derived_count: result.derivedCount,
       }, "forget");
+      await notifyMemoryChanged(env, id, "deleted");
       return json({
         ok: true,
         id,
@@ -10130,8 +10407,8 @@ const defaultHandler = {
 
     // POST /status — set lifecycle status, mirrors the MCP `set_status` tool
     if (url.pathname === "/status" && request.method === "POST") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
 
       let body: { id?: string; status?: string };
       try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
@@ -10153,8 +10430,8 @@ const defaultHandler = {
 
     // POST /chat
     if (url.pathname === "/chat" && request.method === "POST") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
 
       let body: { query?: string; memories?: string; mode?: string };
       try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
@@ -10184,8 +10461,8 @@ const defaultHandler = {
 
     // GET /digest
     if (url.pathname === "/digest" && request.method === "GET") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
       const tag = url.searchParams.get("tag")?.trim();
       if (!tag) return json({ ok: false, error: "tag parameter is required" }, 400);
 
@@ -10207,8 +10484,8 @@ const defaultHandler = {
       url.pathname === "/extract-pending" &&
       (request.method === "POST" || request.method === "GET")
     ) {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
 
       let body: { limit?: number; dryRun?: boolean } = {};
       if (request.method === "POST") {
@@ -10230,8 +10507,8 @@ const defaultHandler = {
 
     // GET /maintenance/vector-index/status — self-host SQLite vector index progress.
     if (url.pathname === "/maintenance/vector-index/status" && request.method === "GET") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
       const status = (env.VECTORIZE as any).indexStatus?.();
       if (!status) {
         return json({
@@ -10244,8 +10521,8 @@ const defaultHandler = {
 
     // POST /maintenance/vector-index/backfill — bounded self-host SQLite index backfill.
     if (url.pathname === "/maintenance/vector-index/backfill" && request.method === "POST") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
       let body: { limit?: number } = {};
       try {
         body = await request.json();
@@ -10268,8 +10545,8 @@ const defaultHandler = {
 
     // POST /vectorize-pending
     if (url.pathname === "/vectorize-pending" && request.method === "POST") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
 
       let body: { limit?: number; includeRecent?: boolean } = {};
       try {
@@ -10551,8 +10828,8 @@ const defaultHandler = {
     // retries failed rows up to CLASSIFICATION_MAX_ATTEMPTS without looping forever.
     // The same queue also runs from scheduled maintenance.
     if (url.pathname === "/classify-pending" && request.method === "POST") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
 
       // Cloudflare's first invocation may also run schema initialization. Keep
       // enough headroom under D1 Free's 50-query invocation cap; self-hosted
@@ -10565,8 +10842,8 @@ const defaultHandler = {
 
     // POST /import — Cloudflare / dashboard JSON export → entries (vector_ids cleared)
     if (url.pathname === "/import" && request.method === "POST") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
       const openRebuild = await loadOpenVectorRebuild(env);
       if (openRebuild) {
         return json({
@@ -10674,8 +10951,8 @@ const defaultHandler = {
 
     // ── Control plane: personal OAuth clients ───────────────────────────────
     if (url.pathname === "/settings/oauth/clients" && request.method === "GET") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
       const cursor = url.searchParams.get("cursor") || undefined;
       const result = await (env as any).OAUTH_PROVIDER.listClients({
         limit: 100,
@@ -10699,8 +10976,8 @@ const defaultHandler = {
       url.pathname.startsWith(oauthClientSettingsPrefix) &&
       request.method === "DELETE"
     ) {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
       let clientId = "";
       try {
         clientId = decodeURIComponent(
@@ -10718,8 +10995,8 @@ const defaultHandler = {
 
     // ── Control plane: model settings ───────────────────────────────────────
     if (url.pathname === "/settings/models" && request.method === "GET") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
 
       await ensureSettingsTable(env.DB);
       const { effective, stored } = await getEffectiveModelSettings(env);
@@ -10736,8 +11013,8 @@ const defaultHandler = {
 
     // PUT /settings/models — save control-plane config (runtime, no restart)
     if (url.pathname === "/settings/models" && request.method === "PUT") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
 
       let body: ModelSettingsPatchBody & { force?: boolean };
       try {
@@ -10861,8 +11138,8 @@ const defaultHandler = {
 
     // POST /settings/models/test — probe candidate config WITHOUT saving
     if (url.pathname === "/settings/models/test" && request.method === "POST") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
 
       let body: ModelSettingsPatchBody & { target?: string };
       try {
@@ -10977,8 +11254,8 @@ const defaultHandler = {
 
     // POST /settings/models/reindex/cancel — abandon a pending blue/green rebuild.
     if (url.pathname === "/settings/models/reindex/cancel" && request.method === "POST") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
 
       const stored = await loadStoredModelSettings(env.DB);
       const pendingFingerprint = stored?.pendingEmbeddingFingerprint;
@@ -11008,8 +11285,8 @@ const defaultHandler = {
     // Existing vector_ids stay active; vectorize-pending writes pending_vector_ids
     // and promotes them only after the whole pending profile finishes cleanly.
     if (url.pathname === "/settings/models/reindex" && request.method === "POST") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
 
       let body: { cancelExisting?: boolean } = {};
       try {
@@ -11131,15 +11408,15 @@ const defaultHandler = {
 
     // GET /settings/telemetry — privacy and retention controls
     if (url.pathname === "/settings/telemetry" && request.method === "GET") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
       return json({ ok: true, telemetry: await loadTelemetryConfig(env) });
     }
 
     // PUT /settings/telemetry — validate before persisting user-controlled values
     if (url.pathname === "/settings/telemetry" && request.method === "PUT") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
       let body: unknown;
       try {
         body = await request.json();
@@ -11160,8 +11437,8 @@ const defaultHandler = {
 
     // GET /analytics/vector-runtime — lightweight vector rebuild / cleanup / local index status.
     if (url.pathname === "/analytics/vector-runtime" && request.method === "GET") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
       return json({
         ok: true,
         generated_at: Date.now(),
@@ -11171,8 +11448,8 @@ const defaultHandler = {
 
     // GET /analytics/memory-overview — four-layer memory health and composition.
     if (url.pathname === "/analytics/memory-overview" && request.method === "GET") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
 
       const now = Date.now();
       const graceCutoff = now - graceMs(env);
@@ -11508,8 +11785,8 @@ const defaultHandler = {
 
     // GET /analytics/overview — Observatory KPIs (last 24h by default)
     if (url.pathname === "/analytics/overview" && request.method === "GET") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
       await ensureTelemetryTables(env.DB);
       const hours = Math.min(Math.max(parseInt(url.searchParams.get("hours") ?? "24", 10) || 24, 1), 168);
       const since = Date.now() - hours * 3_600_000;
@@ -11584,8 +11861,8 @@ const defaultHandler = {
 
     // GET /analytics/timeseries — one point per hour for charts.
     if (url.pathname === "/analytics/timeseries" && request.method === "GET") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
       await ensureTelemetryTables(env.DB);
       const hours = Math.min(Math.max(parseInt(url.searchParams.get("hours") ?? "24", 10) || 24, 1), 168);
       const since = Date.now() - hours * 3_600_000;
@@ -11670,8 +11947,8 @@ const defaultHandler = {
 
     // GET /analytics/logs — recent request logs
     if (url.pathname === "/analytics/logs" && request.method === "GET") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
       await ensureTelemetryTables(env.DB);
       const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") ?? "50", 10) || 50, 1), 200);
       const conditions = ["1 = 1"];
@@ -11699,8 +11976,8 @@ const defaultHandler = {
 
     // GET /analytics/traces/:id
     if (url.pathname.startsWith("/analytics/traces/") && request.method === "GET") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
       await ensureTelemetryTables(env.DB);
       const traceId = url.pathname.slice("/analytics/traces/".length);
       if (!traceId) return json({ ok: false, error: "trace id required" }, 400);
@@ -11724,8 +12001,8 @@ const defaultHandler = {
 
     // POST /analytics/purge — drop old telemetry rows
     if (url.pathname === "/analytics/purge" && request.method === "POST") {
-      const authErr = requireAuth(request, env);
-      if (authErr) return authErr;
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
       const cfg = await loadTelemetryConfig(env);
       const result = await purgeOldTelemetry(env.DB, cfg.retentionDays);
       return json({ ok: true, ...result, retentionDays: cfg.retentionDays });

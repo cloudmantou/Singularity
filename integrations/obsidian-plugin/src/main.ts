@@ -32,6 +32,7 @@ interface RecallResult {
 }
 
 interface PullResult {
+  objectType?: "memory" | "aggregate";
   entryId: string;
   path: string;
   markdown: string;
@@ -46,7 +47,28 @@ interface PullResult {
   link: {
     id: string;
     syncEtag?: string | null;
+    lastSyncedSyncEtag?: string | null;
+    syncStatus?: string | null;
+    syncDirection?: string | null;
   };
+  properties?: Record<string, unknown>;
+}
+
+interface AggregateResult {
+  id: string;
+  path: string;
+  markdown: string;
+  contentHash: string | null;
+  syncEtag: string | null;
+  generatedAt: number | null;
+  staleAt: number | null;
+  link?: {
+    id: string;
+    syncEtag?: string | null;
+    lastSyncedSyncEtag?: string | null;
+    syncStatus?: string | null;
+    syncDirection?: string | null;
+  } | null;
 }
 
 interface PullPage {
@@ -100,6 +122,23 @@ function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
+function normalizedTagsKey(tags: unknown): string {
+  const values = Array.isArray(tags)
+    ? tags
+    : typeof tags === "string"
+      ? tags.split(/[,\s]+/)
+      : [];
+  return [...new Set(values.map((tag) => String(tag).trim().replace(/^#/, "").toLowerCase()).filter(Boolean))]
+    .sort()
+    .join("\n");
+}
+
+function objectValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
 class SingularityClient {
   constructor(private readonly settings: SingularitySettings) {}
 
@@ -123,6 +162,22 @@ class SingularityClient {
     this.assertConfigured();
     const response = await requestUrl({
       url: this.endpoint("/integrations/obsidian/push"),
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify(body),
+      throw: false,
+    });
+    if (response.status >= 400) {
+      const error = response.json?.error || response.text || `HTTP ${response.status}`;
+      throw new Error(String(error));
+    }
+    return response.json as Record<string, unknown>;
+  }
+
+  async upsertRule(body: Record<string, unknown>): Promise<Record<string, unknown>> {
+    this.assertConfigured();
+    const response = await requestUrl({
+      url: this.endpoint("/integrations/obsidian/rules"),
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify(body),
@@ -206,6 +261,53 @@ class SingularityClient {
     }
     return all;
   }
+
+  async pullAggregates(): Promise<PullResult[]> {
+    this.assertConfigured();
+    const params = new URLSearchParams({ vaultId: this.settings.vaultId });
+    const response = await requestUrl({
+      url: this.endpoint(`/integrations/obsidian/aggregates?${params.toString()}`),
+      method: "GET",
+      headers: this.headers(),
+      throw: false,
+    });
+    if (response.status >= 400) {
+      const error = response.json?.error || response.text || `HTTP ${response.status}`;
+      throw new Error(String(error));
+    }
+    const aggregates = Array.isArray(response.json?.results)
+      ? response.json.results as AggregateResult[]
+      : [];
+    return aggregates.map((item) => ({
+      objectType: "aggregate",
+      entryId: item.id,
+      path: item.path,
+      markdown: item.markdown,
+      revisionId: item.generatedAt == null ? null : String(item.generatedAt),
+      contentHash: item.contentHash,
+      syncEtag: item.syncEtag,
+      lastSyncedRevisionId: item.generatedAt == null ? null : String(item.generatedAt),
+      lastSyncedContentHash: item.contentHash,
+      lastSyncedSyncEtag: item.link?.lastSyncedSyncEtag ?? null,
+      syncStatus: item.link?.syncStatus ?? (item.staleAt ? "remote_changed" : "synced"),
+      syncDirection: item.link?.syncDirection ?? "singularity_to_obsidian",
+      link: {
+        id: item.link?.id ?? item.id,
+        syncEtag: item.link?.syncEtag ?? item.syncEtag,
+        lastSyncedSyncEtag: item.link?.lastSyncedSyncEtag ?? null,
+        syncStatus: item.link?.syncStatus ?? null,
+        syncDirection: item.link?.syncDirection ?? null,
+      },
+      properties: {
+        singularity_type: "knowledge-aggregate",
+        singularity_id: item.id,
+        singularity_revision: item.generatedAt == null ? "" : String(item.generatedAt),
+        singularity_sync_etag: item.syncEtag,
+        singularity_status: item.staleAt ? "stale" : "canonical",
+        tags: ["singularity", "aggregate"],
+      },
+    }));
+  }
 }
 
 export default class SingularityPlugin extends Plugin {
@@ -265,6 +367,14 @@ export default class SingularityPlugin extends Plugin {
     const frontmatter = cache?.frontmatter;
     const content = extractMarkdownBody(raw, cache?.frontmatterPosition?.end.offset);
     const singularityType = stringValue(frontmatter?.singularity_type);
+    if (singularityType === "knowledge-aggregate") {
+      new Notice("Singularity aggregate pages are read-only. Pull/export to refresh them.");
+      return;
+    }
+    if (singularityType === "rule-template") {
+      await this.saveRuleTemplate(file, frontmatter, content);
+      return;
+    }
     const pushed = await this.client().push({
       vaultId: this.settings.vaultId,
       path: file.path,
@@ -278,8 +388,17 @@ export default class SingularityPlugin extends Plugin {
       },
       entryId: singularityType === "atomic-memory" ? frontmatter?.singularity_id : undefined,
       baseRevisionId: singularityType === "atomic-memory" ? frontmatter?.singularity_revision : undefined,
+      baseSyncEtag: singularityType === "atomic-memory" ? frontmatter?.singularity_sync_etag : undefined,
+      sourceId: singularityType === "atomic-memory" ? undefined : frontmatter?.singularity_source_id,
     });
-    if (singularityType !== "atomic-memory" && pushed.sourceId) {
+    if (singularityType === "atomic-memory") {
+      await this.app.fileManager.processFrontMatter(file, (data) => {
+        if (pushed.revisionId) data.singularity_revision = pushed.revisionId;
+        if (pushed.link && typeof pushed.link === "object" && "syncEtag" in pushed.link) {
+          data.singularity_sync_etag = (pushed.link as Record<string, unknown>).syncEtag;
+        }
+      });
+    } else if (pushed.sourceId) {
       await this.app.fileManager.processFrontMatter(file, (data) => {
         data.singularity_type = "raw-material";
         data.singularity_source_id = pushed.sourceId;
@@ -290,6 +409,35 @@ export default class SingularityPlugin extends Plugin {
       });
     }
     new Notice("Saved note to Singularity.");
+  }
+
+  async saveRuleTemplate(
+    file: TFile,
+    frontmatter: Record<string, unknown> | undefined,
+    content: string
+  ): Promise<void> {
+    const rule = await this.client().upsertRule({
+      id: frontmatter?.singularity_id,
+      vaultId: this.settings.vaultId,
+      name: stringValue(frontmatter?.name) ?? file.basename,
+      triggerType: stringValue(frontmatter?.trigger_type) ?? "manual",
+      sourceFilter: objectValue(frontmatter?.source_filter),
+      extractorSchema: objectValue(frontmatter?.extractor_schema),
+      tagRules: objectValue(frontmatter?.tag_rules),
+      aggregationRule: objectValue(frontmatter?.aggregation_rule),
+      outputTemplate: content,
+      enabled: frontmatter?.enabled !== false,
+    });
+    const savedRule = objectValue(rule.rule);
+    await this.app.fileManager.processFrontMatter(file, (data) => {
+      data.singularity_type = "rule-template";
+      data.singularity_id = savedRule.id;
+      data.singularity_status = data.singularity_status ?? "canonical";
+      data.singularity_source = "obsidian";
+      data.singularity_synced_at = new Date().toISOString();
+      data.managed_by = data.managed_by ?? "user";
+    });
+    new Notice("Saved rule template to Singularity.");
   }
 
   async saveSelection(selection: string): Promise<void> {
@@ -327,7 +475,11 @@ export default class SingularityPlugin extends Plugin {
   }
 
   async exportManagedMemories(): Promise<void> {
-    const results = await this.client().pull();
+    const [memories, aggregates] = await Promise.all([
+      this.client().pull(),
+      this.client().pullAggregates(),
+    ]);
+    const results = [...memories, ...aggregates];
     let written = 0;
     let skipped = 0;
     let conflicts = 0;
@@ -338,7 +490,7 @@ export default class SingularityPlugin extends Plugin {
       else if (outcome === "conflict") conflicts++;
       else skipped++;
     }
-    new Notice(`Exported ${written} Singularity memories. Skipped ${skipped}; conflicts ${conflicts}.`);
+    new Notice(`Exported ${written} Singularity items. Skipped ${skipped}; conflicts ${conflicts}.`);
   }
 
   localManagedPath(item: PullResult): string {
@@ -369,10 +521,19 @@ export default class SingularityPlugin extends Plugin {
       const localBodyHash = await sha256Hex(localBody);
       const frontmatter = cache?.frontmatter ?? {};
       const localRevision = stringValue(frontmatter.singularity_revision);
+      const remoteProperties = item.properties ?? {};
+      const localStatus = stringValue(frontmatter.singularity_status) ?? "draft";
+      const remoteStatus = stringValue(remoteProperties.singularity_status) ?? "draft";
+      const localKind = stringValue(frontmatter.singularity_kind) ?? "semantic";
+      const remoteKind = stringValue(remoteProperties.singularity_kind) ?? "semantic";
+      const frontmatterChanged =
+        localStatus !== remoteStatus ||
+        localKind !== remoteKind ||
+        normalizedTagsKey(frontmatterTags(frontmatter)) !== normalizedTagsKey(remoteProperties.tags);
       const localChanged =
         localRevision === item.lastSyncedRevisionId &&
-        Boolean(item.lastSyncedContentHash) &&
-        localBodyHash !== item.lastSyncedContentHash;
+        (Boolean(item.lastSyncedContentHash) || Boolean(item.lastSyncedSyncEtag)) &&
+        (localBodyHash !== item.lastSyncedContentHash || frontmatterChanged);
       const remoteChanged =
         (Boolean(item.syncEtag) && item.syncEtag !== item.lastSyncedSyncEtag) ||
         item.revisionId !== item.lastSyncedRevisionId ||
@@ -383,13 +544,13 @@ export default class SingularityPlugin extends Plugin {
       if (localChanged && !remoteChanged) return "skipped";
       if (!remoteChanged && localBodyHash === item.contentHash) return "skipped";
       await this.app.vault.modify(existing, item.markdown);
-      await this.client().ack(item);
+      if (item.objectType !== "aggregate") await this.client().ack(item);
       return "written";
     }
 
     if (existing) throw new Error(`${path} exists but is not a file.`);
     await this.writeMarkdown(path, item.markdown);
-    await this.client().ack(item);
+    if (item.objectType !== "aggregate") await this.client().ack(item);
     return "written";
   }
 
