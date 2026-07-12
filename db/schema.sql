@@ -42,10 +42,14 @@ CREATE INDEX IF NOT EXISTS idx_entries_pending_rebuild
 CREATE TABLE IF NOT EXISTS sb_external_links (
   id TEXT PRIMARY KEY,
   provider TEXT NOT NULL,
-  entry_id TEXT NOT NULL,
   vault_id TEXT NOT NULL,
   external_path TEXT NOT NULL,
+  external_block_id TEXT NOT NULL DEFAULT '',
+  object_type TEXT NOT NULL DEFAULT 'memory',
+  object_id TEXT,
+  entry_id TEXT,
   external_file_id TEXT,
+  content_hash TEXT,
   last_synced_content_hash TEXT,
   last_synced_revision_id TEXT,
   sync_direction TEXT NOT NULL DEFAULT 'bidirectional',
@@ -53,14 +57,49 @@ CREATE TABLE IF NOT EXISTS sb_external_links (
   last_error TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
-  UNIQUE(provider, vault_id, external_path),
   CHECK (sync_direction IN ('bidirectional', 'obsidian_to_singularity', 'singularity_to_obsidian')),
-  CHECK (sync_status IN ('synced', 'local_changed', 'remote_changed', 'conflict', 'deleted_local', 'deleted_remote', 'error'))
+  CHECK (sync_status IN ('synced', 'local_changed', 'remote_changed', 'conflict', 'deleted_local', 'deleted_remote', 'error')),
+  CHECK (object_type IN ('observation', 'memory', 'aggregate', 'rule'))
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_external_links_identity
+  ON sb_external_links(provider, vault_id, external_path, external_block_id, object_type, object_id);
 CREATE INDEX IF NOT EXISTS idx_external_links_entry
   ON sb_external_links(entry_id);
 CREATE INDEX IF NOT EXISTS idx_external_links_provider_vault
   ON sb_external_links(provider, vault_id, sync_status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS sb_automation_rules (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  trigger_type TEXT NOT NULL,
+  source_filter_json TEXT NOT NULL DEFAULT '{}',
+  extractor_schema_json TEXT NOT NULL DEFAULT '{}',
+  tag_rules_json TEXT NOT NULL DEFAULT '{}',
+  aggregation_rule_json TEXT NOT NULL DEFAULT '{}',
+  output_template TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  version INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_automation_rules_trigger
+  ON sb_automation_rules(trigger_type, enabled, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS sb_knowledge_aggregates (
+  id TEXT PRIMARY KEY,
+  aggregate_type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  source_memory_ids_json TEXT NOT NULL DEFAULT '[]',
+  generation_rule_id TEXT,
+  content TEXT NOT NULL,
+  content_hash TEXT,
+  generated_at INTEGER NOT NULL,
+  stale_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_aggregates_stale
+  ON sb_knowledge_aggregates(stale_at, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS sb_vector_rebuilds (
   id TEXT PRIMARY KEY,

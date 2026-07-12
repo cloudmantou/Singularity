@@ -51,6 +51,14 @@ describe("Obsidian integration", () => {
     const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
     try {
       await initializeDatabase(env);
+      const ruleTable = db.prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sb_automation_rules'`
+      ).get() as any;
+      const aggregateTable = db.prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sb_knowledge_aggregates'`
+      ).get() as any;
+      expect(ruleTable.name).toBe("sb_automation_rules");
+      expect(aggregateTable.name).toBe("sb_knowledge_aggregates");
 
       const pushResponse = await fetchAndDrainWaitUntil(
         auth("/integrations/obsidian/push", {
@@ -76,22 +84,36 @@ describe("Obsidian integration", () => {
       expect(pushed.entryId).toEqual(expect.any(String));
       expect(pushed.link).toMatchObject({
         provider: "obsidian",
+        objectType: "memory",
+        vaultId: "work-vault",
+        syncStatus: "synced",
+      });
+      expect(pushed.link.path).toContain("Singularity/10 提炼知识/");
+      expect(pushed.observationId).toEqual(expect.any(String));
+      expect(pushed.observationLink).toMatchObject({
+        provider: "obsidian",
+        objectType: "observation",
+        objectId: pushed.observationId,
         vaultId: "work-vault",
         path: "Singularity/Projects/mtzs.md",
         syncStatus: "synced",
       });
 
-      const linkRow = db.prepare(
-        `SELECT entry_id, vault_id, external_path, sync_status
+      const memoryLinkRow = db.prepare(
+        `SELECT object_type, object_id, entry_id, vault_id, external_path, external_file_id, sync_status
          FROM sb_external_links
-         WHERE provider = 'obsidian'`
+         WHERE provider = 'obsidian'
+           AND object_type = 'memory'`
       ).get() as any;
-      expect(linkRow).toMatchObject({
+      expect(memoryLinkRow).toMatchObject({
+        object_type: "memory",
+        object_id: pushed.entryId,
         entry_id: pushed.entryId,
         vault_id: "work-vault",
-        external_path: "Singularity/Projects/mtzs.md",
+        external_file_id: "Singularity/Projects/mtzs.md",
         sync_status: "synced",
       });
+      expect(memoryLinkRow.external_path).toContain("Singularity/10 提炼知识/");
 
       const pullResponse = await fetchAndDrainWaitUntil(
         auth("/integrations/obsidian/pull?vaultId=work-vault"),
@@ -102,9 +124,12 @@ describe("Obsidian integration", () => {
       expect(pulled.count).toBe(1);
       expect(pulled.results[0]).toMatchObject({
         entryId: pushed.entryId,
-        path: "Singularity/Projects/mtzs.md",
       });
+      expect(pulled.results[0].path).toContain("Singularity/10 提炼知识/");
       expect(pulled.results[0].markdown).toContain("singularity_id:");
+      expect(pulled.results[0].markdown).toContain("singularity_type:");
+      expect(pulled.results[0].markdown).toContain("managed_by: singularity");
+      expect(pulled.results[0].markdown).toContain("source_file: \"Singularity/Projects/mtzs.md\"");
       expect(pulled.results[0].markdown).toContain("project/mtzs");
       expect(pulled.results[0].markdown).toContain("installation_proxy");
 
@@ -116,8 +141,8 @@ describe("Obsidian integration", () => {
       const status = await json(statusResponse);
       expect(status).toMatchObject({
         ok: true,
-        total: 1,
-        byStatus: { synced: 1 },
+        total: 2,
+        byStatus: { synced: 2 },
       });
     } finally {
       db.close();
@@ -183,7 +208,8 @@ describe("Obsidian integration", () => {
          FROM sb_external_links
          WHERE provider = 'obsidian'
            AND vault_id = 'work-vault'
-           AND external_path = 'Singularity/Decisions/vector-v2.md'`
+           AND external_path = 'Singularity/Decisions/vector-v2.md'
+           AND object_type = 'memory'`
       ).get() as any;
       expect(linkRow.sync_status).toBe("conflict");
       expect(linkRow.last_error).toContain("remote memory changed");
