@@ -3397,6 +3397,13 @@
               <div class="obs-view" id="obs-view-system">
                 <p class="obs-privacy-note">请求内容日志可能包含私人记忆；可通过 /settings/telemetry 调整记录级别。</p>
                 <div class="obs-kpi-row" id="obs-kpi-row"></div>
+                <div class="obs-section" id="obs-vector-runtime-section">
+                  <div class="obs-section-head">
+                    <h2>向量运行态</h2>
+                    <span class="sub" id="obs-vector-runtime-meta" style="font-size: 12px; color: var(--text-tertiary)">—</span>
+                  </div>
+                  <div class="obs-health-grid" id="obs-vector-runtime-grid"></div>
+                </div>
                 <div class="obs-chart-grid">
                   <section class="obs-chart">
                     <h2>请求量与错误</h2>
@@ -4138,6 +4145,75 @@
         obsRenderBars('obs-relation-bars', data.relation_types || [])
         obsRenderEntities(data.top_entities || [])
         obsRenderChanges(data.recent_changes || [])
+        obsRenderVectorRuntime(data.vector_runtime || {})
+      }
+
+      function obsRenderVectorRuntime(runtime) {
+        const grid = document.getElementById('obs-vector-runtime-grid')
+        const meta = document.getElementById('obs-vector-runtime-meta')
+        if (!grid) return
+        const rebuild = runtime.rebuild || null
+        const cleanup = runtime.cleanup || {}
+        const queue = cleanup.queue || {}
+        const batches = cleanup.batches || {}
+        const index = runtime.local_index || null
+        const vectorCount = index ? Number(index.vectorCount || 0) : 0
+        const ftsText = index
+          ? `${obsFmtNum(index.ftsIndexed)}/${obsFmtNum(vectorCount)}`
+          : '—'
+        const annText = index
+          ? `${obsFmtNum(index.vecIndexed)}/${obsFmtNum(vectorCount)}`
+          : '—'
+        const cards = [
+          {
+            label: '重建状态',
+            value: rebuild ? rebuild.state : 'idle',
+            hint: rebuild
+              ? `${obsFmtNum(rebuild.processed_entries)}/${obsFmtNum(rebuild.expected_entries)} · joined ${obsFmtNum(rebuild.joined_entries)}`
+              : '无进行中的蓝绿重建',
+          },
+          {
+            label: '重建缺口',
+            value: obsFmtNum((rebuild?.missing_entries || 0) + (rebuild?.live_conflict_entries || 0)),
+            hint: rebuild
+              ? `ready ${obsFmtNum(rebuild.ready_entries)} · failed ${obsFmtNum(rebuild.failed_entries)}`
+              : '无 pending_revision 冲突',
+          },
+          {
+            label: '清理队列',
+            value: obsFmtNum(queue.total || 0),
+            hint: `due ${obsFmtNum(queue.due || 0)} · blocked ${obsFmtNum(queue.blocked || 0)} · failed ${obsFmtNum(queue.failed || 0)}`,
+          },
+          {
+            label: '清理批次',
+            value: obsFmtNum(batches.total || 0),
+            hint: `due ${obsFmtNum(batches.due || 0)} · ready ${obsFmtNum(batches.ready || 0)} · blocked ${obsFmtNum(batches.blocked || 0)}`,
+          },
+          {
+            label: 'FTS 索引',
+            value: ftsText,
+            hint: index
+              ? `${index.ftsAvailable ? (index.ftsTokenizer || 'enabled') : 'unavailable'} · remaining ${obsFmtNum(index.remaining || 0)}`
+              : '当前环境未暴露本地索引状态',
+          },
+          {
+            label: 'ANN 索引',
+            value: annText,
+            hint: index
+              ? `${index.vecAvailable ? 'sqlite-vec' : 'json-cosine'} · remaining ${obsFmtNum(index.remaining || 0)}`
+              : 'Cloudflare Vectorize 环境不需要本地进度',
+          },
+        ]
+        grid.innerHTML = cards.map((c) =>
+          `<div class="obs-health-item"><div class="value">${obsEsc(c.value)}</div>` +
+          `<div class="label">${obsEsc(c.label)}</div>` +
+          `<div class="label">${obsEsc(c.hint)}</div></div>`
+        ).join('')
+        if (meta) {
+          meta.textContent = rebuild
+            ? `rebuild ${String(rebuild.id || '').slice(0, 8)} · ${obsFmtTime(rebuild.updated_at)}`
+            : (index ? `local index · remaining ${obsFmtNum(index.remaining || 0)}` : 'no local index')
+        }
       }
 
       function obsRenderBars(id, rows) {

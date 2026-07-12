@@ -7985,6 +7985,11 @@ const defaultHandler = {
         observationRows,
         sourceRows,
         revisionRows,
+        vectorRebuild,
+        vectorCleanupQueueRows,
+        vectorCleanupBatchRows,
+        vectorCleanupQueueDue,
+        vectorCleanupBatchDue,
       ] = await Promise.all([
         env.DB.prepare(
           `SELECT
@@ -8082,8 +8087,79 @@ const defaultHandler = {
            ORDER BY created_at DESC
            LIMIT 10`
         ).all(),
+        env.DB.prepare(
+          `SELECT r.id, r.state, r.active_fingerprint, r.pending_fingerprint,
+                  r.expected_entries, r.processed_entries, r.failed_entries,
+                  r.conflict_entries, r.last_error, r.created_at, r.updated_at,
+                  (SELECT COUNT(*) FROM entries e
+                   WHERE e.pending_rebuild_id = r.id
+                     AND e.tags NOT LIKE '%"status:deprecated"%') as joined_entries,
+                  (SELECT COUNT(*) FROM entries e
+                   WHERE e.pending_rebuild_id = r.id
+                     AND e.pending_vector_ids IS NOT NULL
+                     AND e.pending_vector_ids != '[]'
+                     AND e.pending_content_hash IS NOT NULL
+                     AND e.pending_revision_id IS NOT NULL
+                     AND e.content_hash = e.pending_content_hash
+                     AND e.tags NOT LIKE '%"status:deprecated"%') as ready_entries,
+                  (SELECT COUNT(*) FROM entries e
+                   WHERE e.pending_rebuild_id = r.id
+                     AND (e.pending_vector_ids IS NULL OR e.pending_vector_ids = '[]')
+                     AND e.tags NOT LIKE '%"status:deprecated"%') as missing_entries,
+                  (SELECT COUNT(*) FROM entries e
+                   WHERE e.pending_rebuild_id = r.id
+                     AND e.pending_vector_ids IS NOT NULL
+                     AND e.pending_vector_ids != '[]'
+                     AND (
+                       e.pending_content_hash IS NULL
+                       OR e.pending_revision_id IS NULL
+                       OR e.content_hash IS NULL
+                       OR e.content_hash != e.pending_content_hash
+                     )
+                     AND e.tags NOT LIKE '%"status:deprecated"%') as live_conflict_entries
+           FROM sb_vector_rebuilds r
+           WHERE r.slot = 'current'
+           LIMIT 1`
+        ).first<Record<string, unknown>>(),
+        env.DB.prepare(
+          `SELECT state, COUNT(*) as count
+           FROM sb_vector_cleanup_queue
+           GROUP BY state`
+        ).all(),
+        env.DB.prepare(
+          `SELECT state, COUNT(*) as count
+           FROM sb_vector_cleanup_batches
+           GROUP BY state`
+        ).all(),
+        env.DB.prepare(
+          `SELECT COUNT(*) as count
+           FROM sb_vector_cleanup_queue
+           WHERE state = 'ready'
+             AND COALESCE(next_attempt_at, 0) <= ?`
+        ).bind(now).first<{ count: number }>(),
+        env.DB.prepare(
+          `SELECT COUNT(*) as count
+           FROM sb_vector_cleanup_batches
+           WHERE state = 'ready'
+             AND COALESCE(next_attempt_at, 0) <= ?`
+        ).bind(now).first<{ count: number }>(),
       ]);
 
+      const summarizeStates = (
+        rows: Record<string, unknown>[],
+        states: string[]
+      ): Record<string, number> => {
+        const summary: Record<string, number> = { total: 0 };
+        for (const state of states) summary[state] = 0;
+        for (const row of rows) {
+          const state = String(row.state ?? "unknown");
+          const count = Number(row.count ?? 0);
+          summary[state] = (summary[state] ?? 0) + count;
+          summary.total += count;
+        }
+        return summary;
+      };
+      const localIndexStatus = (env.VECTORIZE as any).indexStatus?.();
       const recentChanges = [
         ...((observationRows.results ?? []) as Record<string, unknown>[]).map((row) => ({
           type: "observation",
@@ -8156,6 +8232,50 @@ const defaultHandler = {
           name: String(row.name ?? "unknown"),
           count: Number(row.count ?? 0),
         })),
+        vector_runtime: {
+          rebuild: vectorRebuild ? {
+            id: String(vectorRebuild.id),
+            state: String(vectorRebuild.state),
+            active_fingerprint: String(vectorRebuild.active_fingerprint ?? ""),
+            pending_fingerprint: String(vectorRebuild.pending_fingerprint ?? ""),
+            expected_entries: Number(vectorRebuild.expected_entries ?? 0),
+            processed_entries: Number(vectorRebuild.processed_entries ?? 0),
+            failed_entries: Number(vectorRebuild.failed_entries ?? 0),
+            conflict_entries: Number(vectorRebuild.conflict_entries ?? 0),
+            live_conflict_entries: Number(vectorRebuild.live_conflict_entries ?? 0),
+            joined_entries: Number(vectorRebuild.joined_entries ?? 0),
+            ready_entries: Number(vectorRebuild.ready_entries ?? 0),
+            missing_entries: Number(vectorRebuild.missing_entries ?? 0),
+            last_error: vectorRebuild.last_error ? String(vectorRebuild.last_error) : null,
+            created_at: Number(vectorRebuild.created_at ?? 0),
+            updated_at: Number(vectorRebuild.updated_at ?? 0),
+          } : null,
+          cleanup: {
+            queue: {
+              ...summarizeStates(
+                (vectorCleanupQueueRows.results ?? []) as Record<string, unknown>[],
+                ["ready", "blocked", "failed", "completed"]
+              ),
+              due: Number(vectorCleanupQueueDue?.count ?? 0),
+            },
+            batches: {
+              ...summarizeStates(
+                (vectorCleanupBatchRows.results ?? []) as Record<string, unknown>[],
+                ["prepared", "ready", "processing", "blocked", "failed", "completed"]
+              ),
+              due: Number(vectorCleanupBatchDue?.count ?? 0),
+            },
+          },
+          local_index: localIndexStatus ? {
+            vectorCount: Number(localIndexStatus.vectorCount ?? 0),
+            ftsAvailable: Boolean(localIndexStatus.ftsAvailable),
+            ftsTokenizer: localIndexStatus.ftsTokenizer ?? null,
+            ftsIndexed: Number(localIndexStatus.ftsIndexed ?? 0),
+            vecAvailable: Boolean(localIndexStatus.vecAvailable),
+            vecIndexed: Number(localIndexStatus.vecIndexed ?? 0),
+            remaining: Number(localIndexStatus.remaining ?? 0),
+          } : null,
+        },
         recent_changes: recentChanges,
       });
     }

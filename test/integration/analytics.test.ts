@@ -163,6 +163,41 @@ describe("Observatory analytics API", () => {
         old_metadata_json, new_metadata_json, reason, actor, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run("rev-1", "entry-1", "ADD", null, "Atomic overview fact", null, "{}", null, "api", old);
+    db.prepare(
+      `UPDATE entries
+       SET content_hash = ?,
+           pending_vector_ids = ?,
+           pending_embedding_fingerprint = ?,
+           pending_content_hash = ?,
+           pending_revision_id = ?,
+           pending_rebuild_id = ?
+       WHERE id = ?`
+    ).run("hash-1", JSON.stringify(["pending-vector-1"]), "pending-fp", "hash-1", "rev-1", "rebuild-1", "entry-1");
+    db.prepare(
+      `INSERT INTO sb_vector_rebuilds
+       (id, slot, state, active_fingerprint, pending_fingerprint,
+        expected_entries, processed_entries, failed_entries, conflict_entries,
+        last_error, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run("rebuild-1", "current", "building", "active-fp", "pending-fp", 2, 1, 0, 0, null, old, now);
+    db.prepare(
+      `INSERT INTO sb_vector_cleanup_queue
+       (id, vector_id, reason, state, attempts, next_attempt_at, rebuild_id,
+        last_error, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run("cleanup-1", "old-vector-1", "entry_version_switch", "ready", 0, old, "rebuild-1", null, old, now);
+    db.prepare(
+      `INSERT INTO sb_vector_cleanup_queue
+       (id, vector_id, reason, state, attempts, next_attempt_at, rebuild_id,
+        last_error, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run("cleanup-2", "old-vector-2", "forget", "blocked", 0, null, "rebuild-1", "vector_still_referenced", old, now);
+    db.prepare(
+      `INSERT INTO sb_vector_cleanup_batches
+       (id, rebuild_id, vector_ids_json, state, attempts, next_attempt_at,
+        last_error, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run("batch-1", "rebuild-1", JSON.stringify(["pending-old-1"]), "ready", 0, old, null, old, now);
 
     const response = await worker.fetch(
       new Request("http://localhost/analytics/memory-overview", {
@@ -190,6 +225,28 @@ describe("Observatory analytics API", () => {
     expect(body.classes).toContainEqual({ name: "fact", count: 1 });
     expect(body.top_entities[0]).toMatchObject({ name: "Singularity", mention_count: 2 });
     expect(body.relation_types).toContainEqual({ name: "related_to", count: 1 });
+    expect(body.vector_runtime.rebuild).toMatchObject({
+      id: "rebuild-1",
+      state: "building",
+      expected_entries: 2,
+      joined_entries: 1,
+      ready_entries: 1,
+    });
+    expect(body.vector_runtime.cleanup.queue).toMatchObject({
+      total: 2,
+      ready: 1,
+      blocked: 1,
+      due: 1,
+    });
+    expect(body.vector_runtime.cleanup.batches).toMatchObject({
+      total: 1,
+      ready: 1,
+      due: 1,
+    });
+    expect(body.vector_runtime.local_index).toMatchObject({
+      vectorCount: 0,
+      remaining: 0,
+    });
     expect(body.recent_changes.length).toBeGreaterThan(0);
 
     db.close();
