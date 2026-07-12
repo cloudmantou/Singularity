@@ -36,6 +36,14 @@ interface PullResult {
   path: string;
   markdown: string;
   revisionId: string | null;
+  contentHash: string | null;
+  lastSyncedRevisionId: string | null;
+  lastSyncedContentHash: string | null;
+  syncStatus: string;
+  syncDirection: string;
+  link: {
+    id: string;
+  };
 }
 
 const DEFAULT_SETTINGS: SingularitySettings = {
@@ -62,6 +70,25 @@ function frontmatterTags(cache: Record<string, unknown> | undefined): string[] {
   if (Array.isArray(tags)) return tags.map(String);
   if (typeof tags === "string") return tags.split(/[,\s]+/).filter(Boolean);
   return [];
+}
+
+function extractMarkdownBody(raw: string, frontmatterEndOffset?: number): string {
+  if (frontmatterEndOffset == null) return raw.trim();
+  return raw.slice(frontmatterEndOffset).replace(/^\s+/, "").trim();
+}
+
+function normalizeForHash(content: string): string {
+  return content.trim().replace(/\s+/g, " ");
+}
+
+async function sha256Hex(content: string): Promise<string> {
+  const bytes = new TextEncoder().encode(normalizeForHash(content));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 class SingularityClient {
@@ -102,7 +129,7 @@ class SingularityClient {
   async recall(query: string): Promise<RecallResult[]> {
     this.assertConfigured();
     const response = await requestUrl({
-      url: this.endpoint(`/recall?query=${encodeURIComponent(query)}&topK=10`),
+      url: this.endpoint(`/recall?query=${encodeURIComponent(query)}&topK=10&vaultId=${encodeURIComponent(this.settings.vaultId)}`),
       method: "GET",
       headers: this.headers(),
       throw: false,
@@ -112,6 +139,26 @@ class SingularityClient {
       throw new Error(String(error));
     }
     return Array.isArray(response.json?.results) ? response.json.results as RecallResult[] : [];
+  }
+
+  async ack(item: PullResult): Promise<void> {
+    this.assertConfigured();
+    const response = await requestUrl({
+      url: this.endpoint("/integrations/obsidian/ack"),
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify({
+        linkId: item.link.id,
+        vaultId: this.settings.vaultId,
+        revisionId: item.revisionId,
+        contentHash: item.contentHash,
+      }),
+      throw: false,
+    });
+    if (response.status >= 400) {
+      const error = response.json?.error || response.text || `HTTP ${response.status}`;
+      throw new Error(String(error));
+    }
   }
 
   async pull(): Promise<PullResult[]> {
@@ -182,21 +229,35 @@ export default class SingularityPlugin extends Plugin {
       new Notice("No active Markdown note.");
       return;
     }
-    const content = await this.app.vault.read(file);
-    const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
-    await this.client().push({
+    const raw = await this.app.vault.read(file);
+    const cache = this.app.metadataCache.getFileCache(file);
+    const frontmatter = cache?.frontmatter;
+    const content = extractMarkdownBody(raw, cache?.frontmatterPosition?.end.offset);
+    const singularityType = stringValue(frontmatter?.singularity_type);
+    const pushed = await this.client().push({
       vaultId: this.settings.vaultId,
       path: file.path,
       content,
       properties: {
+        ...(frontmatter ?? {}),
         tags: frontmatterTags(frontmatter),
         status: frontmatter?.singularity_status,
         obsidianPath: file.path,
-        obsidianLinks: this.app.metadataCache.getFileCache(file)?.links?.map((link) => link.link) ?? [],
+        obsidianLinks: cache?.links?.map((link) => link.link) ?? [],
       },
-      entryId: frontmatter?.singularity_id,
-      baseRevisionId: frontmatter?.singularity_revision,
+      entryId: singularityType === "atomic-memory" ? frontmatter?.singularity_id : undefined,
+      baseRevisionId: singularityType === "atomic-memory" ? frontmatter?.singularity_revision : undefined,
     });
+    if (singularityType !== "atomic-memory" && pushed.sourceId) {
+      await this.app.fileManager.processFrontMatter(file, (data) => {
+        data.singularity_type = "raw-material";
+        data.singularity_source_id = pushed.sourceId;
+        data.singularity_observation_id = pushed.observationId;
+        data.singularity_source_revision = pushed.sourceRevision;
+        data.singularity_source_hash = pushed.sourceHash;
+        data.singularity_memory_ids = Array.isArray(pushed.memoryIds) ? pushed.memoryIds : [];
+      });
+    }
     new Notice("Saved note to Singularity.");
   }
 
@@ -237,12 +298,16 @@ export default class SingularityPlugin extends Plugin {
   async exportManagedMemories(): Promise<void> {
     const results = await this.client().pull();
     let written = 0;
+    let skipped = 0;
+    let conflicts = 0;
     for (const item of results) {
       const targetPath = this.localManagedPath(item);
-      await this.writeMarkdown(targetPath, item.markdown);
-      written++;
+      const outcome = await this.writeManagedMarkdownSafely(targetPath, item);
+      if (outcome === "written") written++;
+      else if (outcome === "conflict") conflicts++;
+      else skipped++;
     }
-    new Notice(`Exported ${written} Singularity memories.`);
+    new Notice(`Exported ${written} Singularity memories. Skipped ${skipped}; conflicts ${conflicts}.`);
   }
 
   localManagedPath(item: PullResult): string {
@@ -261,6 +326,39 @@ export default class SingularityPlugin extends Plugin {
     }
     if (existing) throw new Error(`${path} exists but is not a file.`);
     await this.app.vault.create(path, content);
+  }
+
+  async writeManagedMarkdownSafely(path: string, item: PullResult): Promise<"written" | "skipped" | "conflict"> {
+    if (item.syncDirection === "obsidian_to_singularity") return "skipped";
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    if (existing instanceof TFile) {
+      const raw = await this.app.vault.read(existing);
+      const cache = this.app.metadataCache.getFileCache(existing);
+      const localBody = extractMarkdownBody(raw, cache?.frontmatterPosition?.end.offset);
+      const localBodyHash = await sha256Hex(localBody);
+      const frontmatter = cache?.frontmatter ?? {};
+      const localRevision = stringValue(frontmatter.singularity_revision);
+      const localChanged =
+        localRevision === item.lastSyncedRevisionId &&
+        Boolean(item.lastSyncedContentHash) &&
+        localBodyHash !== item.lastSyncedContentHash;
+      const remoteChanged =
+        item.revisionId !== item.lastSyncedRevisionId ||
+        item.contentHash !== item.lastSyncedContentHash ||
+        item.syncStatus === "remote_changed";
+
+      if (localChanged && remoteChanged) return "conflict";
+      if (localChanged && !remoteChanged) return "skipped";
+      if (!remoteChanged && localBodyHash === item.contentHash) return "skipped";
+      await this.app.vault.modify(existing, item.markdown);
+      await this.client().ack(item);
+      return "written";
+    }
+
+    if (existing) throw new Error(`${path} exists but is not a file.`);
+    await this.writeMarkdown(path, item.markdown);
+    await this.client().ack(item);
+    return "written";
   }
 
   async ensureParentFolder(path: string): Promise<void> {
@@ -377,7 +475,7 @@ class SingularitySettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Auth token")
-      .setDesc("Bearer token for the Singularity API.")
+      .setDesc("Use an Obsidian-scoped Singularity token. Do not use the server owner AUTH_TOKEN.")
       .addText((text) => {
         text.inputEl.type = "password";
         text

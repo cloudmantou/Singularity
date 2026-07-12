@@ -68,6 +68,36 @@ CREATE INDEX IF NOT EXISTS idx_external_links_entry
 CREATE INDEX IF NOT EXISTS idx_external_links_provider_vault
   ON sb_external_links(provider, vault_id, sync_status, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS sb_external_sources (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  vault_id TEXT NOT NULL,
+  external_path TEXT NOT NULL,
+  external_block_id TEXT NOT NULL DEFAULT '',
+  current_observation_id TEXT,
+  last_content_hash TEXT,
+  last_revision INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(provider, vault_id, external_path, external_block_id)
+);
+CREATE INDEX IF NOT EXISTS idx_external_sources_provider_vault
+  ON sb_external_sources(provider, vault_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS sb_access_tokens (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  scopes_json TEXT NOT NULL,
+  vault_id TEXT,
+  expires_at INTEGER,
+  revoked_at INTEGER,
+  created_at INTEGER NOT NULL,
+  last_used_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_access_tokens_hash
+  ON sb_access_tokens(token_hash);
+
 CREATE TABLE IF NOT EXISTS sb_automation_rules (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,

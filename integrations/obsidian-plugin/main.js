@@ -45,6 +45,21 @@ function frontmatterTags(cache) {
   if (typeof tags === "string") return tags.split(/[,\s]+/).filter(Boolean);
   return [];
 }
+function extractMarkdownBody(raw, frontmatterEndOffset) {
+  if (frontmatterEndOffset == null) return raw.trim();
+  return raw.slice(frontmatterEndOffset).replace(/^\s+/, "").trim();
+}
+function normalizeForHash(content) {
+  return content.trim().replace(/\s+/g, " ");
+}
+async function sha256Hex(content) {
+  const bytes = new TextEncoder().encode(normalizeForHash(content));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+function stringValue(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : void 0;
+}
 var SingularityClient = class {
   constructor(settings) {
     this.settings = settings;
@@ -82,7 +97,7 @@ var SingularityClient = class {
     var _a, _b;
     this.assertConfigured();
     const response = await (0, import_obsidian.requestUrl)({
-      url: this.endpoint(`/recall?query=${encodeURIComponent(query)}&topK=10`),
+      url: this.endpoint(`/recall?query=${encodeURIComponent(query)}&topK=10&vaultId=${encodeURIComponent(this.settings.vaultId)}`),
       method: "GET",
       headers: this.headers(),
       throw: false
@@ -92,6 +107,26 @@ var SingularityClient = class {
       throw new Error(String(error));
     }
     return Array.isArray((_b = response.json) == null ? void 0 : _b.results) ? response.json.results : [];
+  }
+  async ack(item) {
+    var _a;
+    this.assertConfigured();
+    const response = await (0, import_obsidian.requestUrl)({
+      url: this.endpoint("/integrations/obsidian/ack"),
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify({
+        linkId: item.link.id,
+        vaultId: this.settings.vaultId,
+        revisionId: item.revisionId,
+        contentHash: item.contentHash
+      }),
+      throw: false
+    });
+    if (response.status >= 400) {
+      const error = ((_a = response.json) == null ? void 0 : _a.error) || response.text || `HTTP ${response.status}`;
+      throw new Error(String(error));
+    }
   }
   async pull() {
     var _a, _b;
@@ -152,28 +187,42 @@ var SingularityPlugin = class extends import_obsidian.Plugin {
     await this.saveData(this.settings);
   }
   async saveCurrentNote() {
-    var _a, _b, _c, _d;
+    var _a, _b, _c;
     const view = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
     const file = view == null ? void 0 : view.file;
     if (!file) {
       new import_obsidian.Notice("No active Markdown note.");
       return;
     }
-    const content = await this.app.vault.read(file);
-    const frontmatter = (_a = this.app.metadataCache.getFileCache(file)) == null ? void 0 : _a.frontmatter;
-    await this.client().push({
+    const raw = await this.app.vault.read(file);
+    const cache = this.app.metadataCache.getFileCache(file);
+    const frontmatter = cache == null ? void 0 : cache.frontmatter;
+    const content = extractMarkdownBody(raw, (_a = cache == null ? void 0 : cache.frontmatterPosition) == null ? void 0 : _a.end.offset);
+    const singularityType = stringValue(frontmatter == null ? void 0 : frontmatter.singularity_type);
+    const pushed = await this.client().push({
       vaultId: this.settings.vaultId,
       path: file.path,
       content,
       properties: {
+        ...frontmatter != null ? frontmatter : {},
         tags: frontmatterTags(frontmatter),
         status: frontmatter == null ? void 0 : frontmatter.singularity_status,
         obsidianPath: file.path,
-        obsidianLinks: (_d = (_c = (_b = this.app.metadataCache.getFileCache(file)) == null ? void 0 : _b.links) == null ? void 0 : _c.map((link) => link.link)) != null ? _d : []
+        obsidianLinks: (_c = (_b = cache == null ? void 0 : cache.links) == null ? void 0 : _b.map((link) => link.link)) != null ? _c : []
       },
-      entryId: frontmatter == null ? void 0 : frontmatter.singularity_id,
-      baseRevisionId: frontmatter == null ? void 0 : frontmatter.singularity_revision
+      entryId: singularityType === "atomic-memory" ? frontmatter == null ? void 0 : frontmatter.singularity_id : void 0,
+      baseRevisionId: singularityType === "atomic-memory" ? frontmatter == null ? void 0 : frontmatter.singularity_revision : void 0
     });
+    if (singularityType !== "atomic-memory" && pushed.sourceId) {
+      await this.app.fileManager.processFrontMatter(file, (data) => {
+        data.singularity_type = "raw-material";
+        data.singularity_source_id = pushed.sourceId;
+        data.singularity_observation_id = pushed.observationId;
+        data.singularity_source_revision = pushed.sourceRevision;
+        data.singularity_source_hash = pushed.sourceHash;
+        data.singularity_memory_ids = Array.isArray(pushed.memoryIds) ? pushed.memoryIds : [];
+      });
+    }
     new import_obsidian.Notice("Saved note to Singularity.");
   }
   async saveSelection(selection) {
@@ -212,12 +261,16 @@ var SingularityPlugin = class extends import_obsidian.Plugin {
   async exportManagedMemories() {
     const results = await this.client().pull();
     let written = 0;
+    let skipped = 0;
+    let conflicts = 0;
     for (const item of results) {
       const targetPath = this.localManagedPath(item);
-      await this.writeMarkdown(targetPath, item.markdown);
-      written++;
+      const outcome = await this.writeManagedMarkdownSafely(targetPath, item);
+      if (outcome === "written") written++;
+      else if (outcome === "conflict") conflicts++;
+      else skipped++;
     }
-    new import_obsidian.Notice(`Exported ${written} Singularity memories.`);
+    new import_obsidian.Notice(`Exported ${written} Singularity memories. Skipped ${skipped}; conflicts ${conflicts}.`);
   }
   localManagedPath(item) {
     const folder = (0, import_obsidian.normalizePath)(this.settings.managedFolder || "Singularity");
@@ -234,6 +287,31 @@ var SingularityPlugin = class extends import_obsidian.Plugin {
     }
     if (existing) throw new Error(`${path} exists but is not a file.`);
     await this.app.vault.create(path, content);
+  }
+  async writeManagedMarkdownSafely(path, item) {
+    var _a, _b;
+    if (item.syncDirection === "obsidian_to_singularity") return "skipped";
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    if (existing instanceof import_obsidian.TFile) {
+      const raw = await this.app.vault.read(existing);
+      const cache = this.app.metadataCache.getFileCache(existing);
+      const localBody = extractMarkdownBody(raw, (_a = cache == null ? void 0 : cache.frontmatterPosition) == null ? void 0 : _a.end.offset);
+      const localBodyHash = await sha256Hex(localBody);
+      const frontmatter = (_b = cache == null ? void 0 : cache.frontmatter) != null ? _b : {};
+      const localRevision = stringValue(frontmatter.singularity_revision);
+      const localChanged = localRevision === item.lastSyncedRevisionId && Boolean(item.lastSyncedContentHash) && localBodyHash !== item.lastSyncedContentHash;
+      const remoteChanged = item.revisionId !== item.lastSyncedRevisionId || item.contentHash !== item.lastSyncedContentHash || item.syncStatus === "remote_changed";
+      if (localChanged && remoteChanged) return "conflict";
+      if (localChanged && !remoteChanged) return "skipped";
+      if (!remoteChanged && localBodyHash === item.contentHash) return "skipped";
+      await this.app.vault.modify(existing, item.markdown);
+      await this.client().ack(item);
+      return "written";
+    }
+    if (existing) throw new Error(`${path} exists but is not a file.`);
+    await this.writeMarkdown(path, item.markdown);
+    await this.client().ack(item);
+    return "written";
   }
   async ensureParentFolder(path) {
     const parts = (0, import_obsidian.normalizePath)(path).split("/");
@@ -332,7 +410,7 @@ var SingularitySettingTab = class extends import_obsidian.PluginSettingTab {
       this.plugin.settings.endpoint = value.trim();
       await this.plugin.saveSettings();
     }));
-    new import_obsidian.Setting(containerEl).setName("Auth token").setDesc("Bearer token for the Singularity API.").addText((text) => {
+    new import_obsidian.Setting(containerEl).setName("Auth token").setDesc("Use an Obsidian-scoped Singularity token. Do not use the server owner AUTH_TOKEN.").addText((text) => {
       text.inputEl.type = "password";
       text.setPlaceholder("AUTH_TOKEN").setValue(this.plugin.settings.authToken).onChange(async (value) => {
         this.plugin.settings.authToken = value.trim();

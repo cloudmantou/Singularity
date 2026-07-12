@@ -198,10 +198,10 @@ describe("POST /classify-pending", () => {
     expect(db.execCount).toBeGreaterThan(0);
     // Cold-start schema now includes atomic memory, Vector V2 profile fields,
     // vector rebuild state, durable cleanup outboxes, metadata guards,
-    // fact-source provenance, external object links, automation rules,
-    // and regenerable aggregate state;
+    // fact-source provenance, external object/source links, scoped access tokens,
+    // automation rules, and regenerable aggregate state;
     // keep a bounded D1 headroom check instead of letting init grow unnoticed.
-    expect(db.statementCount).toBeLessThanOrEqual(121);
+    expect(db.statementCount).toBeLessThanOrEqual(125);
   });
 
   it("skips entries whose durable classification status is already succeeded", async () => {
