@@ -956,9 +956,14 @@ export async function checkDuplicateAndContradiction(content: string, env: Env):
   const sample = getDuplicateCheckSample(content);
   const snapshot = await loadActiveEmbeddingSnapshot(env);
   const values = await embedWithProvider(snapshot.provider, sample, "query");
+  const queryOptions = {
+    topK: 50,
+    returnMetadata: "all" as const,
+    filter: { embedding_fingerprint: snapshot.fingerprint },
+  };
   const queried = env.SELFHOST === "1"
-    ? await (env.VECTORIZE as any).query(values, { topK: 50, returnMetadata: "all", queryText: sample })
-    : await env.VECTORIZE.query(values, { topK: 50, returnMetadata: "all" });
+    ? await (env.VECTORIZE as any).query(values, { ...queryOptions, queryText: sample })
+    : await env.VECTORIZE.query(values, queryOptions);
   const matches = (await filterActiveVectorMatches(
     queried.matches as VectorizeMatch[],
     env
@@ -2041,6 +2046,44 @@ function prepareVectorCleanupQueueInsert(
   );
 }
 
+function preparePendingGenerationInvalidation(
+  env: Env,
+  input: {
+    pendingVectorIds?: string | null;
+    pendingRebuildId?: string | null;
+    reason: string;
+    now: number;
+  }
+): D1PreparedStatement[] {
+  const pendingIds = parseVectorIds(input.pendingVectorIds);
+  return pendingIds.map((vectorId) =>
+    prepareVectorCleanupQueueInsert(env, {
+      id: crypto.randomUUID(),
+      vectorId,
+      reason: input.reason,
+      state: "ready",
+      rebuildId: input.pendingRebuildId ?? null,
+      now: input.now,
+    })
+  );
+}
+
+function pendingGenerationResetAssignments(): string {
+  return `
+    pending_vector_ids = CASE
+      WHEN pending_rebuild_id IS NOT NULL THEN '[]'
+      ELSE NULL
+    END,
+    pending_embedding_fingerprint = CASE
+      WHEN pending_rebuild_id IS NOT NULL THEN pending_embedding_fingerprint
+      ELSE NULL
+    END,
+    pending_content_hash = NULL,
+    pending_revision_id = NULL,
+    pending_metadata_hash = NULL
+  `;
+}
+
 function chunkArray<T>(items: T[], size: number): T[][] {
   const chunks: T[][] = [];
   for (let i = 0; i < items.length; i += size) chunks.push(items.slice(i, i + size));
@@ -2150,6 +2193,107 @@ async function attachEntryToOpenVectorRebuild(
        AND state IN ('queued', 'building', 'ready')`
   ).bind(now, open.id).run();
   return true;
+}
+
+async function reconcileOpenVectorRebuildEntries(
+  env: Env,
+  rebuild: OpenVectorRebuildContext
+): Promise<number> {
+  const now = Date.now();
+  const result = await env.DB.prepare(
+    `UPDATE entries
+     SET pending_vector_ids = '[]',
+         pending_embedding_fingerprint = ?,
+         pending_content_hash = NULL,
+         pending_revision_id = NULL,
+         pending_metadata_hash = NULL,
+         pending_rebuild_id = ?
+     WHERE tags NOT LIKE '%"status:deprecated"%'
+       AND (
+         pending_rebuild_id IS NULL
+         OR pending_rebuild_id != ?
+       )
+       AND EXISTS (
+         SELECT 1
+         FROM sb_vector_rebuilds
+         WHERE id = ?
+           AND state IN ('queued', 'building', 'ready')
+       )`
+  ).bind(
+    rebuild.pendingFingerprint,
+    rebuild.id,
+    rebuild.id,
+    rebuild.id
+  ).run();
+  await env.DB.prepare(
+    `UPDATE sb_vector_rebuilds
+     SET expected_entries = (
+           SELECT COUNT(*)
+           FROM entries
+           WHERE tags NOT LIKE '%"status:deprecated"%'
+         ),
+         updated_at = ?
+     WHERE id = ?
+       AND state IN ('queued', 'building', 'ready')`
+  ).bind(now, rebuild.id).run();
+  return Number(result.meta?.changes ?? 0);
+}
+
+async function repairStalePendingGenerations(
+  env: Env,
+  rebuild: OpenVectorRebuildContext,
+  limit = 50
+): Promise<number> {
+  const { results } = await env.DB.prepare(
+    `SELECT id, pending_vector_ids, pending_rebuild_id
+     FROM entries
+     WHERE pending_rebuild_id = ?
+       AND pending_vector_ids IS NOT NULL
+       AND pending_vector_ids != '[]'
+       AND (
+         pending_content_hash IS NULL
+         OR content_hash IS NULL
+         OR pending_revision_id IS NULL
+         OR pending_metadata_hash IS NULL
+         OR metadata_hash IS NULL
+         OR pending_content_hash != content_hash
+         OR pending_metadata_hash != metadata_hash
+       )
+       AND tags NOT LIKE '%"status:deprecated"%'
+     ORDER BY created_at DESC
+     LIMIT ?`
+  ).bind(rebuild.id, Math.max(1, Math.min(limit, 200))).all<{
+    id: string;
+    pending_vector_ids: string | null;
+    pending_rebuild_id: string | null;
+  }>();
+  const rows = results ?? [];
+  if (!rows.length) return 0;
+
+  const now = Date.now();
+  const cleanupStatements = rows.flatMap((row) =>
+    preparePendingGenerationInvalidation(env, {
+      pendingVectorIds: row.pending_vector_ids,
+      pendingRebuildId: row.pending_rebuild_id,
+      reason: "pending_generation_stale",
+      now,
+    })
+  );
+  const resetStatements = rows.map((row) =>
+    env.DB.prepare(
+      `UPDATE entries
+       SET pending_vector_ids = '[]',
+           pending_embedding_fingerprint = ?,
+           pending_content_hash = NULL,
+           pending_revision_id = NULL,
+           pending_metadata_hash = NULL,
+           pending_rebuild_id = ?
+       WHERE id = ?
+         AND pending_rebuild_id = ?`
+    ).bind(rebuild.pendingFingerprint, rebuild.id, row.id, rebuild.id)
+  );
+  await env.DB.batch([...cleanupStatements, ...resetStatements]);
+  return rows.length;
 }
 
 async function inspectPendingActivationIntegrity(
@@ -2371,9 +2515,12 @@ async function processVectorCleanupBatches(
       deleted += deletable.length;
       if (referenced.length) {
         blocked += referenced.length;
+        const attempts = Number(row.attempts ?? 0);
+        const updatedAt = Date.now();
         await env.DB.prepare(
           `UPDATE sb_vector_cleanup_batches
            SET vector_ids_json = ?,
+               attempts = attempts + 1,
                state = 'ready',
                next_attempt_at = ?,
                last_error = ?,
@@ -2381,9 +2528,9 @@ async function processVectorCleanupBatches(
            WHERE id = ?`
         ).bind(
           JSON.stringify(referenced),
-          Date.now() + 60_000,
+          updatedAt + referencedVectorRetryDelayMs(attempts),
           `vector_still_referenced:${referenced.length}`,
-          Date.now(),
+          updatedAt,
           row.id
         ).run();
       } else {
@@ -3599,7 +3746,7 @@ export async function compressTag(
 
   // Fetch compressible entries: tagged with this tag, not system-tagged, not high-importance
   const { results: rawEntries } = await env.DB.prepare(`
-    SELECT id, content, tags FROM entries
+    SELECT id, content, tags, pending_vector_ids, pending_rebuild_id FROM entries
     WHERE tags LIKE ?
       AND tags NOT LIKE '%"synthesized"%'
       AND tags NOT LIKE '%"auto-pattern"%'
@@ -3617,6 +3764,8 @@ export async function compressTag(
     id: r.id as string,
     content: r.content as string,
     tags: parseStoredTags(r.tags),
+    pendingVectorIds: r.pending_vector_ids as string | null,
+    pendingRebuildId: r.pending_rebuild_id as string | null,
   }));
   const text = await synthesizeDigest(tag, rows, env);
   if (!text) return { synthesizedId: null, entriesUsed: 0, text: "" };
@@ -3644,6 +3793,15 @@ export async function compressTag(
     row,
     nextTags: row.tags.includes("rolled-up") ? row.tags : [...row.tags, "rolled-up"],
   }));
+  const now = Date.now();
+  const pendingCleanupStatements = rollups.flatMap(({ row }) =>
+    preparePendingGenerationInvalidation(env, {
+      pendingVectorIds: row.pendingVectorIds,
+      pendingRebuildId: row.pendingRebuildId,
+      reason: "rollup_metadata_changed",
+      now,
+    })
+  );
   const rollupRevisions = rollups.map(({ row, nextTags }) =>
     prepareMemoryRevision(env.DB, {
       memoryId: row.id,
@@ -3659,9 +3817,16 @@ export async function compressTag(
   await env.DB.batch([
     ...digestRelations.map(item => item.statement),
     ...rollups.map(({ row, nextTags }) =>
-      env.DB.prepare(`UPDATE entries SET tags = ?, metadata_hash = NULL WHERE id = ?`)
+      env.DB.prepare(
+        `UPDATE entries
+         SET tags = ?,
+             metadata_hash = NULL,
+             ${pendingGenerationResetAssignments()}
+         WHERE id = ?`
+      )
         .bind(JSON.stringify(nextTags), row.id)
     ),
+    ...pendingCleanupStatements,
     ...rollupRevisions.map(item => item.statement),
   ]);
 
@@ -4417,10 +4582,11 @@ export async function recallEntries(
   const tokens = tokenizeQuery(embedQuery);
   let embeddingFailed = false;
   let lexicalRows: KeywordRow[] = [];
-  const [values, queryTags, graphSignals] = await Promise.all([
-    loadActiveEmbeddingSnapshot(env).then((snapshot) =>
-      embedWithProvider(snapshot.provider, embedQuery, "query")
-    ).catch((error) => {
+  const [embeddingResult, queryTags, graphSignals] = await Promise.all([
+    loadActiveEmbeddingSnapshot(env).then(async (snapshot) => {
+      const values = await embedWithProvider(snapshot.provider, embedQuery, "query");
+      return { values, fingerprint: snapshot.fingerprint };
+    }).catch((error) => {
       embeddingFailed = true;
       console.error("Recall embedding failed; continuing with keyword/graph recall:", error);
       return null;
@@ -4434,6 +4600,8 @@ export async function recallEntries(
       return new Map<string, GraphRecallSignal>();
     }),
   ]);
+  const values = embeddingResult?.values ?? null;
+  const activeFingerprint = embeddingResult?.fingerprint ?? null;
 
   let keywordRows: KeywordRow[] = [];
   let results: { matches: VectorizeMatch[] };
@@ -4502,8 +4670,21 @@ export async function recallEntries(
     const [denseResults, kwRows, lexicalIds] = await Promise.all([
       values
         ? env.SELFHOST === "1"
-          ? (env.VECTORIZE as any).query(values, { topK: 50, returnMetadata: "all", queryText: embedQuery })
-          : env.VECTORIZE.query(values, { topK: 50, returnMetadata: "all" })
+          ? (env.VECTORIZE as any).query(values, {
+              topK: 50,
+              returnMetadata: "all",
+              queryText: embedQuery,
+              filter: activeFingerprint
+                ? { embedding_fingerprint: activeFingerprint }
+                : undefined,
+            })
+          : env.VECTORIZE.query(values, {
+              topK: 50,
+              returnMetadata: "all",
+              filter: activeFingerprint
+                ? { embedding_fingerprint: activeFingerprint }
+                : undefined,
+            })
         : Promise.resolve({ matches: [] as VectorizeMatch[] }),
       keywordSearch(tokens, env),
       lexicalIdsPromise,
@@ -4555,6 +4736,9 @@ export async function recallEntries(
   const candidateIds = [...new Set(fusedMatches.map(m => (m.metadata as any)?.parentId ?? m.id))] as string[];
   const rcRows: {
     id: string;
+    tags: string;
+    source: string;
+    created_at: number;
     recall_count: number;
     importance_score: number;
     contradiction_wins: number;
@@ -4565,12 +4749,16 @@ export async function recallEntries(
     const batch = candidateIds.slice(i, i + D1_MAX_BOUND_PARAMS);
     const rcPlaceholders = batch.map(() => "?").join(", ");
     const { results: rows } = await env.DB.prepare(
-      `SELECT id, recall_count, importance_score, contradiction_wins, contradiction_losses,
+      `SELECT id, tags, source, created_at,
+              recall_count, importance_score, contradiction_wins, contradiction_losses,
               classification_confidence
        FROM entries WHERE id IN (${rcPlaceholders})`
     ).bind(...batch).all() as {
       results: {
         id: string;
+        tags: string;
+        source: string;
+        created_at: number;
         recall_count: number;
         importance_score: number;
         contradiction_wins: number;
@@ -4589,9 +4777,41 @@ export async function recallEntries(
       .filter(r => r.classification_confidence != null && Number(r.classification_confidence) > 0)
       .map(r => [r.id, Number(r.classification_confidence)])
   );
+  const currentEntryMetadata = new Map(rcRows.map((row) => {
+    let tags: string[] = [];
+    try {
+      const parsed = JSON.parse(row.tags ?? "[]");
+      tags = Array.isArray(parsed)
+        ? parsed.filter((tag): tag is string => typeof tag === "string")
+        : [];
+    } catch {
+      tags = [];
+    }
+    return [row.id, {
+      tags,
+      source: row.source,
+      created_at: Number(row.created_at ?? Date.now()),
+    }];
+  }));
+  const rerankInput = fusedMatches.map((match) => {
+    const meta = (match.metadata ?? {}) as Record<string, unknown>;
+    const parentId = String(meta.parentId ?? match.id);
+    const current = currentEntryMetadata.get(parentId);
+    if (!current) return match;
+    return {
+      ...match,
+      metadata: {
+        ...meta,
+        parentId,
+        tags: current.tags,
+        source: current.source,
+        created_at: current.created_at,
+      },
+    };
+  });
 
   const reranked = rerankWithTimeDecay(
-    fusedMatches,
+    rerankInput,
     recallCounts,
     importanceScores,
     queryTags,
@@ -4811,11 +5031,16 @@ async function classifyAndPersistEntry(
     const { importance, confidence, canonical, kind } = await classifyEntry(candidate.content, env);
     for (let tagCommitAttempt = 0; tagCommitAttempt < 2; tagCommitAttempt++) {
       const current = await env.DB.prepare(
-        `SELECT tags, source FROM entries
+        `SELECT tags, source, pending_vector_ids, pending_rebuild_id FROM entries
          WHERE id = ? AND content = ?
            AND classification_status = 'processing'
            AND classification_started_at = ?`
-      ).bind(candidate.id, candidate.content, startedAt).first<{ tags: string; source: string }>();
+      ).bind(candidate.id, candidate.content, startedAt).first<{
+        tags: string;
+        source: string;
+        pending_vector_ids: string | null;
+        pending_rebuild_id: string | null;
+      }>();
       if (!current) return "skipped";
       const currentTagsJson = current.tags || "[]";
       const previousTags: string[] = JSON.parse(currentTagsJson);
@@ -4828,12 +5053,39 @@ async function classifyAndPersistEntry(
         source: current.source,
         tags,
       });
-      const updateResult = await env.DB.prepare(
+      const cleanupStatements = preparePendingGenerationInvalidation(env, {
+        pendingVectorIds: current.pending_vector_ids,
+        pendingRebuildId: current.pending_rebuild_id,
+        reason: "classification_metadata_changed",
+        now: classifiedAt,
+      });
+      const classifyRevision = prepareMemoryRevision(env.DB, {
+        memoryId: candidate.id,
+        eventType: "CLASSIFY",
+        oldContent: candidate.content,
+        newContent: candidate.content,
+        oldMetadata: {
+          tags: previousTags,
+        },
+        newMetadata: {
+          tags,
+          importance,
+          confidence,
+          canonical,
+          kind,
+          classification_version: CURRENT_CLASSIFICATION_VERSION,
+        },
+        reason: "Automatic classification",
+        actor: "classifier",
+        createdAt: classifiedAt,
+      });
+      const updateStatement = env.DB.prepare(
         `UPDATE entries
          SET tags = ?, metadata_hash = ?, importance_score = ?, classification_confidence = ?,
              classification_status = 'succeeded', classification_error = NULL,
              classification_next_attempt_at = NULL, classification_started_at = NULL,
-             classification_version = ?, classified_at = ?
+             classification_version = ?, classified_at = ?,
+             ${pendingGenerationResetAssignments()}
          WHERE id = ? AND content = ? AND tags = ?
            AND classification_status = 'processing'
            AND classification_started_at = ?`
@@ -4848,31 +5100,13 @@ async function classifyAndPersistEntry(
         candidate.content,
         currentTagsJson,
         startedAt
-      ).run();
+      );
+      const [updateResult] = await env.DB.batch([
+        updateStatement,
+        ...cleanupStatements,
+      ]);
       if (Number(updateResult.meta?.changes ?? 0) !== 1) continue;
-
-      // Permanent audit trail for automatic classification (kind/status/scores).
       try {
-        const classifyRevision = prepareMemoryRevision(env.DB, {
-          memoryId: candidate.id,
-          eventType: "CLASSIFY",
-          oldContent: candidate.content,
-          newContent: candidate.content,
-          oldMetadata: {
-            tags: previousTags,
-          },
-          newMetadata: {
-            tags,
-            importance,
-            confidence,
-            canonical,
-            kind,
-            classification_version: CURRENT_CLASSIFICATION_VERSION,
-          },
-          reason: "Automatic classification",
-          actor: "classifier",
-          createdAt: classifiedAt,
-        });
         await classifyRevision.statement.run();
       } catch (e) {
         console.error("CLASSIFY revision write failed (non-fatal):", e);
@@ -6016,7 +6250,13 @@ async function captureSingleFact(
       });
       const metadataHash = await entryMetadataFingerprint({ source, tags: nextTags });
       await env.DB.batch([
-        env.DB.prepare(`UPDATE entries SET tags = ?, metadata_hash = ? WHERE id = ?`)
+        env.DB.prepare(
+          `UPDATE entries
+           SET tags = ?,
+               metadata_hash = ?,
+               ${pendingGenerationResetAssignments()}
+           WHERE id = ?`
+        )
           .bind(JSON.stringify(nextTags), metadataHash, id),
         statusRevision.statement,
       ]);
@@ -6290,7 +6530,7 @@ export async function applyStatus(id: string, status: MemoryStatus, env: Env): P
     return deprecateEntry(id, env, "Status set to deprecated", "system");
   }
   const row = await env.DB.prepare(
-    `SELECT content, tags, source FROM entries WHERE id = ?`
+    `SELECT content, tags, source, pending_vector_ids, pending_rebuild_id FROM entries WHERE id = ?`
   ).bind(id).first() as Record<string, any> | null;
   if (!row) return false;
   const tags: string[] = JSON.parse(row.tags ?? "[]");
@@ -6300,6 +6540,13 @@ export async function applyStatus(id: string, status: MemoryStatus, env: Env): P
   const metadataHash = await entryMetadataFingerprint({
     source: String(row.source ?? "api"),
     tags: nextTags,
+  });
+  const now = Date.now();
+  const cleanupStatements = preparePendingGenerationInvalidation(env, {
+    pendingVectorIds: row.pending_vector_ids,
+    pendingRebuildId: row.pending_rebuild_id,
+    reason: "status_metadata_changed",
+    now,
   });
   const statusRevision = prepareMemoryRevision(env.DB, {
     memoryId: id,
@@ -6312,8 +6559,14 @@ export async function applyStatus(id: string, status: MemoryStatus, env: Env): P
     actor: "system",
   });
   await env.DB.batch([
-    env.DB.prepare(`UPDATE entries SET tags = ?, metadata_hash = ? WHERE id = ?`)
-      .bind(JSON.stringify(nextTags), metadataHash, id),
+    env.DB.prepare(
+      `UPDATE entries
+       SET tags = ?,
+           metadata_hash = ?,
+           ${pendingGenerationResetAssignments()}
+       WHERE id = ?`
+    ).bind(JSON.stringify(nextTags), metadataHash, id),
+    ...cleanupStatements,
     statusRevision.statement,
   ]);
   return true;
@@ -7622,9 +7875,27 @@ const defaultHandler = {
           retryable: false,
         }, 409);
       }
-      const usePendingProfile = Boolean(pendingFingerprint && activeRebuild);
+      const openRebuildContext: OpenVectorRebuildContext | null =
+        pendingFingerprint &&
+        activeRebuild &&
+        (activeRebuild.state === "queued" ||
+          activeRebuild.state === "building" ||
+          activeRebuild.state === "ready")
+          ? {
+              id: activeRebuild.id,
+              pendingFingerprint,
+              state: activeRebuild.state,
+            }
+          : null;
+      const usePendingProfile = Boolean(openRebuildContext);
+      let reconciledEntries = 0;
+      let repairedPendingGenerations = 0;
+      if (openRebuildContext) {
+        reconciledEntries = await reconcileOpenVectorRebuildEntries(env, openRebuildContext);
+        repairedPendingGenerations = await repairStalePendingGenerations(env, openRebuildContext, 50);
+      }
       const pendingQueue =
-        usePendingProfile && pendingFingerprint && activeRebuild
+        usePendingProfile && pendingFingerprint && openRebuildContext
           ? await env.DB.prepare(
               `SELECT id, content, tags, source, created_at, content_hash, pending_rebuild_id FROM entries
                WHERE pending_vector_ids = '[]'
@@ -7633,7 +7904,7 @@ const defaultHandler = {
                  AND tags NOT LIKE '%"status:deprecated"%'
                  AND created_at < ?
                ORDER BY created_at DESC LIMIT ?`
-            ).bind(pendingFingerprint, activeRebuild.id, graceCutoff, limit).all()
+            ).bind(pendingFingerprint, openRebuildContext.id, graceCutoff, limit).all()
           : { results: [] };
       const { results: toProcess } = usePendingProfile
         ? pendingQueue
@@ -7661,7 +7932,7 @@ const defaultHandler = {
       if (queueRows.length) {
         try {
           const batchResult = usePendingProfile && pendingFingerprint
-            ? await storePendingEntryVectorBatch(env, queueRows, pendingFingerprint, activeRebuild!.id)
+            ? await storePendingEntryVectorBatch(env, queueRows, pendingFingerprint, openRebuildContext!.id)
             : await storeEntryVectorBatch(env, queueRows, pendingFingerprint);
           processed += batchResult.processed;
           failed += batchResult.failed;
@@ -7671,7 +7942,7 @@ const defaultHandler = {
           for (const row of queueRows) {
             try {
               const ids = usePendingProfile && pendingFingerprint
-                ? await storePendingEntryVectors(env, row, pendingFingerprint, activeRebuild!.id)
+                ? await storePendingEntryVectors(env, row, pendingFingerprint, openRebuildContext!.id)
                 : await storeEntry(
                     env,
                     row.id,
@@ -7697,7 +7968,7 @@ const defaultHandler = {
                AND pending_embedding_fingerprint = ?
                AND pending_rebuild_id = ?
                AND tags NOT LIKE '%"status:deprecated"%'`
-          ).bind(pendingFingerprint, activeRebuild!.id).first() as Record<string, any> | null
+          ).bind(pendingFingerprint, openRebuildContext!.id).first() as Record<string, any> | null
         : await env.DB.prepare(
             `SELECT COUNT(*) as count FROM entries
              WHERE vector_ids = '[]'
@@ -7717,7 +7988,7 @@ const defaultHandler = {
       let activationError: string | undefined;
       let retryable = true;
 
-      if (usePendingProfile && activeRebuild) {
+      if (openRebuildContext) {
         await env.DB.prepare(
           `UPDATE sb_vector_rebuilds
            SET state = ?,
@@ -7733,9 +8004,9 @@ const defaultHandler = {
              AND state IN ('queued', 'building', 'ready')`
         ).bind(
           remainingN === 0 && failed === 0 ? "ready" : "building",
-          activeRebuild.id,
+          openRebuildContext.id,
           Date.now(),
-          activeRebuild.id
+          openRebuildContext.id
         ).run();
         activationState = remainingN === 0 && failed === 0 ? "ready" : "building";
       }
@@ -7744,30 +8015,30 @@ const defaultHandler = {
       if (remainingN === 0 && failed === 0) {
         try {
           const stored = storedSettings ?? await loadStoredModelSettings(env.DB);
-          if (stored?.pendingEmbeddingFingerprint && activeRebuild) {
+          if (stored?.pendingEmbeddingFingerprint && openRebuildContext) {
             activationIntegrity = await inspectPendingActivationIntegrity(
               env,
               stored.pendingEmbeddingFingerprint,
-              activeRebuild.id
+              openRebuildContext.id
             );
             activationBlocked = activationIntegrity.blocked;
             if (activationBlocked === 0) {
               const activationRows = await listPendingActivationRows(
                 env,
                 stored.pendingEmbeddingFingerprint,
-                activeRebuild.id
+                openRebuildContext.id
               );
               const staleVectorIds = staleVectorIdsAfterActivation(activationRows);
               const preparedCleanup = await prepareVectorCleanupBatches(
                 env,
-                activeRebuild.id,
+                openRebuildContext.id,
                 staleVectorIds,
                 "prepared"
               );
               cleanupBatchesPrepared = preparedCleanup.batches;
               const activation = await activatePendingVectorsAndSettings(
                 env,
-                activeRebuild.id,
+                openRebuildContext.id,
                 promoteEmbeddingFingerprint(stored)
               );
               if (activation.ok) {
@@ -7809,6 +8080,8 @@ const defaultHandler = {
         activationState,
         activationError,
         retryable,
+        reconciledEntries,
+        repairedPendingGenerations,
       });
     }
 

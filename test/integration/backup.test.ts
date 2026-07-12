@@ -141,7 +141,7 @@ describe("full memory backup import/export", () => {
         "atomic-memory",
         "temporal-facts",
         "fact-sources",
-        "embedding-profiles",
+        "embedding-fingerprints",
       ])
     );
     expect(backup.features).not.toContain("vector-rebuild-state");

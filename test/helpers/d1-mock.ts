@@ -155,6 +155,19 @@ export class D1Mock {
           }
           return { meta: { changes: row ? 1 : 0 } };
         }
+        if (s.startsWith("UPDATE sb_vector_rebuilds SET expected_entries = (")) {
+          const [updated_at, id] = args;
+          const row = db.vectorRebuilds.find((item: any) =>
+            item.id === id && ["queued", "building", "ready"].includes(item.state)
+          );
+          if (row) {
+            row.expected_entries = db.entries.filter((entry: any) =>
+              !String(entry.tags ?? "[]").includes('"status:deprecated"')
+            ).length;
+            row.updated_at = updated_at;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
         if (s.startsWith("UPDATE sb_vector_rebuilds SET expected_entries = MAX(0, expected_entries - ?")) {
           const [count, updated_at, id] = args;
           const row = db.vectorRebuilds.find((item: any) =>
@@ -261,6 +274,9 @@ export class D1Mock {
           const row = db.vectorCleanupBatches.find((item: any) => item.id === id);
           if (row) {
             row.vector_ids_json = vector_ids_json;
+            if (s.includes("attempts = attempts + 1")) {
+              row.attempts = Number(row.attempts ?? 0) + 1;
+            }
             row.state = "ready";
             row.next_attempt_at = next_attempt_at;
             row.last_error = last_error;
@@ -1298,6 +1314,16 @@ export class D1Mock {
               classification_version,
               classified_at,
             });
+            if (s.includes("pending_vector_ids = CASE")) {
+              const hasPendingRebuild = row.pending_rebuild_id != null;
+              row.pending_vector_ids = hasPendingRebuild ? "[]" : null;
+              row.pending_embedding_fingerprint = hasPendingRebuild
+                ? row.pending_embedding_fingerprint
+                : null;
+              row.pending_content_hash = null;
+              row.pending_revision_id = null;
+              row.pending_metadata_hash = null;
+            }
           }
           return { meta: { changes: row ? 1 : 0 } };
         }
@@ -1355,21 +1381,36 @@ export class D1Mock {
         if (
           s.startsWith("UPDATE entries SET tags = ? WHERE id") ||
           s.startsWith("UPDATE entries SET tags = ?, metadata_hash = ? WHERE id") ||
-          s.startsWith("UPDATE entries SET tags = ?, metadata_hash = NULL WHERE id")
+          s.startsWith("UPDATE entries SET tags = ?, metadata_hash = NULL WHERE id") ||
+          s.startsWith("UPDATE entries SET tags = ?, metadata_hash = ?,") ||
+          s.startsWith("UPDATE entries SET tags = ?, metadata_hash = NULL,")
         ) {
           let tags: any;
           let metadata_hash: any = undefined;
           let id: any;
           if (s.includes("metadata_hash = ?")) {
-            [tags, metadata_hash, id] = args;
+            tags = args[0];
+            metadata_hash = args[1];
+            id = args[args.length - 1];
           } else {
-            [tags, id] = args;
+            tags = args[0];
+            id = args[args.length - 1];
           }
           const row = db.entries.find((e: any) => e.id === id);
           if (row) {
             row.tags = tags;
             if (s.includes("metadata_hash = ?")) row.metadata_hash = metadata_hash;
             if (s.includes("metadata_hash = NULL")) row.metadata_hash = null;
+            if (s.includes("pending_vector_ids = CASE")) {
+              const hasPendingRebuild = row.pending_rebuild_id != null;
+              row.pending_vector_ids = hasPendingRebuild ? "[]" : null;
+              row.pending_embedding_fingerprint = hasPendingRebuild
+                ? row.pending_embedding_fingerprint
+                : null;
+              row.pending_content_hash = null;
+              row.pending_revision_id = null;
+              row.pending_metadata_hash = null;
+            }
           }
           return { meta: { changes: row ? 1 : 0 } };
         }
@@ -1603,6 +1644,18 @@ export class D1Mock {
             ? {
                 id: row.id,
                 vector_ids: row.vector_ids ?? "[]",
+                pending_vector_ids: row.pending_vector_ids ?? null,
+                pending_rebuild_id: row.pending_rebuild_id ?? null,
+              }
+            : null;
+        }
+        if (s.includes("SELECT content, tags, source, pending_vector_ids, pending_rebuild_id FROM entries WHERE id = ?")) {
+          const row = db.entries.find((e: any) => e.id === args[0]);
+          return row
+            ? {
+                content: row.content,
+                tags: row.tags ?? "[]",
+                source: row.source ?? "api",
                 pending_vector_ids: row.pending_vector_ids ?? null,
                 pending_rebuild_id: row.pending_rebuild_id ?? null,
               }
@@ -1849,13 +1902,21 @@ export class D1Mock {
         if (s.includes("COUNT(*) as count")) {
           return { count: db.entries.length };
         }
-        if (s.includes("SELECT tags FROM entries") && s.includes("classification_started_at = ?")) {
+        if (
+          (s.includes("SELECT tags FROM entries") || s.includes("SELECT tags, source")) &&
+          s.includes("classification_started_at = ?")
+        ) {
           const [id, content, startedAt] = args;
           const row = db.entries.find((e: any) =>
             e.id === id && e.content === content && e.classification_status === "processing" &&
             e.classification_started_at === startedAt
           );
-          return row ? { tags: row.tags } : null;
+          return row ? {
+            tags: row.tags,
+            source: row.source ?? "api",
+            pending_vector_ids: row.pending_vector_ids ?? null,
+            pending_rebuild_id: row.pending_rebuild_id ?? null,
+          } : null;
         }
         if (s.includes("SELECT classification_attempts FROM entries") && s.includes("classification_started_at = ?")) {
           const [id, content, startedAt] = args;
@@ -2415,6 +2476,38 @@ export class D1Mock {
           return { results: rows };
         }
         if (
+          s.includes("SELECT id, pending_vector_ids, pending_rebuild_id") &&
+          s.includes("pending_rebuild_id = ?") &&
+          s.includes("pending_vector_ids != '[]'")
+        ) {
+          const rebuildId = String(args[0]);
+          const limit = Number(args[1] ?? 50);
+          const results = [...db.entries]
+            .filter((e: any) =>
+              e.pending_rebuild_id === rebuildId &&
+              e.pending_vector_ids != null &&
+              e.pending_vector_ids !== "[]" &&
+              !String(e.tags ?? "[]").includes('"status:deprecated"') &&
+              (
+                e.pending_content_hash == null ||
+                e.content_hash == null ||
+                e.pending_revision_id == null ||
+                e.pending_metadata_hash == null ||
+                e.metadata_hash == null ||
+                e.pending_content_hash !== e.content_hash ||
+                e.pending_metadata_hash !== e.metadata_hash
+              )
+            )
+            .sort((a: any, b: any) => Number(b.created_at ?? 0) - Number(a.created_at ?? 0))
+            .slice(0, limit)
+            .map((e: any) => ({
+              id: e.id,
+              pending_vector_ids: e.pending_vector_ids,
+              pending_rebuild_id: e.pending_rebuild_id,
+            }));
+          return { results };
+        }
+        if (
           s.includes("SELECT id, vector_ids, pending_vector_ids") &&
           s.includes("pending_embedding_fingerprint = ?")
         ) {
@@ -2516,16 +2609,42 @@ export class D1Mock {
             .map((e: any) => ({ id: e.id, content: e.content, tags: e.tags, source: e.source, created_at: e.created_at }));
           return { results: rows };
         }
-        if (s.includes("SELECT id, recall_count, importance_score") && s.includes("WHERE id IN")) {
+        if (
+          s.includes("recall_count") &&
+          s.includes("importance_score") &&
+          s.includes("WHERE id IN")
+        ) {
           const results = db.entries
             .filter((e: any) => args.includes(e.id))
             .map((e: any) => ({
               id: e.id,
+              tags: e.tags ?? "[]",
+              source: e.source ?? "api",
+              created_at: e.created_at ?? 0,
               recall_count: e.recall_count ?? 0,
               importance_score: e.importance_score ?? 0,
               contradiction_wins: e.contradiction_wins ?? 0,
               contradiction_losses: e.contradiction_losses ?? 0,
               classification_confidence: e.classification_confidence ?? null,
+            }));
+          return { results };
+        }
+        if (
+          s.includes("SELECT id, content, tags, source") &&
+          s.includes("pending_vector_ids") &&
+          s.includes("pending_rebuild_id") &&
+          s.includes("WHERE id IN")
+        ) {
+          const results = db.entries
+            .filter((e: any) => args.includes(e.id))
+            .map((e: any) => ({
+              id: e.id,
+              content: e.content,
+              tags: e.tags,
+              source: e.source,
+              pending_vector_ids: e.pending_vector_ids ?? null,
+              pending_rebuild_id: e.pending_rebuild_id ?? null,
+              has_pending_columns: s.includes("has_pending_columns") ? 1 : undefined,
             }));
           return { results };
         }
@@ -2557,7 +2676,9 @@ export class D1Mock {
           return { results };
         }
         if (
-          (s.includes("SELECT id, content FROM entries") || s.includes("SELECT id, content, tags FROM entries")) &&
+          (s.includes("SELECT id, content FROM entries") ||
+            s.includes("SELECT id, content, tags FROM entries") ||
+            s.includes("SELECT id, content, tags, pending_vector_ids, pending_rebuild_id FROM entries")) &&
           s.includes("WHERE tags LIKE") &&
           s.includes("ORDER BY created_at DESC")
         ) {
@@ -2580,7 +2701,13 @@ export class D1Mock {
             })
             .sort((a: any, b: any) => b.created_at - a.created_at)
             .slice(0, 50)
-            .map((e: any) => ({ id: e.id, content: e.content, tags: e.tags }));
+            .map((e: any) => ({
+              id: e.id,
+              content: e.content,
+              tags: e.tags,
+              pending_vector_ids: e.pending_vector_ids ?? null,
+              pending_rebuild_id: e.pending_rebuild_id ?? null,
+            }));
           return { results };
         }
         if (s.includes("SELECT id, content FROM entries WHERE id IN")) {

@@ -46,6 +46,17 @@ describe("checkDuplicateAndContradiction()", () => {
     expect(contradiction.detected).toBe(false);
   });
 
+  it("passes the active embedding fingerprint filter to the vector query", async () => {
+    const queryFn = vi.fn().mockResolvedValue({ matches: [match("a", 0.3)] });
+    const env = makeEnv("", [], [entry("a", "I enjoy hiking")]);
+    (env.VECTORIZE as any).query = queryFn;
+
+    await checkDuplicateAndContradiction("I live in Paris", env);
+
+    const [, options] = queryFn.mock.calls[0];
+    expect(options.filter).toEqual({ embedding_fingerprint: expect.any(String) });
+  });
+
   it("returns no contradiction when LLM says no contradiction", async () => {
     const env = makeEnv(
       '{"contradicts": false}',

@@ -115,6 +115,69 @@ describe("POST /classify-pending", () => {
     }
   });
 
+  it("invalidates stale pending vectors after classification metadata changes and rebuild activates", async () => {
+    env = makeTestEnv(db, {
+      AI: makeClassifyingAIMock({
+        confidence: 0.9,
+        importance: 4,
+        canonical: true,
+        kind: "semantic",
+      }),
+    });
+    db.entries.push(
+      unclassifiedEntry("needs-classification"),
+      {
+        id: "recent",
+        content: "Recent classified memory",
+        tags: JSON.stringify(["work", "kind:semantic"]),
+        source: "api",
+        created_at: Date.now(),
+        vector_ids: '["recent-active"]',
+        recall_count: 0,
+        importance_score: 0,
+        classification_confidence: 0.9,
+        classification_status: "succeeded",
+        classification_error: null,
+        classification_attempts: 1,
+        classified_at: Date.now(),
+      }
+    );
+
+    await worker.fetch(req("POST", "/settings/models/reindex"), env, ctx);
+    await worker.fetch(req("POST", "/vectorize-pending"), env, ctx);
+    const row = db.entries.find((entry: any) => entry.id === "needs-classification");
+    const stalePendingIds = JSON.parse(row.pending_vector_ids);
+    expect(stalePendingIds.length).toBeGreaterThan(0);
+    expect(row.pending_metadata_hash).toBeTruthy();
+
+    const classifyRes = await worker.fetch(req("POST", "/classify-pending"), env, ctx);
+    const classifyData = await classifyRes.json() as any;
+
+    expect(classifyRes.status).toBe(200);
+    expect(classifyData).toMatchObject({ processed: 1, failed: 0 });
+    expect(row.pending_vector_ids).toBe("[]");
+    expect(row.pending_content_hash).toBeNull();
+    expect(row.pending_revision_id).toBeNull();
+    expect(row.pending_metadata_hash).toBeNull();
+    expect(db.vectorCleanupQueue.map((item: any) => item.vector_id)).toEqual(stalePendingIds);
+    expect(db.vectorCleanupQueue.every((item: any) => item.reason === "classification_metadata_changed")).toBe(true);
+
+    const vectorizeRes = await worker.fetch(
+      req("POST", "/vectorize-pending", { body: { includeRecent: true } }),
+      env,
+      ctx
+    );
+    const vectorizeData = await vectorizeRes.json() as any;
+
+    expect(vectorizeRes.status).toBe(200);
+    expect(vectorizeData.mode).toBe("blue_green");
+    expect(vectorizeData.repairedPendingGenerations).toBe(0);
+    expect(vectorizeData.activated).toBe(2);
+    expect(vectorizeData.activationBlocked).toBe(0);
+    expect(row.pending_vector_ids).toBeNull();
+    expect(row.vector_ids).not.toBe('["v"]');
+  });
+
   it("keeps self-hosted classification batches bounded", async () => {
     env = makeTestEnv(db, {
       AI: makeClassifyingAIMock({ importance: 3, canonical: false, kind: "semantic" }),

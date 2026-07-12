@@ -7,7 +7,7 @@ const MEMORY_BACKUP_FEATURES = [
   "atomic-memory",
   "temporal-facts",
   "fact-sources",
-  "embedding-profiles",
+  "embedding-fingerprints",
 ] as const;
 
 const GRAPH_ARRAY_KEYS = [

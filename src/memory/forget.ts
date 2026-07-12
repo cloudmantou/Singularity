@@ -32,6 +32,9 @@ interface DigestSourceRow {
   content: string;
   tags: string;
   source: string;
+  pending_vector_ids: string | null;
+  pending_rebuild_id: string | null;
+  has_pending_columns?: number;
 }
 
 interface AtomicGraphRows {
@@ -186,13 +189,30 @@ async function loadSurvivingDigestSources(
 
   const rows: DigestSourceRow[] = [];
   for (const batch of chunks([...sourceIds], QUERY_BATCH_SIZE)) {
-    const { results } = await db
-      .prepare(
-        `SELECT id, content, tags, source FROM entries
-         WHERE id IN (${placeholders(batch.length)})`
-      )
-      .bind(...batch)
-      .all<DigestSourceRow>();
+    let results: DigestSourceRow[];
+    try {
+      ({ results } = await db
+        .prepare(
+          `SELECT id, content, tags, source, pending_vector_ids, pending_rebuild_id,
+                  1 AS has_pending_columns
+           FROM entries
+           WHERE id IN (${placeholders(batch.length)})`
+        )
+        .bind(...batch)
+        .all<DigestSourceRow>());
+    } catch (error) {
+      if (!isMissingPendingEntryColumn(error)) throw error;
+      ({ results } = await db
+        .prepare(
+          `SELECT id, content, tags, source,
+                  NULL AS pending_vector_ids, NULL AS pending_rebuild_id,
+                  0 AS has_pending_columns
+           FROM entries
+           WHERE id IN (${placeholders(batch.length)})`
+        )
+        .bind(...batch)
+        .all<DigestSourceRow>());
+    }
     rows.push(...results);
   }
   return rows.every(row => parseTags(row.tags) !== null) ? rows : null;
@@ -241,12 +261,14 @@ function prepareDatabaseErase(
   db: D1Database,
   ids: string[],
   survivingDigestSources: DigestSourceRow[],
-  atomicGraph: AtomicGraphRows
+  atomicGraph: AtomicGraphRows,
+  prepareVectorCleanup?: (vectorIds: string[], reason: string) => D1PreparedStatement[],
 ) {
   const unrollStatements = survivingDigestSources.flatMap(row => {
     const oldTags = parseTags(row.tags) ?? [];
     if (!oldTags.includes("rolled-up")) return [];
     const nextTags = oldTags.filter(tag => tag !== "rolled-up");
+    const pendingIds = parseVectorIds(row.pending_vector_ids ?? "[]") ?? [];
     const revision = prepareMemoryRevision(db, {
       memoryId: row.id,
       eventType: "UNROLL",
@@ -257,9 +279,33 @@ function prepareDatabaseErase(
       reason: "Derived digest was erased and must be rebuilt",
       actor: "system",
     });
+    const updateStatement = row.has_pending_columns === 0
+      ? db.prepare(
+          `UPDATE entries
+           SET tags = ?,
+               metadata_hash = NULL
+           WHERE id = ?`
+        ).bind(JSON.stringify(nextTags), row.id)
+      : db.prepare(
+          `UPDATE entries
+           SET tags = ?,
+               metadata_hash = NULL,
+               pending_vector_ids = CASE
+                 WHEN pending_rebuild_id IS NOT NULL THEN '[]'
+                 ELSE NULL
+               END,
+               pending_embedding_fingerprint = CASE
+                 WHEN pending_rebuild_id IS NOT NULL THEN pending_embedding_fingerprint
+                 ELSE NULL
+               END,
+               pending_content_hash = NULL,
+               pending_revision_id = NULL,
+               pending_metadata_hash = NULL
+           WHERE id = ?`
+        ).bind(JSON.stringify(nextTags), row.id);
     return [
-      db.prepare(`UPDATE entries SET tags = ?, metadata_hash = NULL WHERE id = ?`)
-        .bind(JSON.stringify(nextTags), row.id),
+      ...(prepareVectorCleanup?.(pendingIds, "memory_unroll") ?? []),
+      updateStatement,
       revision.statement,
     ];
   });
@@ -429,7 +475,13 @@ export async function forgetMemoryGraph(
     await db.batch([
       ...cleanupStatements,
       ...rebuildExitStatements,
-      ...prepareDatabaseErase(db, [...trackedIds], survivingDigestSources, atomicGraph),
+      ...prepareDatabaseErase(
+        db,
+        [...trackedIds],
+        survivingDigestSources,
+        atomicGraph,
+        options.prepareVectorCleanup
+      ),
     ]);
   } catch (error) {
     console.error("Database erase failed after vector deletion; retry is safe:", error);

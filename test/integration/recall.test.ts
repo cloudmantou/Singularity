@@ -112,11 +112,12 @@ describe("GET /recall", () => {
       { id: "entry-1", content: "First memory", tags: '["work"]', source: "api", created_at: 1000, vector_ids: "[]", recall_count: 0, importance_score: 0 },
       { id: "entry-2", content: "Second memory", tags: '["idea"]', source: "api", created_at: 2000, vector_ids: "[]", recall_count: 0, importance_score: 0 },
     );
+    const queryMock = vi.fn().mockResolvedValue({
+      matches: [makeMatch("entry-1", 0.9), makeMatch("entry-2", 0.8)],
+    });
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({
-        query: vi.fn().mockResolvedValue({
-          matches: [makeMatch("entry-1", 0.9), makeMatch("entry-2", 0.8)],
-        }),
+        query: queryMock,
       }),
     });
 
@@ -131,6 +132,61 @@ describe("GET /recall", () => {
     expect(data.results[1].score).toBeLessThanOrEqual(data.results[0].score);
     expect(data.results[1]).toMatchObject({ id: "entry-2", content: "Second memory" });
     expect(typeof data.insight === "string" || data.insight === null).toBe(true);
+    const [, options] = queryMock.mock.calls[0];
+    expect(options.filter).toEqual({ embedding_fingerprint: expect.any(String) });
+  });
+
+  it("uses current D1 tags for rerank instead of stale vector metadata", async () => {
+    const now = Date.now();
+    db.entries.push(
+      {
+        id: "entry-current-work",
+        content: "Current D1 tags should drive ranking",
+        tags: '["work"]',
+        source: "api",
+        created_at: now,
+        vector_ids: '["entry-current-work"]',
+        recall_count: 0,
+        importance_score: 0,
+      },
+      {
+        id: "entry-stale-work",
+        content: "Stale vector metadata should not win",
+        tags: '["personal"]',
+        source: "api",
+        created_at: now,
+        vector_ids: '["entry-stale-work"]',
+        recall_count: 0,
+        importance_score: 0,
+      },
+    );
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({
+          matches: [
+            makeMatch("entry-stale-work", 0.9, {
+              parentId: "entry-stale-work",
+              tags: ["work"],
+              created_at: now,
+            }),
+            makeMatch("entry-current-work", 0.9, {
+              parentId: "entry-current-work",
+              tags: ["personal"],
+              created_at: now,
+            }),
+          ],
+        }),
+      }),
+    });
+
+    const res = await worker.fetch(req("GET", "/recall?query=work&topK=2"), env, ctx);
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.results.map((entry: any) => entry.id)).toEqual([
+      "entry-current-work",
+      "entry-stale-work",
+    ]);
   });
 
   it("ignores stale vectors that are no longer referenced by the D1 entry", async () => {
