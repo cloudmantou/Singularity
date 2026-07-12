@@ -241,6 +241,35 @@ describe("SqliteVectorizeIndex", () => {
     expect(matches[0].id).toBe("json-only");
   });
 
+  it("backfills legacy FTS and vec indexes in bounded batches", async () => {
+    raw
+      .prepare(
+        `INSERT INTO sb_vectors (id, values_json, metadata_json, vec_rowid, vector_dim)
+         VALUES (?, ?, ?, NULL, NULL)`
+      )
+      .run(
+        "legacy-index",
+        JSON.stringify([1, 0]),
+        JSON.stringify({ parentId: "legacy", content: "sqlite vector legacy row" })
+      );
+
+    const before = vec.indexStatus();
+    expect(before.vectorCount).toBe(1);
+    if (before.ftsAvailable) expect(before.ftsIndexed).toBe(0);
+    if (before.vecAvailable) expect(before.vecIndexed).toBe(0);
+
+    const result = vec.backfillIndexBatch(10);
+    expect(result.ftsProcessed).toBe(before.ftsAvailable ? 1 : 0);
+    expect(result.vecProcessed).toBe(before.vecAvailable ? 1 : 0);
+    expect(result.remaining).toBe(0);
+
+    const after = vec.indexStatus();
+    expect(after.remaining).toBe(0);
+    if (after.ftsAvailable) {
+      expect(vec.queryLexical("sqlite vector", 10)).toContain("legacy-index");
+    }
+  });
+
   it("keeps queryText out of vector KNN and exposes lexical recall separately", async () => {
     const ftsTable = raw.prepare(
       `SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name = 'sb_vector_fts'`

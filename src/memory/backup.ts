@@ -1,6 +1,15 @@
 import { importEntries, type ImportMode, type ImportOptions, type ImportResult } from "../import-entries";
 
-export const MEMORY_BACKUP_SCHEMA_VERSION = 4;
+export const MEMORY_BACKUP_SCHEMA_VERSION = 5;
+const MEMORY_BACKUP_FORMAT = "singularity-memory-backup";
+const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5]);
+const MEMORY_BACKUP_FEATURES = [
+  "atomic-memory",
+  "temporal-facts",
+  "fact-sources",
+  "embedding-profiles",
+  "vector-rebuild-state",
+] as const;
 
 const GRAPH_ARRAY_KEYS = [
   "observations",
@@ -29,8 +38,10 @@ export interface BackupIntegrityReport {
   issues: Record<string, number>;
 }
 
-export interface MemoryBackupV4 {
-  schemaVersion: 4;
+export interface MemoryBackup {
+  backupFormat: typeof MEMORY_BACKUP_FORMAT;
+  schemaVersion: 5;
+  features: Array<(typeof MEMORY_BACKUP_FEATURES)[number]>;
   exportedAt: string;
   source: string;
   totals: Record<string, number>;
@@ -48,7 +59,7 @@ export interface MemoryBackupV4 {
 }
 
 export interface MemoryBackupImportResult extends ImportResult {
-  schemaVersion: 4;
+  schemaVersion: 5;
   graph: Record<GraphArrayKey, TableImportStats>;
   integrity: BackupIntegrityReport;
 }
@@ -61,7 +72,8 @@ function arrayFrom(value: unknown): BackupRow[] {
 export function isMemoryBackupPayload(body: unknown): boolean {
   if (!body || typeof body !== "object" || Array.isArray(body)) return false;
   const record = body as Record<string, unknown>;
-  return record.schemaVersion === MEMORY_BACKUP_SCHEMA_VERSION ||
+  const schemaVersion = Number(record.schemaVersion);
+  return SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS.has(schemaVersion) ||
     GRAPH_ARRAY_KEYS.some((key) => Array.isArray(record[key]));
 }
 
@@ -148,7 +160,7 @@ export async function inspectMemoryBackupIntegrity(db: D1Database): Promise<Back
 export async function exportMemoryBackup(
   db: D1Database,
   input: { source: string }
-): Promise<MemoryBackupV4> {
+): Promise<MemoryBackup> {
   const [
     entries,
     observations,
@@ -213,7 +225,9 @@ export async function exportMemoryBackup(
   ]);
 
   return {
+    backupFormat: MEMORY_BACKUP_FORMAT,
     schemaVersion: MEMORY_BACKUP_SCHEMA_VERSION,
+    features: [...MEMORY_BACKUP_FEATURES],
     exportedAt: new Date().toISOString(),
     source: input.source,
     totals: {
@@ -332,6 +346,15 @@ export async function importMemoryBackup(
   body: Record<string, unknown>,
   options: ImportOptions = {}
 ): Promise<MemoryBackupImportResult> {
+  const rawSchemaVersion = body.schemaVersion == null ? 4 : Number(body.schemaVersion);
+  if (!Number.isFinite(rawSchemaVersion) || rawSchemaVersion < 4) {
+    throw new Error("Unsupported memory backup schemaVersion");
+  }
+  if (rawSchemaVersion > MEMORY_BACKUP_SCHEMA_VERSION) {
+    throw new Error(
+      `Unsupported memory backup schemaVersion ${rawSchemaVersion}; this runtime supports up to ${MEMORY_BACKUP_SCHEMA_VERSION}`
+    );
+  }
   const mode: ImportMode = options.mode === "overwrite" ? "overwrite" : "skip";
   const entries = arrayFrom(body.entries);
   const entryResult = await importEntries(db, entries, {

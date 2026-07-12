@@ -141,7 +141,6 @@ export class SqliteVectorizeIndex {
     this.ensureMainColumns();
     this.initializeSqliteVec();
     this.initializeFts();
-    this.backfillIndexes();
   }
 
   async insert(
@@ -273,6 +272,119 @@ export class SqliteVectorizeIndex {
     return this.ftsCandidateIds(queryText, Math.max(1, Math.min(topK, 500)));
   }
 
+  backfillIndexBatch(limit = 200): {
+    ftsProcessed: number;
+    vecProcessed: number;
+    remaining: number;
+  } {
+    const safeLimit = Math.max(1, Math.min(Math.trunc(limit) || 200, 1000));
+    let ftsProcessed = 0;
+    let vecProcessed = 0;
+
+    if (this.ftsAvailable) {
+      const rows = this.db
+        .prepare(
+          `SELECT v.id, v.metadata_json
+           FROM sb_vectors v
+           LEFT JOIN sb_vector_fts f ON f.id = v.id
+           WHERE f.id IS NULL
+           ORDER BY v.id
+           LIMIT ?`
+        )
+        .all(safeLimit) as Array<{ id: string; metadata_json: string }>;
+      if (rows.length) {
+        const insertFts = this.db.prepare(
+          `INSERT INTO sb_vector_fts (id, content) VALUES (?, ?)`
+        );
+        const tx = this.db.transaction((items: typeof rows) => {
+          for (const row of items) {
+            insertFts.run(row.id, ftsContent(parseJson(row.metadata_json, {})));
+          }
+        });
+        tx(rows);
+        ftsProcessed = rows.length;
+      }
+    }
+
+    if (this.vecAvailable) {
+      const rows = this.db
+        .prepare(
+          `SELECT id, values_json
+           FROM sb_vectors
+           WHERE vec_rowid IS NULL OR vector_dim IS NULL
+           ORDER BY id
+           LIMIT ?`
+        )
+        .all(safeLimit) as Array<{ id: string; values_json: string }>;
+      if (rows.length) {
+        const update = this.db.prepare(
+          `UPDATE sb_vectors SET vec_rowid = ?, vector_dim = ? WHERE id = ?`
+        );
+        const tx = this.db.transaction((items: typeof rows) => {
+          for (const row of items) {
+            const values = parseJson<number[]>(row.values_json, []);
+            const dim = vectorDimension(values);
+            if (dim == null) continue;
+            const vecRowid = this.insertVecRow(dim, values);
+            update.run(vecRowid, dim, row.id);
+            vecProcessed++;
+          }
+        });
+        tx(rows);
+      }
+    }
+
+    return {
+      ftsProcessed,
+      vecProcessed,
+      remaining: this.indexStatus().remaining,
+    };
+  }
+
+  indexStatus(): {
+    vectorCount: number;
+    ftsAvailable: boolean;
+    ftsTokenizer: "trigram" | "unicode61" | null;
+    ftsIndexed: number;
+    vecAvailable: boolean;
+    vecIndexed: number;
+    remaining: number;
+  } {
+    const vectorCount = Number((this.db
+      .prepare(`SELECT COUNT(*) as count FROM sb_vectors`)
+      .get() as { count: number }).count ?? 0);
+    const ftsIndexed = this.ftsAvailable
+      ? Number((this.db
+          .prepare(`SELECT COUNT(DISTINCT id) as count FROM sb_vector_fts`)
+          .get() as { count: number }).count ?? 0)
+      : vectorCount;
+    const vecIndexed = this.vecAvailable
+      ? Number((this.db
+          .prepare(
+            `SELECT COUNT(*) as count
+             FROM sb_vectors
+             WHERE vec_rowid IS NOT NULL
+               AND vector_dim IS NOT NULL`
+          )
+          .get() as { count: number }).count ?? 0)
+      : vectorCount;
+    const ftsRemaining = this.ftsAvailable
+      ? Math.max(0, vectorCount - ftsIndexed)
+      : 0;
+    const vecRemaining = this.vecAvailable
+      ? Math.max(0, vectorCount - vecIndexed)
+      : 0;
+    return {
+      vectorCount,
+      ftsAvailable: this.ftsAvailable,
+      ftsTokenizer: this.ftsTokenizer,
+      ftsIndexed,
+      vecAvailable: this.vecAvailable,
+      vecIndexed,
+      remaining: ftsRemaining + vecRemaining,
+    };
+  }
+
   async describe(): Promise<VectorizeIndexDetails> {
     const row = this.db.prepare(`SELECT COUNT(*) as n FROM sb_vectors`).get() as { n: number };
     const sample = this.db
@@ -379,53 +491,6 @@ export class SqliteVectorizeIndex {
         );
       }
     }
-  }
-
-  private backfillIndexes(): void {
-    if (this.ftsAvailable) {
-      const ftsCount = this.db
-        .prepare(`SELECT COUNT(*) as count FROM sb_vector_fts`)
-        .get() as { count: number };
-      const vectorCount = this.db
-        .prepare(`SELECT COUNT(*) as count FROM sb_vectors`)
-        .get() as { count: number };
-      if (ftsCount.count !== vectorCount.count) {
-        const rows = this.selectAllRows();
-        const insertFts = this.db.prepare(
-          `INSERT INTO sb_vector_fts (id, content) VALUES (?, ?)`
-        );
-        const tx = this.db.transaction((items: VectorRow[]) => {
-          this.db.prepare(`DELETE FROM sb_vector_fts`).run();
-          for (const row of items) {
-            insertFts.run(row.id, ftsContent(parseJson(row.metadata_json, {})));
-          }
-        });
-        tx(rows);
-      }
-    }
-
-    if (!this.vecAvailable) return;
-    const missing = this.db
-      .prepare(
-        `SELECT id, values_json FROM sb_vectors
-         WHERE vec_rowid IS NULL OR vector_dim IS NULL`
-      )
-      .all() as Array<{ id: string; values_json: string }>;
-    if (!missing.length) return;
-
-    const update = this.db.prepare(
-      `UPDATE sb_vectors SET vec_rowid = ?, vector_dim = ? WHERE id = ?`
-    );
-    const tx = this.db.transaction((rows: typeof missing) => {
-      for (const row of rows) {
-        const values = parseJson<number[]>(row.values_json, []);
-        const dim = vectorDimension(values);
-        if (dim == null) continue;
-        const vecRowid = this.insertVecRow(dim, values);
-        update.run(vecRowid, dim, row.id);
-      }
-    });
-    tx(missing);
   }
 
   private ensureVecTable(dim: number): void {

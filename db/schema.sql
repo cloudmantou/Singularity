@@ -255,3 +255,18 @@ CREATE TABLE IF NOT EXISTS sb_fact_sources (
 );
 CREATE INDEX IF NOT EXISTS idx_sb_fact_sources_relation ON sb_fact_sources(relation_id);
 CREATE INDEX IF NOT EXISTS idx_sb_fact_sources_memory ON sb_fact_sources(memory_id);
+DELETE FROM sb_fact_sources
+WHERE rowid NOT IN (
+  SELECT MIN(rowid)
+  FROM sb_fact_sources
+  GROUP BY
+    relation_id,
+    COALESCE(memory_id, ''),
+    COALESCE(observation_id, '')
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fact_sources_identity
+  ON sb_fact_sources (
+    relation_id,
+    COALESCE(memory_id, ''),
+    COALESCE(observation_id, '')
+  );

@@ -176,6 +176,55 @@ describe("memory data model", () => {
     expect(factSources).toBeTruthy();
   });
 
+  it("deduplicates NULL fact sources before adding the identity index", async () => {
+    const db = new SqliteD1Database(raw) as unknown as D1Database;
+    raw.exec(`
+      CREATE TABLE sb_fact_sources (
+        id TEXT PRIMARY KEY,
+        relation_id TEXT NOT NULL,
+        memory_id TEXT,
+        observation_id TEXT,
+        created_at INTEGER NOT NULL,
+        UNIQUE(relation_id, memory_id, observation_id)
+      )
+    `);
+    raw
+      .prepare(
+        `INSERT INTO sb_fact_sources (id, relation_id, memory_id, observation_id, created_at)
+         VALUES (?, ?, ?, ?, ?)`
+      )
+      .run("source-a", "relation-1", "memory-1", null, 1);
+    raw
+      .prepare(
+        `INSERT INTO sb_fact_sources (id, relation_id, memory_id, observation_id, created_at)
+         VALUES (?, ?, ?, ?, ?)`
+      )
+      .run("source-b", "relation-1", "memory-1", null, 2);
+
+    await ensureMemoryDataModel(db);
+
+    const rows = raw
+      .prepare(`SELECT id FROM sb_fact_sources ORDER BY created_at`)
+      .all() as Array<{ id: string }>;
+    expect(rows).toEqual([{ id: "source-a" }]);
+    const indexes = raw
+      .prepare(`PRAGMA index_list('sb_fact_sources')`)
+      .all() as Array<{ name: string; unique: number }>;
+    expect(indexes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "idx_fact_sources_identity", unique: 1 }),
+      ])
+    );
+    expect(() =>
+      raw
+        .prepare(
+          `INSERT INTO sb_fact_sources (id, relation_id, memory_id, observation_id, created_at)
+           VALUES (?, ?, ?, ?, ?)`
+        )
+        .run("source-c", "relation-1", "memory-1", null, 3)
+    ).toThrow();
+  });
+
   it("rejects invalid relation endpoints, types, and scores before SQL", () => {
     expect(() => buildMemoryRelation({
       fromMemoryId: "same",

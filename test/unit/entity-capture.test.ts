@@ -171,4 +171,66 @@ describe("entity dual-write from capture", () => {
     expect(db.factSources).toHaveLength(3);
     expect(db.factSources.map((source) => source.memory_id).sort()).toEqual(["mem-1", "mem-2", "mem-3"]);
   });
+
+  it("keeps identical facts in separate temporal windows", async () => {
+    const now = Date.now();
+    const base = {
+      entities: [
+        { name: "Singularity", entityType: "project" as const },
+        { name: "SQLite", entityType: "product" as const },
+      ],
+      relations: [
+        {
+          from: "Singularity",
+          to: "SQLite",
+          relationType: "uses" as const,
+          fact: "Singularity uses SQLite",
+        },
+      ],
+      score: 0.8,
+    };
+
+    await attachEntitiesToMemory(db as unknown as D1Database, {
+      ...base,
+      memoryId: "mem-window-a",
+      observationId: "obs-window-a",
+      validFrom: 1_000,
+      validTo: 2_000,
+      createdAt: now - 300,
+    });
+    await attachEntitiesToMemory(db as unknown as D1Database, {
+      ...base,
+      memoryId: "mem-window-b",
+      observationId: "obs-window-b",
+      validFrom: 1_500,
+      validTo: 2_500,
+      score: 0.9,
+      createdAt: now - 200,
+    });
+    await attachEntitiesToMemory(db as unknown as D1Database, {
+      ...base,
+      memoryId: "mem-window-c",
+      observationId: "obs-window-c",
+      validFrom: 200_000_000,
+      validTo: 200_010_000,
+      createdAt: now - 100,
+    });
+
+    const uses = db.entityRelations
+      .filter((relation) => relation.relation_type === "uses")
+      .sort((a, b) => Number(a.valid_from ?? 0) - Number(b.valid_from ?? 0));
+    expect(uses).toHaveLength(2);
+    expect(uses[0]).toMatchObject({
+      evidence_count: 2,
+      score: 0.9,
+      valid_from: 1_000,
+      valid_to: 2_500,
+    });
+    expect(uses[1]).toMatchObject({
+      evidence_count: 1,
+      valid_from: 200_000_000,
+      valid_to: 200_010_000,
+    });
+    expect(db.factSources).toHaveLength(3);
+  });
 });

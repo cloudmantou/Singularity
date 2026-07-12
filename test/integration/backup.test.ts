@@ -134,7 +134,17 @@ describe("full memory backup import/export", () => {
     expect(exportResponse.status).toBe(200);
     const backup = await exportResponse.json() as any;
 
-    expect(backup.schemaVersion).toBe(4);
+    expect(backup.backupFormat).toBe("singularity-memory-backup");
+    expect(backup.schemaVersion).toBe(5);
+    expect(backup.features).toEqual(
+      expect.arrayContaining([
+        "atomic-memory",
+        "temporal-facts",
+        "fact-sources",
+        "embedding-profiles",
+        "vector-rebuild-state",
+      ])
+    );
     expect(backup.integrity.ok).toBe(true);
     expect(backup.totals).toMatchObject({
       entries: 2,
@@ -161,7 +171,7 @@ describe("full memory backup import/export", () => {
     );
     expect(importResponse.status).toBe(200);
     const imported = await importResponse.json() as any;
-    expect(imported.schemaVersion).toBe(4);
+    expect(imported.schemaVersion).toBe(5);
     expect(imported.inserted).toBe(2);
     expect(imported.graph.memories.imported).toBe(1);
     expect(imported.graph.entityRelations.imported).toBe(1);
@@ -177,7 +187,41 @@ describe("full memory backup import/export", () => {
     expect(restoredBackup.totals).toMatchObject(backup.totals);
     expect(restoredBackup.integrity.ok).toBe(true);
 
+    const legacy = {
+      ...backup,
+      schemaVersion: 4,
+      features: undefined,
+      factSources: undefined,
+    };
+    const legacyRestored = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    await initializeDatabase(legacyRestored.env);
+    const legacyImportResponse = await worker.fetch(
+      auth("/import", {
+        method: "POST",
+        body: JSON.stringify(legacy),
+      }),
+      legacyRestored.env,
+      createExecutionContext()
+    );
+    expect(legacyImportResponse.status).toBe(200);
+    const legacyImported = await legacyImportResponse.json() as any;
+    expect(legacyImported.schemaVersion).toBe(5);
+    expect(legacyImported.graph.factSources.total).toBe(0);
+
+    const futureImportResponse = await worker.fetch(
+      auth("/import", {
+        method: "POST",
+        body: JSON.stringify({ ...backup, schemaVersion: 6 }),
+      }),
+      legacyRestored.env,
+      createExecutionContext()
+    );
+    expect(futureImportResponse.status).toBe(400);
+    const futureImported = await futureImportResponse.json() as any;
+    expect(futureImported.error).toMatch(/schemaVersion 6/);
+
     db.close();
     restored.db.close();
+    legacyRestored.db.close();
   });
 });

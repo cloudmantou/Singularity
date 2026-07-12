@@ -6481,7 +6481,8 @@ const defaultHandler = {
       const fullExport =
         url.searchParams.get("full") === "1" ||
         url.searchParams.get("full") === "true" ||
-        url.searchParams.get("schemaVersion") === "4";
+        url.searchParams.get("schemaVersion") === "4" ||
+        url.searchParams.get("schemaVersion") === "5";
       if (fullExport) {
         return json(await exportMemoryBackup(env.DB, {
           source: env.SELFHOST === "1" ? "selfhost" : "cloudflare",
@@ -6857,6 +6858,44 @@ const defaultHandler = {
         url.searchParams.get("dryRun") === "true";
       if (dryRun) return json(await inspectExtractionQueue(env, limit));
       return json(await processExtractionQueue(env, ctx, limit));
+    }
+
+    // GET /maintenance/vector-index/status — self-host SQLite vector index progress.
+    if (url.pathname === "/maintenance/vector-index/status" && request.method === "GET") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+      const status = (env.VECTORIZE as any).indexStatus?.();
+      if (!status) {
+        return json({
+          ok: false,
+          error: "vector_index_status_unavailable",
+        }, 400);
+      }
+      return json({ ok: true, status });
+    }
+
+    // POST /maintenance/vector-index/backfill — bounded self-host SQLite index backfill.
+    if (url.pathname === "/maintenance/vector-index/backfill" && request.method === "POST") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+      let body: { limit?: number } = {};
+      try {
+        body = await request.json();
+      } catch {
+        /* empty body OK */
+      }
+      const backfill = (env.VECTORIZE as any).backfillIndexBatch?.bind(env.VECTORIZE);
+      if (!backfill) {
+        return json({
+          ok: false,
+          error: "vector_index_backfill_unavailable",
+        }, 400);
+      }
+      const limit = Math.min(Math.max(Number(body.limit) || 200, 1), 1000);
+      return json({
+        ok: true,
+        ...backfill(limit),
+      });
     }
 
     // POST /vectorize-pending

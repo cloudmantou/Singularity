@@ -85,6 +85,38 @@ function entityRelationFactHash(input: {
   );
 }
 
+function finiteOrNull(value: number | null | undefined): number | null {
+  return value == null || !Number.isFinite(Number(value)) ? null : Number(value);
+}
+
+function temporalPointOrNull(input: {
+  validFrom?: number | null;
+  validTo?: number | null;
+  referenceTime?: number | null;
+}): { from: number | null; to: number | null } {
+  const validFrom = finiteOrNull(input.validFrom);
+  const validTo = finiteOrNull(input.validTo);
+  const referenceTime = finiteOrNull(input.referenceTime);
+  if (validFrom == null && validTo == null && referenceTime != null) {
+    return { from: referenceTime, to: referenceTime };
+  }
+  return { from: validFrom, to: validTo };
+}
+
+export function temporalWindowsOverlap(
+  aFrom: number | null | undefined,
+  aTo: number | null | undefined,
+  bFrom: number | null | undefined,
+  bTo: number | null | undefined,
+  toleranceMs = 86_400_000
+): boolean {
+  const aStart = finiteOrNull(aFrom) ?? Number.NEGATIVE_INFINITY;
+  const aEnd = finiteOrNull(aTo) ?? Number.POSITIVE_INFINITY;
+  const bStart = finiteOrNull(bFrom) ?? Number.NEGATIVE_INFINITY;
+  const bEnd = finiteOrNull(bTo) ?? Number.POSITIVE_INFINITY;
+  return aStart <= bEnd + toleranceMs && bStart <= aEnd + toleranceMs;
+}
+
 export function normalizeEntityType(raw: unknown): EntityType | null {
   if (typeof raw !== "string") return null;
   const v = raw.trim().toLowerCase().replace(/\s+/g, "_");
@@ -246,6 +278,25 @@ export async function ensureEntityDataModel(db: D1Database): Promise<void> {
   for (const statement of ENTITY_SCHEMA_STATEMENTS) {
     await db.exec(statement);
   }
+  await db.exec(
+    `DELETE FROM sb_fact_sources
+     WHERE rowid NOT IN (
+       SELECT MIN(rowid)
+       FROM sb_fact_sources
+       GROUP BY
+         relation_id,
+         COALESCE(memory_id, ''),
+         COALESCE(observation_id, '')
+     )`
+  );
+  await db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_fact_sources_identity
+     ON sb_fact_sources (
+       relation_id,
+       COALESCE(memory_id, ''),
+       COALESCE(observation_id, '')
+     )`
+  );
   for (const alter of [
     `ALTER TABLE sb_memories ADD COLUMN reference_time INTEGER`,
     `ALTER TABLE sb_memories ADD COLUMN invalid_at INTEGER`,
@@ -346,22 +397,6 @@ async function insertFactSource(
     createdAt: number;
   }
 ): Promise<boolean> {
-  const existing = await db
-    .prepare(
-      `SELECT id FROM sb_fact_sources
-       WHERE relation_id = ?
-         AND COALESCE(memory_id, '') = ?
-         AND COALESCE(observation_id, '') = ?
-       LIMIT 1`
-    )
-    .bind(
-      input.relationId,
-      input.memoryId ?? "",
-      input.observationId ?? ""
-    )
-    .first<{ id: string }>();
-  if (existing?.id) return false;
-
   const result = await db
     .prepare(
       `INSERT OR IGNORE INTO sb_fact_sources (
@@ -400,9 +435,11 @@ export async function insertEntityRelation(
 ): Promise<string> {
   const factKey = normalizeEntityFactKey(input.fact);
   const factHash = entityRelationFactHash(input);
-  const existing = await db
+  const inputWindow = temporalPointOrNull(input);
+  const existingRows = await db
     .prepare(
-      `SELECT id FROM sb_entity_relations
+      `SELECT id, valid_from, valid_to, reference_time
+       FROM sb_entity_relations
        WHERE from_entity_id = ?
          AND to_entity_id = ?
          AND relation_type = ?
@@ -412,7 +449,8 @@ export async function insertEntityRelation(
          )
          AND invalid_at IS NULL
          AND expired_at IS NULL
-       LIMIT 1`
+       ORDER BY created_at DESC
+       LIMIT 20`
     )
     .bind(
       input.fromEntityId,
@@ -421,7 +459,20 @@ export async function insertEntityRelation(
       factHash,
       factKey
     )
-    .first<{ id: string }>();
+    .all<{ id: string; valid_from: number | null; valid_to: number | null; reference_time: number | null }>();
+  const existing = (existingRows.results ?? []).find((row) => {
+    const rowWindow = temporalPointOrNull({
+      validFrom: row.valid_from,
+      validTo: row.valid_to,
+      referenceTime: row.reference_time,
+    });
+    return temporalWindowsOverlap(
+      rowWindow.from,
+      rowWindow.to,
+      inputWindow.from,
+      inputWindow.to
+    );
+  });
   if (existing?.id) {
     const sourceInserted = await insertFactSource(db, {
       relationId: existing.id,
@@ -441,7 +492,18 @@ export async function insertEntityRelation(
                WHEN ? IS NULL THEN score
                WHEN score IS NULL OR score < ? THEN ?
                ELSE score
-             END
+             END,
+             valid_from = CASE
+               WHEN valid_from IS NULL THEN ?
+               WHEN ? IS NULL THEN valid_from
+               ELSE MIN(valid_from, ?)
+             END,
+             valid_to = CASE
+               WHEN valid_to IS NULL THEN ?
+               WHEN ? IS NULL THEN valid_to
+               ELSE MAX(valid_to, ?)
+             END,
+             reference_time = COALESCE(reference_time, ?)
          WHERE id = ?`
       )
       .bind(
@@ -450,6 +512,13 @@ export async function insertEntityRelation(
         input.score ?? null,
         input.score ?? null,
         input.score ?? null,
+        input.validFrom ?? null,
+        input.validFrom ?? null,
+        input.validFrom ?? null,
+        input.validTo ?? null,
+        input.validTo ?? null,
+        input.validTo ?? null,
+        input.referenceTime ?? null,
         existing.id
       )
       .run();

@@ -497,7 +497,21 @@ export class D1Mock {
           return { meta: { changes } };
         }
         if (s.startsWith("UPDATE sb_entity_relations SET fact_hash")) {
-          const [fact_hash, sourceInserted, scoreA, scoreB, scoreC, id] = args;
+          const [
+            fact_hash,
+            sourceInserted,
+            scoreA,
+            scoreB,
+            scoreC,
+            validFromA,
+            validFromB,
+            validFromC,
+            validToA,
+            validToB,
+            validToC,
+            referenceTime,
+            id,
+          ] = args;
           const row = db.entityRelations.find((relation: any) => relation.id === id);
           if (row) {
             row.fact_hash = row.fact_hash ?? fact_hash;
@@ -505,6 +519,11 @@ export class D1Mock {
             if (scoreA != null && (row.score == null || Number(row.score) < Number(scoreB))) {
               row.score = scoreC;
             }
+            if (row.valid_from == null) row.valid_from = validFromA ?? null;
+            else if (validFromB != null) row.valid_from = Math.min(Number(row.valid_from), Number(validFromC));
+            if (row.valid_to == null) row.valid_to = validToA ?? null;
+            else if (validToB != null) row.valid_to = Math.max(Number(row.valid_to), Number(validToC));
+            row.reference_time = row.reference_time ?? referenceTime ?? null;
           }
           return { meta: { changes: row ? 1 : 0 } };
         }
@@ -1690,6 +1709,30 @@ export class D1Mock {
       },
       async all() {
         db.statementCount += 1;
+        if (s.includes("SELECT id, valid_from, valid_to, reference_time") && s.includes("FROM sb_entity_relations")) {
+          const [fromEntityId, toEntityId, relationType, factHash, factKey] = args.map(String);
+          const results = db.entityRelations
+            .filter((relation: any) =>
+              String(relation.from_entity_id) === fromEntityId &&
+              String(relation.to_entity_id) === toEntityId &&
+              String(relation.relation_type) === relationType &&
+              (
+                String(relation.fact_hash ?? "") === factHash ||
+                (!relation.fact_hash && String(relation.fact ?? "").trim().toLowerCase() === factKey)
+              ) &&
+              relation.invalid_at == null &&
+              relation.expired_at == null
+            )
+            .sort((a: any, b: any) => Number(b.created_at ?? 0) - Number(a.created_at ?? 0))
+            .slice(0, 20)
+            .map((relation: any) => ({
+              id: relation.id,
+              valid_from: relation.valid_from ?? null,
+              valid_to: relation.valid_to ?? null,
+              reference_time: relation.reference_time ?? null,
+            }));
+          return { results };
+        }
         if (s.includes("SELECT id, vector_ids, pending_vector_ids") && s.includes("pending_rebuild_id = ?")) {
           const pendingFingerprint = String(args[0]);
           const rebuildId = String(args[1]);
