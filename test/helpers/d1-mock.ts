@@ -13,6 +13,9 @@ export class D1Mock {
   entries: any[] = [];
   relations: any[] = [];
   revisions: any[] = [];
+  scopes: any[] = [];
+  parentUnits: any[] = [];
+  parentVersions: any[] = [];
   observations: any[] = [];
   memories: any[] = [];
   memorySources: any[] = [];
@@ -383,8 +386,135 @@ export class D1Mock {
           );
           return { meta: { changes: before - db.vectorCleanupQueue.length } };
         }
+        if (s.startsWith("INSERT INTO sb_scopes") || s.startsWith("INSERT OR IGNORE INTO sb_scopes") || s.startsWith("INSERT OR REPLACE INTO sb_scopes")) {
+          const [scope_id, parent_scope_id, canonical_name, aliases_json, scope_type, created_at, updated_at] = args;
+          const existing = db.scopes.find((row: any) => row.scope_id === scope_id);
+          const next = { scope_id, parent_scope_id, canonical_name, aliases_json, scope_type, created_at, updated_at };
+          if (existing) Object.assign(existing, next);
+          else db.scopes.push(next);
+          return { meta: { changes: existing && s.startsWith("INSERT OR IGNORE") ? 0 : 1 } };
+        }
+        if (s.startsWith("INSERT INTO sb_parent_units") || s.startsWith("INSERT OR IGNORE INTO sb_parent_units") || s.startsWith("INSERT OR REPLACE INTO sb_parent_units")) {
+          const [parent_id, active_version_id, scope_id, created_at, updated_at] = args;
+          const existing = db.parentUnits.find((row: any) => row.parent_id === parent_id);
+          if (existing) {
+            if (s.startsWith("INSERT OR IGNORE")) return { meta: { changes: 0 } };
+            if (!s.startsWith("INSERT INTO sb_parent_units") || !s.includes("ON CONFLICT")) {
+              existing.active_version_id = active_version_id;
+              existing.scope_id = scope_id;
+              existing.created_at = created_at;
+            }
+            existing.updated_at = updated_at;
+          } else {
+            db.parentUnits.push({ parent_id, active_version_id, scope_id, created_at, updated_at });
+          }
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("INSERT OR IGNORE INTO sb_parent_versions") || s.startsWith("INSERT OR REPLACE INTO sb_parent_versions")) {
+          let version_id: any;
+          let parent_id: any;
+          let version_number: any;
+          let source_observation_id: any;
+          let source_snapshot_hash: any;
+          let summary: any = null;
+          let state: any;
+          let summary_vector_ids: any = "[]";
+          let created_at: any;
+          let updated_at: any;
+          if (args.length >= 10) {
+            [
+              version_id, parent_id, version_number, source_observation_id,
+              source_snapshot_hash, summary, state, summary_vector_ids, created_at, updated_at,
+            ] = args;
+          } else {
+            [
+              version_id, parent_id, version_number, source_observation_id,
+              source_snapshot_hash, state, created_at, updated_at,
+            ] = args;
+          }
+          const existing = db.parentVersions.find((row: any) =>
+            row.version_id === version_id ||
+            (row.parent_id === parent_id && Number(row.version_number) === Number(version_number))
+          );
+          if (existing) {
+            if (s.startsWith("INSERT OR REPLACE")) {
+              Object.assign(existing, {
+                version_id, parent_id, version_number, source_observation_id,
+                source_snapshot_hash, summary, state, summary_vector_ids, created_at, updated_at,
+              });
+              return { meta: { changes: 1 } };
+            }
+            return { meta: { changes: 0 } };
+          }
+          db.parentVersions.push({
+            version_id, parent_id, version_number, source_observation_id,
+            source_snapshot_hash, summary, state, summary_vector_ids, created_at, updated_at,
+          });
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("UPDATE sb_parent_versions SET state = 'superseded'")) {
+          const [updated_at, parent_id, version_id] = args;
+          let changes = 0;
+          for (const row of db.parentVersions) {
+            if (row.parent_id === parent_id && row.state === "active" && row.version_id !== version_id) {
+              row.state = "superseded";
+              row.updated_at = updated_at;
+              changes++;
+            }
+          }
+          return { meta: { changes } };
+        }
+        if (s.startsWith("UPDATE sb_parent_versions SET state = 'active'")) {
+          const [updated_at, parent_id, version_id] = args;
+          const row = db.parentVersions.find((item: any) =>
+            item.parent_id === parent_id && item.version_id === version_id
+          );
+          if (row) {
+            row.state = "active";
+            row.updated_at = updated_at;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE sb_parent_versions SET state = 'failed'")) {
+          const [updated_at, version_id] = args;
+          const row = db.parentVersions.find((item: any) =>
+            item.version_id === version_id && item.state === "building"
+          );
+          if (row) {
+            row.state = "failed";
+            row.updated_at = updated_at;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE sb_parent_units SET active_version_id")) {
+          const [active_version_id, updated_at, parent_id] = args;
+          const row = db.parentUnits.find((item: any) => item.parent_id === parent_id);
+          if (row) {
+            row.active_version_id = active_version_id;
+            row.updated_at = updated_at;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
         if (s.startsWith("INSERT INTO sb_observations")) {
-          if (args.length >= 14) {
+          if (args.length >= 22) {
+            const [
+              id, content, source, metadata_json, content_hash,
+              source_channel, source_identity, author_type, source_uri,
+              source_timestamp, revision, root_evidence_id, previous_evidence_id,
+              extraction_status, extraction_version, extraction_attempts,
+              extraction_error, next_attempt_at, processing_started_at,
+              processed_at, needs_reprocess, created_at,
+            ] = args;
+            db.observations.push({
+              id, content, source, metadata_json, content_hash,
+              source_channel, source_identity, author_type, source_uri,
+              source_timestamp, revision, root_evidence_id, previous_evidence_id,
+              extraction_status, extraction_version, extraction_attempts,
+              extraction_error, next_attempt_at, processing_started_at,
+              processed_at, needs_reprocess,
+              created_at,
+            });
+          } else if (args.length >= 14) {
             const [
               id, content, source, metadata_json, content_hash,
               extraction_status, extraction_version, extraction_attempts,
@@ -393,6 +523,14 @@ export class D1Mock {
             ] = args;
             db.observations.push({
               id, content, source, metadata_json, content_hash,
+              source_channel: source,
+              source_identity: null,
+              author_type: "unknown",
+              source_uri: null,
+              source_timestamp: created_at,
+              revision: 1,
+              root_evidence_id: id,
+              previous_evidence_id: null,
               extraction_status, extraction_version, extraction_attempts,
               extraction_error, next_attempt_at, processing_started_at,
               processed_at, needs_reprocess,
@@ -403,6 +541,14 @@ export class D1Mock {
             db.observations.push({
               id, content, source, metadata_json,
               content_hash: null,
+              source_channel: source,
+              source_identity: null,
+              author_type: "unknown",
+              source_uri: null,
+              source_timestamp: created_at,
+              revision: 1,
+              root_evidence_id: id,
+              previous_evidence_id: null,
               extraction_status: "pending",
               extraction_version: 1,
               extraction_attempts: 0,
@@ -507,6 +653,12 @@ export class D1Mock {
           }
           return { meta: { changes: row ? 1 : 0 } };
         }
+        if (s.startsWith("UPDATE sb_observations SET metadata_json = ?")) {
+          const [metadata_json, id] = args;
+          const row = db.observations.find((observation: any) => observation.id === id);
+          if (row) row.metadata_json = metadata_json;
+          return { meta: { changes: row ? 1 : 0 } };
+        }
         if (s.startsWith("INSERT INTO sb_memories")) {
           let id: any;
           let content: any;
@@ -515,6 +667,15 @@ export class D1Mock {
           let importance: any;
           let confidence: any;
           let entry_id: any;
+          let parent_version_id: any = null;
+          let claim_subject: any = null;
+          let claim_predicate: any = null;
+          let claim_object: any = null;
+          let scope_id: any = null;
+          let polarity: any = "positive";
+          let modality: any = "asserted";
+          let claim_status: any = "supported";
+          let scores_json: any = "{}";
           let content_hash: any;
           let observed_at: any;
           let valid_from: any;
@@ -524,7 +685,15 @@ export class D1Mock {
           let expired_at: any;
           let entities_json: any;
           let created_at: any;
-          if (args.length >= 16) {
+          if (args.length >= 25) {
+            [
+              id, content, kind, memory_class, importance, confidence,
+              entry_id, parent_version_id, claim_subject, claim_predicate,
+              claim_object, scope_id, polarity, modality, claim_status,
+              scores_json, content_hash, observed_at, valid_from, valid_to,
+              reference_time, invalid_at, expired_at, entities_json, created_at,
+            ] = args;
+          } else if (args.length >= 16) {
             [
               id, content, kind, memory_class, importance, confidence,
               entry_id, content_hash, observed_at, valid_from, valid_to,
@@ -546,13 +715,47 @@ export class D1Mock {
           }
           db.memories.push({
             id, content, kind, memory_class, importance, confidence,
-            entry_id, content_hash, observed_at, valid_from, valid_to,
+            entry_id, parent_version_id, claim_subject, claim_predicate,
+            claim_object, scope_id, polarity, modality, claim_status,
+            scores_json, content_hash, observed_at, valid_from, valid_to,
             reference_time, invalid_at, expired_at, entities_json, created_at,
           });
           return { meta: { changes: 1 } };
         }
         if (s.startsWith("INSERT INTO sb_memory_sources")) {
-          const [id, memory_id, observation_id, role, score, created_at] = args;
+          let id: any;
+          let memory_id: any;
+          let observation_id: any;
+          let role: any;
+          let score: any;
+          let relation: any = "derived_from";
+          let extract_span: any = null;
+          let evidence_score: any = null;
+          let derivation_confidence: any = null;
+          let extractor_model: any = null;
+          let extractor_version: any = null;
+          let evidence_root_id: any;
+          let created_at: any;
+          if (args.length >= 13) {
+            [
+              id,
+              memory_id,
+              observation_id,
+              role,
+              score,
+              relation,
+              extract_span,
+              evidence_score,
+              derivation_confidence,
+              extractor_model,
+              extractor_version,
+              evidence_root_id,
+              created_at,
+            ] = args;
+          } else {
+            [id, memory_id, observation_id, role, score, created_at] = args;
+            evidence_root_id = observation_id;
+          }
           const existing = db.memorySources.find(
             (row: any) =>
               row.memory_id === memory_id &&
@@ -561,8 +764,14 @@ export class D1Mock {
           );
           if (existing) {
             if (score != null) existing.score = score;
+            if (evidence_score != null) existing.evidence_score = evidence_score;
+            if (derivation_confidence != null) existing.derivation_confidence = derivation_confidence;
           } else {
-            db.memorySources.push({ id, memory_id, observation_id, role, score, created_at });
+            db.memorySources.push({
+              id, memory_id, observation_id, role, score, relation,
+              extract_span, evidence_score, derivation_confidence,
+              extractor_model, extractor_version, evidence_root_id, created_at,
+            });
           }
           return { meta: { changes: 1 } };
         }
@@ -1829,6 +2038,45 @@ export class D1Mock {
           )[0];
           return latest ? { event_hash: latest.event_hash } : null;
         }
+        if (s.includes("memory_sources_missing_memory") && s.includes("parent_versions_missing_parent")) {
+          const has = (rows: any[], key: string, value: any) =>
+            rows.some((row: any) => String(row[key]) === String(value));
+          return {
+            memory_sources_missing_memory: db.memorySources.filter((source: any) => !has(db.memories, "id", source.memory_id)).length,
+            memory_sources_missing_observation: db.memorySources.filter((source: any) => !has(db.observations, "id", source.observation_id)).length,
+            parent_versions_missing_parent: db.parentVersions.filter((version: any) => !has(db.parentUnits, "parent_id", version.parent_id)).length,
+            parent_units_missing_active_version: db.parentUnits.filter((unit: any) =>
+              unit.active_version_id != null && !has(db.parentVersions, "version_id", unit.active_version_id)
+            ).length,
+            memories_missing_parent_version: db.memories.filter((memory: any) =>
+              memory.parent_version_id != null && !has(db.parentVersions, "version_id", memory.parent_version_id)
+            ).length,
+            memory_entities_missing_memory: db.memoryEntities.filter((link: any) => !has(db.memories, "id", link.memory_id)).length,
+            memory_entities_missing_entity: db.memoryEntities.filter((link: any) => !has(db.entities, "id", link.entity_id)).length,
+            entity_relations_missing_from_entity: db.entityRelations.filter((relation: any) => !has(db.entities, "id", relation.from_entity_id)).length,
+            entity_relations_missing_to_entity: db.entityRelations.filter((relation: any) => !has(db.entities, "id", relation.to_entity_id)).length,
+            entity_relations_missing_memory: db.entityRelations.filter((relation: any) =>
+              relation.memory_id != null && !has(db.memories, "id", relation.memory_id)
+            ).length,
+            entity_relations_missing_observation: db.entityRelations.filter((relation: any) =>
+              relation.observation_id != null && !has(db.observations, "id", relation.observation_id)
+            ).length,
+            fact_sources_missing_relation: db.factSources.filter((source: any) => !has(db.entityRelations, "id", source.relation_id)).length,
+            fact_sources_missing_memory: db.factSources.filter((source: any) =>
+              source.memory_id != null && !has(db.memories, "id", source.memory_id)
+            ).length,
+            fact_sources_missing_observation: db.factSources.filter((source: any) =>
+              source.observation_id != null && !has(db.observations, "id", source.observation_id)
+            ).length,
+            memory_relations_missing_from_entry: db.relations.filter((relation: any) => !has(db.entries, "id", relation.from_memory_id)).length,
+            memory_relations_missing_to_entry: db.relations.filter((relation: any) => !has(db.entries, "id", relation.to_memory_id)).length,
+            revisions_missing_entry: db.revisions.filter((revision: any) => !has(db.entries, "id", revision.memory_id)).length,
+            merge_candidates_missing_source: db.mergeCandidates.filter((candidate: any) => !has(db.entries, "id", candidate.source_memory_id)).length,
+            merge_candidates_missing_target: db.mergeCandidates.filter((candidate: any) => !has(db.entries, "id", candidate.target_memory_id)).length,
+            conflict_cases_missing_old: db.conflictCases.filter((conflict: any) => !has(db.entries, "id", conflict.old_memory_id)).length,
+            conflict_cases_missing_new: db.conflictCases.filter((conflict: any) => !has(db.entries, "id", conflict.new_memory_id)).length,
+          };
+        }
         if (s.includes("SELECT id, vector_ids, pending_vector_ids, pending_rebuild_id FROM entries WHERE id = ?")) {
           const row = db.entries.find((e: any) => e.id === args[0]);
           return row
@@ -2266,6 +2514,24 @@ export class D1Mock {
       },
       async all() {
         db.statementCount += 1;
+        if (!s.includes(" LIMIT ") && s.includes("ORDER BY") && !s.includes("json_each")) {
+          if (s.includes("FROM sb_scopes")) return { results: [...db.scopes] };
+          if (s.includes("FROM sb_parent_units")) return { results: [...db.parentUnits] };
+          if (s.includes("FROM sb_parent_versions")) return { results: [...db.parentVersions] };
+          if (s.includes("FROM entries")) return { results: [...db.entries] };
+          if (s.includes("FROM sb_observations")) return { results: [...db.observations] };
+          if (s.includes("FROM sb_memories")) return { results: [...db.memories] };
+          if (s.includes("FROM sb_memory_sources")) return { results: [...db.memorySources] };
+          if (s.includes("FROM sb_entities")) return { results: [...db.entities] };
+          if (s.includes("FROM sb_memory_entities")) return { results: [...db.memoryEntities] };
+          if (s.includes("FROM sb_entity_relations")) return { results: [...db.entityRelations] };
+          if (s.includes("FROM sb_fact_sources")) return { results: [...db.factSources] };
+          if (s.includes("FROM sb_memory_relations")) return { results: [...db.relations] };
+          if (s.includes("FROM sb_memory_revisions")) return { results: [...db.revisions] };
+          if (s.includes("FROM sb_memory_merge_candidates")) return { results: [...db.mergeCandidates] };
+          if (s.includes("FROM sb_conflict_cases")) return { results: [...db.conflictCases] };
+          if (s.includes("FROM sb_audit_events")) return { results: [...db.auditEvents] };
+        }
         if (s.includes("SELECT id, valid_from, valid_to, reference_time") && s.includes("FROM sb_entity_relations")) {
           const [fromEntityId, toEntityId, relationType, factHash, factKey] = args.map(String);
           const results = db.entityRelations
@@ -2376,6 +2642,14 @@ export class D1Mock {
               "source",
               "metadata_json",
               "content_hash",
+              "source_channel",
+              "source_identity",
+              "author_type",
+              "source_uri",
+              "source_timestamp",
+              "revision",
+              "root_evidence_id",
+              "previous_evidence_id",
               "extraction_status",
               "extraction_version",
               "extraction_attempts",
@@ -2384,6 +2658,56 @@ export class D1Mock {
               "processing_started_at",
               "processed_at",
               "needs_reprocess",
+              "created_at",
+            ].map((name) => ({ name })),
+          };
+        }
+        if (s === "PRAGMA table_info(sb_memories)") {
+          return {
+            results: [
+              "id",
+              "content",
+              "kind",
+              "memory_class",
+              "importance",
+              "confidence",
+              "entry_id",
+              "parent_version_id",
+              "claim_subject",
+              "claim_predicate",
+              "claim_object",
+              "scope_id",
+              "polarity",
+              "modality",
+              "claim_status",
+              "scores_json",
+              "content_hash",
+              "observed_at",
+              "valid_from",
+              "valid_to",
+              "reference_time",
+              "invalid_at",
+              "expired_at",
+              "entities_json",
+              "created_at",
+            ].map((name) => ({ name })),
+          };
+        }
+        if (s === "PRAGMA table_info(sb_memory_sources)") {
+          return {
+            results: [
+              "id",
+              "memory_id",
+              "observation_id",
+              "role",
+              "score",
+              "relation",
+              "extract_span",
+              "evidence_score",
+              "derivation_confidence",
+              "extractor_model",
+              "extractor_version",
+              "evidence_root_id",
               "created_at",
             ].map((name) => ({ name })),
           };
@@ -3106,6 +3430,9 @@ export class D1Mock {
     this.entries = [];
     this.relations = [];
     this.revisions = [];
+    this.scopes = [];
+    this.parentUnits = [];
+    this.parentVersions = [];
     this.observations = [];
     this.memories = [];
     this.memorySources = [];

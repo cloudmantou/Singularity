@@ -1,8 +1,8 @@
 import { importEntries, type ImportMode, type ImportOptions, type ImportResult } from "../import-entries";
 
-export const MEMORY_BACKUP_SCHEMA_VERSION = 5;
+export const MEMORY_BACKUP_SCHEMA_VERSION = 6;
 const MEMORY_BACKUP_FORMAT = "singularity-memory-backup";
-const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5]);
+const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6]);
 const MEMORY_BACKUP_FEATURES = [
   "atomic-memory",
   "temporal-facts",
@@ -10,9 +10,14 @@ const MEMORY_BACKUP_FEATURES = [
   "embedding-fingerprints",
   "quality-review",
   "compliance-audit",
+  "evidence-claim-provenance",
+  "parent-versions",
 ] as const;
 
 const GRAPH_ARRAY_KEYS = [
+  "scopes",
+  "parentUnits",
+  "parentVersions",
   "observations",
   "memories",
   "memorySources",
@@ -44,12 +49,15 @@ export interface BackupIntegrityReport {
 
 export interface MemoryBackup {
   backupFormat: typeof MEMORY_BACKUP_FORMAT;
-  schemaVersion: 5;
+  schemaVersion: 6;
   features: Array<(typeof MEMORY_BACKUP_FEATURES)[number]>;
   exportedAt: string;
   source: string;
   totals: Record<string, number>;
   integrity: BackupIntegrityReport;
+  scopes: BackupRow[];
+  parentUnits: BackupRow[];
+  parentVersions: BackupRow[];
   entries: BackupRow[];
   observations: BackupRow[];
   memories: BackupRow[];
@@ -66,7 +74,7 @@ export interface MemoryBackup {
 }
 
 export interface MemoryBackupImportResult extends ImportResult {
-  schemaVersion: 5;
+  schemaVersion: 6;
   graph: Record<GraphArrayKey, TableImportStats>;
   integrity: BackupIntegrityReport;
 }
@@ -83,7 +91,9 @@ export function isMemoryBackupPayload(body: unknown): boolean {
   if (schemaVersion === MEMORY_BACKUP_SCHEMA_VERSION) {
     return record.backupFormat === MEMORY_BACKUP_FORMAT;
   }
-  if (schemaVersion === 4) return true;
+  if (SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS.has(schemaVersion)) {
+    return schemaVersion === 4 || record.backupFormat === MEMORY_BACKUP_FORMAT;
+  }
   return Number.isFinite(schemaVersion) && schemaVersion > MEMORY_BACKUP_SCHEMA_VERSION;
 }
 
@@ -120,6 +130,15 @@ export async function inspectMemoryBackupIntegrity(db: D1Database): Promise<Back
        (SELECT COUNT(*) FROM sb_memory_sources s
         LEFT JOIN sb_observations o ON o.id = s.observation_id
         WHERE o.id IS NULL) as memory_sources_missing_observation,
+       (SELECT COUNT(*) FROM sb_parent_versions pv
+        LEFT JOIN sb_parent_units pu ON pu.parent_id = pv.parent_id
+        WHERE pu.parent_id IS NULL) as parent_versions_missing_parent,
+       (SELECT COUNT(*) FROM sb_parent_units pu
+        LEFT JOIN sb_parent_versions pv ON pv.version_id = pu.active_version_id
+        WHERE pu.active_version_id IS NOT NULL AND pv.version_id IS NULL) as parent_units_missing_active_version,
+       (SELECT COUNT(*) FROM sb_memories m
+        LEFT JOIN sb_parent_versions pv ON pv.version_id = m.parent_version_id
+        WHERE m.parent_version_id IS NOT NULL AND pv.version_id IS NULL) as memories_missing_parent_version,
        (SELECT COUNT(*) FROM sb_memory_entities me
         LEFT JOIN sb_memories m ON m.id = me.memory_id
         WHERE m.id IS NULL) as memory_entities_missing_memory,
@@ -184,6 +203,9 @@ export async function exportMemoryBackup(
   input: { source: string }
 ): Promise<MemoryBackup> {
   const [
+    scopes,
+    parentUnits,
+    parentVersions,
     entries,
     observations,
     memories,
@@ -198,6 +220,18 @@ export async function exportMemoryBackup(
     conflictCases,
     auditEvents,
   ] = await Promise.all([
+    allRows(db, `SELECT scope_id, parent_scope_id, canonical_name, aliases_json,
+                       scope_type, created_at, updated_at
+                FROM sb_scopes
+                ORDER BY updated_at DESC, scope_id DESC`),
+    allRows(db, `SELECT parent_id, active_version_id, scope_id, created_at, updated_at
+                FROM sb_parent_units
+                ORDER BY updated_at DESC, parent_id DESC`),
+    allRows(db, `SELECT version_id, parent_id, version_number, source_observation_id,
+                       source_snapshot_hash, summary, state, summary_vector_ids,
+                       created_at, updated_at
+                FROM sb_parent_versions
+                ORDER BY created_at DESC, version_id DESC`),
     allRows(db, `SELECT id, content, tags, source, created_at, vector_ids,
                        recall_count, importance_score, classification_confidence,
                        classification_status, classification_error, classification_attempts,
@@ -208,17 +242,23 @@ export async function exportMemoryBackup(
                 FROM entries
                 ORDER BY created_at DESC, id DESC`),
     allRows(db, `SELECT id, content, source, metadata_json, content_hash,
+                       source_channel, source_identity, author_type, source_uri,
+                       source_timestamp, revision, root_evidence_id, previous_evidence_id,
                        extraction_status, extraction_version, extraction_attempts,
                        extraction_error, next_attempt_at, processing_started_at,
                        processed_at, needs_reprocess, created_at
                 FROM sb_observations
                 ORDER BY created_at DESC, id DESC`),
     allRows(db, `SELECT id, content, kind, memory_class, importance, confidence,
-                       entry_id, content_hash, observed_at, valid_from, valid_to,
+                       entry_id, parent_version_id, claim_subject, claim_predicate,
+                       claim_object, scope_id, polarity, modality, claim_status,
+                       scores_json, content_hash, observed_at, valid_from, valid_to,
                        reference_time, invalid_at, expired_at, entities_json, created_at
                 FROM sb_memories
                 ORDER BY created_at DESC, id DESC`),
-    allRows(db, `SELECT id, memory_id, observation_id, role, score, created_at
+    allRows(db, `SELECT id, memory_id, observation_id, role, score, relation,
+                       extract_span, evidence_score, derivation_confidence,
+                       extractor_model, extractor_version, evidence_root_id, created_at
                 FROM sb_memory_sources
                 ORDER BY created_at DESC, id DESC`),
     allRows(db, `SELECT id, name, name_normalized, entity_type, aliases_json,
@@ -269,6 +309,9 @@ export async function exportMemoryBackup(
     exportedAt: new Date().toISOString(),
     source: input.source,
     totals: {
+      scopes: countRows(scopes),
+      parentUnits: countRows(parentUnits),
+      parentVersions: countRows(parentVersions),
       entries: countRows(entries),
       observations: countRows(observations),
       memories: countRows(memories),
@@ -284,6 +327,9 @@ export async function exportMemoryBackup(
       auditEvents: countRows(auditEvents),
     },
     integrity: await inspectMemoryBackupIntegrity(db),
+    scopes,
+    parentUnits,
+    parentVersions,
     entries,
     observations,
     memories,
@@ -409,20 +455,82 @@ export async function importMemoryBackup(
 
   const graph = {} as Record<GraphArrayKey, TableImportStats>;
 
+  graph.scopes = await importTable(db, rowsFor(body, "scopes"), (row) =>
+    db.prepare(
+      `${insertVerb(mode)} INTO sb_scopes (
+         scope_id, parent_scope_id, canonical_name, aliases_json,
+         scope_type, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "scope_id"),
+      textOrNull(row, "parent_scope_id"),
+      requiredText(row, "canonical_name"),
+      jsonText(row, "aliases_json", "[]"),
+      textOrNull(row, "scope_type"),
+      intOrDefault(row, "created_at", Date.now()),
+      intOrDefault(row, "updated_at", Date.now())
+    )
+  );
+
+  graph.parentUnits = await importTable(db, rowsFor(body, "parentUnits"), (row) =>
+    db.prepare(
+      `${insertVerb(mode)} INTO sb_parent_units (
+         parent_id, active_version_id, scope_id, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "parent_id"),
+      textOrNull(row, "active_version_id"),
+      textOrNull(row, "scope_id"),
+      intOrDefault(row, "created_at", Date.now()),
+      intOrDefault(row, "updated_at", Date.now())
+    )
+  );
+
+  graph.parentVersions = await importTable(db, rowsFor(body, "parentVersions"), (row) =>
+    db.prepare(
+      `${insertVerb(mode)} INTO sb_parent_versions (
+         version_id, parent_id, version_number, source_observation_id,
+         source_snapshot_hash, summary, state, summary_vector_ids,
+         created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "version_id"),
+      requiredText(row, "parent_id"),
+      intOrDefault(row, "version_number", 1),
+      textOrNull(row, "source_observation_id"),
+      textOrNull(row, "source_snapshot_hash"),
+      textOrNull(row, "summary"),
+      textOrDefault(row, "state", "building"),
+      jsonText(row, "summary_vector_ids", "[]"),
+      intOrDefault(row, "created_at", Date.now()),
+      intOrDefault(row, "updated_at", Date.now())
+    )
+  );
+
   graph.observations = await importTable(db, rowsFor(body, "observations"), (row) =>
     db.prepare(
       `${insertVerb(mode)} INTO sb_observations (
          id, content, source, metadata_json, content_hash,
+         source_channel, source_identity, author_type, source_uri,
+         source_timestamp, revision, root_evidence_id, previous_evidence_id,
          extraction_status, extraction_version, extraction_attempts,
          extraction_error, next_attempt_at, processing_started_at,
          processed_at, needs_reprocess, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       requiredText(row, "id"),
       requiredText(row, "content"),
       textOrDefault(row, "source", "import"),
       jsonText(row, "metadata_json", "{}"),
       textOrNull(row, "content_hash"),
+      textOrDefault(row, "source_channel", textOrDefault(row, "source", "import")),
+      textOrNull(row, "source_identity"),
+      textOrDefault(row, "author_type", "unknown"),
+      textOrNull(row, "source_uri"),
+      numberOrNull(row, "source_timestamp"),
+      intOrDefault(row, "revision", 1),
+      textOrDefault(row, "root_evidence_id", requiredText(row, "id")),
+      textOrNull(row, "previous_evidence_id"),
       textOrDefault(row, "extraction_status", "pending"),
       intOrDefault(row, "extraction_version", 1),
       intOrDefault(row, "extraction_attempts", 0),
@@ -439,9 +547,11 @@ export async function importMemoryBackup(
     db.prepare(
       `${insertVerb(mode)} INTO sb_memories (
          id, content, kind, memory_class, importance, confidence,
-         entry_id, content_hash, observed_at, valid_from, valid_to,
+         entry_id, parent_version_id, claim_subject, claim_predicate,
+         claim_object, scope_id, polarity, modality, claim_status,
+         scores_json, content_hash, observed_at, valid_from, valid_to,
          reference_time, invalid_at, expired_at, entities_json, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       requiredText(row, "id"),
       requiredText(row, "content"),
@@ -450,6 +560,15 @@ export async function importMemoryBackup(
       numberOrNull(row, "importance"),
       numberOrNull(row, "confidence"),
       textOrNull(row, "entry_id"),
+      textOrNull(row, "parent_version_id"),
+      textOrNull(row, "claim_subject"),
+      textOrNull(row, "claim_predicate"),
+      textOrNull(row, "claim_object"),
+      textOrNull(row, "scope_id"),
+      textOrDefault(row, "polarity", "positive"),
+      textOrDefault(row, "modality", "asserted"),
+      textOrDefault(row, "claim_status", "supported"),
+      jsonText(row, "scores_json", "{}"),
       textOrNull(row, "content_hash"),
       numberOrNull(row, "observed_at"),
       numberOrNull(row, "valid_from"),
@@ -465,14 +584,23 @@ export async function importMemoryBackup(
   graph.memorySources = await importTable(db, rowsFor(body, "memorySources"), (row) =>
     db.prepare(
       `${insertVerb(mode)} INTO sb_memory_sources (
-         id, memory_id, observation_id, role, score, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?)`
+         id, memory_id, observation_id, role, score, relation, extract_span,
+         evidence_score, derivation_confidence, extractor_model,
+         extractor_version, evidence_root_id, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       requiredText(row, "id"),
       requiredText(row, "memory_id"),
       requiredText(row, "observation_id"),
       textOrDefault(row, "role", "derived_from"),
       numberOrNull(row, "score"),
+      textOrDefault(row, "relation", textOrDefault(row, "role", "derived_from")),
+      textOrNull(row, "extract_span"),
+      numberOrNull(row, "evidence_score"),
+      numberOrNull(row, "derivation_confidence"),
+      textOrNull(row, "extractor_model"),
+      textOrNull(row, "extractor_version"),
+      textOrDefault(row, "evidence_root_id", requiredText(row, "observation_id")),
       intOrDefault(row, "created_at", Date.now())
     )
   );

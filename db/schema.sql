@@ -325,6 +325,14 @@ CREATE TABLE IF NOT EXISTS sb_observations (
   source TEXT NOT NULL DEFAULT 'api',
   metadata_json TEXT NOT NULL DEFAULT '{}',
   content_hash TEXT,
+  source_channel TEXT,
+  source_identity TEXT,
+  author_type TEXT NOT NULL DEFAULT 'unknown',
+  source_uri TEXT,
+  source_timestamp INTEGER,
+  revision INTEGER NOT NULL DEFAULT 1,
+  root_evidence_id TEXT,
+  previous_evidence_id TEXT,
   extraction_status TEXT NOT NULL DEFAULT 'pending',
   extraction_version INTEGER NOT NULL DEFAULT 1,
   extraction_attempts INTEGER NOT NULL DEFAULT 0,
@@ -341,6 +349,57 @@ CREATE INDEX IF NOT EXISTS idx_sb_observations_hash
   ON sb_observations(content_hash);
 CREATE INDEX IF NOT EXISTS idx_sb_observations_extraction_queue
   ON sb_observations(extraction_status, next_attempt_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_observations_evidence_root
+  ON sb_observations(root_evidence_id, revision DESC);
+CREATE INDEX IF NOT EXISTS idx_observations_source_identity
+  ON sb_observations(source_channel, source_identity, revision DESC);
+
+CREATE TABLE IF NOT EXISTS sb_scopes (
+  scope_id TEXT PRIMARY KEY,
+  parent_scope_id TEXT,
+  canonical_name TEXT NOT NULL,
+  aliases_json TEXT NOT NULL DEFAULT '[]',
+  scope_type TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scopes_parent
+  ON sb_scopes(parent_scope_id, canonical_name);
+CREATE INDEX IF NOT EXISTS idx_scopes_type
+  ON sb_scopes(scope_type, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS sb_parent_units (
+  parent_id TEXT PRIMARY KEY,
+  active_version_id TEXT,
+  scope_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_parent_units_active
+  ON sb_parent_units(active_version_id);
+CREATE INDEX IF NOT EXISTS idx_parent_units_scope
+  ON sb_parent_units(scope_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS sb_parent_versions (
+  version_id TEXT PRIMARY KEY,
+  parent_id TEXT NOT NULL,
+  version_number INTEGER NOT NULL,
+  source_observation_id TEXT,
+  source_snapshot_hash TEXT,
+  summary TEXT,
+  state TEXT NOT NULL DEFAULT 'building',
+  summary_vector_ids TEXT NOT NULL DEFAULT '[]',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  CHECK (state IN ('building', 'active', 'superseded', 'failed')),
+  UNIQUE(parent_id, version_number)
+);
+CREATE INDEX IF NOT EXISTS idx_parent_versions_parent
+  ON sb_parent_versions(parent_id, version_number DESC);
+CREATE INDEX IF NOT EXISTS idx_parent_versions_source
+  ON sb_parent_versions(source_observation_id);
+CREATE INDEX IF NOT EXISTS idx_parent_versions_state
+  ON sb_parent_versions(state, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS sb_memories (
   id TEXT PRIMARY KEY,
@@ -350,6 +409,15 @@ CREATE TABLE IF NOT EXISTS sb_memories (
   importance REAL,
   confidence REAL,
   entry_id TEXT,
+  parent_version_id TEXT,
+  claim_subject TEXT,
+  claim_predicate TEXT,
+  claim_object TEXT,
+  scope_id TEXT,
+  polarity TEXT NOT NULL DEFAULT 'positive',
+  modality TEXT NOT NULL DEFAULT 'asserted',
+  claim_status TEXT NOT NULL DEFAULT 'supported',
+  scores_json TEXT NOT NULL DEFAULT '{}',
   content_hash TEXT,
   observed_at INTEGER,
   valid_from INTEGER,
@@ -363,6 +431,12 @@ CREATE TABLE IF NOT EXISTS sb_memories (
 CREATE INDEX IF NOT EXISTS idx_sb_memories_entry ON sb_memories(entry_id);
 CREATE INDEX IF NOT EXISTS idx_sb_memories_hash ON sb_memories(content_hash);
 CREATE INDEX IF NOT EXISTS idx_sb_memories_created ON sb_memories(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_claim_status
+  ON sb_memories(claim_status, valid_from, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_scope
+  ON sb_memories(scope_id, claim_status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_parent_version
+  ON sb_memories(parent_version_id, claim_status, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS sb_memory_sources (
   id TEXT PRIMARY KEY,
@@ -370,11 +444,20 @@ CREATE TABLE IF NOT EXISTS sb_memory_sources (
   observation_id TEXT NOT NULL,
   role TEXT NOT NULL DEFAULT 'derived_from',
   score REAL,
+  relation TEXT NOT NULL DEFAULT 'derived_from',
+  extract_span TEXT,
+  evidence_score REAL,
+  derivation_confidence REAL,
+  extractor_model TEXT,
+  extractor_version TEXT,
+  evidence_root_id TEXT,
   created_at INTEGER NOT NULL,
   UNIQUE(memory_id, observation_id, role)
 );
 CREATE INDEX IF NOT EXISTS idx_sb_memory_sources_memory ON sb_memory_sources(memory_id);
 CREATE INDEX IF NOT EXISTS idx_sb_memory_sources_observation ON sb_memory_sources(observation_id);
+CREATE INDEX IF NOT EXISTS idx_memory_sources_relation
+  ON sb_memory_sources(relation, evidence_score, created_at DESC);
 
 -- Entity + temporal fact graph
 CREATE TABLE IF NOT EXISTS sb_entities (

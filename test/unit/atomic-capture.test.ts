@@ -56,6 +56,13 @@ describe("captureEntry atomic dual-write", () => {
         facts: [
           {
             content: "用户已完成 Singularity 分类系统。",
+            subject: "Singularity",
+            predicate: "completed_component",
+            object: "分类系统",
+            scope_id: "singularity",
+            polarity: "positive",
+            modality: "confirmed",
+            status: "confirmed",
             kind: "episodic",
             memory_class: "milestone",
             importance: 4,
@@ -103,6 +110,24 @@ describe("captureEntry atomic dual-write", () => {
       needs_reprocess: 0,
     });
     expect(typeof db.observations[0].processed_at).toBe("number");
+    expect(db.observations[0]).toMatchObject({
+      source_channel: "api",
+      author_type: "user",
+      revision: 1,
+      root_evidence_id: result.observationId,
+    });
+    expect(db.parentUnits).toHaveLength(1);
+    expect(db.parentVersions).toHaveLength(1);
+    expect(db.parentVersions[0]).toMatchObject({
+      parent_id: result.observationId,
+      source_observation_id: result.observationId,
+      source_snapshot_hash: db.observations[0].content_hash,
+      state: "active",
+    });
+    expect(db.parentUnits[0]).toMatchObject({
+      parent_id: result.observationId,
+      active_version_id: db.parentVersions[0].version_id,
+    });
     expect(db.memories).toHaveLength(3);
     expect(db.memorySources).toHaveLength(3);
     expect(db.entries).toHaveLength(3);
@@ -110,7 +135,24 @@ describe("captureEntry atomic dual-write", () => {
     expect(db.memories.map((m) => m.memory_class).sort()).toEqual(
       ["milestone", "plan", "project"].sort()
     );
+    expect(db.memories.every((memory) => memory.parent_version_id === db.parentVersions[0].version_id)).toBe(true);
+    expect(db.memories[0]).toMatchObject({
+      claim_subject: "Singularity",
+      claim_predicate: "completed_component",
+      claim_object: "分类系统",
+      scope_id: "singularity",
+      polarity: "positive",
+      modality: "confirmed",
+      claim_status: "confirmed",
+    });
+    expect(JSON.parse(db.memories[0].scores_json)).toMatchObject({
+      evidenceQuality: 0.92,
+      derivationConfidence: 0.92,
+      conflictState: "none",
+    });
     expect(db.memorySources.every((s) => s.observation_id === result.observationId)).toBe(true);
+    expect(db.memorySources.every((s) => s.relation === "supports")).toBe(true);
+    expect(db.memorySources.every((s) => s.evidence_root_id === result.observationId)).toBe(true);
   });
 
   it("falls back to a single dual-written fact when extraction fails", async () => {
@@ -134,6 +176,10 @@ describe("captureEntry atomic dual-write", () => {
     expect(db.entries).toHaveLength(1);
     expect(db.memories).toHaveLength(1);
     expect(db.memorySources).toHaveLength(1);
+    expect(db.parentVersions[0]).toMatchObject({
+      source_observation_id: db.observations[0].id,
+      state: "active",
+    });
   });
 
   it("reprocesses fallback observations through the extraction queue", async () => {
@@ -191,6 +237,12 @@ describe("captureEntry atomic dual-write", () => {
     expect(db.entries).toHaveLength(3);
     expect(db.memories).toHaveLength(3);
     expect(new Set(db.memorySources.map((source) => source.observation_id)).size).toBe(1);
+    expect(db.parentVersions).toHaveLength(2);
+    expect(db.parentVersions.filter((version) => version.state === "active")).toHaveLength(1);
+    expect(db.parentVersions.filter((version) => version.state === "superseded")).toHaveLength(1);
+    const activeVersion = db.parentVersions.find((version) => version.state === "active");
+    expect(db.parentUnits[0].active_version_id).toBe(activeVersion?.version_id);
+    expect(db.memories.slice(1).every((memory) => memory.parent_version_id === activeVersion?.version_id)).toBe(true);
   });
 
   it("dry-runs the extraction queue with orphan and retry breakdowns", async () => {

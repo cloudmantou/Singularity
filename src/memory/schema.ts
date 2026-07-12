@@ -5,9 +5,17 @@ import {
   ATOMIC_SCHEMA_STATEMENTS,
 } from "./atomic";
 import { ensureEntityDataModel } from "./entities";
+import {
+  EVIDENCE_CONTRACT_INDEX_STATEMENTS,
+  EVIDENCE_CONTRACT_SCHEMA_STATEMENTS,
+  MEMORY_CLAIM_MIGRATIONS,
+  MEMORY_SOURCE_PROVENANCE_MIGRATIONS,
+  OBSERVATION_EVIDENCE_MIGRATIONS,
+} from "./evidence-contract";
 
 const MEMORY_SCHEMA_STATEMENTS = [
   ...ATOMIC_SCHEMA_STATEMENTS,
+  ...EVIDENCE_CONTRACT_SCHEMA_STATEMENTS,
   `CREATE TABLE IF NOT EXISTS sb_memory_relations (
     id TEXT PRIMARY KEY,
     from_memory_id TEXT NOT NULL,
@@ -38,22 +46,25 @@ const MEMORY_SCHEMA_STATEMENTS = [
     ON sb_memory_revisions(memory_id, created_at ASC)`,
 ] as const;
 
-export async function ensureMemoryDataModel(db: D1Database): Promise<void> {
-  for (const statement of MEMORY_SCHEMA_STATEMENTS) {
-    await db.exec(statement);
-  }
-  let observationColumns: Set<string> | null = null;
+async function tableColumns(db: D1Database, table: string): Promise<Set<string> | null> {
   try {
     const { results } = await db
-      .prepare(`PRAGMA table_info(sb_observations)`)
+      .prepare(`PRAGMA table_info(${table})`)
       .all<{ name: string }>();
-    observationColumns = new Set(results.map((row) => row.name));
+    return new Set(results.map((row) => row.name));
   } catch {
-    observationColumns = null;
+    return null;
   }
+}
 
-  for (const migration of ATOMIC_OBSERVATION_MIGRATIONS) {
-    if (observationColumns?.has(migration.column)) continue;
+async function applyColumnMigrations(
+  db: D1Database,
+  table: string,
+  migrations: readonly { column: string; statement: string }[]
+): Promise<void> {
+  const columns = await tableColumns(db, table);
+  for (const migration of migrations) {
+    if (columns?.has(migration.column)) continue;
     try {
       await db.exec(migration.statement);
     } catch (error) {
@@ -61,7 +72,22 @@ export async function ensureMemoryDataModel(db: D1Database): Promise<void> {
       if (!/duplicate column name|already exists/i.test(message)) throw error;
     }
   }
+}
+
+export async function ensureMemoryDataModel(db: D1Database): Promise<void> {
+  for (const statement of MEMORY_SCHEMA_STATEMENTS) {
+    await db.exec(statement);
+  }
+  await applyColumnMigrations(db, "sb_observations", [
+    ...ATOMIC_OBSERVATION_MIGRATIONS,
+    ...OBSERVATION_EVIDENCE_MIGRATIONS,
+  ]);
+  await applyColumnMigrations(db, "sb_memories", MEMORY_CLAIM_MIGRATIONS);
+  await applyColumnMigrations(db, "sb_memory_sources", MEMORY_SOURCE_PROVENANCE_MIGRATIONS);
   for (const statement of ATOMIC_POST_MIGRATION_INDEX_STATEMENTS) {
+    await db.exec(statement);
+  }
+  for (const statement of EVIDENCE_CONTRACT_INDEX_STATEMENTS) {
     await db.exec(statement);
   }
   for (const statement of ATOMIC_SCHEMA_BACKFILL_STATEMENTS) {

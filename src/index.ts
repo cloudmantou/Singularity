@@ -118,6 +118,12 @@ import {
   normalizeEntityFactKey,
   normalizeEntityName,
 } from "./memory/entities";
+import {
+  prepareParentUnitInsert,
+  prepareParentVersionActivation,
+  prepareParentVersionFailure,
+  prepareParentVersionInsert,
+} from "./memory/evidence-contract";
 import { runMigrations, MIGRATIONS } from "./migrations";
 import {
   CONFLICT_CASE_STATES,
@@ -1853,37 +1859,67 @@ async function linkObsidianObservation(
     entryId: string;
     vaultId: string;
     externalPath: string;
+    externalBlockId?: string;
     content: string;
     contentHash: string;
     properties: Record<string, unknown>;
+    revisionNumber?: number;
     createdAt: number;
   }
 ): Promise<void> {
   const observationId = crypto.randomUUID();
-  await prepareObservationInsert(env.DB, {
-    id: observationId,
-    content: input.content,
-    source: OBSIDIAN_PROVIDER,
-    metadata: {
-      provider: OBSIDIAN_PROVIDER,
-      vault_id: input.vaultId,
-      external_path: input.externalPath,
-      properties: input.properties,
-      needs_reprocess: true,
-    },
-    contentHash: input.contentHash,
-    extractionStatus: "fallback",
-    processedAt: input.createdAt,
-    needsReprocess: true,
-    createdAt: input.createdAt,
-  }).run();
+  const parentRef: ObservationParentVersionRef = {
+    parentId: `${OBSIDIAN_PROVIDER}:memory:${input.entryId}`,
+    versionId: crypto.randomUUID(),
+    versionNumber: Math.max(1, Math.trunc(input.revisionNumber ?? input.createdAt) || 1),
+    evidenceRootId: `${OBSIDIAN_PROVIDER}:memory:${input.entryId}`,
+  };
+  const metadata = {
+    provider: OBSIDIAN_PROVIDER,
+    vault_id: input.vaultId,
+    external_path: input.externalPath,
+    external_block_id: input.externalBlockId ?? "",
+    properties: input.properties,
+    needs_reprocess: true,
+    review_proposal: input.properties.managed_by === "singularity",
+    ...observationParentVersionMetadata(parentRef),
+  };
+  await env.DB.batch([
+    prepareObservationInsert(env.DB, {
+      id: observationId,
+      content: input.content,
+      source: OBSIDIAN_PROVIDER,
+      metadata,
+      contentHash: input.contentHash,
+      sourceChannel: OBSIDIAN_PROVIDER,
+      sourceIdentity: obsidianEvidenceIdentity(input.vaultId, input.externalPath, input.externalBlockId ?? ""),
+      authorType: "user",
+      sourceUri: obsidianEvidenceUri(input.vaultId, input.externalPath, input.externalBlockId ?? ""),
+      sourceTimestamp: input.createdAt,
+      revision: parentRef.versionNumber,
+      rootEvidenceId: parentRef.evidenceRootId,
+      extractionStatus: "fallback",
+      processedAt: input.createdAt,
+      needsReprocess: true,
+      createdAt: input.createdAt,
+    }),
+    ...prepareObservationParentVersionStatements(env.DB, {
+      ...parentRef,
+      observationId,
+      contentHash: input.contentHash,
+      createdAt: input.createdAt,
+    }),
+  ]);
   await linkObservationToAtomicMemory(env.DB, {
     entryId: input.entryId,
     content: input.content,
     contentHash: input.contentHash,
     observationId,
+    parentVersionId: parentRef.versionId,
+    evidenceRootId: parentRef.evidenceRootId,
     createdAt: input.createdAt,
   });
+  await activateObservationParentVersion(env, { metadata_json: JSON.stringify(metadata) });
 }
 
 function serializeObsidianLink(row: ObsidianLinkRow): Record<string, unknown> {
@@ -2060,9 +2096,22 @@ function obsidianAtomicMemoryPath(entryId: string, content: string): string {
   return `Singularity/10 提炼知识/${safeTitle}-${entryId.slice(0, 8)}.md`;
 }
 
+function obsidianEvidenceIdentity(vaultId: string, externalPath: string, externalBlockId = ""): string {
+  return `${vaultId}:${externalPath}${externalBlockId ? `#${externalBlockId}` : ""}`;
+}
+
+function obsidianEvidenceUri(vaultId: string, externalPath: string, externalBlockId = ""): string {
+  const file = encodeURIComponent(externalPath);
+  const vault = encodeURIComponent(vaultId);
+  const block = externalBlockId ? `#${encodeURIComponent(externalBlockId)}` : "";
+  return `obsidian://open?vault=${vault}&file=${file}${block}`;
+}
+
 async function createObsidianObservation(
   env: Env,
   input: {
+    sourceId: string;
+    sourceRevision: number;
     vaultId: string;
     externalPath: string;
     externalBlockId: string;
@@ -2076,6 +2125,13 @@ async function createObsidianObservation(
   }
 ): Promise<ObservationExtractionRow> {
   const observationId = crypto.randomUUID();
+  const parentVersionId = crypto.randomUUID();
+  const parentRef: ObservationParentVersionRef = {
+    parentId: input.sourceId,
+    versionId: parentVersionId,
+    versionNumber: Math.max(1, Math.trunc(input.sourceRevision) || 1),
+    evidenceRootId: input.sourceId,
+  };
   const metadata = {
     provider: OBSIDIAN_PROVIDER,
     vault_id: input.vaultId,
@@ -2085,16 +2141,33 @@ async function createObsidianObservation(
     properties: input.properties,
     sync_direction: input.syncDirection,
     previous_observation_id: input.previousObservationId ?? null,
+    ...observationParentVersionMetadata(parentRef),
   };
-  await prepareObservationInsert(env.DB, {
-    id: observationId,
-    content: input.content,
-    source: OBSIDIAN_PROVIDER,
-    metadata,
-    contentHash: input.contentHash,
-    extractionStatus: "pending",
-    createdAt: input.createdAt,
-  }).run();
+  await env.DB.batch([
+    prepareObservationInsert(env.DB, {
+      id: observationId,
+      content: input.content,
+      source: OBSIDIAN_PROVIDER,
+      metadata,
+      contentHash: input.contentHash,
+      sourceChannel: OBSIDIAN_PROVIDER,
+      sourceIdentity: obsidianEvidenceIdentity(input.vaultId, input.externalPath, input.externalBlockId),
+      authorType: "user",
+      sourceUri: obsidianEvidenceUri(input.vaultId, input.externalPath, input.externalBlockId),
+      sourceTimestamp: input.createdAt,
+      revision: parentRef.versionNumber,
+      rootEvidenceId: parentRef.evidenceRootId,
+      previousEvidenceId: input.previousObservationId ?? null,
+      extractionStatus: "pending",
+      createdAt: input.createdAt,
+    }),
+    ...prepareObservationParentVersionStatements(env.DB, {
+      ...parentRef,
+      observationId,
+      contentHash: input.contentHash,
+      createdAt: input.createdAt,
+    }),
+  ]);
   return {
     id: observationId,
     content: input.content,
@@ -2370,7 +2443,10 @@ async function handleObsidianPush(
       });
     }
     const sourceId = existingSource?.id ?? crypto.randomUUID();
+    const sourceRevision = existingSource ? Number(existingSource.last_revision ?? 0) + 1 : 1;
     const observation = await createObsidianObservation(env, {
+      sourceId,
+      sourceRevision,
       vaultId,
       externalPath,
       externalBlockId,
@@ -2552,6 +2628,7 @@ async function handleObsidianPush(
     vectors = newVectorIds.length;
     contentHash = await contentFingerprint(content);
     finalRevisionId = await latestMemoryRevisionId(env, entryId, false);
+    const updateObservedAt = Date.now();
     try {
       await replaceEntryAtomicMemory(env.DB, {
         entryId,
@@ -2559,11 +2636,27 @@ async function handleObsidianPush(
         contentHash,
         source: OBSIDIAN_PROVIDER,
         eventType: "update",
-        createdAt: Date.now(),
+        createdAt: updateObservedAt,
       });
     } catch (error) {
       console.error("Obsidian atomic memory update sync failed (non-fatal):", error);
       atomicSyncWarning = "atomic_sync_failed";
+    }
+    try {
+      await linkObsidianObservation(env, {
+        entryId,
+        vaultId,
+        externalPath,
+        externalBlockId,
+        content,
+        contentHash,
+        properties,
+        revisionNumber: updateObservedAt,
+        createdAt: updateObservedAt,
+      });
+    } catch (error) {
+      console.error("Obsidian evidence revision link failed (non-fatal):", error);
+      atomicSyncWarning = atomicSyncWarning ?? "evidence_link_failed";
     }
     scheduleClassifyAndTag(entryId, content, env, ctx);
   }
@@ -7780,6 +7873,10 @@ export interface CaptureOptions {
   skipExtract?: boolean;
   /** Dual-write sb_memories/sb_memory_sources against this observation. */
   observationId?: string;
+  /** Immutable parent version that owns atomic claims derived from the observation. */
+  parentVersionId?: string | null;
+  /** Stable evidence root/source id used for provenance dedupe. */
+  evidenceRootId?: string | null;
   /** Fields produced by the atomic extractor. */
   atomic?: AtomicFactDraft;
 }
@@ -8247,6 +8344,13 @@ function tagsFromObservationMetadata(metadataJson: string | null | undefined): s
 function fallbackAtomicDraft(content: string, observedAt: number): AtomicFactDraft {
   return {
     content,
+    subject: null,
+    predicate: null,
+    object: null,
+    scopeId: null,
+    polarity: "positive",
+    modality: "asserted",
+    status: "supported",
     kind: null,
     memoryClass: null,
     importance: null,
@@ -8258,6 +8362,149 @@ function fallbackAtomicDraft(content: string, observedAt: number): AtomicFactDra
     entities: [],
     relations: [],
   };
+}
+
+interface ObservationParentVersionRef {
+  parentId: string;
+  versionId: string;
+  versionNumber: number;
+  evidenceRootId: string;
+}
+
+function observationParentVersionMetadata(input: ObservationParentVersionRef): Record<string, unknown> {
+  return {
+    parent_id: input.parentId,
+    parent_version_id: input.versionId,
+    parent_version_number: input.versionNumber,
+    evidence_root_id: input.evidenceRootId,
+  };
+}
+
+function parentVersionFromObservationMetadata(metadataJson: string | null | undefined): ObservationParentVersionRef | null {
+  try {
+    const metadata = JSON.parse(metadataJson || "{}") as Record<string, unknown>;
+    const parentId = optionalTrimmedString(metadata.parent_id);
+    const versionId = optionalTrimmedString(metadata.parent_version_id);
+    if (!parentId || !versionId) return null;
+    const versionNumber = Math.max(1, Math.trunc(Number(metadata.parent_version_number ?? 1)) || 1);
+    return {
+      parentId,
+      versionId,
+      versionNumber,
+      evidenceRootId: optionalTrimmedString(metadata.evidence_root_id) ?? parentId,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function observationMetadataWithParentVersion(
+  metadataJson: string | null | undefined,
+  parent: ObservationParentVersionRef,
+  previousParentVersionId?: string | null
+): string {
+  let metadata: Record<string, unknown>;
+  try {
+    metadata = JSON.parse(metadataJson || "{}") as Record<string, unknown>;
+    if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) metadata = {};
+  } catch {
+    metadata = {};
+  }
+  return JSON.stringify({
+    ...metadata,
+    previous_parent_version_id: previousParentVersionId ?? metadata.previous_parent_version_id ?? null,
+    ...observationParentVersionMetadata(parent),
+  });
+}
+
+function prepareObservationParentVersionStatements(
+  db: D1Database,
+  input: ObservationParentVersionRef & {
+    observationId: string;
+    contentHash: string | null;
+    createdAt: number;
+  }
+): D1PreparedStatement[] {
+  return [
+    prepareParentUnitInsert(db, {
+      parentId: input.parentId,
+      createdAt: input.createdAt,
+    }),
+    prepareParentVersionInsert(db, {
+      versionId: input.versionId,
+      parentId: input.parentId,
+      versionNumber: input.versionNumber,
+      sourceObservationId: input.observationId,
+      sourceSnapshotHash: input.contentHash,
+      state: "building",
+      createdAt: input.createdAt,
+    }),
+  ];
+}
+
+function shouldBuildReplacementParentVersion(
+  row: ObservationExtractionRow,
+  statusBeforeLease: ObservationExtractionStatus
+): boolean {
+  return (
+    statusBeforeLease === "fallback" ||
+    statusBeforeLease === "partial_error" ||
+    statusBeforeLease === "succeeded" ||
+    Number(row.extraction_version ?? 0) < ATOMIC_EXTRACTION_VERSION
+  );
+}
+
+async function prepareObservationParentVersionForProcessing(
+  env: Env,
+  row: ObservationExtractionRow,
+  statusBeforeLease: ObservationExtractionStatus
+): Promise<ObservationExtractionRow> {
+  const parent = parentVersionFromObservationMetadata(row.metadata_json);
+  if (!parent || !shouldBuildReplacementParentVersion(row, statusBeforeLease)) return row;
+  const nextParent: ObservationParentVersionRef = {
+    parentId: parent.parentId,
+    versionId: crypto.randomUUID(),
+    versionNumber: parent.versionNumber + 1,
+    evidenceRootId: parent.evidenceRootId,
+  };
+  const metadataJson = observationMetadataWithParentVersion(
+    row.metadata_json,
+    nextParent,
+    parent.versionId
+  );
+  await env.DB.batch([
+    ...prepareObservationParentVersionStatements(env.DB, {
+      ...nextParent,
+      observationId: row.id,
+      contentHash: row.content_hash,
+      createdAt: Date.now(),
+    }),
+    env.DB.prepare(
+      `UPDATE sb_observations
+       SET metadata_json = ?
+       WHERE id = ?`
+    ).bind(metadataJson, row.id),
+  ]);
+  return { ...row, metadata_json: metadataJson };
+}
+
+async function activateObservationParentVersion(env: Env, row: Pick<ObservationExtractionRow, "metadata_json">): Promise<void> {
+  const parent = parentVersionFromObservationMetadata(row.metadata_json);
+  if (!parent) return;
+  await env.DB.batch(prepareParentVersionActivation(env.DB, {
+    parentId: parent.parentId,
+    versionId: parent.versionId,
+    updatedAt: Date.now(),
+  }));
+}
+
+async function failObservationParentVersion(env: Env, row: Pick<ObservationExtractionRow, "metadata_json">): Promise<void> {
+  const parent = parentVersionFromObservationMetadata(row.metadata_json);
+  if (!parent) return;
+  await prepareParentVersionFailure(env.DB, {
+    versionId: parent.versionId,
+    updatedAt: Date.now(),
+  }).run();
 }
 
 async function leaseObservationForExtraction(
@@ -8406,11 +8653,14 @@ async function captureExtractedFactsFromObservation(
   ctx: ExecutionContext
 ): Promise<CaptureResult> {
   const baseTags = tagsFromObservationMetadata(row.metadata_json);
+  const parentVersion = parentVersionFromObservationMetadata(row.metadata_json);
   if (facts.length <= 1) {
     const draft = facts[0] ?? fallbackAtomicDraft(row.content, row.created_at);
     return captureSingleFact(draft.content || row.content, baseTags, row.source, env, ctx, {
       skipExtract: true,
       observationId: row.id,
+      parentVersionId: parentVersion?.versionId ?? null,
+      evidenceRootId: parentVersion?.evidenceRootId ?? row.id,
       atomic: draft,
     });
   }
@@ -8420,6 +8670,8 @@ async function captureExtractedFactsFromObservation(
     const result = await captureSingleFact(draft.content, baseTags, row.source, env, ctx, {
       skipExtract: true,
       observationId: row.id,
+      parentVersionId: parentVersion?.versionId ?? null,
+      evidenceRootId: parentVersion?.evidenceRootId ?? row.id,
       atomic: draft,
     });
     results.push(result);
@@ -8440,23 +8692,25 @@ async function processObservationExtraction(
   options: { fallbackOnError?: boolean } = {}
 ): Promise<ObservationExtractionProcessResult> {
   const startedAt = Date.now();
+  const statusBeforeLease = row.extraction_status;
   const leased = await leaseObservationForExtraction(env, row, startedAt);
   if (!leased) return { status: "skipped", observationId: row.id };
 
   const lease = await readObservationLease(env, row.id);
   const attempts = lease?.attempts ?? Number(row.extraction_attempts ?? 0) + 1;
   const processingStartedAt = lease?.startedAt ?? startedAt;
+  const processingRow = await prepareObservationParentVersionForProcessing(env, row, statusBeforeLease);
 
   let facts: AtomicFactDraft[];
   try {
-    facts = await extractAtomicFacts(row.content, env);
+    facts = await extractAtomicFacts(processingRow.content, env);
   } catch (error) {
     const message = atomicExtractionErrorMessage(error);
     const now = Date.now();
     if (options.fallbackOnError) {
       const result = await captureExtractedFactsFromObservation(
-        row,
-        [fallbackAtomicDraft(row.content, row.created_at)],
+        processingRow,
+        [fallbackAtomicDraft(processingRow.content, processingRow.created_at)],
         env,
         ctx
       );
@@ -8469,6 +8723,7 @@ async function processObservationExtraction(
         processedAt: now,
         needsReprocess: true,
       });
+      await activateObservationParentVersion(env, processingRow);
       return { status: "fallback", observationId: row.id, result, error: message };
     }
 
@@ -8482,15 +8737,17 @@ async function processObservationExtraction(
       processedAt: final ? now : null,
       needsReprocess: Boolean(row.needs_reprocess),
     });
+    if (final) await failObservationParentVersion(env, processingRow);
     return { status: "failed", observationId: row.id, error: message, final };
   }
 
-  const result = await captureExtractedFactsFromObservation(row, facts, env, ctx);
+  const result = await captureExtractedFactsFromObservation(processingRow, facts, env, ctx);
   await markObservationExtractionSucceeded(env, {
     id: row.id,
     startedAt: processingStartedAt,
     processedAt: Date.now(),
   });
+  await activateObservationParentVersion(env, processingRow);
   return { status: "succeeded", observationId: row.id, result };
 }
 
@@ -8722,6 +8979,8 @@ async function dualWriteAtomicMemory(
     content: string;
     contentHash: string;
     observationId: string;
+    parentVersionId?: string | null;
+    evidenceRootId?: string | null;
     atomic?: AtomicFactDraft;
     createdAt: number;
   }
@@ -8737,6 +8996,14 @@ async function dualWriteAtomicMemory(
         importance: input.atomic?.importance ?? null,
         confidence: input.atomic?.confidence ?? null,
         entryId: input.entryId,
+        parentVersionId: input.parentVersionId ?? null,
+        claimSubject: input.atomic?.subject ?? null,
+        claimPredicate: input.atomic?.predicate ?? null,
+        claimObject: input.atomic?.object ?? null,
+        scopeId: input.atomic?.scopeId ?? null,
+        polarity: input.atomic?.polarity ?? "positive",
+        modality: input.atomic?.modality ?? "asserted",
+        claimStatus: input.atomic?.status ?? "supported",
         contentHash: input.contentHash,
         observedAt: input.atomic?.observedAt ?? input.createdAt,
         validFrom: input.atomic?.validFrom ?? null,
@@ -8751,7 +9018,11 @@ async function dualWriteAtomicMemory(
         memoryId,
         observationId: input.observationId,
         role: "derived_from",
+        relation: "supports",
         score: input.atomic?.confidence ?? null,
+        evidenceScore: input.atomic?.confidence ?? null,
+        derivationConfidence: input.atomic?.confidence ?? null,
+        evidenceRootId: input.evidenceRootId ?? input.observationId,
         createdAt: input.createdAt,
       }),
     ]);
@@ -8805,6 +9076,8 @@ async function captureSingleFact(
           content: c,
           contentHash,
           observationId: options.observationId,
+          parentVersionId: options.parentVersionId ?? null,
+          evidenceRootId: options.evidenceRootId ?? options.observationId,
           atomic: options.atomic,
           createdAt: Date.now(),
         });
@@ -8959,6 +9232,8 @@ async function captureSingleFact(
       content: c,
       contentHash,
       observationId: options.observationId,
+      parentVersionId: options.parentVersionId ?? null,
+      evidenceRootId: options.evidenceRootId ?? options.observationId,
       atomic: options.atomic,
       createdAt: now,
     });
@@ -9164,25 +9439,54 @@ export async function captureEntry(
     if (exactId) {
       if (shouldExtract) {
         const observationId = crypto.randomUUID();
+        const parentVersionId = crypto.randomUUID();
         const observedAt = Date.now();
+        const parentRef: ObservationParentVersionRef = {
+          parentId: observationId,
+          versionId: parentVersionId,
+          versionNumber: 1,
+          evidenceRootId: observationId,
+        };
+        const metadata = {
+          tags: baseTags,
+          duplicate_of: exactId,
+          ...observationParentVersionMetadata(parentRef),
+        };
         try {
-          await prepareObservationInsert(env.DB, {
-            id: observationId,
-            content: c,
-            source,
-            metadata: { tags: baseTags, duplicate_of: exactId },
-            contentHash: wholeHash,
-            extractionStatus: "succeeded",
-            processedAt: observedAt,
-            createdAt: observedAt,
-          }).run();
+          await env.DB.batch([
+            prepareObservationInsert(env.DB, {
+              id: observationId,
+              content: c,
+              source,
+              metadata,
+              contentHash: wholeHash,
+              sourceChannel: source,
+              sourceIdentity: `${source}:${observationId}`,
+              authorType: source === "system" ? "system" : "user",
+              sourceTimestamp: observedAt,
+              revision: 1,
+              rootEvidenceId: parentRef.evidenceRootId,
+              extractionStatus: "succeeded",
+              processedAt: observedAt,
+              createdAt: observedAt,
+            }),
+            ...prepareObservationParentVersionStatements(env.DB, {
+              ...parentRef,
+              observationId,
+              contentHash: wholeHash,
+              createdAt: observedAt,
+            }),
+          ]);
           const linked = await linkObservationToAtomicMemory(env.DB, {
             entryId: exactId,
             content: c,
             contentHash: wholeHash,
             observationId,
+            parentVersionId,
+            evidenceRootId: parentRef.evidenceRootId,
             createdAt: observedAt,
           });
+          await activateObservationParentVersion(env, { metadata_json: JSON.stringify(metadata) });
           return {
             status: "sourced",
             id: exactId,
@@ -9210,18 +9514,43 @@ export async function captureEntry(
   }
 
   const observationId = crypto.randomUUID();
+  const parentVersionId = crypto.randomUUID();
   const observedAt = Date.now();
   const observationHash = wholeHash ?? await contentFingerprint(c);
+  const parentRef: ObservationParentVersionRef = {
+    parentId: observationId,
+    versionId: parentVersionId,
+    versionNumber: 1,
+    evidenceRootId: observationId,
+  };
+  const observationMetadata = {
+    tags: baseTags,
+    ...observationParentVersionMetadata(parentRef),
+  };
   try {
-    await prepareObservationInsert(env.DB, {
-      id: observationId,
-      content: c,
-      source,
-      metadata: { tags: baseTags },
-      contentHash: observationHash,
-      extractionStatus: "pending",
-      createdAt: observedAt,
-    }).run();
+    await env.DB.batch([
+      prepareObservationInsert(env.DB, {
+        id: observationId,
+        content: c,
+        source,
+        metadata: observationMetadata,
+        contentHash: observationHash,
+        sourceChannel: source,
+        sourceIdentity: `${source}:${observationId}`,
+        authorType: source === "system" ? "system" : "user",
+        sourceTimestamp: observedAt,
+        revision: 1,
+        rootEvidenceId: parentRef.evidenceRootId,
+        extractionStatus: "pending",
+        createdAt: observedAt,
+      }),
+      ...prepareObservationParentVersionStatements(env.DB, {
+        ...parentRef,
+        observationId,
+        contentHash: observationHash,
+        createdAt: observedAt,
+      }),
+    ]);
   } catch (e) {
     console.error("Observation insert failed; falling back to single capture:", e);
     return captureSingleFact(c, baseTags, source, env, ctx, { skipExtract: true });
@@ -9232,7 +9561,7 @@ export async function captureEntry(
       id: observationId,
       content: c,
       source,
-      metadata_json: JSON.stringify({ tags: baseTags }),
+      metadata_json: JSON.stringify(observationMetadata),
       created_at: observedAt,
       content_hash: observationHash,
       extraction_status: "pending",
@@ -9255,6 +9584,8 @@ export async function captureEntry(
   return captureSingleFact(c, baseTags, source, env, ctx, {
     skipExtract: true,
     observationId,
+    parentVersionId,
+    evidenceRootId: parentRef.evidenceRootId,
   });
 }
 
@@ -10544,7 +10875,8 @@ const defaultHandler = {
         url.searchParams.get("full") === "1" ||
         url.searchParams.get("full") === "true" ||
         url.searchParams.get("schemaVersion") === "4" ||
-        url.searchParams.get("schemaVersion") === "5";
+        url.searchParams.get("schemaVersion") === "5" ||
+        url.searchParams.get("schemaVersion") === "6";
       if (fullExport) {
         return json(await exportMemoryBackup(env.DB, {
           source: env.SELFHOST === "1" ? "selfhost" : "cloudflare",

@@ -9,6 +9,19 @@ import {
   type EntityDraft,
   type EntityRelationDraft,
 } from "./entities";
+import {
+  defaultClaimScores,
+  normalizeClaimModality,
+  normalizeClaimPolarity,
+  normalizeClaimStatus,
+  normalizeEvidenceAuthorType,
+  normalizeProvenanceRelation,
+  type ClaimModality,
+  type ClaimPolarity,
+  type ClaimStatus,
+  type EvidenceAuthorType,
+  type ProvenanceRelation,
+} from "./evidence-contract";
 
 export const MEMORY_CLASS_VALUES = [
   "fact",
@@ -34,6 +47,13 @@ export type AtomicMemoryKind = (typeof KIND_FOR_MEMORY)[number];
 
 export interface AtomicFactDraft {
   content: string;
+  subject: string | null;
+  predicate: string | null;
+  object: string | null;
+  scopeId: string | null;
+  polarity: ClaimPolarity | null;
+  modality: ClaimModality | null;
+  status: ClaimStatus | null;
   kind: AtomicMemoryKind | null;
   memoryClass: MemoryClass | null;
   importance: number | null;
@@ -117,11 +137,17 @@ function clampConfidence(raw: unknown): number | null {
   return n;
 }
 
+function optionalText(raw: unknown, max = 512): string | null {
+  if (raw == null) return null;
+  const text = String(raw).trim();
+  return text ? text.slice(0, max) : null;
+}
+
 export function buildAtomicExtractionPrompt(content: string): string {
   const sample = content.slice(0, ATOMIC_EXTRACTION_CONTENT_LIMIT);
   return (
     `Split this memory input into independent atomic facts. Respond with ONLY one JSON object.\n` +
-    `{"facts":[{"content":"...","kind":"episodic|semantic|procedural","memory_class":"fact|preference|project|task|decision|plan|event|milestone|problem|solution|document|procedure|inference|summary","importance":1-5,"confidence":0-1,"observed_at":null,"valid_from":null,"valid_to":null,"reference_time":null,"entities":[{"name":"...","type":"person|project|organization|place|product|concept|other"}],"relations":[{"from":"...","to":"...","type":"uses|part_of|owns|works_on|depends_on|related_to|located_in","fact":"..."}]}]}\n` +
+    `{"facts":[{"content":"...","subject":null,"predicate":null,"object":null,"scope_id":null,"polarity":"positive|negative|neutral","modality":"asserted|confirmed|inferred|hypothetical","status":"supported|confirmed|contested|superseded|unsupported|deprecated","kind":"episodic|semantic|procedural","memory_class":"fact|preference|project|task|decision|plan|event|milestone|problem|solution|document|procedure|inference|summary","importance":1-5,"confidence":0-1,"observed_at":null,"valid_from":null,"valid_to":null,"reference_time":null,"entities":[{"name":"...","type":"person|project|organization|place|product|concept|other"}],"relations":[{"from":"...","to":"...","type":"uses|part_of|owns|works_on|depends_on|related_to|located_in","fact":"..."}]}]}\n` +
     `Rules:\n` +
     `- One fact per object; do not merge unrelated claims.\n` +
     `- Preserve the user's language.\n` +
@@ -168,6 +194,13 @@ export function parseAtomicExtraction(text: string): AtomicFactDraft[] {
     );
     facts.push({
       content: content.slice(0, 2_000),
+      subject: optionalText((item as any).subject),
+      predicate: optionalText((item as any).predicate),
+      object: optionalText((item as any).object),
+      scopeId: optionalText((item as any).scope_id ?? (item as any).scopeId),
+      polarity: normalizeClaimPolarity((item as any).polarity),
+      modality: normalizeClaimModality((item as any).modality),
+      status: normalizeClaimStatus((item as any).status),
       kind: normalizeAtomicKind((item as any).kind),
       memoryClass: normalizeMemoryClass(
         (item as any).memory_class ?? (item as any).memoryClass ?? (item as any).category
@@ -197,6 +230,14 @@ export function prepareObservationInsert(
     source: string;
     metadata?: Record<string, unknown>;
     contentHash?: string | null;
+    sourceChannel?: string | null;
+    sourceIdentity?: string | null;
+    authorType?: EvidenceAuthorType | string | null;
+    sourceUri?: string | null;
+    sourceTimestamp?: number | null;
+    revision?: number | null;
+    rootEvidenceId?: string | null;
+    previousEvidenceId?: string | null;
     extractionStatus?: ObservationExtractionStatus;
     extractionVersion?: number;
     extractionAttempts?: number;
@@ -212,10 +253,12 @@ export function prepareObservationInsert(
     .prepare(
       `INSERT INTO sb_observations (
          id, content, source, metadata_json, content_hash,
+         source_channel, source_identity, author_type, source_uri,
+         source_timestamp, revision, root_evidence_id, previous_evidence_id,
          extraction_status, extraction_version, extraction_attempts,
          extraction_error, next_attempt_at, processing_started_at,
          processed_at, needs_reprocess, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       input.id,
@@ -223,6 +266,14 @@ export function prepareObservationInsert(
       input.source,
       JSON.stringify(input.metadata ?? {}),
       input.contentHash ?? null,
+      input.sourceChannel ?? input.source,
+      input.sourceIdentity ?? null,
+      normalizeEvidenceAuthorType(input.authorType),
+      input.sourceUri ?? null,
+      input.sourceTimestamp ?? input.createdAt,
+      input.revision ?? 1,
+      input.rootEvidenceId ?? input.id,
+      input.previousEvidenceId ?? null,
       input.extractionStatus ?? "pending",
       input.extractionVersion ?? ATOMIC_EXTRACTION_VERSION,
       input.extractionAttempts ?? 0,
@@ -245,6 +296,15 @@ export function prepareAtomicMemoryInsert(
     importance: number | null;
     confidence: number | null;
     entryId: string | null;
+    parentVersionId?: string | null;
+    claimSubject?: string | null;
+    claimPredicate?: string | null;
+    claimObject?: string | null;
+    scopeId?: string | null;
+    polarity?: ClaimPolarity | string | null;
+    modality?: ClaimModality | string | null;
+    claimStatus?: ClaimStatus | string | null;
+    scoresJson?: string | null;
     contentHash: string | null;
     observedAt: number | null;
     validFrom: number | null;
@@ -260,9 +320,11 @@ export function prepareAtomicMemoryInsert(
     .prepare(
       `INSERT INTO sb_memories (
          id, content, kind, memory_class, importance, confidence,
-         entry_id, content_hash, observed_at, valid_from, valid_to,
+         entry_id, parent_version_id, claim_subject, claim_predicate,
+         claim_object, scope_id, polarity, modality, claim_status,
+         scores_json, content_hash, observed_at, valid_from, valid_to,
          reference_time, invalid_at, expired_at, entities_json, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       input.id,
@@ -272,6 +334,18 @@ export function prepareAtomicMemoryInsert(
       input.importance,
       input.confidence,
       input.entryId,
+      input.parentVersionId ?? null,
+      input.claimSubject ?? null,
+      input.claimPredicate ?? null,
+      input.claimObject ?? null,
+      input.scopeId ?? null,
+      normalizeClaimPolarity(input.polarity),
+      normalizeClaimModality(input.modality),
+      normalizeClaimStatus(input.claimStatus),
+      input.scoresJson ?? JSON.stringify(defaultClaimScores({
+        confidence: input.confidence,
+        evidenceScore: input.confidence,
+      })),
       input.contentHash,
       input.observedAt,
       input.validFrom,
@@ -292,13 +366,23 @@ export function prepareMemorySourceInsert(
     observationId: string;
     role?: string;
     score?: number | null;
+    relation?: ProvenanceRelation | string | null;
+    extractSpan?: string | null;
+    evidenceScore?: number | null;
+    derivationConfidence?: number | null;
+    extractorModel?: string | null;
+    extractorVersion?: string | null;
+    evidenceRootId?: string | null;
     createdAt: number;
   }
 ) {
   return db
     .prepare(
-      `INSERT INTO sb_memory_sources (id, memory_id, observation_id, role, score, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`
+      `INSERT INTO sb_memory_sources (
+         id, memory_id, observation_id, role, score, relation, extract_span,
+         evidence_score, derivation_confidence, extractor_model,
+         extractor_version, evidence_root_id, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       input.id,
@@ -306,6 +390,13 @@ export function prepareMemorySourceInsert(
       input.observationId,
       input.role ?? "derived_from",
       input.score ?? null,
+      normalizeProvenanceRelation(input.relation ?? input.role),
+      input.extractSpan ?? null,
+      input.evidenceScore ?? input.score ?? null,
+      input.derivationConfidence ?? input.score ?? null,
+      input.extractorModel ?? null,
+      input.extractorVersion ?? String(ATOMIC_EXTRACTION_VERSION),
+      input.evidenceRootId ?? input.observationId,
       input.createdAt
     );
 }
@@ -317,6 +408,8 @@ export async function linkObservationToAtomicMemory(
     content: string;
     contentHash: string;
     observationId: string;
+    parentVersionId?: string | null;
+    evidenceRootId?: string | null;
     atomic?: AtomicFactDraft;
     createdAt: number;
   }
@@ -348,6 +441,18 @@ export async function linkObservationToAtomicMemory(
         importance: input.atomic?.importance ?? null,
         confidence: sourceScore,
         entryId: input.entryId,
+        parentVersionId: input.parentVersionId ?? null,
+        claimSubject: input.atomic?.subject ?? null,
+        claimPredicate: input.atomic?.predicate ?? null,
+        claimObject: input.atomic?.object ?? null,
+        scopeId: input.atomic?.scopeId ?? null,
+        polarity: input.atomic?.polarity ?? "positive",
+        modality: input.atomic?.modality ?? "asserted",
+        claimStatus: input.atomic?.status ?? "supported",
+        scoresJson: JSON.stringify(defaultClaimScores({
+          confidence: sourceScore,
+          evidenceScore: sourceScore,
+        })),
         contentHash: input.contentHash,
         observedAt: input.atomic?.observedAt ?? input.createdAt,
         validFrom: input.atomic?.validFrom ?? null,
@@ -377,10 +482,16 @@ export async function linkObservationToAtomicMemory(
   statements.push(
     db
       .prepare(
-        `INSERT INTO sb_memory_sources (id, memory_id, observation_id, role, score, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO sb_memory_sources (
+           id, memory_id, observation_id, role, score, relation,
+           extract_span, evidence_score, derivation_confidence,
+           extractor_model, extractor_version, evidence_root_id, created_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(memory_id, observation_id, role) DO UPDATE SET
-           score = COALESCE(excluded.score, sb_memory_sources.score)`
+           score = COALESCE(excluded.score, sb_memory_sources.score),
+           evidence_score = COALESCE(excluded.evidence_score, sb_memory_sources.evidence_score),
+           derivation_confidence = COALESCE(excluded.derivation_confidence, sb_memory_sources.derivation_confidence)`
       )
       .bind(
         crypto.randomUUID(),
@@ -388,6 +499,13 @@ export async function linkObservationToAtomicMemory(
         input.observationId,
         "derived_from",
         sourceScore,
+        "supports",
+        null,
+        sourceScore,
+        sourceScore,
+        null,
+        String(ATOMIC_EXTRACTION_VERSION),
+        input.evidenceRootId ?? input.observationId,
         input.createdAt
       )
   );
@@ -517,6 +635,14 @@ export const ATOMIC_SCHEMA_STATEMENTS = [
     source TEXT NOT NULL DEFAULT 'api',
     metadata_json TEXT NOT NULL DEFAULT '{}',
     content_hash TEXT,
+    source_channel TEXT,
+    source_identity TEXT,
+    author_type TEXT NOT NULL DEFAULT 'unknown',
+    source_uri TEXT,
+    source_timestamp INTEGER,
+    revision INTEGER NOT NULL DEFAULT 1,
+    root_evidence_id TEXT,
+    previous_evidence_id TEXT,
     extraction_status TEXT NOT NULL DEFAULT 'pending',
     extraction_version INTEGER NOT NULL DEFAULT 1,
     extraction_attempts INTEGER NOT NULL DEFAULT 0,
@@ -537,6 +663,15 @@ export const ATOMIC_SCHEMA_STATEMENTS = [
     importance REAL,
     confidence REAL,
     entry_id TEXT,
+    parent_version_id TEXT,
+    claim_subject TEXT,
+    claim_predicate TEXT,
+    claim_object TEXT,
+    scope_id TEXT,
+    polarity TEXT NOT NULL DEFAULT 'positive',
+    modality TEXT NOT NULL DEFAULT 'asserted',
+    claim_status TEXT NOT NULL DEFAULT 'supported',
+    scores_json TEXT NOT NULL DEFAULT '{}',
     content_hash TEXT,
     observed_at INTEGER,
     valid_from INTEGER,
@@ -559,6 +694,13 @@ export const ATOMIC_SCHEMA_STATEMENTS = [
     observation_id TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'derived_from',
     score REAL,
+    relation TEXT NOT NULL DEFAULT 'derived_from',
+    extract_span TEXT,
+    evidence_score REAL,
+    derivation_confidence REAL,
+    extractor_model TEXT,
+    extractor_version TEXT,
+    evidence_root_id TEXT,
     created_at INTEGER NOT NULL,
     UNIQUE(memory_id, observation_id, role)
   )`,
