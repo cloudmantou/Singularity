@@ -242,15 +242,30 @@ export class SqliteVectorizeIndex {
     options: SqliteVectorizeQueryOptions = {}
   ): Promise<VectorizeMatches> {
     const topK = options.topK ?? 10;
-    const scored =
-      options.filter
-        ? this.scoreRows(this.selectRowsForFilter(options.filter), vector, options.returnValues)
-        : (
-            this.queryVec0(vector, Math.max(topK, 50), Boolean(options.returnValues)) ??
-            this.scoreRows(this.selectAllRows(), vector, options.returnValues)
-          )
-            .sort((a, b) => b.score - a.score)
-            .slice(0, Math.max(topK, 50));
+    const returnValues = Boolean(options.returnValues);
+    const scored = (() => {
+      if (options.filter) {
+        const limitSteps = [
+          Math.max(topK, 50),
+          Math.max(topK, 200),
+          Math.max(topK, 500),
+          Math.max(topK, 1000),
+        ];
+        for (const limit of limitSteps) {
+          const vecMatches = this.queryVec0(vector, limit, returnValues, options.filter);
+          if (vecMatches && vecMatches.length >= topK) return vecMatches;
+        }
+        const partialVecMatches = this.queryVec0(vector, limitSteps[limitSteps.length - 1], returnValues, options.filter);
+        if (partialVecMatches?.length) return partialVecMatches;
+        return this.scoreRows(this.selectRowsForFilter(options.filter), vector, options.returnValues);
+      }
+      return (
+        this.queryVec0(vector, Math.max(topK, 50), returnValues) ??
+        this.scoreRows(this.selectAllRows(), vector, options.returnValues)
+      );
+    })()
+      .sort((a, b) => b.score - a.score)
+      .slice(0, Math.max(topK, 50));
 
     scored.sort((a, b) => b.score - a.score);
     const matches = scored.slice(0, topK).map((m) => {
@@ -349,6 +364,7 @@ export class SqliteVectorizeIndex {
     ftsIndexed: number;
     vecAvailable: boolean;
     vecIndexed: number;
+    filteredVecAvailable: boolean;
     remaining: number;
   } {
     const vectorCount = Number((this.db
@@ -373,6 +389,7 @@ export class SqliteVectorizeIndex {
       ftsIndexed,
       vecAvailable: this.vecAvailable,
       vecIndexed,
+      filteredVecAvailable: this.vecAvailable,
       remaining: ftsRemaining + vecRemaining,
     };
   }
@@ -602,7 +619,8 @@ export class SqliteVectorizeIndex {
   private queryVec0(
     vector: number[],
     topK: number,
-    returnValues: boolean
+    returnValues: boolean,
+    filter?: Record<string, unknown>
   ): ScoredVector[] | null {
     const dim = vectorDimension(vector);
     if (!this.vecAvailable || dim == null) return null;
@@ -628,15 +646,17 @@ export class SqliteVectorizeIndex {
       if (Number(missing.count ?? 0) > 0) {
         return null;
       }
+      const filterPredicate = this.metadataFilterPredicate(filter, "m.metadata_json");
       const rows = this.db
         .prepare(
           `SELECT m.id, m.values_json, m.metadata_json, v.distance
            FROM ${vecTableName(dim)} v
            JOIN sb_vectors m ON m.vector_dim = ? AND m.vec_rowid = v.rowid
            WHERE v.embedding MATCH vec_f32(?) AND k = ?
+             ${filterPredicate.sql}
            ORDER BY v.distance`
         )
-        .all(dim, JSON.stringify(vector), topK) as Array<VectorRow & { distance: number }>;
+        .all(dim, JSON.stringify(vector), topK, ...filterPredicate.params) as Array<VectorRow & { distance: number }>;
       return rows.map((row) => {
         const values = parseJson<number[]>(row.values_json, []);
         return {
@@ -733,6 +753,21 @@ export class SqliteVectorizeIndex {
 
   private selectRowsForFilter(filter: Record<string, unknown> | undefined): VectorRow[] {
     if (!filter || Object.keys(filter).length === 0) return this.selectAllRows();
+    const predicate = this.metadataFilterPredicate(filter, "metadata_json");
+    const where = predicate.sql ? `WHERE ${predicate.sql.replace(/^\s*AND\s+/, "")}` : "";
+    return this.db
+      .prepare(
+        `SELECT id, values_json, metadata_json, vec_rowid, vector_dim
+         FROM sb_vectors ${where}`
+      )
+      .all(...predicate.params) as VectorRow[];
+  }
+
+  private metadataFilterPredicate(
+    filter: Record<string, unknown> | undefined,
+    metadataExpression: string
+  ): { sql: string; params: unknown[] } {
+    if (!filter || Object.keys(filter).length === 0) return { sql: "", params: [] };
     const supported = new Set(["parentId", "source", "embedding_fingerprint", "tag"]);
     for (const key of Object.keys(filter)) {
       if (!supported.has(key)) throw new Error(`Unsupported local vector filter: ${key}`);
@@ -740,34 +775,31 @@ export class SqliteVectorizeIndex {
     const clauses: string[] = [];
     const params: unknown[] = [];
     if (typeof filter.parentId === "string") {
-      clauses.push(`json_extract(metadata_json, '$.parentId') = ?`);
+      clauses.push(`json_extract(${metadataExpression}, '$.parentId') = ?`);
       params.push(filter.parentId);
     }
     if (typeof filter.source === "string") {
-      clauses.push(`json_extract(metadata_json, '$.source') = ?`);
+      clauses.push(`json_extract(${metadataExpression}, '$.source') = ?`);
       params.push(filter.source);
     }
     if (typeof filter.embedding_fingerprint === "string") {
-      clauses.push(`json_extract(metadata_json, '$.embedding_fingerprint') = ?`);
+      clauses.push(`json_extract(${metadataExpression}, '$.embedding_fingerprint') = ?`);
       params.push(filter.embedding_fingerprint);
     }
     if (typeof filter.tag === "string") {
       clauses.push(
         `EXISTS (
           SELECT 1
-          FROM json_each(json_extract(metadata_json, '$.tags'))
+          FROM json_each(json_extract(${metadataExpression}, '$.tags'))
           WHERE value = ?
         )`
       );
       params.push(filter.tag);
     }
-    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
-    return this.db
-      .prepare(
-        `SELECT id, values_json, metadata_json, vec_rowid, vector_dim
-         FROM sb_vectors ${where}`
-      )
-      .all(...params) as VectorRow[];
+    return {
+      sql: clauses.length ? `AND ${clauses.join(" AND ")}` : "",
+      params,
+    };
   }
 
   private selectAllRows(): VectorRow[] {

@@ -27,6 +27,7 @@ export class D1Mock {
   statementCount = 0;
   execCount = 0;
   beforeClassificationCommit?: (row: any) => boolean | void;
+  beforePendingGenerationReset?: (row: any) => boolean | void;
 
   prepare(sql: string) {
     const s = sql.replace(/\s+/g, " ").trim();
@@ -1109,14 +1110,75 @@ export class D1Mock {
           return { meta: { changes: row ? 1 : 0 } };
         }
         if (s.startsWith("UPDATE entries SET pending_vector_ids = '[]'")) {
+          if (s.includes("pending_revision_id IS ?") && s.includes("pending_vector_ids = ?")) {
+            const [
+              pending_embedding_fingerprint,
+              pending_rebuild_id,
+              id,
+              expected_pending_rebuild_id,
+              expected_pending_vector_ids,
+              expected_pending_revision_id,
+              expected_pending_content_hash,
+              expected_pending_metadata_hash,
+            ] = args;
+            const candidate = db.entries.find((e: any) =>
+              e.id === id &&
+              e.pending_rebuild_id === expected_pending_rebuild_id &&
+              e.pending_vector_ids === expected_pending_vector_ids &&
+              (e.pending_revision_id ?? null) === (expected_pending_revision_id ?? null) &&
+              (e.pending_content_hash ?? null) === (expected_pending_content_hash ?? null) &&
+              (e.pending_metadata_hash ?? null) === (expected_pending_metadata_hash ?? null) &&
+              (
+                e.pending_content_hash == null ||
+                e.content_hash == null ||
+                e.pending_revision_id == null ||
+                e.pending_metadata_hash == null ||
+                e.metadata_hash == null ||
+                e.pending_content_hash !== e.content_hash ||
+                e.pending_metadata_hash !== e.metadata_hash
+              )
+            );
+            if (candidate && db.beforePendingGenerationReset) {
+              const hook = db.beforePendingGenerationReset;
+              const keepHook = hook(candidate);
+              if (keepHook !== true) db.beforePendingGenerationReset = undefined;
+            }
+            const row = db.entries.find((e: any) =>
+              e.id === id &&
+              e.pending_rebuild_id === expected_pending_rebuild_id &&
+              e.pending_vector_ids === expected_pending_vector_ids &&
+              (e.pending_revision_id ?? null) === (expected_pending_revision_id ?? null) &&
+              (e.pending_content_hash ?? null) === (expected_pending_content_hash ?? null) &&
+              (e.pending_metadata_hash ?? null) === (expected_pending_metadata_hash ?? null) &&
+              (
+                e.pending_content_hash == null ||
+                e.content_hash == null ||
+                e.pending_revision_id == null ||
+                e.pending_metadata_hash == null ||
+                e.metadata_hash == null ||
+                e.pending_content_hash !== e.content_hash ||
+                e.pending_metadata_hash !== e.metadata_hash
+              )
+            );
+            if (row) {
+              row.pending_vector_ids = "[]";
+              row.pending_embedding_fingerprint = pending_embedding_fingerprint;
+              row.pending_content_hash = null;
+              row.pending_revision_id = null;
+              row.pending_metadata_hash = null;
+              row.pending_rebuild_id = pending_rebuild_id;
+            }
+            return { meta: { changes: row ? 1 : 0 } };
+          }
           const [pending_embedding_fingerprint, pending_rebuild_id, maybe_id, maybe_expected_rebuild_id, maybe_exists_rebuild_id] = args;
-          const scopedId = s.includes("WHERE id = ?") ? String(maybe_id) : null;
+          const hasEntryScopedWhere = s.includes("WHERE id = ? AND tags NOT LIKE");
+          const scopedId = hasEntryScopedWhere ? String(maybe_id) : null;
           const expectedDifferentRebuildId = s.includes("pending_rebuild_id IS NULL OR pending_rebuild_id != ?")
-            ? String(maybe_expected_rebuild_id)
+            ? String(hasEntryScopedWhere ? maybe_expected_rebuild_id : maybe_id)
             : null;
           const existsRebuildId = String(
             s.includes("pending_rebuild_id IS NULL OR pending_rebuild_id != ?")
-              ? maybe_exists_rebuild_id
+              ? (hasEntryScopedWhere ? maybe_exists_rebuild_id : maybe_expected_rebuild_id)
               : (scopedId ? maybe_expected_rebuild_id : pending_rebuild_id)
           );
           const rebuildOpen = db.vectorRebuilds.some((item: any) =>
@@ -1126,7 +1188,7 @@ export class D1Mock {
           for (const row of db.entries) {
             if (scopedId && row.id !== scopedId) continue;
             if (String(row.tags ?? "[]").includes('"status:deprecated"')) continue;
-            if (scopedId && !rebuildOpen) continue;
+            if (!rebuildOpen) continue;
             if (expectedDifferentRebuildId && row.pending_rebuild_id === expectedDifferentRebuildId) continue;
             row.pending_vector_ids = "[]";
             row.pending_embedding_fingerprint = pending_embedding_fingerprint;
@@ -1681,6 +1743,42 @@ export class D1Mock {
             : 0;
           const unclassified = db.entries.filter((e: any) => e.classification_status !== "succeeded").length;
           return { count, avg_importance, unvectorized, unclassified };
+        }
+        if (
+          s.includes("COUNT(*) as count") &&
+          s.includes("pending_rebuild_id = ?") &&
+          s.includes("pending_vector_ids != '[]'") &&
+          s.includes("pending_content_hash IS NULL")
+        ) {
+          const rebuildId = String(args[0]);
+          const count = db.entries.filter((e: any) =>
+            e.pending_rebuild_id === rebuildId &&
+            e.pending_vector_ids != null &&
+            e.pending_vector_ids !== "[]" &&
+            !String(e.tags ?? "[]").includes('"status:deprecated"') &&
+            (
+              e.pending_content_hash == null ||
+              e.content_hash == null ||
+              e.pending_revision_id == null ||
+              e.pending_metadata_hash == null ||
+              e.metadata_hash == null ||
+              e.pending_content_hash !== e.content_hash ||
+              e.pending_metadata_hash !== e.metadata_hash
+            )
+          ).length;
+          return { count };
+        }
+        if (
+          s.includes("COUNT(*) as count") &&
+          s.includes("pending_rebuild_id IS NULL") &&
+          s.includes("pending_rebuild_id != ?")
+        ) {
+          const rebuildId = String(args[0]);
+          const count = db.entries.filter((e: any) =>
+            !String(e.tags ?? "[]").includes('"status:deprecated"') &&
+            (e.pending_rebuild_id == null || e.pending_rebuild_id !== rebuildId)
+          ).length;
+          return { count };
         }
         if (s.includes("COUNT(*) as count") && s.includes("pending_embedding_fingerprint = ?") && s.includes("pending_content_hash != content_hash")) {
           const pendingFingerprint = String(args[0]);
@@ -2477,6 +2575,27 @@ export class D1Mock {
         }
         if (
           s.includes("SELECT id, pending_vector_ids, pending_rebuild_id") &&
+          s.includes("pending_rebuild_id IS NULL") &&
+          s.includes("pending_rebuild_id != ?") &&
+          s.includes("pending_vector_ids != '[]'")
+        ) {
+          const rebuildId = String(args[0]);
+          const results = [...db.entries]
+            .filter((e: any) =>
+              e.pending_vector_ids != null &&
+              e.pending_vector_ids !== "[]" &&
+              !String(e.tags ?? "[]").includes('"status:deprecated"') &&
+              (e.pending_rebuild_id == null || e.pending_rebuild_id !== rebuildId)
+            )
+            .map((e: any) => ({
+              id: e.id,
+              pending_vector_ids: e.pending_vector_ids,
+              pending_rebuild_id: e.pending_rebuild_id ?? null,
+            }));
+          return { results };
+        }
+        if (
+          s.includes("SELECT id, pending_vector_ids, pending_rebuild_id") &&
           s.includes("pending_rebuild_id = ?") &&
           s.includes("pending_vector_ids != '[]'")
         ) {
@@ -2504,6 +2623,9 @@ export class D1Mock {
               id: e.id,
               pending_vector_ids: e.pending_vector_ids,
               pending_rebuild_id: e.pending_rebuild_id,
+              pending_revision_id: e.pending_revision_id ?? null,
+              pending_content_hash: e.pending_content_hash ?? null,
+              pending_metadata_hash: e.pending_metadata_hash ?? null,
             }));
           return { results };
         }

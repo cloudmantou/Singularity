@@ -57,6 +57,21 @@ describe("checkDuplicateAndContradiction()", () => {
     expect(options.filter).toEqual({ embedding_fingerprint: expect.any(String) });
   });
 
+  it("falls back to active-ID filtering when metadata filter query fails", async () => {
+    const queryFn = vi.fn()
+      .mockRejectedValueOnce(new Error("metadata index missing"))
+      .mockResolvedValueOnce({ matches: [match("a", 0.96)] });
+    const env = makeEnv("", [], [entry("a", "I enjoy hiking")]);
+    (env.VECTORIZE as any).query = queryFn;
+
+    const { duplicate } = await checkDuplicateAndContradiction("I enjoy hiking", env);
+
+    expect(duplicate.status).toBe("flagged");
+    expect(queryFn).toHaveBeenCalledTimes(2);
+    expect(queryFn.mock.calls[0][1].filter).toEqual({ embedding_fingerprint: expect.any(String) });
+    expect(queryFn.mock.calls[1][1].filter).toBeUndefined();
+  });
+
   it("returns no contradiction when LLM says no contradiction", async () => {
     const env = makeEnv(
       '{"contradicts": false}',

@@ -301,7 +301,7 @@ describe("POST /vectorize-pending", () => {
     expect(db.vectorRebuilds[0].expected_entries).toBe(2);
   });
 
-  it("blocks activation when a current non-deprecated entry has not joined the rebuild", async () => {
+  it("reconciles a current non-deprecated entry that has not joined the rebuild", async () => {
     db.entries.push({
       ...pastGraceEntry("active"),
       vector_ids: '["active-old"]',
@@ -328,12 +328,13 @@ describe("POST /vectorize-pending", () => {
     const data = await res.json() as any;
 
     expect(data.mode).toBe("blue_green");
-    expect(data.processed).toBe(1);
+    expect(data.reconciledEntries).toBe(1);
+    expect(data.processed).toBe(2);
     expect(data.remaining).toBe(0);
-    expect(data.activated).toBe(0);
-    expect(data.activationState).toBe("blocked");
-    expect(data.activationError).toBe("vector_activation_conflict");
-    expect(db.entries.find((entry: any) => entry.id === "active").vector_ids).toBe('["active-old"]');
+    expect(data.activated).toBe(2);
+    expect(data.activationState).toBe("active");
+    expect(data.activationIntegrity).toEqual({ activatable: 2, blocked: 0 });
+    expect(db.entries.find((entry: any) => entry.id === "active").vector_ids).not.toBe('["active-old"]');
   });
 
   it("deletes ready stale active vector batches during scheduled cleanup", async () => {
@@ -611,6 +612,113 @@ describe("POST /vectorize-pending", () => {
     expect(data.activationIntegrity).toEqual({ activatable: 2, blocked: 0 });
     expect(old.vector_ids).not.toBe('["old-active"]');
     expect(old.pending_vector_ids).toBeNull();
+  });
+
+  it("does not overwrite a fresh pending generation written during stale repair", async () => {
+    db.entries.push({
+      ...pastGraceEntry("old"),
+      vector_ids: '["old-active"]',
+      content_hash: "content-current",
+      metadata_hash: "metadata-current",
+    });
+
+    await worker.fetch(req("POST", "/settings/models/reindex"), env, ctx);
+    const rebuild = db.vectorRebuilds[0];
+    const old = db.entries[0];
+    old.pending_vector_ids = '["stale-pending"]';
+    old.pending_embedding_fingerprint = rebuild.pending_fingerprint;
+    old.pending_rebuild_id = rebuild.id;
+    old.pending_revision_id = "stale-revision";
+    old.pending_content_hash = "content-stale";
+    old.pending_metadata_hash = "metadata-stale";
+
+    db.beforePendingGenerationReset = (row: any) => {
+      row.pending_vector_ids = '["fresh-pending"]';
+      row.pending_revision_id = "fresh-revision";
+      row.pending_content_hash = row.content_hash;
+      row.pending_metadata_hash = row.metadata_hash;
+    };
+
+    const res = await worker.fetch(
+      req("POST", "/vectorize-pending", { body: { includeRecent: true } }),
+      env,
+      ctx
+    );
+    const data = await res.json() as any;
+
+    expect(data.repairedPendingGenerations).toBe(0);
+    expect(data.remaining).toBe(0);
+    expect(data.activated).toBe(1);
+    expect(old.vector_ids).toBe('["fresh-pending"]');
+    expect(db.vectorCleanupQueue.map((item: any) => item.vector_id)).toEqual(["stale-pending"]);
+    expect(db.vectorCleanupQueue[0].reason).toBe("pending_generation_stale");
+  });
+
+  it("queues displaced pending vectors before reconcile attaches an entry to the current rebuild", async () => {
+    db.entries.push({
+      ...pastGraceEntry("old"),
+      vector_ids: '["old-active"]',
+    });
+
+    await worker.fetch(req("POST", "/settings/models/reindex"), env, ctx);
+    const old = db.entries[0];
+    old.pending_vector_ids = '["old-rebuild-pending"]';
+    old.pending_embedding_fingerprint = "old-fingerprint";
+    old.pending_rebuild_id = "old-rebuild";
+    old.pending_revision_id = "old-revision";
+    old.pending_content_hash = "old-content";
+    old.pending_metadata_hash = "old-metadata";
+
+    const res = await worker.fetch(
+      req("POST", "/vectorize-pending", { body: { includeRecent: true } }),
+      env,
+      ctx
+    );
+    const data = await res.json() as any;
+
+    expect(data.reconciledEntries).toBe(1);
+    expect(data.remaining).toBe(0);
+    expect(data.activated).toBe(1);
+    expect(db.vectorCleanupQueue.map((item: any) => item.vector_id)).toEqual(["old-rebuild-pending"]);
+    expect(db.vectorCleanupQueue[0].reason).toBe("rebuild_reconcile_displaced_pending");
+  });
+
+  it("counts unrepaired stale pending rows in remaining when repair limit is reached", async () => {
+    for (let index = 0; index < 60; index++) {
+      db.entries.push({
+        ...pastGraceEntry(`stale-${index}`),
+        vector_ids: `["active-${index}"]`,
+        content_hash: `content-current-${index}`,
+        metadata_hash: `metadata-current-${index}`,
+      });
+    }
+
+    await worker.fetch(req("POST", "/settings/models/reindex"), env, ctx);
+    const rebuild = db.vectorRebuilds[0];
+    for (let index = 0; index < 60; index++) {
+      const row = db.entries[index];
+      row.pending_vector_ids = `["stale-pending-${index}"]`;
+      row.pending_embedding_fingerprint = rebuild.pending_fingerprint;
+      row.pending_rebuild_id = rebuild.id;
+      row.pending_revision_id = `stale-revision-${index}`;
+      row.pending_content_hash = `content-stale-${index}`;
+      row.pending_metadata_hash = `metadata-stale-${index}`;
+    }
+
+    const res = await worker.fetch(
+      req("POST", "/vectorize-pending", { body: { includeRecent: true, limit: 200 } }),
+      env,
+      ctx
+    );
+    const data = await res.json() as any;
+
+    expect(data.repairedPendingGenerations).toBe(50);
+    expect(data.pendingQueueRemaining).toBe(0);
+    expect(data.stalePendingRemaining).toBe(10);
+    expect(data.unjoinedRemaining).toBe(0);
+    expect(data.remaining).toBe(10);
+    expect(data.activationState).toBe("building");
+    expect(data.activated).toBe(0);
   });
 
   it("rejects starting a second rebuild while pending vectors are still referenced", async () => {

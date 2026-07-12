@@ -343,14 +343,34 @@ export function emptyModelSettings(): ModelSettings {
   };
 }
 
-export function embeddingFingerprintOf(emb: EmbeddingSettings): string {
+export function embeddingConfigSignatureOf(emb: EmbeddingSettings): string {
   const base = (emb.baseURL || "").replace(/\/+$/, "").toLowerCase();
-  return [
-    emb.provider || "none",
-    emb.model || "",
-    String(emb.dimensions || 0),
+  return JSON.stringify({
+    provider: emb.provider || "none",
+    model: emb.model || "",
+    dimensions: Number(emb.dimensions || 0),
     base,
-  ].join("|");
+    supportsDimensionsParameter: Boolean(emb.supportsDimensionsParameter),
+  });
+}
+
+function fnv1a64Hex(input: string, seed: bigint): string {
+  const bytes = new TextEncoder().encode(input);
+  let hash = seed;
+  const prime = 0x100000001b3n;
+  const mask = 0xffffffffffffffffn;
+  for (const byte of bytes) {
+    hash ^= BigInt(byte);
+    hash = (hash * prime) & mask;
+  }
+  return hash.toString(16).padStart(16, "0");
+}
+
+export function embeddingFingerprintOf(emb: EmbeddingSettings): string {
+  const signature = embeddingConfigSignatureOf(emb);
+  const high = fnv1a64Hex(signature, 0xcbf29ce484222325n);
+  const low = fnv1a64Hex(`emb2:${signature}`, 0x84222325cbf29ce4n);
+  return `emb2_${high}${low}`;
 }
 
 export function cloneEmbeddingSettings(embedding: EmbeddingSettings): EmbeddingSettings {

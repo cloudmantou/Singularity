@@ -945,6 +945,55 @@ async function filterActiveVectorMatches(
   });
 }
 
+interface ActiveVectorQueryResult {
+  matches: VectorizeMatch[];
+  degraded: boolean;
+  degradedReason?: "vector_metadata_filter_unavailable";
+}
+
+async function queryActiveVectors(
+  env: Env,
+  vector: number[],
+  fingerprint: string,
+  topK: number,
+  queryText?: string
+): Promise<ActiveVectorQueryResult> {
+  const queryOptions = {
+    topK,
+    returnMetadata: "all" as const,
+    filter: { embedding_fingerprint: fingerprint },
+  };
+  try {
+    const result = env.SELFHOST === "1"
+      ? await (env.VECTORIZE as any).query(vector, { ...queryOptions, queryText })
+      : await env.VECTORIZE.query(vector, queryOptions);
+    return {
+      matches: result.matches as VectorizeMatch[],
+      degraded: false,
+    };
+  } catch (error) {
+    console.error(
+      "Active fingerprint filtering failed; using active-ID fallback:",
+      error
+    );
+    const fallbackOptions = {
+      topK: Math.max(topK, 50),
+      returnMetadata: "all" as const,
+    };
+    const fallback = env.SELFHOST === "1"
+      ? await (env.VECTORIZE as any).query(vector, { ...fallbackOptions, queryText })
+      : await env.VECTORIZE.query(vector, fallbackOptions);
+    return {
+      matches: await filterActiveVectorMatches(
+        fallback.matches as VectorizeMatch[],
+        env
+      ),
+      degraded: true,
+      degradedReason: "vector_metadata_filter_unavailable",
+    };
+  }
+}
+
 // Semantic similarity, contradiction detection, and smart merge in one embed +
 // Vectorize query. High similarity (≥0.85, including former "block" band) is
 // always flagged — never hard-blocked — so ADD + relation can still run.
@@ -956,14 +1005,7 @@ export async function checkDuplicateAndContradiction(content: string, env: Env):
   const sample = getDuplicateCheckSample(content);
   const snapshot = await loadActiveEmbeddingSnapshot(env);
   const values = await embedWithProvider(snapshot.provider, sample, "query");
-  const queryOptions = {
-    topK: 50,
-    returnMetadata: "all" as const,
-    filter: { embedding_fingerprint: snapshot.fingerprint },
-  };
-  const queried = env.SELFHOST === "1"
-    ? await (env.VECTORIZE as any).query(values, { ...queryOptions, queryText: sample })
-    : await env.VECTORIZE.query(values, queryOptions);
+  const queried = await queryActiveVectors(env, values, snapshot.fingerprint, 50, sample);
   const matches = (await filterActiveVectorMatches(
     queried.matches as VectorizeMatch[],
     env
@@ -2200,31 +2242,58 @@ async function reconcileOpenVectorRebuildEntries(
   rebuild: OpenVectorRebuildContext
 ): Promise<number> {
   const now = Date.now();
-  const result = await env.DB.prepare(
-    `UPDATE entries
-     SET pending_vector_ids = '[]',
-         pending_embedding_fingerprint = ?,
-         pending_content_hash = NULL,
-         pending_revision_id = NULL,
-         pending_metadata_hash = NULL,
-         pending_rebuild_id = ?
+  const { results: displacedRows } = await env.DB.prepare(
+    `SELECT id, pending_vector_ids, pending_rebuild_id
+     FROM entries
      WHERE tags NOT LIKE '%"status:deprecated"%'
+       AND pending_vector_ids IS NOT NULL
+       AND pending_vector_ids != '[]'
        AND (
          pending_rebuild_id IS NULL
          OR pending_rebuild_id != ?
-       )
-       AND EXISTS (
-         SELECT 1
-         FROM sb_vector_rebuilds
-         WHERE id = ?
-           AND state IN ('queued', 'building', 'ready')
        )`
+  ).bind(rebuild.id).all<{
+    id: string;
+    pending_vector_ids: string | null;
+    pending_rebuild_id: string | null;
+  }>();
+  const cleanupStatements = (displacedRows ?? []).flatMap((row) =>
+    preparePendingGenerationInvalidation(env, {
+      pendingVectorIds: row.pending_vector_ids,
+      pendingRebuildId: row.pending_rebuild_id,
+      reason: "rebuild_reconcile_displaced_pending",
+      now,
+    })
+  );
+  const updateStatement = env.DB.prepare(
+    `UPDATE entries
+      SET pending_vector_ids = '[]',
+          pending_embedding_fingerprint = ?,
+          pending_content_hash = NULL,
+          pending_revision_id = NULL,
+          pending_metadata_hash = NULL,
+          pending_rebuild_id = ?
+      WHERE tags NOT LIKE '%"status:deprecated"%'
+        AND (
+          pending_rebuild_id IS NULL
+          OR pending_rebuild_id != ?
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM sb_vector_rebuilds
+          WHERE id = ?
+            AND state IN ('queued', 'building', 'ready')
+        )`
   ).bind(
     rebuild.pendingFingerprint,
     rebuild.id,
     rebuild.id,
     rebuild.id
-  ).run();
+  );
+  const batchResults = cleanupStatements.length
+    ? await env.DB.batch([...cleanupStatements, updateStatement])
+    : [await updateStatement.run()];
+  const result = batchResults[batchResults.length - 1];
   await env.DB.prepare(
     `UPDATE sb_vector_rebuilds
      SET expected_entries = (
@@ -2245,7 +2314,8 @@ async function repairStalePendingGenerations(
   limit = 50
 ): Promise<number> {
   const { results } = await env.DB.prepare(
-    `SELECT id, pending_vector_ids, pending_rebuild_id
+    `SELECT id, pending_vector_ids, pending_rebuild_id,
+            pending_revision_id, pending_content_hash, pending_metadata_hash
      FROM entries
      WHERE pending_rebuild_id = ?
        AND pending_vector_ids IS NOT NULL
@@ -2266,6 +2336,9 @@ async function repairStalePendingGenerations(
     id: string;
     pending_vector_ids: string | null;
     pending_rebuild_id: string | null;
+    pending_revision_id: string | null;
+    pending_content_hash: string | null;
+    pending_metadata_hash: string | null;
   }>();
   const rows = results ?? [];
   if (!rows.length) return 0;
@@ -2289,11 +2362,75 @@ async function repairStalePendingGenerations(
            pending_metadata_hash = NULL,
            pending_rebuild_id = ?
        WHERE id = ?
-         AND pending_rebuild_id = ?`
-    ).bind(rebuild.pendingFingerprint, rebuild.id, row.id, rebuild.id)
+         AND pending_rebuild_id = ?
+         AND pending_vector_ids = ?
+         AND pending_revision_id IS ?
+         AND pending_content_hash IS ?
+         AND pending_metadata_hash IS ?
+         AND (
+           pending_content_hash IS NULL
+           OR content_hash IS NULL
+           OR pending_revision_id IS NULL
+           OR pending_metadata_hash IS NULL
+           OR metadata_hash IS NULL
+           OR pending_content_hash != content_hash
+           OR pending_metadata_hash != metadata_hash
+         )`
+    ).bind(
+      rebuild.pendingFingerprint,
+      rebuild.id,
+      row.id,
+      rebuild.id,
+      row.pending_vector_ids,
+      row.pending_revision_id,
+      row.pending_content_hash,
+      row.pending_metadata_hash
+    )
   );
-  await env.DB.batch([...cleanupStatements, ...resetStatements]);
-  return rows.length;
+  const batchResults = await env.DB.batch([...cleanupStatements, ...resetStatements]);
+  return batchResults
+    .slice(cleanupStatements.length)
+    .reduce((total, result) => total + Number(result.meta?.changes ?? 0), 0);
+}
+
+async function countStalePendingGenerations(
+  env: Env,
+  rebuild: OpenVectorRebuildContext
+): Promise<number> {
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) as count
+     FROM entries
+     WHERE pending_rebuild_id = ?
+       AND pending_vector_ids IS NOT NULL
+       AND pending_vector_ids != '[]'
+       AND (
+         pending_content_hash IS NULL
+         OR content_hash IS NULL
+         OR pending_revision_id IS NULL
+         OR pending_metadata_hash IS NULL
+         OR metadata_hash IS NULL
+         OR pending_content_hash != content_hash
+         OR pending_metadata_hash != metadata_hash
+       )
+       AND tags NOT LIKE '%"status:deprecated"%'`
+  ).bind(rebuild.id).first() as Record<string, any> | null;
+  return Number(row?.count ?? 0);
+}
+
+async function countUnjoinedVectorRebuildEntries(
+  env: Env,
+  rebuild: OpenVectorRebuildContext
+): Promise<number> {
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) as count
+     FROM entries
+     WHERE tags NOT LIKE '%"status:deprecated"%'
+       AND (
+         pending_rebuild_id IS NULL
+         OR pending_rebuild_id != ?
+       )`
+  ).bind(rebuild.id).first() as Record<string, any> | null;
+  return Number(row?.count ?? 0);
 }
 
 async function inspectPendingActivationIntegrity(
@@ -4602,6 +4739,8 @@ export async function recallEntries(
   ]);
   const values = embeddingResult?.values ?? null;
   const activeFingerprint = embeddingResult?.fingerprint ?? null;
+  let vectorQueryDegraded = false;
+  let vectorQueryDegradedReason: RecallSearchResult["degradedReason"] | undefined;
 
   let keywordRows: KeywordRow[] = [];
   let results: { matches: VectorizeMatch[] };
@@ -4668,27 +4807,19 @@ export async function recallEntries(
             })
         : Promise.resolve([]);
     const [denseResults, kwRows, lexicalIds] = await Promise.all([
-      values
-        ? env.SELFHOST === "1"
-          ? (env.VECTORIZE as any).query(values, {
-              topK: 50,
-              returnMetadata: "all",
-              queryText: embedQuery,
-              filter: activeFingerprint
-                ? { embedding_fingerprint: activeFingerprint }
-                : undefined,
-            })
-          : env.VECTORIZE.query(values, {
-              topK: 50,
-              returnMetadata: "all",
-              filter: activeFingerprint
-                ? { embedding_fingerprint: activeFingerprint }
-                : undefined,
-            })
-        : Promise.resolve({ matches: [] as VectorizeMatch[] }),
+      values && activeFingerprint
+        ? queryActiveVectors(env, values, activeFingerprint, 50, embedQuery)
+        : Promise.resolve({
+            matches: [] as VectorizeMatch[],
+            degraded: false,
+          } satisfies ActiveVectorQueryResult),
       keywordSearch(tokens, env),
       lexicalIdsPromise,
     ]);
+    if (denseResults.degraded) {
+      vectorQueryDegraded = true;
+      vectorQueryDegradedReason = denseResults.degradedReason;
+    }
     results = denseResults;
     keywordRows = kwRows;
     lexicalRows = await lexicalVectorRows(lexicalIds, env).catch((error) => {
@@ -4726,8 +4857,10 @@ export async function recallEntries(
   if (!fusedMatches.length) return {
     matches: [],
     insight: "",
-    degraded: embeddingFailed,
-    degradedReason: embeddingFailed ? "embedding_failed" : undefined,
+    degraded: embeddingFailed || vectorQueryDegraded,
+    degradedReason: embeddingFailed
+      ? "embedding_failed"
+      : vectorQueryDegradedReason,
   };
 
   // Fetch recall_count and importance_score for all candidates to use in scoring.
@@ -4831,8 +4964,10 @@ export async function recallEntries(
   if (!deduped.length) return {
     matches: [],
     insight: "",
-    degraded: embeddingFailed,
-    degradedReason: embeddingFailed ? "embedding_failed" : undefined,
+    degraded: embeddingFailed || vectorQueryDegraded,
+    degradedReason: embeddingFailed
+      ? "embedding_failed"
+      : vectorQueryDegradedReason,
   };
 
   // Fetch full content from D1 for all matched parent IDs. Entry-level time filters are
@@ -4945,8 +5080,10 @@ export async function recallEntries(
   return {
     matches,
     insight,
-    degraded: embeddingFailed,
-    degradedReason: embeddingFailed ? "embedding_failed" : undefined,
+    degraded: embeddingFailed || vectorQueryDegraded,
+    degradedReason: embeddingFailed
+      ? "embedding_failed"
+      : vectorQueryDegradedReason,
   };
 }
 
@@ -7961,7 +8098,7 @@ const defaultHandler = {
         }
       }
 
-      const remaining = usePendingProfile && pendingFingerprint
+      const pendingQueueRemainingRow = usePendingProfile && pendingFingerprint
         ? await env.DB.prepare(
             `SELECT COUNT(*) as count FROM entries
              WHERE pending_vector_ids = '[]'
@@ -7975,7 +8112,16 @@ const defaultHandler = {
                AND tags NOT LIKE '%"status:deprecated"%'
                AND created_at < ?`
           ).bind(graceCutoff).first() as Record<string, any> | null;
-      const remainingN = (remaining?.count as number) ?? 0;
+      const pendingQueueRemaining = Number(pendingQueueRemainingRow?.count ?? 0);
+      const stalePendingRemaining = openRebuildContext
+        ? await countStalePendingGenerations(env, openRebuildContext)
+        : 0;
+      const unjoinedRemaining = openRebuildContext
+        ? await countUnjoinedVectorRebuildEntries(env, openRebuildContext)
+        : 0;
+      const remainingN = usePendingProfile
+        ? pendingQueueRemaining + stalePendingRemaining + unjoinedRemaining
+        : pendingQueueRemaining;
       let activated = 0;
       let activationBlocked = 0;
       let activationIntegrity: PendingActivationIntegrity | null = null;
@@ -8066,6 +8212,9 @@ const defaultHandler = {
         failed,
         skipped,
         remaining: remainingN,
+        pendingQueueRemaining,
+        stalePendingRemaining,
+        unjoinedRemaining,
         limit,
         mode: usePendingProfile ? "blue_green" : "legacy",
         pendingFingerprint: pendingFingerprint ?? undefined,

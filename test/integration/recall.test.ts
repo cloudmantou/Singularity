@@ -189,6 +189,39 @@ describe("GET /recall", () => {
     ]);
   });
 
+  it("degrades to active-id fallback when Vectorize metadata filter is unavailable", async () => {
+    db.entries.push({
+      id: "entry-1",
+      content: "Fallback memory",
+      tags: '["work"]',
+      source: "api",
+      created_at: Date.now(),
+      vector_ids: '["active-vector"]',
+      recall_count: 0,
+      importance_score: 0,
+    });
+    const queryMock = vi.fn()
+      .mockRejectedValueOnce(new Error("metadata index missing"))
+      .mockResolvedValueOnce({
+        matches: [makeMatch("active-vector", 0.91, { parentId: "entry-1" })],
+      });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({ query: queryMock }),
+    });
+
+    const res = await worker.fetch(req("GET", "/recall?query=fallback"), env, ctx);
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.degraded_mode).toBe(true);
+    expect(data.degraded_reason).toBe("vector_metadata_filter_unavailable");
+    expect(data.results).toHaveLength(1);
+    expect(data.results[0].id).toBe("entry-1");
+    expect(queryMock).toHaveBeenCalledTimes(2);
+    expect(queryMock.mock.calls[0][1].filter).toEqual({ embedding_fingerprint: expect.any(String) });
+    expect(queryMock.mock.calls[1][1].filter).toBeUndefined();
+  });
+
   it("ignores stale vectors that are no longer referenced by the D1 entry", async () => {
     db.entries.push({
       id: "entry-1",

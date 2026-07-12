@@ -187,6 +187,30 @@ describe("SqliteVectorizeIndex", () => {
     expect(matches.map((match) => match.id)).toEqual(["keep-a", "keep-b"]);
   });
 
+  it("uses sqlite-vec KNN for embedding_fingerprint filters before JSON fallback", async () => {
+    await vec.insert([
+      { id: "active-a", values: [1, 0], metadata: { parentId: "active", embedding_fingerprint: "emb2_active" } },
+      { id: "pending-a", values: [0.99, 0.01], metadata: { parentId: "pending", embedding_fingerprint: "emb2_pending" } },
+    ]);
+    const details = await vec.describe() as any;
+    if (details.config.backend !== "sqlite-vec") {
+      expect(details.config.backend).toBe("json-cosine");
+      return;
+    }
+
+    raw
+      .prepare(`UPDATE sb_vectors SET values_json = ? WHERE id = ?`)
+      .run(JSON.stringify([]), "active-a");
+
+    const { matches } = await vec.query([1, 0], {
+      topK: 1,
+      filter: { embedding_fingerprint: "emb2_active" },
+    } as any);
+
+    expect(matches.map((match) => match.id)).toEqual(["active-a"]);
+    expect(vec.indexStatus().filteredVecAvailable).toBe(true);
+  });
+
   it("mirrors vectors into sqlite-vec vec0 tables when the extension is available", async () => {
     await vec.insert([
       { id: "d2-a", values: [1, 0], metadata: { parentId: "p2a" } },

@@ -7,6 +7,7 @@ import { SqliteD1Database } from "../../src/selfhost/sqlite-d1";
 import {
   applyModelSettingsPatch,
   emptyModelSettings,
+  embeddingConfigSignatureOf,
   embeddingFingerprintOf,
   maskSecret,
   mergeModelSettings,
@@ -113,6 +114,24 @@ describe("model-settings helpers", () => {
     }
     expect(LLM_PRESETS.some((p) => p.id === "minimax")).toBe(true);
     expect(maskSecret("sk-super-secret-value")).not.toContain("super-secret");
+  });
+
+  it("uses a short embedding fingerprint suitable for Vectorize string metadata indexes", () => {
+    const embedding = {
+      provider: "custom",
+      baseURL: "https://very-long-gateway.example.com/openai/compatible/v1/tenant/project/environment",
+      apiKey: "secret",
+      model: "vendor/very-long-multilingual-embedding-model-name-that-would-exceed-sixty-four-bytes",
+      dimensions: 1536,
+      supportsDimensionsParameter: true,
+    };
+
+    const fingerprint = embeddingFingerprintOf(embedding);
+
+    expect(fingerprint).toMatch(/^emb2_[0-9a-f]{32}$/);
+    expect(new TextEncoder().encode(fingerprint).byteLength).toBeLessThanOrEqual(64);
+    expect(embeddingConfigSignatureOf(embedding)).toContain("very-long-gateway");
+    expect(fingerprint).not.toContain("very-long-gateway");
   });
 });
 
