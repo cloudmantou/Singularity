@@ -1,3 +1,5 @@
+import { MEMORY_QUALITY_SCHEMA_STATEMENTS } from "./memory/quality";
+
 // Centralised schema migration runner with checksum verification.
 // All DDL changes are tracked in the registry so that missing or changed
 // migration statements are detected at startup (strict + auto-repair).
@@ -346,6 +348,10 @@ const OBSIDIAN_V2_STATEMENTS = [
      AND object_type IN ('memory', 'aggregate')`,
 ];
 
+// ── Memory quality review + compliance audit ────────────────────────────────
+
+const MEMORY_QUALITY_REVIEW_STATEMENTS = [...MEMORY_QUALITY_SCHEMA_STATEMENTS];
+
 // ── Registry ─────────────────────────────────────────────────────────────────
 
 export const MIGRATIONS: Migration[] = [
@@ -369,5 +375,11 @@ export const MIGRATIONS: Migration[] = [
     name: "Obsidian v2 sync ETag (content+metadata+status) and vault binding audit trail",
     checksum: "obsidian-v2-sync-etag-vault-v2",
     statements: OBSIDIAN_V2_STATEMENTS,
+  },
+  {
+    id: "20260713_memory_quality_review_and_audit",
+    name: "Memory quality review queues and compliance audit events",
+    checksum: "memory-quality-review-audit-v1",
+    statements: MEMORY_QUALITY_REVIEW_STATEMENTS,
   },
 ];

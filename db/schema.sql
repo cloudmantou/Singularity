@@ -241,6 +241,83 @@ CREATE TABLE IF NOT EXISTS sb_memory_revisions (
 CREATE INDEX IF NOT EXISTS idx_sb_memory_revisions_memory
   ON sb_memory_revisions(memory_id, created_at ASC);
 
+CREATE TABLE IF NOT EXISTS sb_memory_merge_candidates (
+  id TEXT PRIMARY KEY,
+  source_memory_id TEXT NOT NULL,
+  target_memory_id TEXT NOT NULL,
+  similarity REAL,
+  suggested_action TEXT NOT NULL,
+  reason TEXT,
+  state TEXT NOT NULL DEFAULT 'pending',
+  reviewed_by TEXT,
+  reviewed_at INTEGER,
+  created_at INTEGER NOT NULL,
+  CHECK (suggested_action IN ('merge', 'replace', 'keep_both', 'duplicate')),
+  CHECK (state IN ('pending', 'accepted', 'rejected', 'resolved'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_merge_candidates_identity
+  ON sb_memory_merge_candidates(source_memory_id, target_memory_id, suggested_action);
+CREATE INDEX IF NOT EXISTS idx_memory_merge_candidates_state
+  ON sb_memory_merge_candidates(state, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memory_merge_candidates_source
+  ON sb_memory_merge_candidates(source_memory_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memory_merge_candidates_target
+  ON sb_memory_merge_candidates(target_memory_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS sb_conflict_cases (
+  id TEXT PRIMARY KEY,
+  old_memory_id TEXT NOT NULL,
+  new_memory_id TEXT NOT NULL,
+  conflict_type TEXT NOT NULL,
+  reason TEXT,
+  confidence REAL,
+  state TEXT NOT NULL DEFAULT 'pending',
+  resolution TEXT,
+  resolved_by TEXT,
+  resolved_at INTEGER,
+  created_at INTEGER NOT NULL,
+  CHECK (state IN ('pending', 'resolved', 'dismissed')),
+  CHECK (resolution IS NULL OR resolution IN ('use_old', 'use_new', 'keep_both', 'manual', 'dismissed'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_conflict_cases_identity
+  ON sb_conflict_cases(old_memory_id, new_memory_id, conflict_type);
+CREATE INDEX IF NOT EXISTS idx_conflict_cases_state
+  ON sb_conflict_cases(state, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_conflict_cases_old
+  ON sb_conflict_cases(old_memory_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_conflict_cases_new
+  ON sb_conflict_cases(new_memory_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS sb_audit_events (
+  id TEXT PRIMARY KEY,
+  occurred_at INTEGER NOT NULL,
+  trace_id TEXT,
+  actor_type TEXT NOT NULL,
+  actor_id TEXT,
+  token_id TEXT,
+  action TEXT NOT NULL,
+  object_type TEXT NOT NULL,
+  object_id TEXT,
+  vault_id TEXT,
+  before_hash TEXT,
+  after_hash TEXT,
+  success INTEGER NOT NULL DEFAULT 1,
+  error_code TEXT,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  previous_event_hash TEXT,
+  event_hash TEXT NOT NULL UNIQUE
+);
+CREATE INDEX IF NOT EXISTS idx_audit_events_occurred
+  ON sb_audit_events(occurred_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_events_trace
+  ON sb_audit_events(trace_id);
+CREATE INDEX IF NOT EXISTS idx_audit_events_object
+  ON sb_audit_events(object_type, object_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_events_vault
+  ON sb_audit_events(vault_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_events_token
+  ON sb_audit_events(token_id, occurred_at DESC);
+
 -- Atomic memory layer (Observation → Memory → Source)
 CREATE TABLE IF NOT EXISTS sb_observations (
   id TEXT PRIMARY KEY,

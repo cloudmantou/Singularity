@@ -119,6 +119,20 @@ import {
   normalizeEntityName,
 } from "./memory/entities";
 import { runMigrations, MIGRATIONS } from "./migrations";
+import {
+  CONFLICT_CASE_STATES,
+  CONFLICT_RESOLUTIONS,
+  MERGE_CANDIDATE_STATES,
+  prepareComplianceAuditEvent,
+  prepareConflictCase,
+  prepareMemoryMergeCandidate,
+  recordComplianceAuditEvent,
+  type ComplianceAuditEventInput,
+  type ConflictCaseState,
+  type ConflictResolution,
+  type MergeCandidateState,
+  type MergeSuggestedAction,
+} from "./memory/quality";
 
 export interface Env {
   DB: D1Database;
@@ -417,6 +431,32 @@ function requireAuth(request: Request, env: Env): AuthResult {
     return { ok: true, principal: { owner: true, tokenId: null, vaultId: null, scopes: [] } };
   }
   return { ok: false, response: json({ ok: false, error: "Unauthorized" }, 401) };
+}
+
+function auditActorFromPrincipal(principal: AuthPrincipal): Pick<
+  ComplianceAuditEventInput,
+  "actorType" | "actorId" | "tokenId" | "vaultId"
+> {
+  if (principal.owner) {
+    return { actorType: "owner", actorId: "owner", tokenId: null, vaultId: null };
+  }
+  return {
+    actorType: "token",
+    actorId: principal.tokenId,
+    tokenId: principal.tokenId,
+    vaultId: principal.vaultId,
+  };
+}
+
+async function safeRecordComplianceAuditEvent(
+  env: Env,
+  input: ComplianceAuditEventInput
+): Promise<void> {
+  try {
+    await recordComplianceAuditEvent(env.DB, input);
+  } catch (error) {
+    console.error("Compliance audit event write failed (non-fatal):", error);
+  }
 }
 
 interface OAuthLoginDetails {
@@ -5731,6 +5771,7 @@ async function commitEntryVersion(
   let switchResult: D1Result;
   try {
     const newHash = await contentFingerprint(input.newContent);
+    const oldHash = await contentFingerprint(input.oldContent);
     const metadataHash = await entryMetadataFingerprint({
       source: input.source,
       tags: input.newTags,
@@ -5749,6 +5790,22 @@ async function commitEntryVersion(
         now,
       })
     );
+    const auditEvent = await prepareComplianceAuditEvent(env.DB, {
+      actorType: input.actor === "system" ? "system" : "api",
+      actorId: input.actor,
+      action: input.eventType === "APPEND" ? "memory.append" : "memory.update",
+      objectType: "memory",
+      objectId: input.id,
+      beforeHash: oldHash,
+      afterHash: newHash,
+      metadata: {
+        source: input.source,
+        reason: input.reason ?? null,
+        event_type: input.eventType,
+        old_tags: input.oldTags,
+        new_tags: input.newTags,
+      },
+    });
     const results = await env.DB.batch([
       env.DB.prepare(
         `UPDATE entries
@@ -5790,6 +5847,7 @@ async function commitEntryVersion(
       ),
       revision.statement,
       ...cleanupStatements,
+      auditEvent.statement,
     ]);
     switchResult = results[0];
   } catch (error) {
@@ -5929,6 +5987,7 @@ async function appendToEntry(
   let switchResult: D1Result;
   try {
     const newHash = await contentFingerprint(newContent);
+    const oldHash = await contentFingerprint(existingContent);
     const metadataHash = await entryMetadataFingerprint({ source, tags });
     const cleanupStatements = [...new Set(oldPendingVectorIds)].map((vectorId) =>
       prepareVectorCleanupQueueInsert(env, {
@@ -5940,6 +5999,20 @@ async function appendToEntry(
         now: Date.now(),
       })
     );
+    const auditEvent = await prepareComplianceAuditEvent(env.DB, {
+      actorType: source === "system" ? "system" : "api",
+      actorId: source,
+      action: "memory.append",
+      objectType: "memory",
+      objectId: id,
+      beforeHash: oldHash,
+      afterHash: newHash,
+      metadata: {
+        source,
+        append_mode: "single-vector",
+        tags,
+      },
+    });
     const results = await env.DB.batch([
       env.DB.prepare(
         `UPDATE entries
@@ -5980,6 +6053,7 @@ async function appendToEntry(
       ),
       appendRevision.statement,
       ...cleanupStatements,
+      auditEvent.statement,
     ]);
     switchResult = results[0];
   } catch (error) {
@@ -7827,6 +7901,266 @@ async function planCaptureRelation(
   };
 }
 
+function mergeSuggestedActionFromRelation(
+  relationPlan: CaptureRelationPlan | null
+): MergeSuggestedAction | null {
+  if (!relationPlan || relationPlan.relationType === "contradicts") return null;
+  const decision = typeof relationPlan.metadata.decision === "string"
+    ? relationPlan.metadata.decision
+    : null;
+  if (decision === "replace") return "replace";
+  if (decision === "merge") return "merge";
+  return "keep_both";
+}
+
+function relationPlanReason(relationPlan: CaptureRelationPlan): string {
+  const decision = typeof relationPlan.metadata.decision === "string"
+    ? relationPlan.metadata.decision
+    : "keep_both";
+  if (relationPlan.relationType === "supersedes") {
+    return "High semantic similarity; new memory may replace the target.";
+  }
+  if (relationPlan.relationType === "continuation_of") {
+    return "High semantic similarity; new memory may merge with the target.";
+  }
+  if (decision === "replace" && relationPlan.metadata.target_protected === true) {
+    return "Replace was suggested but target is protected; review required.";
+  }
+  return "High semantic similarity; memories should be reviewed together.";
+}
+
+function boundedQualityLimit(value: unknown, fallback = 50): number {
+  const raw = Number(value ?? fallback);
+  return Number.isFinite(raw) ? Math.max(1, Math.min(Math.trunc(raw), 100)) : fallback;
+}
+
+function parseQualityState<T extends string>(
+  value: unknown,
+  allowed: readonly T[]
+): T | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  return (allowed as readonly string[]).includes(value.trim())
+    ? value.trim() as T
+    : null;
+}
+
+function parseReviewId(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+async function listMemoryMergeCandidates(
+  env: Env,
+  input: { state: MergeCandidateState | null; limit: number }
+): Promise<Record<string, unknown>[]> {
+  const stateClause = input.state ? "WHERE c.state = ?" : "";
+  const bindings: unknown[] = [];
+  if (input.state) bindings.push(input.state);
+  bindings.push(input.limit);
+  const { results } = await env.DB.prepare(
+    `SELECT
+       c.*,
+       source.content AS source_content,
+       source.tags AS source_tags,
+       target.content AS target_content,
+       target.tags AS target_tags
+     FROM sb_memory_merge_candidates c
+     LEFT JOIN entries source ON source.id = c.source_memory_id
+     LEFT JOIN entries target ON target.id = c.target_memory_id
+     ${stateClause}
+     ORDER BY c.created_at DESC, c.id DESC
+     LIMIT ?`
+  ).bind(...bindings).all<Record<string, any>>();
+
+  return (results ?? []).map((row) => ({
+    id: row.id,
+    sourceMemoryId: row.source_memory_id,
+    targetMemoryId: row.target_memory_id,
+    similarity: row.similarity == null ? null : Number(row.similarity),
+    suggestedAction: row.suggested_action,
+    reason: row.reason,
+    state: row.state,
+    reviewedBy: row.reviewed_by,
+    reviewedAt: row.reviewed_at,
+    createdAt: row.created_at,
+    source: {
+      id: row.source_memory_id,
+      content: row.source_content ?? null,
+      tags: parseStoredTags(row.source_tags),
+    },
+    target: {
+      id: row.target_memory_id,
+      content: row.target_content ?? null,
+      tags: parseStoredTags(row.target_tags),
+    },
+  }));
+}
+
+async function resolveMemoryMergeCandidate(
+  env: Env,
+  input: {
+    id: string;
+    state: MergeCandidateState;
+    reviewedBy: string;
+    principal: AuthPrincipal;
+  }
+): Promise<boolean> {
+  const now = Date.now();
+  const auditEvent = await prepareComplianceAuditEvent(env.DB, {
+    ...auditActorFromPrincipal(input.principal),
+    action: "quality.merge_candidate.resolve",
+    objectType: "memory_merge_candidate",
+    objectId: input.id,
+    metadata: {
+      state: input.state,
+      reviewed_by: input.reviewedBy,
+    },
+  });
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE sb_memory_merge_candidates
+       SET state = ?, reviewed_by = ?, reviewed_at = ?
+       WHERE id = ?`
+    ).bind(input.state, input.reviewedBy, now, input.id),
+    auditEvent.statement,
+  ]);
+  return Number(results[0]?.meta?.changes ?? 0) > 0;
+}
+
+async function listConflictCases(
+  env: Env,
+  input: { state: ConflictCaseState | null; limit: number }
+): Promise<Record<string, unknown>[]> {
+  const stateClause = input.state ? "WHERE c.state = ?" : "";
+  const bindings: unknown[] = [];
+  if (input.state) bindings.push(input.state);
+  bindings.push(input.limit);
+  const { results } = await env.DB.prepare(
+    `SELECT
+       c.*,
+       old_entry.content AS old_content,
+       old_entry.tags AS old_tags,
+       new_entry.content AS new_content,
+       new_entry.tags AS new_tags
+     FROM sb_conflict_cases c
+     LEFT JOIN entries old_entry ON old_entry.id = c.old_memory_id
+     LEFT JOIN entries new_entry ON new_entry.id = c.new_memory_id
+     ${stateClause}
+     ORDER BY c.created_at DESC, c.id DESC
+     LIMIT ?`
+  ).bind(...bindings).all<Record<string, any>>();
+
+  return (results ?? []).map((row) => ({
+    id: row.id,
+    oldMemoryId: row.old_memory_id,
+    newMemoryId: row.new_memory_id,
+    conflictType: row.conflict_type,
+    reason: row.reason,
+    confidence: row.confidence == null ? null : Number(row.confidence),
+    state: row.state,
+    resolution: row.resolution,
+    resolvedBy: row.resolved_by,
+    resolvedAt: row.resolved_at,
+    createdAt: row.created_at,
+    oldMemory: {
+      id: row.old_memory_id,
+      content: row.old_content ?? null,
+      tags: parseStoredTags(row.old_tags),
+    },
+    newMemory: {
+      id: row.new_memory_id,
+      content: row.new_content ?? null,
+      tags: parseStoredTags(row.new_tags),
+    },
+  }));
+}
+
+async function resolveConflictCase(
+  env: Env,
+  input: {
+    id: string;
+    state: ConflictCaseState;
+    resolution: ConflictResolution;
+    resolvedBy: string;
+    principal: AuthPrincipal;
+  }
+): Promise<boolean> {
+  const now = Date.now();
+  const auditEvent = await prepareComplianceAuditEvent(env.DB, {
+    ...auditActorFromPrincipal(input.principal),
+    action: "quality.conflict_case.resolve",
+    objectType: "conflict_case",
+    objectId: input.id,
+    metadata: {
+      state: input.state,
+      resolution: input.resolution,
+      resolved_by: input.resolvedBy,
+    },
+  });
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE sb_conflict_cases
+       SET state = ?, resolution = ?, resolved_by = ?, resolved_at = ?
+       WHERE id = ?`
+    ).bind(input.state, input.resolution, input.resolvedBy, now, input.id),
+    auditEvent.statement,
+  ]);
+  return Number(results[0]?.meta?.changes ?? 0) > 0;
+}
+
+async function listAuditEvents(
+  env: Env,
+  input: {
+    limit: number;
+    action?: string | null;
+    objectType?: string | null;
+    objectId?: string | null;
+    vaultId?: string | null;
+    traceId?: string | null;
+  }
+): Promise<Record<string, unknown>[]> {
+  const conditions = ["1 = 1"];
+  const bindings: unknown[] = [];
+  const add = (column: string, value: string | null | undefined) => {
+    if (!value) return;
+    conditions.push(`${column} = ?`);
+    bindings.push(value);
+  };
+  add("action", input.action);
+  add("object_type", input.objectType);
+  add("object_id", input.objectId);
+  add("vault_id", input.vaultId);
+  add("trace_id", input.traceId);
+  bindings.push(input.limit);
+  const { results } = await env.DB.prepare(
+    `SELECT id, occurred_at, trace_id, actor_type, actor_id, token_id,
+            action, object_type, object_id, vault_id, before_hash, after_hash,
+            success, error_code, metadata_json, previous_event_hash, event_hash
+     FROM sb_audit_events
+     WHERE ${conditions.join(" AND ")}
+     ORDER BY occurred_at DESC, id DESC
+     LIMIT ?`
+  ).bind(...bindings).all<Record<string, any>>();
+  return (results ?? []).map((row) => ({
+    id: row.id,
+    occurredAt: row.occurred_at,
+    traceId: row.trace_id,
+    actorType: row.actor_type,
+    actorId: row.actor_id,
+    tokenId: row.token_id,
+    action: row.action,
+    objectType: row.object_type,
+    objectId: row.object_id,
+    vaultId: row.vault_id,
+    beforeHash: row.before_hash,
+    afterHash: row.after_hash,
+    success: Boolean(row.success),
+    errorCode: row.error_code,
+    metadata: parseJsonObject(row.metadata_json),
+    previousEventHash: row.previous_event_hash,
+    eventHash: row.event_hash,
+  }));
+}
+
 export async function extractAtomicFacts(content: string, env: Env): Promise<AtomicFactDraft[]> {
   let text: string;
   try {
@@ -8576,6 +8910,47 @@ async function captureSingleFact(
       ).bind(now, openRebuild.id, id, openRebuild.id)
     );
   }
+  const mergeSuggestedAction = mergeSuggestedActionFromRelation(relationPlan);
+  if (mergeSuggestedAction && relationPlan) {
+    statements.push(
+      prepareMemoryMergeCandidate(env.DB, {
+        sourceMemoryId: id,
+        targetMemoryId: relationPlan.toMemoryId,
+        similarity: relationPlan.score,
+        suggestedAction: mergeSuggestedAction,
+        reason: relationPlanReason(relationPlan),
+        createdAt: now,
+      }).statement
+    );
+  }
+  if (contradiction.detected && contradiction.conflicting_id) {
+    statements.push(
+      prepareConflictCase(env.DB, {
+        oldMemoryId: contradiction.conflicting_id,
+        newMemoryId: id,
+        conflictType: "contradiction",
+        reason: contradiction.reason ?? null,
+        confidence: relationPlan?.score ?? (dup.status === "flagged" ? dup.score : 0.5),
+        createdAt: now,
+      }).statement
+    );
+  }
+  statements.push((await prepareComplianceAuditEvent(env.DB, {
+    actorType: source === "system" ? "system" : "api",
+    actorId: source,
+    action: "memory.create",
+    objectType: "memory",
+    objectId: id,
+    afterHash: contentHash,
+    metadata: {
+      source,
+      tags: finalTags,
+      observation_id: options.observationId ?? null,
+      duplicate_status: dup.status,
+      relation_type: relationPlan?.relationType ?? null,
+      conflict: contradiction.detected,
+    },
+  })).statement);
   await env.DB.batch(statements);
 
   if (options.observationId) {
@@ -8691,6 +9066,21 @@ async function captureSingleFact(
         actor: "system",
       });
       const metadataHash = await entryMetadataFingerprint({ source, tags: nextTags });
+      const auditEvent = await prepareComplianceAuditEvent(env.DB, {
+        actorType: "system",
+        actorId: "contradiction-protection",
+        action: "memory.status",
+        objectType: "memory",
+        objectId: id,
+        beforeHash: contentHash,
+        afterHash: contentHash,
+        metadata: {
+          from_status: getStatus(finalTags),
+          to_status: "draft",
+          reason: `Conflicts with canonical memory ${conflictId}`,
+          conflict_id: conflictId,
+        },
+      });
       await env.DB.batch([
         env.DB.prepare(
           `UPDATE entries
@@ -8701,6 +9091,7 @@ async function captureSingleFact(
         )
           .bind(JSON.stringify(nextTags), metadataHash, id),
         statusRevision.statement,
+        auditEvent.statement,
       ]);
       try {
         await env.DB.prepare(`UPDATE entries SET contradiction_wins = contradiction_wins + 1 WHERE id = ?`).bind(conflictId).run();
@@ -8934,6 +9325,23 @@ export async function deprecateEntry(
     actor,
     createdAt: now,
   });
+  const contentHash = await contentFingerprint(row.content as string);
+  const auditEvent = await prepareComplianceAuditEvent(env.DB, {
+    actorType: actor === "system" ? "system" : "api",
+    actorId: actor,
+    action: "memory.deprecate",
+    objectType: "memory",
+    objectId: id,
+    beforeHash: contentHash,
+    afterHash: contentHash,
+    metadata: {
+      reason,
+      old_status: getStatus(tags),
+      new_status: "deprecated",
+      vector_count: vectorIds.length,
+      pending_vector_count: pendingVectorIds.length,
+    },
+  });
   await env.DB.batch([
     ...cleanupStatements,
     env.DB.prepare(
@@ -8949,6 +9357,7 @@ export async function deprecateEntry(
        WHERE id = ?`
     ).bind(JSON.stringify(nextTags), "[]", id),
     deprecateRevision.statement,
+    auditEvent.statement,
     ...(pendingRebuildId
       ? [
           env.DB.prepare(
@@ -9001,6 +9410,21 @@ export async function applyStatus(id: string, status: MemoryStatus, env: Env): P
     reason: `Status set to ${status}`,
     actor: "system",
   });
+  const contentHash = await contentFingerprint(row.content as string);
+  const auditEvent = await prepareComplianceAuditEvent(env.DB, {
+    actorType: "system",
+    actorId: "status-api",
+    action: "memory.status",
+    objectType: "memory",
+    objectId: id,
+    beforeHash: contentHash,
+    afterHash: contentHash,
+    metadata: {
+      from_status: getStatus(tags),
+      to_status: status,
+      source: row.source,
+    },
+  });
   await env.DB.batch([
     env.DB.prepare(
       `UPDATE entries
@@ -9011,6 +9435,7 @@ export async function applyStatus(id: string, status: MemoryStatus, env: Env): P
     ).bind(JSON.stringify(nextTags), metadataHash, id),
     ...cleanupStatements,
     statusRevision.statement,
+    auditEvent.statement,
   ]);
   await notifyMemoryChanged(env, id, "status");
   return true;
@@ -10299,6 +10724,99 @@ const defaultHandler = {
       return json({ ok: true, id, relations });
     }
 
+    // GET /quality/merge-candidates — human review queue for high-similarity memories
+    if (url.pathname === "/quality/merge-candidates" && request.method === "GET") {
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
+      const state = parseQualityState(url.searchParams.get("state"), MERGE_CANDIDATE_STATES);
+      if (url.searchParams.has("state") && !state) {
+        return json({ ok: false, error: `state must be one of: ${MERGE_CANDIDATE_STATES.join(", ")}` }, 400);
+      }
+      const limit = boundedQualityLimit(url.searchParams.get("limit"));
+      const candidates = await listMemoryMergeCandidates(env, { state, limit });
+      return json({ ok: true, count: candidates.length, candidates });
+    }
+
+    // POST /quality/merge-candidates/resolve — mark a merge candidate reviewed
+    if (url.pathname === "/quality/merge-candidates/resolve" && request.method === "POST") {
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
+      let body: { id?: string; state?: string; reviewedBy?: string };
+      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      const id = parseReviewId(body.id);
+      if (!id) return json({ ok: false, error: "id is required" }, 400);
+      const state = parseQualityState(body.state, MERGE_CANDIDATE_STATES);
+      if (!state || state === "pending") {
+        return json({ ok: false, error: "state must be accepted, rejected, or resolved" }, 400);
+      }
+      const reviewedBy = parseReviewId(body.reviewedBy) ?? "owner";
+      const ok = await resolveMemoryMergeCandidate(env, {
+        id,
+        state,
+        reviewedBy,
+        principal: auth.principal,
+      });
+      if (!ok) return json({ ok: false, error: `No merge candidate found with ID: ${id}` }, 404);
+      return json({ ok: true, id, state, reviewedBy });
+    }
+
+    // GET /quality/conflict-cases — human review queue for contradictory memories
+    if (url.pathname === "/quality/conflict-cases" && request.method === "GET") {
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
+      const state = parseQualityState(url.searchParams.get("state"), CONFLICT_CASE_STATES);
+      if (url.searchParams.has("state") && !state) {
+        return json({ ok: false, error: `state must be one of: ${CONFLICT_CASE_STATES.join(", ")}` }, 400);
+      }
+      const limit = boundedQualityLimit(url.searchParams.get("limit"));
+      const conflicts = await listConflictCases(env, { state, limit });
+      return json({ ok: true, count: conflicts.length, conflicts });
+    }
+
+    // POST /quality/conflict-cases/resolve — record a human conflict decision
+    if (url.pathname === "/quality/conflict-cases/resolve" && request.method === "POST") {
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
+      let body: { id?: string; state?: string; resolution?: string; resolvedBy?: string };
+      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      const id = parseReviewId(body.id);
+      if (!id) return json({ ok: false, error: "id is required" }, 400);
+      const state = parseQualityState(body.state, CONFLICT_CASE_STATES);
+      if (!state || state === "pending") {
+        return json({ ok: false, error: "state must be resolved or dismissed" }, 400);
+      }
+      const resolution = parseQualityState(body.resolution, CONFLICT_RESOLUTIONS);
+      if (!resolution) {
+        return json({ ok: false, error: `resolution must be one of: ${CONFLICT_RESOLUTIONS.join(", ")}` }, 400);
+      }
+      const resolvedBy = parseReviewId(body.resolvedBy) ?? "owner";
+      const ok = await resolveConflictCase(env, {
+        id,
+        state,
+        resolution,
+        resolvedBy,
+        principal: auth.principal,
+      });
+      if (!ok) return json({ ok: false, error: `No conflict case found with ID: ${id}` }, 404);
+      return json({ ok: true, id, state, resolution, resolvedBy });
+    }
+
+    // GET /audit/events — compliance audit trail (hash-chained, content hashes only)
+    if (url.pathname === "/audit/events" && request.method === "GET") {
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
+      const limit = boundedQualityLimit(url.searchParams.get("limit"));
+      const events = await listAuditEvents(env, {
+        limit,
+        action: optionalTrimmedString(url.searchParams.get("action")),
+        objectType: optionalTrimmedString(url.searchParams.get("objectType")),
+        objectId: optionalTrimmedString(url.searchParams.get("objectId")),
+        vaultId: optionalTrimmedString(url.searchParams.get("vaultId")),
+        traceId: optionalTrimmedString(url.searchParams.get("traceId")),
+      });
+      return json({ ok: true, count: events.length, events });
+    }
+
     // GET /entities — list / search knowledge entities
     if (url.pathname === "/entities" && request.method === "GET") {
       const auth = requireAuth(request, env);
@@ -10396,6 +10914,16 @@ const defaultHandler = {
         vector_count: result.vectorCount,
         derived_count: result.derivedCount,
       }, "forget");
+      await safeRecordComplianceAuditEvent(env, {
+        ...auditActorFromPrincipal(auth.principal),
+        action: "memory.delete",
+        objectType: "memory",
+        objectId: id,
+        metadata: {
+          vector_count: result.vectorCount,
+          derived_count: result.derivedCount,
+        },
+      });
       await notifyMemoryChanged(env, id, "deleted");
       return json({
         ok: true,

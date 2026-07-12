@@ -8,6 +8,8 @@ const MEMORY_BACKUP_FEATURES = [
   "temporal-facts",
   "fact-sources",
   "embedding-fingerprints",
+  "quality-review",
+  "compliance-audit",
 ] as const;
 
 const GRAPH_ARRAY_KEYS = [
@@ -20,6 +22,9 @@ const GRAPH_ARRAY_KEYS = [
   "factSources",
   "memoryRelations",
   "revisions",
+  "mergeCandidates",
+  "conflictCases",
+  "auditEvents",
 ] as const;
 
 type GraphArrayKey = (typeof GRAPH_ARRAY_KEYS)[number];
@@ -55,6 +60,9 @@ export interface MemoryBackup {
   factSources: BackupRow[];
   memoryRelations: BackupRow[];
   revisions: BackupRow[];
+  mergeCandidates: BackupRow[];
+  conflictCases: BackupRow[];
+  auditEvents: BackupRow[];
 }
 
 export interface MemoryBackupImportResult extends ImportResult {
@@ -147,7 +155,19 @@ export async function inspectMemoryBackupIntegrity(db: D1Database): Promise<Back
         WHERE e.id IS NULL) as memory_relations_missing_to_entry,
        (SELECT COUNT(*) FROM sb_memory_revisions r
         LEFT JOIN entries e ON e.id = r.memory_id
-        WHERE e.id IS NULL) as revisions_missing_entry`
+        WHERE e.id IS NULL) as revisions_missing_entry,
+       (SELECT COUNT(*) FROM sb_memory_merge_candidates c
+        LEFT JOIN entries e ON e.id = c.source_memory_id
+        WHERE e.id IS NULL) as merge_candidates_missing_source,
+       (SELECT COUNT(*) FROM sb_memory_merge_candidates c
+        LEFT JOIN entries e ON e.id = c.target_memory_id
+        WHERE e.id IS NULL) as merge_candidates_missing_target,
+       (SELECT COUNT(*) FROM sb_conflict_cases c
+        LEFT JOIN entries e ON e.id = c.old_memory_id
+        WHERE e.id IS NULL) as conflict_cases_missing_old,
+       (SELECT COUNT(*) FROM sb_conflict_cases c
+        LEFT JOIN entries e ON e.id = c.new_memory_id
+        WHERE e.id IS NULL) as conflict_cases_missing_new`
   );
   const issues: Record<string, number> = {};
   for (const [key, value] of Object.entries(row ?? {})) {
@@ -174,6 +194,9 @@ export async function exportMemoryBackup(
     factSources,
     memoryRelations,
     revisions,
+    mergeCandidates,
+    conflictCases,
+    auditEvents,
   ] = await Promise.all([
     allRows(db, `SELECT id, content, tags, source, created_at, vector_ids,
                        recall_count, importance_score, classification_confidence,
@@ -222,6 +245,21 @@ export async function exportMemoryBackup(
                        old_metadata_json, new_metadata_json, reason, actor, created_at
                 FROM sb_memory_revisions
                 ORDER BY created_at DESC, id DESC`),
+    allRows(db, `SELECT id, source_memory_id, target_memory_id, similarity,
+                       suggested_action, reason, state, reviewed_by, reviewed_at, created_at
+                FROM sb_memory_merge_candidates
+                ORDER BY created_at DESC, id DESC`),
+    allRows(db, `SELECT id, old_memory_id, new_memory_id, conflict_type,
+                       reason, confidence, state, resolution, resolved_by,
+                       resolved_at, created_at
+                FROM sb_conflict_cases
+                ORDER BY created_at DESC, id DESC`),
+    allRows(db, `SELECT id, occurred_at, trace_id, actor_type, actor_id,
+                       token_id, action, object_type, object_id, vault_id,
+                       before_hash, after_hash, success, error_code,
+                       metadata_json, previous_event_hash, event_hash
+                FROM sb_audit_events
+                ORDER BY occurred_at DESC, id DESC`),
   ]);
 
   return {
@@ -241,6 +279,9 @@ export async function exportMemoryBackup(
       factSources: countRows(factSources),
       memoryRelations: countRows(memoryRelations),
       revisions: countRows(revisions),
+      mergeCandidates: countRows(mergeCandidates),
+      conflictCases: countRows(conflictCases),
+      auditEvents: countRows(auditEvents),
     },
     integrity: await inspectMemoryBackupIntegrity(db),
     entries,
@@ -253,6 +294,9 @@ export async function exportMemoryBackup(
     factSources,
     memoryRelations,
     revisions,
+    mergeCandidates,
+    conflictCases,
+    auditEvents,
   };
 }
 
@@ -543,6 +587,75 @@ export async function importMemoryBackup(
       textOrNull(row, "reason"),
       textOrDefault(row, "actor", "import"),
       intOrDefault(row, "created_at", Date.now())
+    )
+  );
+
+  graph.mergeCandidates = await importTable(db, rowsFor(body, "mergeCandidates"), (row) =>
+    db.prepare(
+      `${insertVerb(mode)} INTO sb_memory_merge_candidates (
+         id, source_memory_id, target_memory_id, similarity,
+         suggested_action, reason, state, reviewed_by, reviewed_at, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "id"),
+      requiredText(row, "source_memory_id"),
+      requiredText(row, "target_memory_id"),
+      numberOrNull(row, "similarity"),
+      textOrDefault(row, "suggested_action", "keep_both"),
+      textOrNull(row, "reason"),
+      textOrDefault(row, "state", "pending"),
+      textOrNull(row, "reviewed_by"),
+      numberOrNull(row, "reviewed_at"),
+      intOrDefault(row, "created_at", Date.now())
+    )
+  );
+
+  graph.conflictCases = await importTable(db, rowsFor(body, "conflictCases"), (row) =>
+    db.prepare(
+      `${insertVerb(mode)} INTO sb_conflict_cases (
+         id, old_memory_id, new_memory_id, conflict_type, reason,
+         confidence, state, resolution, resolved_by, resolved_at, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "id"),
+      requiredText(row, "old_memory_id"),
+      requiredText(row, "new_memory_id"),
+      textOrDefault(row, "conflict_type", "contradiction"),
+      textOrNull(row, "reason"),
+      numberOrNull(row, "confidence"),
+      textOrDefault(row, "state", "pending"),
+      textOrNull(row, "resolution"),
+      textOrNull(row, "resolved_by"),
+      numberOrNull(row, "resolved_at"),
+      intOrDefault(row, "created_at", Date.now())
+    )
+  );
+
+  graph.auditEvents = await importTable(db, rowsFor(body, "auditEvents"), (row) =>
+    db.prepare(
+      `${insertVerb(mode)} INTO sb_audit_events (
+         id, occurred_at, trace_id, actor_type, actor_id, token_id,
+         action, object_type, object_id, vault_id, before_hash, after_hash,
+         success, error_code, metadata_json, previous_event_hash, event_hash
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "id"),
+      intOrDefault(row, "occurred_at", Date.now()),
+      textOrNull(row, "trace_id"),
+      textOrDefault(row, "actor_type", "system"),
+      textOrNull(row, "actor_id"),
+      textOrNull(row, "token_id"),
+      textOrDefault(row, "action", "imported"),
+      textOrDefault(row, "object_type", "unknown"),
+      textOrNull(row, "object_id"),
+      textOrNull(row, "vault_id"),
+      textOrNull(row, "before_hash"),
+      textOrNull(row, "after_hash"),
+      intOrDefault(row, "success", 1),
+      textOrNull(row, "error_code"),
+      jsonText(row, "metadata_json", "{}"),
+      textOrNull(row, "previous_event_hash"),
+      requiredText(row, "event_hash")
     )
   );
 

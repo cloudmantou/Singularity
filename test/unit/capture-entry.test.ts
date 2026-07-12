@@ -251,6 +251,15 @@ describe("captureEntry()", () => {
         relation_type: "contradicts",
       })
     );
+    expect(db.conflictCases).toContainEqual(
+      expect.objectContaining({
+        old_memory_id: "old-entry",
+        new_memory_id: result.id,
+        conflict_type: "contradiction",
+        reason: "different city",
+        state: "pending",
+      })
+    );
     // The scoring metadata still promotes the newer observation.
     expect(db.entries.find(e => e.id === result.id)!.contradiction_wins).toBe(1);
     expect(conflictRow!.contradiction_losses).toBe(1);
@@ -360,6 +369,14 @@ describe("captureEntry()", () => {
     expect(db.entries).toHaveLength(2);
     expect(db.entries.find(entry => entry.id === "existing")!.content).toBe("I use VSCode");
     expect(db.entries.find(entry => entry.id === result.id)!.content).toBe("I switched to Cursor");
+    expect(db.mergeCandidates).toContainEqual(
+      expect.objectContaining({
+        source_memory_id: result.id,
+        target_memory_id: "existing",
+        suggested_action: "replace",
+        state: "pending",
+      })
+    );
   });
 
   it("replace: never deletes vectors belonging to the existing entry", async () => {
@@ -422,6 +439,14 @@ describe("captureEntry()", () => {
     expect(db.entries).toHaveLength(2);
     expect(db.entries.find(entry => entry.id === "existing")!.content).toBe("I prefer dark mode");
     expect(db.entries.find(entry => entry.id === result.id)!.content).toBe("I like dark mode especially at night");
+    expect(db.mergeCandidates).toContainEqual(
+      expect.objectContaining({
+        source_memory_id: result.id,
+        target_memory_id: "existing",
+        suggested_action: "merge",
+        state: "pending",
+      })
+    );
   });
 
   it("merge: embeds the raw new content, not the model-generated rewrite", async () => {

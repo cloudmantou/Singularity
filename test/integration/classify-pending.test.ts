@@ -201,9 +201,10 @@ describe("POST /classify-pending", () => {
     // fact-source provenance, external object/source links, scoped access tokens,
     // automation rules, regenerable aggregate state, formal schema migration
     // ledger rows, migration checksum verification, vault-bound Obsidian
-    // prechecks, and unified sync2 etags;
+    // prechecks, unified sync2 etags, quality review queues, and compliance
+    // audit event indexes;
     // keep a bounded D1 headroom check instead of letting init grow unnoticed.
-    expect(db.statementCount).toBeLessThanOrEqual(145);
+    expect(db.statementCount).toBeLessThanOrEqual(170);
   });
 
   it("skips entries whose durable classification status is already succeeded", async () => {

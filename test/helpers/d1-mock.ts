@@ -20,6 +20,9 @@ export class D1Mock {
   memoryEntities: any[] = [];
   entityRelations: any[] = [];
   factSources: any[] = [];
+  mergeCandidates: any[] = [];
+  conflictCases: any[] = [];
+  auditEvents: any[] = [];
   appSettings: Record<string, { value: string; updated_at: number }> = {};
   vectorRebuilds: any[] = [];
   vectorCleanupQueue: any[] = [];
@@ -785,6 +788,126 @@ export class D1Mock {
             reason,
             actor,
             created_at,
+          });
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("INSERT OR IGNORE INTO sb_memory_merge_candidates")) {
+          const [
+            id,
+            source_memory_id,
+            target_memory_id,
+            similarity,
+            suggested_action,
+            reason,
+            created_at,
+          ] = args;
+          const exists = db.mergeCandidates.some((candidate: any) =>
+            candidate.source_memory_id === source_memory_id &&
+            candidate.target_memory_id === target_memory_id &&
+            candidate.suggested_action === suggested_action
+          );
+          if (!exists) {
+            db.mergeCandidates.push({
+              id,
+              source_memory_id,
+              target_memory_id,
+              similarity,
+              suggested_action,
+              reason,
+              state: "pending",
+              reviewed_by: null,
+              reviewed_at: null,
+              created_at,
+            });
+          }
+          return { meta: { changes: exists ? 0 : 1 } };
+        }
+        if (s.startsWith("UPDATE sb_memory_merge_candidates SET state = ?")) {
+          const [state, reviewed_by, reviewed_at, id] = args;
+          const row = db.mergeCandidates.find((candidate: any) => candidate.id === id);
+          if (row) {
+            Object.assign(row, { state, reviewed_by, reviewed_at });
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("INSERT OR IGNORE INTO sb_conflict_cases")) {
+          const [
+            id,
+            old_memory_id,
+            new_memory_id,
+            conflict_type,
+            reason,
+            confidence,
+            created_at,
+          ] = args;
+          const exists = db.conflictCases.some((conflict: any) =>
+            conflict.old_memory_id === old_memory_id &&
+            conflict.new_memory_id === new_memory_id &&
+            conflict.conflict_type === conflict_type
+          );
+          if (!exists) {
+            db.conflictCases.push({
+              id,
+              old_memory_id,
+              new_memory_id,
+              conflict_type,
+              reason,
+              confidence,
+              state: "pending",
+              resolution: null,
+              resolved_by: null,
+              resolved_at: null,
+              created_at,
+            });
+          }
+          return { meta: { changes: exists ? 0 : 1 } };
+        }
+        if (s.startsWith("UPDATE sb_conflict_cases SET state = ?")) {
+          const [state, resolution, resolved_by, resolved_at, id] = args;
+          const row = db.conflictCases.find((conflict: any) => conflict.id === id);
+          if (row) {
+            Object.assign(row, { state, resolution, resolved_by, resolved_at });
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("INSERT INTO sb_audit_events")) {
+          const [
+            id,
+            occurred_at,
+            trace_id,
+            actor_type,
+            actor_id,
+            token_id,
+            action,
+            object_type,
+            object_id,
+            vault_id,
+            before_hash,
+            after_hash,
+            success,
+            error_code,
+            metadata_json,
+            previous_event_hash,
+            event_hash,
+          ] = args;
+          db.auditEvents.push({
+            id,
+            occurred_at,
+            trace_id,
+            actor_type,
+            actor_id,
+            token_id,
+            action,
+            object_type,
+            object_id,
+            vault_id,
+            before_hash,
+            after_hash,
+            success,
+            error_code,
+            metadata_json,
+            previous_event_hash,
+            event_hash,
           });
           return { meta: { changes: 1 } };
         }
@@ -1699,6 +1822,12 @@ export class D1Mock {
         if (s.includes("SELECT value FROM sb_app_settings WHERE key = ?")) {
           const row = db.appSettings[String(args[0])];
           return row ? { value: row.value } : null;
+        }
+        if (s.includes("SELECT event_hash FROM sb_audit_events")) {
+          const latest = [...db.auditEvents].sort((a: any, b: any) =>
+            Number(b.occurred_at ?? 0) - Number(a.occurred_at ?? 0)
+          )[0];
+          return latest ? { event_hash: latest.event_hash } : null;
         }
         if (s.includes("SELECT id, vector_ids, pending_vector_ids, pending_rebuild_id FROM entries WHERE id = ?")) {
           const row = db.entries.find((e: any) => e.id === args[0]);
@@ -2984,6 +3113,9 @@ export class D1Mock {
     this.memoryEntities = [];
     this.entityRelations = [];
     this.factSources = [];
+    this.mergeCandidates = [];
+    this.conflictCases = [];
+    this.auditEvents = [];
     this.appSettings = {};
     this.vectorRebuilds = [];
     this.vectorCleanupQueue = [];
