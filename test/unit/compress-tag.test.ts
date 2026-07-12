@@ -38,7 +38,7 @@ function makeCtx() {
 
 function seedEntries(db: D1Mock, tag: string, count: number, overrides: Partial<any> = {}) {
   for (let i = 0; i < count; i++) {
-    db.entries.push({
+    const entry = {
       id: `entry-${i}`,
       content: `Memory about ${tag} number ${i + 1}`,
       tags: JSON.stringify([tag]),
@@ -48,6 +48,22 @@ function seedEntries(db: D1Mock, tag: string, count: number, overrides: Partial<
       recall_count: 0,
       importance_score: 0,
       ...overrides,
+    };
+    db.entries.push(entry);
+    db.memories.push({
+      id: `claim-${entry.id}`,
+      entry_id: entry.id,
+      content: entry.content,
+      kind: "semantic",
+      memory_class: "fact",
+      claim_status: "supported",
+      importance: 4,
+      confidence: 0.9,
+      valid_from: entry.created_at ?? null,
+      valid_to: null,
+      invalid_at: null,
+      expired_at: null,
+      created_at: entry.created_at ?? Date.now(),
     });
   }
 }

@@ -205,7 +205,7 @@ describe("POST /classify-pending", () => {
     // audit event indexes, evidence/claim/provenance contracts, and parent
     // version snapshots plus parent-version claim links;
     // keep a bounded D1 headroom check instead of letting init grow unnoticed.
-    expect(db.statementCount).toBeLessThanOrEqual(190);
+    expect(db.statementCount).toBeLessThanOrEqual(195);
   });
 
   it("skips entries whose durable classification status is already succeeded", async () => {

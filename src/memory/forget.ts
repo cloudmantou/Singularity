@@ -364,6 +364,52 @@ function prepareDatabaseErase(
       db.prepare(`DELETE FROM sb_fact_sources WHERE memory_id IN (${inList})`).bind(...batch),
       db.prepare(`DELETE FROM sb_memory_entities WHERE memory_id IN (${inList})`).bind(...batch),
       db.prepare(`DELETE FROM sb_memory_sources WHERE memory_id IN (${inList})`).bind(...batch),
+      db.prepare(
+        `UPDATE sb_parent_units
+         SET active_version_id = NULL,
+             updated_at = ?
+         WHERE active_version_id IN (
+           SELECT pv.version_id
+           FROM sb_parent_versions pv
+           WHERE pv.version_id IN (
+             SELECT parent_version_id
+             FROM sb_parent_version_claims
+             WHERE memory_id IN (${inList})
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM sb_parent_version_claims pvc_keep
+             WHERE pvc_keep.parent_version_id = pv.version_id
+               AND pvc_keep.memory_id NOT IN (${inList})
+           )
+         )`
+      ).bind(Date.now(), ...batch, ...batch),
+      db.prepare(
+        `DELETE FROM sb_parent_versions
+         WHERE version_id IN (
+           SELECT pv.version_id
+           FROM sb_parent_versions pv
+           WHERE pv.version_id IN (
+             SELECT parent_version_id
+             FROM sb_parent_version_claims
+             WHERE memory_id IN (${inList})
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM sb_parent_version_claims pvc_keep
+             WHERE pvc_keep.parent_version_id = pv.version_id
+               AND pvc_keep.memory_id NOT IN (${inList})
+           )
+         )`
+      ).bind(...batch, ...batch),
+      db.prepare(`DELETE FROM sb_parent_version_claims WHERE memory_id IN (${inList})`).bind(...batch),
+      db.prepare(
+        `DELETE FROM sb_parent_units
+         WHERE active_version_id IS NULL
+           AND parent_id NOT IN (
+             SELECT parent_id FROM sb_parent_versions
+           )`
+      ),
       db.prepare(`DELETE FROM sb_memories WHERE id IN (${inList})`).bind(...batch),
     ];
   });

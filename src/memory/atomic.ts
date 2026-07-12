@@ -16,7 +16,10 @@ import {
   normalizeClaimStatus,
   normalizeEvidenceAuthorType,
   normalizeProvenanceRelation,
+  prepareParentUnitInsert,
+  prepareParentVersionActivation,
   prepareParentVersionClaimInsert,
+  prepareParentVersionInsert,
   type ClaimModality,
   type ClaimPolarity,
   type ClaimStatus,
@@ -540,8 +543,47 @@ export async function replaceEntryAtomicMemory(
 ): Promise<{ observationId: string; memoryId: string }> {
   const observationId = crypto.randomUUID();
   const memoryId = crypto.randomUUID();
+  const parentRow = await db
+    .prepare(
+      `SELECT pv.parent_id AS parent_id
+       FROM sb_memories m
+       JOIN sb_parent_version_claims pvc ON pvc.memory_id = m.id
+       JOIN sb_parent_versions pv ON pv.version_id = pvc.parent_version_id
+       WHERE m.entry_id = ?
+       ORDER BY CASE WHEN pv.state IN ('active', 'active_degraded') THEN 0 ELSE 1 END,
+                pv.version_number DESC
+       LIMIT 1`
+    )
+    .bind(input.entryId)
+    .first<{ parent_id: string }>();
+  const legacyParentRow = parentRow
+    ? null
+    : await db
+        .prepare(
+          `SELECT pv.parent_id AS parent_id
+           FROM sb_memories m
+           JOIN sb_parent_versions pv ON pv.version_id = m.parent_version_id
+           WHERE m.entry_id = ?
+           ORDER BY CASE WHEN pv.state IN ('active', 'active_degraded') THEN 0 ELSE 1 END,
+                    pv.version_number DESC
+           LIMIT 1`
+        )
+        .bind(input.entryId)
+        .first<{ parent_id: string }>();
+  const parentId = parentRow?.parent_id ?? legacyParentRow?.parent_id ?? `entry:${input.entryId}`;
+  const latestVersion = await db
+    .prepare(
+      `SELECT COALESCE(MAX(version_number), 0) AS version_number
+       FROM sb_parent_versions
+       WHERE parent_id = ?`
+    )
+    .bind(parentId)
+    .first<{ version_number: number }>();
+  const parentVersionId = crypto.randomUUID();
+  const parentVersionNumber = Math.max(1, Number(latestVersion?.version_number ?? 0) + 1);
+  const evidenceRootId = parentId;
 
-  await db.batch([
+  const statements = [
     db
       .prepare(
         `UPDATE sb_entity_relations
@@ -563,6 +605,19 @@ export async function replaceEntryAtomicMemory(
            AND expired_at IS NULL`
       )
       .bind(input.createdAt, input.createdAt, input.createdAt, input.entryId),
+    prepareParentUnitInsert(db, {
+      parentId,
+      createdAt: input.createdAt,
+    }),
+    prepareParentVersionInsert(db, {
+      versionId: parentVersionId,
+      parentId,
+      versionNumber: parentVersionNumber,
+      sourceObservationId: observationId,
+      sourceSnapshotHash: input.contentHash,
+      state: "building",
+      createdAt: input.createdAt,
+    }),
     prepareObservationInsert(db, {
       id: observationId,
       content: input.content,
@@ -571,8 +626,16 @@ export async function replaceEntryAtomicMemory(
         lifecycle_event: input.eventType,
         entry_id: input.entryId,
         needs_reprocess: true,
+        parent_id: parentId,
+        parent_version_id: parentVersionId,
+        parent_version_number: parentVersionNumber,
+        evidence_root_id: evidenceRootId,
       },
       contentHash: input.contentHash,
+      sourceChannel: input.source,
+      sourceIdentity: `${input.source}:${input.entryId}:${parentVersionNumber}`,
+      rootEvidenceId: evidenceRootId,
+      revision: parentVersionNumber,
       extractionStatus: "fallback",
       processedAt: input.createdAt,
       needsReprocess: true,
@@ -602,9 +665,31 @@ export async function replaceEntryAtomicMemory(
       observationId,
       role: "derived_from",
       score: null,
+      relation: "supports",
+      evidenceRootId,
       createdAt: input.createdAt,
     }),
-  ]);
+    prepareParentVersionClaimInsert(db, {
+      parentVersionId,
+      memoryId,
+      relation: "supports",
+      createdAt: input.createdAt,
+    }),
+    ...prepareParentVersionActivation(db, {
+      parentId,
+      versionId: parentVersionId,
+      state: "active_degraded",
+      updatedAt: input.createdAt,
+    }),
+  ];
+
+  const results = await db.batch(statements);
+  const activationStart = statements.length - 3;
+  const activated = Number(results[activationStart]?.meta?.changes ?? 0);
+  const parentUnitUpdated = Number(results[activationStart + 1]?.meta?.changes ?? 0);
+  if (activated !== 1 || parentUnitUpdated !== 1) {
+    throw new Error(`parent_version_activation_failed:${parentVersionId}`);
+  }
 
   return { observationId, memoryId };
 }

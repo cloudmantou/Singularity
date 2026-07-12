@@ -3940,6 +3940,7 @@ export function buildEntryFilterQuery(params: {
   after?: number;
   before?: number;
   vaultFilter?: string | null;
+  strictEvidence?: boolean;
 }): { sql: string; bindings: (string | number)[] } {
   const conds: string[] = [];
   const bindings: (string | number)[] = [];
@@ -3956,6 +3957,15 @@ export function buildEntryFilterQuery(params: {
   if (params.vaultFilter) {
     conds.push(`EXISTS (SELECT 1 FROM sb_external_links l WHERE l.entry_id = entries.id AND l.provider = 'obsidian' AND l.object_type = 'memory' AND l.vault_id = ?)`);
     bindings.push(params.vaultFilter);
+  }
+  if (params.strictEvidence !== false) {
+    conds.push(
+      activeParentEntryPredicateAt(
+        "entries.id",
+        String(params.before ?? Date.now()),
+        { requireEvidence: true }
+      ).replace(/^AND\s+/, "")
+    );
   }
 
   let sql = `SELECT id, content, tags, source, created_at, vector_ids,
@@ -4024,6 +4034,7 @@ async function listRecentActivity(
     after: plan.after,
     before: plan.before,
     vaultFilter,
+    strictEvidence: true,
   });
   const { results } = await env.DB.prepare(sql).bind(...bindings).all();
 
@@ -6356,6 +6367,7 @@ export async function compressTag(
   }
 
   // Fetch compressible entries: tagged with this tag, not system-tagged, not high-importance
+  const compressionAsOf = Date.now();
   const { results: rawEntries } = await env.DB.prepare(`
     SELECT id, content, tags, pending_vector_ids, pending_rebuild_id FROM entries
     WHERE tags LIKE ?
@@ -6363,6 +6375,7 @@ export async function compressTag(
       AND tags NOT LIKE '%"auto-pattern"%'
       AND tags NOT LIKE '%"rolled-up"%'
       AND ${compressionEligibilitySql()}
+      ${activeParentEntryPredicateAt("entries.id", String(compressionAsOf), { requireEvidence: true })}
     ORDER BY created_at DESC
     LIMIT 50
   `).bind(`%"${tag}"%`, Date.now() - COMPRESSION_MIN_AGE_MS).all();
@@ -6457,6 +6470,7 @@ async function runNightlyCompression(env: Env, ctx: ExecutionContext): Promise<v
       AND entries.tags NOT LIKE '%"synthesized"%'
       AND entries.tags NOT LIKE '%"auto-pattern"%'
       AND ${compressionEligibilitySql("entries.")}
+      ${activeParentEntryPredicateAt("entries.id", String(Date.now()), { requireEvidence: true })}
     GROUP BY value
     HAVING count > 10
     ORDER BY count DESC
@@ -6536,9 +6550,13 @@ export interface RecallSearchResult {
 
 interface KeywordRow { id: string; content: string; tags: string; source: string; created_at: number; }
 
-function activeMemoryClaimPredicate(memoryRef: string): string {
+function activeMemoryClaimPredicate(memoryRef: string, asOfExpression: string): string {
   return `(
     ${memoryRef}.claim_status IN ('supported', 'confirmed', 'contested')
+    AND (${memoryRef}.valid_from IS NULL OR ${memoryRef}.valid_from <= ${asOfExpression})
+    AND (${memoryRef}.valid_to IS NULL OR ${memoryRef}.valid_to > ${asOfExpression})
+    AND (${memoryRef}.invalid_at IS NULL OR ${memoryRef}.invalid_at > ${asOfExpression})
+    AND (${memoryRef}.expired_at IS NULL OR ${memoryRef}.expired_at > ${asOfExpression})
     AND (
       EXISTS (
         SELECT 1
@@ -6575,17 +6593,28 @@ function activeMemoryClaimPredicate(memoryRef: string): string {
 }
 
 function activeParentEntryPredicate(entryRef: string): string {
-  return `AND (
-    NOT EXISTS (
+  return activeParentEntryPredicateAt(entryRef, String(Date.now()));
+}
+
+function activeParentEntryPredicateAt(
+  entryRef: string,
+  asOfExpression: string,
+  options: { requireEvidence?: boolean } = {}
+): string {
+  const compatEmptyEntry = options.requireEvidence
+    ? ""
+    : `NOT EXISTS (
       SELECT 1
       FROM sb_memories m_any
       WHERE m_any.entry_id = ${entryRef}
     )
-    OR EXISTS (
+    OR`;
+  return `AND (
+    ${compatEmptyEntry} EXISTS (
       SELECT 1
       FROM sb_memories m_active
       WHERE m_active.entry_id = ${entryRef}
-        AND ${activeMemoryClaimPredicate("m_active")}
+        AND ${activeMemoryClaimPredicate("m_active", asOfExpression)}
     )
   )`;
 }
@@ -6872,7 +6901,7 @@ export function tokenizeQuery(query: string): string[] {
 
 // Keyword candidates: entries whose content contains any query token, bounded by
 // KEYWORD_CANDIDATE_LIMIT. Relevance ranking happens in fuseDenseAndKeyword.
-async function keywordSearch(tokens: string[], env: Env): Promise<KeywordRow[]> {
+async function keywordSearch(tokens: string[], env: Env, asOf: number): Promise<KeywordRow[]> {
   if (!tokens.length) return [];
   const where = tokens.map(() => "content LIKE ?").join(" OR ");
   const { results } = await env.DB.prepare(
@@ -6880,7 +6909,7 @@ async function keywordSearch(tokens: string[], env: Env): Promise<KeywordRow[]> 
      WHERE (${where})
        AND tags NOT LIKE '%"status:deprecated"%'
        AND tags NOT LIKE '%"auto-pattern"%'
-       ${activeParentEntryPredicate("entries.id")}
+       ${activeParentEntryPredicateAt("entries.id", String(asOf), { requireEvidence: true })}
      ORDER BY created_at DESC LIMIT ?`
   ).bind(...tokens.map(t => `%${t}%`), KEYWORD_CANDIDATE_LIMIT).all();
   return results as unknown as KeywordRow[];
@@ -6888,7 +6917,8 @@ async function keywordSearch(tokens: string[], env: Env): Promise<KeywordRow[]> 
 
 async function lexicalVectorRows(
   vectorIds: string[],
-  env: Env
+  env: Env,
+  asOf: number
 ): Promise<KeywordRow[]> {
   if (!vectorIds.length) return [];
   const vectors: VectorizeVector[] = [];
@@ -6911,7 +6941,7 @@ async function lexicalVectorRows(
        WHERE id IN (${placeholders})
          AND tags NOT LIKE '%"status:deprecated"%'
          AND tags NOT LIKE '%"auto-pattern"%'
-         ${activeParentEntryPredicate("entries.id")}`
+         ${activeParentEntryPredicateAt("entries.id", String(asOf), { requireEvidence: true })}`
     ).bind(...batch).all<KeywordRow & { vector_ids?: string }>();
     for (const row of results ?? []) byId.set(row.id, row);
   }
@@ -7005,7 +7035,7 @@ async function buildGraphRecallSignals(
        AND (m.expired_at IS NULL OR m.expired_at > ?)
        AND (m.valid_from IS NULL OR m.valid_from <= ?)
        AND (m.valid_to IS NULL OR m.valid_to > ?)
-       AND ${activeMemoryClaimPredicate("m")}
+       AND ${activeMemoryClaimPredicate("m", String(asOf))}
      ORDER BY COALESCE(me.score, 0) DESC, m.created_at DESC
      LIMIT ?`
   ).bind(...entityIds, asOf, asOf, asOf, asOf, GRAPH_DIRECT_MEMORY_LIMIT).all() as {
@@ -7050,7 +7080,7 @@ async function buildGraphRecallSignals(
        AND m.entry_id IS NOT NULL
        AND (m.invalid_at IS NULL OR m.invalid_at > ?)
        AND (m.expired_at IS NULL OR m.expired_at > ?)
-       AND ${activeMemoryClaimPredicate("m")}
+       AND ${activeMemoryClaimPredicate("m", String(asOf))}
      ORDER BY COALESCE(r.score, 0) DESC, r.created_at DESC
      LIMIT ?`
   ).bind(
@@ -7269,6 +7299,7 @@ export async function recallEntries(
   }
 
   const tokens = tokenizeQuery(embedQuery);
+  const recallAsOf = before ?? now;
   let embeddingFailed = false;
   let lexicalRows: KeywordRow[] = [];
   const [embeddingResult, queryTags, graphSignals] = await Promise.all([
@@ -7307,7 +7338,7 @@ export async function recallEntries(
        WHERE tags LIKE ?
          AND tags NOT LIKE '%"status:deprecated"%'
          AND tags NOT LIKE '%"auto-pattern"%'
-         ${activeParentEntryPredicate("entries.id")}`
+         ${activeParentEntryPredicateAt("entries.id", String(recallAsOf), { requireEvidence: true })}`
     ).bind(`%"${tag}"%`).all();
     if (!tagRows.length) return {
       matches: [],
@@ -7366,7 +7397,7 @@ export async function recallEntries(
             matches: [] as VectorizeMatch[],
             degraded: false,
           } satisfies ActiveVectorQueryResult),
-      keywordSearch(tokens, env),
+      keywordSearch(tokens, env, recallAsOf),
       lexicalIdsPromise,
     ]);
     if (denseResults.degraded) {
@@ -7375,7 +7406,7 @@ export async function recallEntries(
     }
     results = denseResults;
     keywordRows = kwRows;
-    lexicalRows = await lexicalVectorRows(lexicalIds, env).catch((error) => {
+    lexicalRows = await lexicalVectorRows(lexicalIds, env, recallAsOf).catch((error) => {
       console.error("Self-host lexical row hydration failed (non-fatal):", error);
       return [];
     });
@@ -7444,7 +7475,7 @@ export async function recallEntries(
                FROM sb_memories m
                LEFT JOIN sb_memory_sources ms ON ms.memory_id = m.id
                WHERE m.entry_id = entries.id
-                 AND ${activeMemoryClaimPredicate("m")}) AS evidence_score,
+                 AND ${activeMemoryClaimPredicate("m", String(recallAsOf))}) AS evidence_score,
               COALESCE(
                 (SELECT pv.state
                  FROM sb_memories m
@@ -7476,7 +7507,7 @@ export async function recallEntries(
                  LIMIT 1)
               ) AS parent_version_state
        FROM entries WHERE id IN (${rcPlaceholders})
-       ${activeParentEntryPredicate("entries.id")}`
+       ${activeParentEntryPredicateAt("entries.id", String(recallAsOf), { requireEvidence: true })}`
     ).bind(...batch).all() as {
       results: {
         id: string;
@@ -7592,7 +7623,7 @@ export async function recallEntries(
   const parentIds = deduped.map((m) => (m.metadata as any)?.parentId ?? m.id);
   const placeholders = parentIds.map(() => "?").join(", ");
   const d1Bindings: (string | number)[] = [...parentIds];
-  let d1Sql = `SELECT id, content, tags, source, created_at FROM entries WHERE id IN (${placeholders}) AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"status:deprecated"%' ${activeParentEntryPredicate("entries.id")}`;
+  let d1Sql = `SELECT id, content, tags, source, created_at FROM entries WHERE id IN (${placeholders}) AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"status:deprecated"%' ${activeParentEntryPredicateAt("entries.id", String(recallAsOf), { requireEvidence: true })}`;
   if (vaultFilter) {
     d1Sql += ` AND EXISTS (SELECT 1 FROM sb_external_links l WHERE l.entry_id = entries.id AND l.provider = 'obsidian' AND l.object_type = 'memory' AND l.vault_id = ?)`;
     d1Bindings.push(vaultFilter);
@@ -10082,6 +10113,53 @@ export async function applyStatus(id: string, status: MemoryStatus, env: Env): P
       source: row.source,
     },
   });
+  const { results: claimRows } = await env.DB.prepare(
+    `SELECT id, claim_status, scores_json
+     FROM sb_memories
+     WHERE entry_id = ?
+       AND invalid_at IS NULL
+       AND expired_at IS NULL`
+  ).bind(id).all<{ id: string; claim_status: string | null; scores_json: string | null }>();
+  const claimStatements = (claimRows ?? []).flatMap((claim) => {
+    let scores: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(claim.scores_json || "{}");
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        scores = parsed as Record<string, unknown>;
+      }
+    } catch {
+      scores = {};
+    }
+    if (status === "canonical") {
+      const maturity = typeof scores.maturity === "number" ? scores.maturity : 0;
+      return [
+        env.DB.prepare(
+          `UPDATE sb_memories
+           SET claim_status = 'confirmed',
+               scores_json = ?
+           WHERE id = ?`
+        ).bind(JSON.stringify({
+          ...scores,
+          humanConfirmation: 1,
+          maturity: Math.max(maturity, 0.9),
+        }), claim.id),
+      ];
+    }
+    if (status === "draft" && claim.claim_status === "confirmed") {
+      return [
+        env.DB.prepare(
+          `UPDATE sb_memories
+           SET claim_status = 'supported',
+               scores_json = ?
+           WHERE id = ?`
+        ).bind(JSON.stringify({
+          ...scores,
+          humanConfirmation: 0,
+        }), claim.id),
+      ];
+    }
+    return [];
+  });
   await env.DB.batch([
     env.DB.prepare(
       `UPDATE entries
@@ -10091,6 +10169,7 @@ export async function applyStatus(id: string, status: MemoryStatus, env: Env): P
        WHERE id = ?`
     ).bind(JSON.stringify(nextTags), metadataHash, id),
     ...cleanupStatements,
+    ...claimStatements,
     statusRevision.statement,
     auditEvent.statement,
   ]);
@@ -10162,13 +10241,30 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
           isError: true,
         };
       }
+      let atomicSyncWarning: string | undefined;
+      try {
+        await replaceEntryAtomicMemory(env.DB, {
+          entryId: id,
+          content: appendedContent,
+          contentHash: await contentFingerprint(appendedContent),
+          source,
+          eventType: "append",
+          createdAt: Date.now(),
+        });
+      } catch (e) {
+        console.error("MCP atomic memory append sync failed (non-fatal):", e);
+        atomicSyncWarning = "atomic_sync_failed";
+      }
       scheduleClassifyAndTag(id, appendedContent, env, ctx);
 
       return {
         content: [{
           type: "text",
-          text: `Appended to entry ${id}. The original content is preserved and your update has been added with today's date.`,
+          text: atomicSyncWarning
+            ? `Appended to entry ${id}, but atomic memory sync failed. Run extraction repair from Observatory.`
+            : `Appended to entry ${id}. The original content is preserved and your update has been added with today's date.`,
         }],
+        isError: atomicSyncWarning === "atomic_sync_failed",
       };
     }
   );
@@ -10227,10 +10323,30 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
           isError: true,
         };
       }
+      let atomicSyncWarning: string | undefined;
+      try {
+        await replaceEntryAtomicMemory(env.DB, {
+          entryId: id,
+          content: newContent,
+          contentHash: await contentFingerprint(newContent),
+          source,
+          eventType: "update",
+          createdAt: Date.now(),
+        });
+      } catch (e) {
+        console.error("MCP atomic memory update sync failed (non-fatal):", e);
+        atomicSyncWarning = "atomic_sync_failed";
+      }
       scheduleClassifyAndTag(id, newContent, env, ctx);
 
       return {
-        content: [{ type: "text", text: `Updated entry ${id}. Re-embedded as ${newVectorIds.length} vector(s).` }],
+        content: [{
+          type: "text",
+          text: atomicSyncWarning
+            ? `Updated entry ${id}, but atomic memory sync failed. Run extraction repair from Observatory.`
+            : `Updated entry ${id}. Re-embedded as ${newVectorIds.length} vector(s).`,
+        }],
+        isError: atomicSyncWarning === "atomic_sync_failed",
       };
     }
   );

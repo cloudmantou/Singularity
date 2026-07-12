@@ -354,7 +354,7 @@ const MEMORY_QUALITY_REVIEW_STATEMENTS = [...MEMORY_QUALITY_SCHEMA_STATEMENTS];
 
 // ── Parent version claim links ───────────────────────────────────────────────
 
-const PARENT_VERSION_CLAIMS_STATEMENTS = [
+const PARENT_VERSION_CLAIMS_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS sb_parent_version_claims (
     parent_version_id TEXT NOT NULL,
     memory_id TEXT NOT NULL,
@@ -367,6 +367,23 @@ const PARENT_VERSION_CLAIMS_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_parent_version_claims_parent
     ON sb_parent_version_claims(parent_version_id, relation, created_at DESC)`,
 ];
+
+const PARENT_VERSION_CLAIMS_BACKFILL_STATEMENT =
+  `INSERT OR IGNORE INTO sb_parent_version_claims (
+     parent_version_id, memory_id, relation, created_at
+   )
+   SELECT parent_version_id, id, 'supports', created_at
+   FROM sb_memories
+   WHERE parent_version_id IS NOT NULL`;
+
+async function parentVersionClaimsExecute(db: D1Database): Promise<void> {
+  for (const statement of PARENT_VERSION_CLAIMS_SCHEMA_STATEMENTS) {
+    await executeIdempotentSchemaStatement(db, statement);
+  }
+  if (await tableExists(db, "sb_memories")) {
+    await executeIdempotentSchemaStatement(db, PARENT_VERSION_CLAIMS_BACKFILL_STATEMENT);
+  }
+}
 
 // ── Parent version state expansion ───────────────────────────────────────────
 
@@ -475,7 +492,8 @@ export const MIGRATIONS: Migration[] = [
   {
     id: "20260713_parent_version_claim_links",
     name: "Add many-to-many Parent Version to Claim links",
-    checksum: "parent-version-claim-links-v1",
-    statements: PARENT_VERSION_CLAIMS_STATEMENTS,
+    checksum: "parent-version-claim-links-v2",
+    statements: [],
+    execute: parentVersionClaimsExecute,
   },
 ];

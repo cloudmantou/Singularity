@@ -123,7 +123,7 @@ describe("POST /append", () => {
     const originalBatch = db.batch.bind(db);
     db.batch = vi.fn(async (statements: any[]) => {
       const looksLikeAtomicReplacement =
-        statements.length === 5 &&
+        statements.length >= 8 &&
         db.entries[0]?.content.includes("New info") &&
         db.revisions.some((revision: any) => revision.event_type === "APPEND");
       if (looksLikeAtomicReplacement) {
