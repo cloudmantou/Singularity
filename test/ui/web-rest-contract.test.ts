@@ -57,5 +57,8 @@ describe("web memory mutation API contract", () => {
     expect(html).toContain("t('obs.vector.cleanupQueue')");
     expect(html).toContain("t('obs.vector.ftsIndex')");
     expect(html).toContain("t('obs.vector.annIndex')");
+    expect(html).toContain("filteredQueryBackend");
+    expect(html).toContain("filteredVecAvailable");
+    expect(html).toContain("t('obs.vector.filteredKnn')");
   });
 });

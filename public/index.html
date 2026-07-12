@@ -4173,6 +4173,13 @@
         const annText = index
           ? `${obsFmtNum(index.vecIndexed)}/${obsFmtNum(vectorCount)}`
           : '—'
+        const annBackend = index
+          ? (index.filteredQueryBackend || (index.filteredVecAvailable ? 'sqlite-vec-filtered-knn' : 'json-filter-scan'))
+          : ''
+        const annBackendText = annBackend === 'sqlite-vec-filtered-knn'
+          ? t('obs.vector.filteredKnn')
+          : t('obs.vector.jsonFilterScan')
+        const profileRemaining = index ? Number(index.profileVecRemaining || 0) : 0
         const cards = [
           {
             label: t('obs.vector.rebuildState'),
@@ -4209,7 +4216,7 @@
             label: t('obs.vector.annIndex'),
             value: annText,
             hint: index
-              ? `${index.vecAvailable ? 'sqlite-vec' : 'json-cosine'} · remaining ${obsFmtNum(index.remaining || 0)}`
+              ? `${annBackendText} · ${index.vecAvailable ? 'sqlite-vec loaded' : 'sqlite-vec unavailable'} · profile remaining ${obsFmtNum(profileRemaining)} · remaining ${obsFmtNum(index.remaining || 0)}`
               : t('obs.vector.noCloudflareIndex'),
           },
         ]

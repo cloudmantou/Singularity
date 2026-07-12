@@ -199,7 +199,7 @@ describe("SqliteVectorizeIndex", () => {
     }
 
     raw
-      .prepare(`UPDATE sb_vectors SET values_json = ? WHERE id = ?`)
+      .prepare(`UPDATE sb_vectors SET values_json = ?, vec_rowid = NULL WHERE id = ?`)
       .run(JSON.stringify([]), "active-a");
 
     const { matches } = await vec.query([1, 0], {
@@ -208,7 +208,12 @@ describe("SqliteVectorizeIndex", () => {
     } as any);
 
     expect(matches.map((match) => match.id)).toEqual(["active-a"]);
-    expect(vec.indexStatus().filteredVecAvailable).toBe(true);
+    expect(vec.indexStatus()).toMatchObject({
+      profileVectorCount: 2,
+      profileVecRemaining: 0,
+      filteredVecAvailable: true,
+      filteredQueryBackend: "sqlite-vec-filtered-knn",
+    });
   });
 
   it("mirrors vectors into sqlite-vec vec0 tables when the extension is available", async () => {
@@ -274,13 +279,23 @@ describe("SqliteVectorizeIndex", () => {
       .run(
         "legacy-index",
         JSON.stringify([1, 0]),
-        JSON.stringify({ parentId: "legacy", content: "sqlite vector legacy row" })
+        JSON.stringify({
+          parentId: "legacy",
+          content: "sqlite vector legacy row",
+          embedding_fingerprint: "emb2_11111111111111111111111111111111",
+        })
       );
 
     const before = vec.indexStatus();
     expect(before.vectorCount).toBe(1);
     if (before.ftsAvailable) expect(before.ftsIndexed).toBe(0);
-    if (before.vecAvailable) expect(before.vecIndexed).toBe(0);
+    if (before.vecAvailable) {
+      expect(before.vecIndexed).toBe(0);
+      expect(before.filteredVecAvailable).toBe(false);
+      expect(before.filteredQueryBackend).toBe("json-filter-scan");
+      expect(before.profileVectorCount).toBe(1);
+      expect(before.profileVecRemaining).toBe(1);
+    }
 
     const result = vec.backfillIndexBatch(10);
     expect(result.ftsProcessed).toBe(before.ftsAvailable ? 1 : 0);
@@ -289,6 +304,12 @@ describe("SqliteVectorizeIndex", () => {
 
     const after = vec.indexStatus();
     expect(after.remaining).toBe(0);
+    if (after.vecAvailable) {
+      expect(after.profileVectorCount).toBe(1);
+      expect(after.profileVecRemaining).toBe(0);
+      expect(after.filteredVecAvailable).toBe(true);
+      expect(after.filteredQueryBackend).toBe("sqlite-vec-filtered-knn");
+    }
     if (after.ftsAvailable) {
       expect(vec.queryLexical("sqlite vector", 10)).toContain("legacy-index");
     }

@@ -16,6 +16,8 @@ type VectorRow = {
   metadata_json: string;
   vec_rowid?: number | null;
   vector_dim?: number | null;
+  profile_vec_rowid?: number | null;
+  vector_profile_id?: string | null;
 };
 
 type ScoredVector = {
@@ -119,6 +121,34 @@ function vecTableName(dim: number): string {
   return `sb_vectors_vec_${dim}`;
 }
 
+function fnv1a64Hex(input: string): string {
+  const bytes = new TextEncoder().encode(input);
+  let hash = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  const mask = 0xffffffffffffffffn;
+  for (const byte of bytes) {
+    hash ^= BigInt(byte);
+    hash = (hash * prime) & mask;
+  }
+  return hash.toString(16).padStart(16, "0");
+}
+
+function profileTableSuffix(profileId: string): string {
+  if (/^emb2_[0-9a-f]{32}$/i.test(profileId)) return profileId;
+  return `fp_${fnv1a64Hex(profileId)}`;
+}
+
+function profileVecTableName(dim: number, profileId: string): string {
+  return `${vecTableName(dim)}_${profileTableSuffix(profileId)}`;
+}
+
+function vectorProfileId(metadata: Record<string, unknown>): string | null {
+  const profileId = metadata.embedding_fingerprint;
+  return typeof profileId === "string" && profileId.trim().length > 0
+    ? profileId
+    : null;
+}
+
 function similarityFromCosineDistance(distance: number): number {
   if (!Number.isFinite(distance)) return 0;
   return Math.max(-1, Math.min(1, 1 - distance));
@@ -129,6 +159,7 @@ export class SqliteVectorizeIndex {
   private ftsTokenizer: "trigram" | "unicode61" | null = null;
   private vecAvailable = false;
   private readonly vecTables = new Set<number>();
+  private readonly profileVecTables = new Set<string>();
 
   constructor(private db: Database.Database) {
     this.db.exec(`
@@ -147,16 +178,22 @@ export class SqliteVectorizeIndex {
     vectors: { id: string; values: number[]; metadata?: Record<string, unknown> }[]
   ): Promise<{ mutationId: string }> {
     const upsert = this.db.prepare(`
-      INSERT INTO sb_vectors (id, values_json, metadata_json, vec_rowid, vector_dim)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO sb_vectors (
+        id, values_json, metadata_json, vec_rowid, vector_dim,
+        profile_vec_rowid, vector_profile_id
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         values_json = excluded.values_json,
         metadata_json = excluded.metadata_json,
         vec_rowid = excluded.vec_rowid,
-        vector_dim = excluded.vector_dim
+        vector_dim = excluded.vector_dim,
+        profile_vec_rowid = excluded.profile_vec_rowid,
+        vector_profile_id = excluded.vector_profile_id
     `);
     const existingStmt = this.db.prepare(
-      `SELECT vec_rowid, vector_dim FROM sb_vectors WHERE id = ?`
+      `SELECT vec_rowid, vector_dim, profile_vec_rowid, vector_profile_id
+       FROM sb_vectors WHERE id = ?`
     );
     const deleteFts = this.ftsAvailable
       ? this.db.prepare(`DELETE FROM sb_vector_fts WHERE id = ?`)
@@ -168,19 +205,35 @@ export class SqliteVectorizeIndex {
     const tx = this.db.transaction((rows: typeof vectors) => {
       for (const v of rows) {
         const existing = existingStmt.get(v.id) as
-          | { vec_rowid: number | null; vector_dim: number | null }
+          | {
+              vec_rowid: number | null;
+              vector_dim: number | null;
+              profile_vec_rowid: number | null;
+              vector_profile_id: string | null;
+            }
           | undefined;
         this.deleteVecRow(existing?.vector_dim ?? null, existing?.vec_rowid ?? null);
+        this.deleteProfileVecRow(
+          existing?.vector_dim ?? null,
+          existing?.vector_profile_id ?? null,
+          existing?.profile_vec_rowid ?? null
+        );
 
         const metadata = v.metadata ?? {};
         const dim = vectorDimension(v.values);
+        const profileId = vectorProfileId(metadata);
         const vecRowid = dim == null ? null : this.insertVecRow(dim, v.values);
+        const profileVecRowid = dim == null || !profileId
+          ? null
+          : this.insertProfileVecRow(dim, profileId, v.values);
         upsert.run(
           v.id,
           JSON.stringify(v.values),
           JSON.stringify(metadata),
           vecRowid,
-          dim
+          dim,
+          profileVecRowid,
+          profileId
         );
         deleteFts?.run(v.id);
         insertFts?.run(v.id, ftsContent(metadata));
@@ -199,7 +252,8 @@ export class SqliteVectorizeIndex {
   async deleteByIds(ids: string[]): Promise<{ mutationId: string }> {
     if (!ids.length) return { mutationId: `del-${Date.now()}` };
     const get = this.db.prepare(
-      `SELECT vec_rowid, vector_dim FROM sb_vectors WHERE id = ?`
+      `SELECT vec_rowid, vector_dim, profile_vec_rowid, vector_profile_id
+       FROM sb_vectors WHERE id = ?`
     );
     const del = this.db.prepare(`DELETE FROM sb_vectors WHERE id = ?`);
     const deleteFts = this.ftsAvailable
@@ -208,9 +262,19 @@ export class SqliteVectorizeIndex {
     const tx = this.db.transaction((rowIds: string[]) => {
       for (const id of rowIds) {
         const row = get.get(id) as
-          | { vec_rowid: number | null; vector_dim: number | null }
+          | {
+              vec_rowid: number | null;
+              vector_dim: number | null;
+              profile_vec_rowid: number | null;
+              vector_profile_id: string | null;
+            }
           | undefined;
         this.deleteVecRow(row?.vector_dim ?? null, row?.vec_rowid ?? null);
+        this.deleteProfileVecRow(
+          row?.vector_dim ?? null,
+          row?.vector_profile_id ?? null,
+          row?.profile_vec_rowid ?? null
+        );
         del.run(id);
         deleteFts?.run(id);
       }
@@ -325,24 +389,50 @@ export class SqliteVectorizeIndex {
       this.repairDanglingVecPointers();
       const rows = this.db
         .prepare(
-          `SELECT id, values_json
+          `SELECT id, values_json, metadata_json, vec_rowid, vector_dim,
+                  profile_vec_rowid, vector_profile_id
            FROM sb_vectors
-           WHERE vec_rowid IS NULL OR vector_dim IS NULL
+           WHERE vec_rowid IS NULL
+              OR vector_dim IS NULL
+              OR (
+                json_extract(metadata_json, '$.embedding_fingerprint') IS NOT NULL
+                AND (
+                  profile_vec_rowid IS NULL
+                  OR vector_profile_id IS NULL
+                  OR vector_profile_id != json_extract(metadata_json, '$.embedding_fingerprint')
+                )
+              )
            ORDER BY id
            LIMIT ?`
         )
-        .all(safeLimit) as Array<{ id: string; values_json: string }>;
+        .all(safeLimit) as Array<VectorRow>;
       if (rows.length) {
         const update = this.db.prepare(
-          `UPDATE sb_vectors SET vec_rowid = ?, vector_dim = ? WHERE id = ?`
+          `UPDATE sb_vectors
+           SET vec_rowid = ?,
+               vector_dim = ?,
+               profile_vec_rowid = ?,
+               vector_profile_id = ?
+           WHERE id = ?`
         );
         const tx = this.db.transaction((items: typeof rows) => {
           for (const row of items) {
+            this.deleteVecRow(row.vector_dim ?? null, row.vec_rowid ?? null);
+            this.deleteProfileVecRow(
+              row.vector_dim ?? null,
+              row.vector_profile_id ?? null,
+              row.profile_vec_rowid ?? null
+            );
             const values = parseJson<number[]>(row.values_json, []);
             const dim = vectorDimension(values);
             if (dim == null) continue;
+            const metadata = parseJson<Record<string, unknown>>(row.metadata_json, {});
+            const profileId = vectorProfileId(metadata);
             const vecRowid = this.insertVecRow(dim, values);
-            update.run(vecRowid, dim, row.id);
+            const profileVecRowid = profileId
+              ? this.insertProfileVecRow(dim, profileId, values)
+              : null;
+            update.run(vecRowid, dim, profileVecRowid, profileId, row.id);
             vecProcessed++;
           }
         });
@@ -364,7 +454,11 @@ export class SqliteVectorizeIndex {
     ftsIndexed: number;
     vecAvailable: boolean;
     vecIndexed: number;
+    profileVectorCount: number;
+    profileVecIndexed: number;
+    profileVecRemaining: number;
     filteredVecAvailable: boolean;
+    filteredQueryBackend: "sqlite-vec-filtered-knn" | "json-filter-scan";
     remaining: number;
   } {
     const vectorCount = Number((this.db
@@ -376,6 +470,11 @@ export class SqliteVectorizeIndex {
           .get() as { count: number }).count ?? 0)
       : vectorCount;
     const vecIndexed = this.vecAvailable ? this.countLiveVecRows() : vectorCount;
+    const profileVectorCount = this.countProfileVectorRows();
+    const profileVecRemaining = this.vecAvailable ? this.countProfileVecRemaining() : profileVectorCount;
+    const profileVecIndexed = this.vecAvailable
+      ? Math.max(0, profileVectorCount - profileVecRemaining)
+      : profileVectorCount;
     const ftsRemaining = this.ftsAvailable
       ? Math.max(0, vectorCount - ftsIndexed)
       : 0;
@@ -389,7 +488,13 @@ export class SqliteVectorizeIndex {
       ftsIndexed,
       vecAvailable: this.vecAvailable,
       vecIndexed,
-      filteredVecAvailable: this.vecAvailable,
+      profileVectorCount,
+      profileVecIndexed,
+      profileVecRemaining,
+      filteredVecAvailable: this.vecAvailable && profileVectorCount > 0 && profileVecRemaining === 0,
+      filteredQueryBackend: this.vecAvailable && profileVectorCount > 0 && profileVecRemaining === 0
+        ? "sqlite-vec-filtered-knn"
+        : "json-filter-scan",
       remaining: ftsRemaining + vecRemaining,
     };
   }
@@ -429,10 +534,21 @@ export class SqliteVectorizeIndex {
     const dims = this.db
       .prepare(`SELECT DISTINCT vector_dim FROM sb_vectors WHERE vector_dim IS NOT NULL`)
       .all() as Array<{ vector_dim: number }>;
+    const profileDims = this.db
+      .prepare(
+        `SELECT DISTINCT vector_dim, vector_profile_id
+         FROM sb_vectors
+         WHERE vector_dim IS NOT NULL
+           AND vector_profile_id IS NOT NULL`
+      )
+      .all() as Array<{ vector_dim: number; vector_profile_id: string }>;
     const info = this.db.prepare(`DELETE FROM sb_vectors`).run();
     if (this.ftsAvailable) this.db.prepare(`DELETE FROM sb_vector_fts`).run();
     for (const row of dims) {
       this.deleteAllVecRows(row.vector_dim);
+    }
+    for (const row of profileDims) {
+      this.deleteAllProfileVecRows(row.vector_dim, row.vector_profile_id);
     }
     return info.changes;
   }
@@ -441,6 +557,8 @@ export class SqliteVectorizeIndex {
     for (const alter of [
       `ALTER TABLE sb_vectors ADD COLUMN vec_rowid INTEGER`,
       `ALTER TABLE sb_vectors ADD COLUMN vector_dim INTEGER`,
+      `ALTER TABLE sb_vectors ADD COLUMN profile_vec_rowid INTEGER`,
+      `ALTER TABLE sb_vectors ADD COLUMN vector_profile_id TEXT`,
     ]) {
       try {
         this.db.exec(alter);
@@ -453,6 +571,11 @@ export class SqliteVectorizeIndex {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_sb_vectors_vec_rowid_dim
       ON sb_vectors(vector_dim, vec_rowid)
       WHERE vec_rowid IS NOT NULL
+    `);
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_sb_vectors_profile_vec_rowid
+      ON sb_vectors(vector_dim, vector_profile_id, profile_vec_rowid)
+      WHERE profile_vec_rowid IS NOT NULL
     `);
   }
 
@@ -521,6 +644,17 @@ export class SqliteVectorizeIndex {
     this.vecTables.add(dim);
   }
 
+  private ensureProfileVecTable(dim: number, profileId: string): void {
+    const key = `${dim}:${profileId}`;
+    if (!this.vecAvailable || this.profileVecTables.has(key)) return;
+    const table = profileVecTableName(dim, profileId);
+    this.db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS ${table}
+      USING vec0(embedding float[${dim}] distance_metric=cosine)
+    `);
+    this.profileVecTables.add(key);
+  }
+
   private insertVecRow(dim: number, values: number[]): number | null {
     if (!this.vecAvailable) return null;
     try {
@@ -535,6 +669,20 @@ export class SqliteVectorizeIndex {
     }
   }
 
+  private insertProfileVecRow(dim: number, profileId: string, values: number[]): number | null {
+    if (!this.vecAvailable) return null;
+    try {
+      this.ensureProfileVecTable(dim, profileId);
+      const result = this.db
+        .prepare(`INSERT INTO ${profileVecTableName(dim, profileId)} (embedding) VALUES (vec_f32(?))`)
+        .run(JSON.stringify(values));
+      return Number(result.lastInsertRowid);
+    } catch (error) {
+      console.warn("sqlite-vec profile insert failed; row remains JSON-searchable:", error);
+      return null;
+    }
+  }
+
   private deleteVecRow(dim: number | null, rowid: number | null): void {
     if (!this.vecAvailable || dim == null || rowid == null) return;
     try {
@@ -545,6 +693,20 @@ export class SqliteVectorizeIndex {
     }
   }
 
+  private deleteProfileVecRow(
+    dim: number | null,
+    profileId: string | null,
+    rowid: number | null
+  ): void {
+    if (!this.vecAvailable || dim == null || !profileId || rowid == null) return;
+    try {
+      this.ensureProfileVecTable(dim, profileId);
+      this.db.prepare(`DELETE FROM ${profileVecTableName(dim, profileId)} WHERE rowid = ?`).run(rowid);
+    } catch (error) {
+      console.warn("sqlite-vec profile delete failed; stale profile vec0 row may remain:", error);
+    }
+  }
+
   private deleteAllVecRows(dim: number | null): void {
     if (!this.vecAvailable || dim == null) return;
     try {
@@ -552,6 +714,16 @@ export class SqliteVectorizeIndex {
       this.db.prepare(`DELETE FROM ${vecTableName(dim)}`).run();
     } catch (error) {
       console.warn("sqlite-vec clear failed:", error);
+    }
+  }
+
+  private deleteAllProfileVecRows(dim: number | null, profileId: string | null): void {
+    if (!this.vecAvailable || dim == null || !profileId) return;
+    try {
+      this.ensureProfileVecTable(dim, profileId);
+      this.db.prepare(`DELETE FROM ${profileVecTableName(dim, profileId)}`).run();
+    } catch (error) {
+      console.warn("sqlite-vec profile clear failed:", error);
     }
   }
 
@@ -585,6 +757,42 @@ export class SqliteVectorizeIndex {
         console.warn("sqlite-vec dangling pointer repair failed:", error);
       }
     }
+    this.repairDanglingProfileVecPointers();
+  }
+
+  private repairDanglingProfileVecPointers(): void {
+    if (!this.vecAvailable) return;
+    const profiles = this.db
+      .prepare(
+        `SELECT DISTINCT vector_dim, vector_profile_id
+         FROM sb_vectors
+         WHERE vector_dim IS NOT NULL
+           AND vector_profile_id IS NOT NULL
+           AND profile_vec_rowid IS NOT NULL`
+      )
+      .all() as Array<{ vector_dim: number; vector_profile_id: string }>;
+    for (const row of profiles) {
+      const dim = Number(row.vector_dim);
+      const profileId = row.vector_profile_id;
+      if (!Number.isFinite(dim) || dim <= 0 || !profileId) continue;
+      try {
+        this.ensureProfileVecTable(dim, profileId);
+        this.db.prepare(
+          `UPDATE sb_vectors
+           SET profile_vec_rowid = NULL
+           WHERE vector_dim = ?
+             AND vector_profile_id = ?
+             AND profile_vec_rowid IS NOT NULL
+             AND NOT EXISTS (
+               SELECT 1
+               FROM ${profileVecTableName(dim, profileId)} v
+               WHERE v.rowid = sb_vectors.profile_vec_rowid
+             )`
+        ).run(dim, profileId);
+      } catch (error) {
+        console.warn("sqlite-vec profile dangling pointer repair failed:", error);
+      }
+    }
   }
 
   private countLiveVecRows(): number {
@@ -616,6 +824,35 @@ export class SqliteVectorizeIndex {
     return total;
   }
 
+  private countProfileVectorRows(): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) as count
+         FROM sb_vectors
+         WHERE json_type(metadata_json, '$.embedding_fingerprint') = 'text'`
+      )
+      .get() as { count: number };
+    return Number(row.count ?? 0);
+  }
+
+  private countProfileVecRemaining(): number {
+    if (!this.vecAvailable) return this.countProfileVectorRows();
+    this.repairDanglingProfileVecPointers();
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) as count
+         FROM sb_vectors
+         WHERE json_type(metadata_json, '$.embedding_fingerprint') = 'text'
+           AND (
+             profile_vec_rowid IS NULL
+             OR vector_profile_id IS NULL
+             OR vector_profile_id != json_extract(metadata_json, '$.embedding_fingerprint')
+           )`
+      )
+      .get() as { count: number };
+    return Number(row.count ?? 0);
+  }
+
   private queryVec0(
     vector: number[],
     topK: number,
@@ -624,6 +861,17 @@ export class SqliteVectorizeIndex {
   ): ScoredVector[] | null {
     const dim = vectorDimension(vector);
     if (!this.vecAvailable || dim == null) return null;
+    if (typeof filter?.embedding_fingerprint === "string") {
+      const profileMatches = this.queryProfileVec0(
+        vector,
+        dim,
+        topK,
+        returnValues,
+        filter.embedding_fingerprint,
+        filter
+      );
+      if (profileMatches !== null) return profileMatches;
+    }
     try {
       const coverage = this.db.prepare(
         `SELECT
@@ -668,6 +916,70 @@ export class SqliteVectorizeIndex {
       });
     } catch (error) {
       console.warn("sqlite-vec KNN failed; falling back to JSON cosine scan:", error);
+      return null;
+    }
+  }
+
+  private queryProfileVec0(
+    vector: number[],
+    dim: number,
+    topK: number,
+    returnValues: boolean,
+    profileId: string,
+    filter?: Record<string, unknown>
+  ): ScoredVector[] | null {
+    try {
+      this.ensureProfileVecTable(dim, profileId);
+      const coverage = this.db.prepare(
+        `SELECT
+           COUNT(*) as total,
+           SUM(CASE
+             WHEN profile_vec_rowid IS NOT NULL
+              AND vector_profile_id = ?
+             THEN 1 ELSE 0
+           END) as indexed
+         FROM sb_vectors
+         WHERE vector_dim = ?
+           AND json_extract(metadata_json, '$.embedding_fingerprint') = ?`
+      ).get(profileId, dim, profileId) as { total: number; indexed: number | null };
+      if (coverage.total === 0) return [];
+      if (coverage.total !== Number(coverage.indexed ?? 0)) return null;
+      const missing = this.db.prepare(
+        `SELECT COUNT(*) as count
+         FROM sb_vectors m
+         LEFT JOIN ${profileVecTableName(dim, profileId)} v ON v.rowid = m.profile_vec_rowid
+         WHERE m.vector_dim = ?
+           AND m.vector_profile_id = ?
+           AND json_extract(m.metadata_json, '$.embedding_fingerprint') = ?
+           AND (m.profile_vec_rowid IS NULL OR v.rowid IS NULL)`
+      ).get(dim, profileId, profileId) as { count: number };
+      if (Number(missing.count ?? 0) > 0) return null;
+
+      const filterPredicate = this.metadataFilterPredicate(filter, "m.metadata_json");
+      const rows = this.db
+        .prepare(
+          `SELECT m.id, m.values_json, m.metadata_json, v.distance
+           FROM ${profileVecTableName(dim, profileId)} v
+           JOIN sb_vectors m
+             ON m.vector_dim = ?
+            AND m.vector_profile_id = ?
+            AND m.profile_vec_rowid = v.rowid
+           WHERE v.embedding MATCH vec_f32(?) AND k = ?
+             ${filterPredicate.sql}
+           ORDER BY v.distance`
+        )
+        .all(dim, profileId, JSON.stringify(vector), topK, ...filterPredicate.params) as Array<VectorRow & { distance: number }>;
+      return rows.map((row) => {
+        const values = parseJson<number[]>(row.values_json, []);
+        return {
+          id: row.id,
+          score: similarityFromCosineDistance(row.distance),
+          metadata: parseJson(row.metadata_json, {}),
+          values: returnValues ? values : undefined,
+        };
+      });
+    } catch (error) {
+      console.warn("sqlite-vec profile KNN failed; falling back to filtered query path:", error);
       return null;
     }
   }
@@ -740,7 +1052,8 @@ export class SqliteVectorizeIndex {
   private selectRowsByIds(ids: string[]): VectorRow[] {
     if (!ids.length) return [];
     const get = this.db.prepare(
-      `SELECT id, values_json, metadata_json, vec_rowid, vector_dim
+      `SELECT id, values_json, metadata_json, vec_rowid, vector_dim,
+              profile_vec_rowid, vector_profile_id
        FROM sb_vectors WHERE id = ?`
     );
     const rows: VectorRow[] = [];
@@ -757,7 +1070,8 @@ export class SqliteVectorizeIndex {
     const where = predicate.sql ? `WHERE ${predicate.sql.replace(/^\s*AND\s+/, "")}` : "";
     return this.db
       .prepare(
-        `SELECT id, values_json, metadata_json, vec_rowid, vector_dim
+        `SELECT id, values_json, metadata_json, vec_rowid, vector_dim,
+                profile_vec_rowid, vector_profile_id
          FROM sb_vectors ${where}`
       )
       .all(...predicate.params) as VectorRow[];
@@ -804,7 +1118,11 @@ export class SqliteVectorizeIndex {
 
   private selectAllRows(): VectorRow[] {
     return this.db
-      .prepare(`SELECT id, values_json, metadata_json, vec_rowid, vector_dim FROM sb_vectors`)
+      .prepare(
+        `SELECT id, values_json, metadata_json, vec_rowid, vector_dim,
+                profile_vec_rowid, vector_profile_id
+         FROM sb_vectors`
+      )
       .all() as VectorRow[];
   }
 }

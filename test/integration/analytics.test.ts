@@ -247,6 +247,10 @@ describe("Observatory analytics API", () => {
     });
     expect(body.vector_runtime.local_index).toMatchObject({
       vectorCount: 0,
+      profileVectorCount: 0,
+      profileVecRemaining: 0,
+      filteredVecAvailable: false,
+      filteredQueryBackend: "json-filter-scan",
       remaining: 0,
     });
     expect(body.recent_changes.length).toBeGreaterThan(0);
@@ -265,6 +269,7 @@ describe("Observatory analytics API", () => {
       state: "building",
       ready_entries: 1,
     });
+    expect(vectorRuntimeBody.vector_runtime.local_index.filteredQueryBackend).toBe("json-filter-scan");
 
     db.close();
   });
