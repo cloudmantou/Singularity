@@ -72,18 +72,14 @@ describe("synthesizeInsight()", () => {
     expect(messages[0].content).toContain("switched to Postgres");
   });
 
-  it("grounds the prompt: only-these-memories, no absence claims, no speculation", async () => {
-    // The insight only ever sees the retrieved subset, so the prompt must forbid both
-    // claiming information is absent and speculating beyond the provided memories.
+  it("grounds the prompt: local evidence refs, insufficient-evidence path, no speculation", async () => {
     const env = makeTestEnv(undefined, { AI: aiMock("ok") });
     await synthesizeInsight("release v1.9", [{ id: "1", content: "note" }], env);
     const [, { messages }] = (env.AI.run as ReturnType<typeof vi.fn>).mock.calls[0];
     const prompt = (messages[0].content as string).toLowerCase();
-    // grounding
     expect(prompt).toContain("only");
-    // no absence claims
-    expect(prompt).toMatch(/missing|unavailable|does not exist/);
-    // no speculation
+    expect(prompt).toContain("[e1]");
+    expect(prompt).toContain("insufficient");
     expect(prompt).toMatch(/speculate|guess|infer/);
   });
 });

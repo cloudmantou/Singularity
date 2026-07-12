@@ -62,6 +62,55 @@ describe("memory quality review queues", () => {
     }
   });
 
+  it("migrates existing parent version CHECK constraints to allow active_degraded", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      db.exec(
+        `CREATE TABLE sb_parent_versions (
+          version_id TEXT PRIMARY KEY,
+          parent_id TEXT NOT NULL,
+          version_number INTEGER NOT NULL,
+          source_observation_id TEXT,
+          source_snapshot_hash TEXT,
+          summary TEXT,
+          state TEXT NOT NULL DEFAULT 'building',
+          summary_vector_ids TEXT NOT NULL DEFAULT '[]',
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          CHECK (state IN ('building', 'active', 'superseded', 'failed')),
+          UNIQUE(parent_id, version_number)
+        )`
+      );
+      db.prepare(
+        `INSERT INTO sb_parent_versions (
+           version_id, parent_id, version_number, source_observation_id,
+           source_snapshot_hash, summary, state, summary_vector_ids, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run("old-version", "parent-1", 1, "obs-1", "hash-1", null, "active", "[]", 1, 1);
+
+      await initializeDatabase(env);
+
+      const schema = db.prepare(
+        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sb_parent_versions'`
+      ).get() as { sql: string };
+      expect(schema.sql).toContain("active_degraded");
+      expect(db.prepare(`SELECT state FROM sb_parent_versions WHERE version_id = ?`).get("old-version")).toEqual({
+        state: "active",
+      });
+      db.prepare(
+        `INSERT INTO sb_parent_versions (
+           version_id, parent_id, version_number, source_observation_id,
+           source_snapshot_hash, summary, state, summary_vector_ids, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run("degraded-version", "parent-1", 2, "obs-2", "hash-2", null, "active_degraded", "[]", 2, 2);
+      expect(db.prepare(`SELECT state FROM sb_parent_versions WHERE version_id = ?`).get("degraded-version")).toEqual({
+        state: "active_degraded",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
   it("lists and resolves merge candidates and conflict cases", async () => {
     const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
     try {
@@ -114,6 +163,47 @@ describe("memory quality review queues", () => {
         "different city",
         0.72,
         "pending",
+        now
+      );
+      db.prepare(
+        `INSERT INTO sb_memories (
+           id, content, kind, memory_class, importance, confidence, entry_id,
+           content_hash, observed_at, valid_from, valid_to, reference_time,
+           invalid_at, expired_at, entities_json, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?),
+                  (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        "old-claim",
+        "I live in NYC",
+        "semantic",
+        "fact",
+        3,
+        0.8,
+        "old-memory",
+        "old-hash",
+        now - 10,
+        null,
+        null,
+        null,
+        null,
+        null,
+        "[]",
+        now - 10,
+        "new-claim",
+        "I moved to LA",
+        "semantic",
+        "fact",
+        4,
+        0.9,
+        "new-memory",
+        "new-hash",
+        now,
+        null,
+        null,
+        null,
+        null,
+        null,
+        "[]",
         now
       );
 
@@ -187,6 +277,12 @@ describe("memory quality review queues", () => {
           resolution: "use_new",
           resolved_by: "mantou",
         });
+      expect(db.prepare(`SELECT claim_status FROM sb_memories WHERE id = ?`).get("old-claim")).toEqual({
+        claim_status: "superseded",
+      });
+      expect(db.prepare(`SELECT claim_status FROM sb_memories WHERE id = ?`).get("new-claim")).toEqual({
+        claim_status: "confirmed",
+      });
 
       const audit = await json(await worker.fetch(
         auth("/audit/events?action=quality.conflict_case.resolve"),

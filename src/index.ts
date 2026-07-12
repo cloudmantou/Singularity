@@ -123,6 +123,7 @@ import {
   prepareParentVersionActivation,
   prepareParentVersionFailure,
   prepareParentVersionInsert,
+  type EvidenceAuthorType,
 } from "./memory/evidence-contract";
 import { runMigrations, MIGRATIONS } from "./migrations";
 import {
@@ -1919,7 +1920,10 @@ async function linkObsidianObservation(
     evidenceRootId: parentRef.evidenceRootId,
     createdAt: input.createdAt,
   });
-  await activateObservationParentVersion(env, { metadata_json: JSON.stringify(metadata) });
+  await activateObservationParentVersion(env, { metadata_json: JSON.stringify(metadata) }, {
+    state: "active_degraded",
+    requireComplete: false,
+  });
 }
 
 function serializeObsidianLink(row: ObsidianLinkRow): Record<string, unknown> {
@@ -2075,14 +2079,22 @@ async function handleCreateObsidianToken(env: Env, body: ObsidianTokenBody): Pro
 function captureResultMemoryIds(result: CaptureResult): string[] {
   if (result.status === "batch") {
     return [...new Set(result.results.flatMap((item) => {
-      if ("id" in item) return [item.id];
+      if ("id" in item && item.status !== "failed") return [item.id];
       if (item.status === "blocked") return [item.matchId];
       return [];
     }))];
   }
-  if ("id" in result) return [result.id];
+  if ("id" in result && result.status !== "failed") return [result.id];
   if (result.status === "blocked") return [result.matchId];
   return [];
+}
+
+function captureResultFailures(result: CaptureResult): Array<{ id: string; reason: string }> {
+  if (result.status === "failed") return [{ id: result.id, reason: result.reason }];
+  if (result.status !== "batch") return [];
+  return result.results.flatMap((item) =>
+    item.status === "failed" ? [{ id: item.id, reason: item.reason }] : []
+  );
 }
 
 function obsidianAtomicMemoryPath(entryId: string, content: string): string {
@@ -3676,6 +3688,7 @@ export function rerankWithTimeDecay(
         conf == null || !(conf > 0)
           ? 1.0
           : 0.9 + Math.min(1, Math.max(0, conf)) * 0.1;
+      const parentVersionMultiplier = meta?.parent_version_state === "active_degraded" ? 0.98 : 1.0;
 
       return {
         ...match,
@@ -3685,7 +3698,8 @@ export function rerankWithTimeDecay(
           * rolledUpPenalty
           * importanceMultiplier
           * tagBoost
-          * confidenceMultiplier,
+          * confidenceMultiplier
+          * parentVersionMultiplier,
       };
     })
     .sort((a, b) => b.score - a.score);
@@ -6183,7 +6197,7 @@ export async function synthesizeInsight(
   if (!rows.length) return "";
 
   const memoriesList = rows
-    .map((r, i) => `[${i + 1}] ID: ${r.id}\n${r.content}`)
+    .map((r, i) => `[E${i + 1}]\n${r.content}`)
     .join("\n\n");
 
   const prompt = `You are a second brain assistant. Summarize what the user's stored memories below say in relation to their query. Base the insight ONLY on these memories.
@@ -6195,8 +6209,9 @@ ${memoriesList}
 
 Rules:
 - Use ONLY the information in the memories above. Do not add, infer, guess, or speculate, and do not use hedging language like "might" or "it seems".
-- These memories are a retrieved subset, not the user's full memory store. Never say that information is missing, unavailable, or does not exist.
-- If the memories don't address the query, briefly state only what they do contain.
+- Cite supporting evidence with the local references like E1 or E2 when you state a fact.
+- These memories are a retrieved subset, not the user's full memory store.
+- If the memories do not support answering the query, say the retrieved evidence is insufficient and briefly state only what the evidence does contain.
 
 Write a brief insight (2-4 sentences).`;
 
@@ -6521,6 +6536,29 @@ export interface RecallSearchResult {
 
 interface KeywordRow { id: string; content: string; tags: string; source: string; created_at: number; }
 
+function activeParentEntryPredicate(entryRef: string): string {
+  return `AND (
+    NOT EXISTS (
+      SELECT 1
+      FROM sb_memories m_any
+      WHERE m_any.entry_id = ${entryRef}
+        AND m_any.parent_version_id IS NOT NULL
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM sb_memories m_active
+      JOIN sb_parent_versions pv_active
+        ON pv_active.version_id = m_active.parent_version_id
+      JOIN sb_parent_units pu_active
+        ON pu_active.active_version_id = pv_active.version_id
+       AND pu_active.parent_id = pv_active.parent_id
+      WHERE m_active.entry_id = ${entryRef}
+        AND pv_active.state IN ('active', 'active_degraded')
+        AND m_active.claim_status IN ('supported', 'confirmed', 'contested')
+    )
+  )`;
+}
+
 export interface RecallScoreDetails {
   semantic?: number;
   keyword?: number;
@@ -6607,10 +6645,19 @@ function roundScoreDetails(details: RecallScoreDetails | undefined): RecallScore
   return Object.keys(out).length ? out : undefined;
 }
 
+function finiteTime(value: unknown): number | null {
+  if (value == null) return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
 function activeAt(row: { valid_from?: unknown; valid_to?: unknown; invalid_at?: unknown; expired_at?: unknown }, asOf: number): boolean {
-  if (row.invalid_at != null || row.expired_at != null) return false;
-  const validFrom = row.valid_from == null ? null : Number(row.valid_from);
-  const validTo = row.valid_to == null ? null : Number(row.valid_to);
+  const invalidAt = finiteTime(row.invalid_at);
+  const expiredAt = finiteTime(row.expired_at);
+  if (invalidAt != null && invalidAt <= asOf) return false;
+  if (expiredAt != null && expiredAt <= asOf) return false;
+  const validFrom = finiteTime(row.valid_from);
+  const validTo = finiteTime(row.valid_to);
   return (validFrom == null || validFrom <= asOf) && (validTo == null || validTo > asOf);
 }
 
@@ -6802,6 +6849,7 @@ async function keywordSearch(tokens: string[], env: Env): Promise<KeywordRow[]> 
      WHERE (${where})
        AND tags NOT LIKE '%"status:deprecated"%'
        AND tags NOT LIKE '%"auto-pattern"%'
+       ${activeParentEntryPredicate("entries.id")}
      ORDER BY created_at DESC LIMIT ?`
   ).bind(...tokens.map(t => `%${t}%`), KEYWORD_CANDIDATE_LIMIT).all();
   return results as unknown as KeywordRow[];
@@ -6831,7 +6879,8 @@ async function lexicalVectorRows(
        FROM entries
        WHERE id IN (${placeholders})
          AND tags NOT LIKE '%"status:deprecated"%'
-         AND tags NOT LIKE '%"auto-pattern"%'`
+         AND tags NOT LIKE '%"auto-pattern"%'
+         ${activeParentEntryPredicate("entries.id")}`
     ).bind(...batch).all<KeywordRow & { vector_ids?: string }>();
     for (const row of results ?? []) byId.set(row.id, row);
   }
@@ -6921,13 +6970,13 @@ async function buildGraphRecallSignals(
      JOIN sb_entities e ON e.id = me.entity_id
      WHERE me.entity_id IN (${placeholders})
        AND m.entry_id IS NOT NULL
-       AND m.invalid_at IS NULL
-       AND m.expired_at IS NULL
+       AND (m.invalid_at IS NULL OR m.invalid_at > ?)
+       AND (m.expired_at IS NULL OR m.expired_at > ?)
        AND (m.valid_from IS NULL OR m.valid_from <= ?)
        AND (m.valid_to IS NULL OR m.valid_to > ?)
      ORDER BY COALESCE(me.score, 0) DESC, m.created_at DESC
      LIMIT ?`
-  ).bind(...entityIds, asOf, asOf, GRAPH_DIRECT_MEMORY_LIMIT).all() as {
+  ).bind(...entityIds, asOf, asOf, asOf, asOf, GRAPH_DIRECT_MEMORY_LIMIT).all() as {
     results: Array<Record<string, unknown>>;
   };
 
@@ -6962,16 +7011,26 @@ async function buildGraphRecallSignals(
      JOIN sb_entities fe ON fe.id = r.from_entity_id
      JOIN sb_entities te ON te.id = r.to_entity_id
      WHERE (r.from_entity_id IN (${relationWhere}) OR r.to_entity_id IN (${relationWhere}))
-       AND r.invalid_at IS NULL
-       AND r.expired_at IS NULL
+       AND (r.invalid_at IS NULL OR r.invalid_at > ?)
+       AND (r.expired_at IS NULL OR r.expired_at > ?)
        AND (r.valid_from IS NULL OR r.valid_from <= ?)
        AND (r.valid_to IS NULL OR r.valid_to > ?)
        AND m.entry_id IS NOT NULL
-       AND m.invalid_at IS NULL
-       AND m.expired_at IS NULL
+       AND (m.invalid_at IS NULL OR m.invalid_at > ?)
+       AND (m.expired_at IS NULL OR m.expired_at > ?)
      ORDER BY COALESCE(r.score, 0) DESC, r.created_at DESC
      LIMIT ?`
-  ).bind(...entityIds, ...entityIds, asOf, asOf, GRAPH_RELATION_MEMORY_LIMIT).all() as {
+  ).bind(
+    ...entityIds,
+    ...entityIds,
+    asOf,
+    asOf,
+    asOf,
+    asOf,
+    asOf,
+    asOf,
+    GRAPH_RELATION_MEMORY_LIMIT
+  ).all() as {
     results: Array<Record<string, unknown>>;
   };
 
@@ -7214,7 +7273,8 @@ export async function recallEntries(
       `SELECT id, vector_ids, content, tags, source, created_at FROM entries
        WHERE tags LIKE ?
          AND tags NOT LIKE '%"status:deprecated"%'
-         AND tags NOT LIKE '%"auto-pattern"%'`
+         AND tags NOT LIKE '%"auto-pattern"%'
+         ${activeParentEntryPredicate("entries.id")}`
     ).bind(`%"${tag}"%`).all();
     if (!tagRows.length) return {
       matches: [],
@@ -7337,6 +7397,8 @@ export async function recallEntries(
     contradiction_wins: number;
     contradiction_losses: number;
     classification_confidence: number | null;
+    evidence_score: number | null;
+    parent_version_state: string | null;
   }[] = [];
   for (let i = 0; i < candidateIds.length; i += D1_MAX_BOUND_PARAMS) {
     const batch = candidateIds.slice(i, i + D1_MAX_BOUND_PARAMS);
@@ -7344,8 +7406,24 @@ export async function recallEntries(
     const { results: rows } = await env.DB.prepare(
       `SELECT id, tags, source, created_at,
               recall_count, importance_score, contradiction_wins, contradiction_losses,
-              classification_confidence
-       FROM entries WHERE id IN (${rcPlaceholders})`
+              classification_confidence,
+              (SELECT MAX(COALESCE(ms.evidence_score, m.confidence, 0))
+               FROM sb_memories m
+               LEFT JOIN sb_memory_sources ms ON ms.memory_id = m.id
+               WHERE m.entry_id = entries.id
+                 AND m.claim_status IN ('supported', 'confirmed', 'contested')) AS evidence_score,
+              (SELECT pv.state
+               FROM sb_memories m
+               JOIN sb_parent_versions pv ON pv.version_id = m.parent_version_id
+               JOIN sb_parent_units pu
+                 ON pu.active_version_id = pv.version_id
+                AND pu.parent_id = pv.parent_id
+               WHERE m.entry_id = entries.id
+                 AND pv.state IN ('active', 'active_degraded')
+               ORDER BY CASE pv.state WHEN 'active' THEN 0 ELSE 1 END
+               LIMIT 1) AS parent_version_state
+       FROM entries WHERE id IN (${rcPlaceholders})
+       ${activeParentEntryPredicate("entries.id")}`
     ).bind(...batch).all() as {
       results: {
         id: string;
@@ -7357,6 +7435,8 @@ export async function recallEntries(
         contradiction_wins: number;
         contradiction_losses: number;
         classification_confidence: number | null;
+        evidence_score: number | null;
+        parent_version_state: string | null;
       }[];
     };
     rcRows.push(...rows);
@@ -7367,8 +7447,17 @@ export async function recallEntries(
   const contradictionLosses = new Map(rcRows.map(r => [r.id, r.contradiction_losses ?? 0]));
   const confidenceScores = new Map(
     rcRows
-      .filter(r => r.classification_confidence != null && Number(r.classification_confidence) > 0)
-      .map(r => [r.id, Number(r.classification_confidence)])
+      .map(r => {
+        const classification = r.classification_confidence == null ? 0 : Number(r.classification_confidence);
+        const evidence = r.evidence_score == null ? 0 : Number(r.evidence_score);
+        return [r.id, Math.max(classification, evidence)] as const;
+      })
+      .filter(([, score]) => Number.isFinite(score) && score > 0)
+  );
+  const parentVersionStates = new Map(
+    rcRows
+      .filter(r => typeof r.parent_version_state === "string" && r.parent_version_state)
+      .map(r => [r.id, String(r.parent_version_state)])
   );
   const currentEntryMetadata = new Map(rcRows.map((row) => {
     let tags: string[] = [];
@@ -7399,6 +7488,7 @@ export async function recallEntries(
         tags: current.tags,
         source: current.source,
         created_at: current.created_at,
+        parent_version_state: parentVersionStates.get(parentId) ?? null,
       },
     };
   });
@@ -7436,7 +7526,7 @@ export async function recallEntries(
   const parentIds = deduped.map((m) => (m.metadata as any)?.parentId ?? m.id);
   const placeholders = parentIds.map(() => "?").join(", ");
   const d1Bindings: (string | number)[] = [...parentIds];
-  let d1Sql = `SELECT id, content, tags, source, created_at FROM entries WHERE id IN (${placeholders}) AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"status:deprecated"%'`;
+  let d1Sql = `SELECT id, content, tags, source, created_at FROM entries WHERE id IN (${placeholders}) AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"status:deprecated"%' ${activeParentEntryPredicate("entries.id")}`;
   if (vaultFilter) {
     d1Sql += ` AND EXISTS (SELECT 1 FROM sb_external_links l WHERE l.entry_id = entries.id AND l.provider = 'obsidian' AND l.object_type = 'memory' AND l.vault_id = ?)`;
     d1Bindings.push(vaultFilter);
@@ -7853,6 +7943,7 @@ function scheduleClassifyAndTag(
 
 export type CaptureSingleResult =
   | { status: "blocked"; matchId: string; score: number }
+  | { status: "failed"; id: string; reason: string }
   | { status: "sourced"; id: string; observationId: string; memoryId: string }
   | { status: "stored"; id: string }
   | { status: "flagged"; id: string; matchId: string; score: number }
@@ -7881,17 +7972,47 @@ export interface CaptureOptions {
   atomic?: AtomicFactDraft;
 }
 
+function evidenceAuthorTypeForSource(source: string, tags: string[] = []): EvidenceAuthorType {
+  const normalized = source.trim().toLowerCase();
+  if (
+    normalized === "system" ||
+    tags.includes("synthesized") ||
+    tags.includes("auto-pattern")
+  ) {
+    return "system";
+  }
+  if (
+    normalized.includes("claude") ||
+    normalized.includes("chatgpt") ||
+    normalized.includes("openai") ||
+    normalized.includes("assistant") ||
+    normalized === "ai"
+  ) {
+    return "assistant";
+  }
+  if (normalized.includes("import")) return "import";
+  if (normalized.includes("tool") || normalized.includes("mcp") || normalized.includes("browser")) {
+    return "tool";
+  }
+  return "user";
+}
+
 export function captureResultEntryIds(result: CaptureResult): string[] {
   if (result.status === "batch") {
-    return [...new Set(result.results.flatMap((item) => ("id" in item ? [item.id] : [])))];
+    return [...new Set(result.results.flatMap((item) =>
+      "id" in item && item.status !== "failed" ? [item.id] : []
+    ))];
   }
-  if ("id" in result) return [result.id];
+  if ("id" in result && result.status !== "failed") return [result.id];
   return [];
 }
 
 export function formatCaptureResultMessage(result: CaptureResult): string {
   if (result.status === "blocked") {
     return `Duplicate detected — not stored. Existing entry ID: ${result.matchId}`;
+  }
+  if (result.status === "failed") {
+    return `Capture failed after creating an audit-only entry ${result.id}: ${result.reason}`;
   }
   if (result.status === "batch") {
     const ids = captureResultEntryIds(result);
@@ -7900,7 +8021,7 @@ export function formatCaptureResultMessage(result: CaptureResult): string {
     }
     const sourced = result.results.filter((item) => item.status === "sourced").length;
     const created = result.results.filter(
-      (item) => item.status !== "blocked" && item.status !== "sourced"
+      (item) => item.status !== "blocked" && item.status !== "sourced" && item.status !== "failed"
     ).length;
     if (sourced && !created) {
       return `Observation ${result.observationId} linked ${sourced} duplicate facts as new sources.`;
@@ -8182,6 +8303,11 @@ async function resolveConflictCase(
   }
 ): Promise<boolean> {
   const now = Date.now();
+  const conflict = await env.DB.prepare(
+    `SELECT old_memory_id, new_memory_id
+     FROM sb_conflict_cases
+     WHERE id = ?`
+  ).bind(input.id).first<{ old_memory_id: string; new_memory_id: string }>();
   const auditEvent = await prepareComplianceAuditEvent(env.DB, {
     ...auditActorFromPrincipal(input.principal),
     action: "quality.conflict_case.resolve",
@@ -8193,14 +8319,50 @@ async function resolveConflictCase(
       resolved_by: input.resolvedBy,
     },
   });
-  const results = await env.DB.batch([
+  const statements: D1PreparedStatement[] = [
     env.DB.prepare(
       `UPDATE sb_conflict_cases
        SET state = ?, resolution = ?, resolved_by = ?, resolved_at = ?
        WHERE id = ?`
     ).bind(input.state, input.resolution, input.resolvedBy, now, input.id),
-    auditEvent.statement,
-  ]);
+  ];
+  if (conflict && input.state === "resolved" && input.resolution === "use_new") {
+    statements.push(
+      env.DB.prepare(
+        `UPDATE sb_memories
+         SET claim_status = 'superseded',
+             invalid_at = COALESCE(invalid_at, ?),
+             valid_to = COALESCE(valid_to, ?)
+         WHERE entry_id = ?
+           AND claim_status NOT IN ('superseded', 'deprecated')`
+      ).bind(now, now, conflict.old_memory_id),
+      env.DB.prepare(
+        `UPDATE sb_memories
+         SET claim_status = 'confirmed'
+         WHERE entry_id = ?
+           AND claim_status IN ('supported', 'contested', 'unsupported')`
+      ).bind(conflict.new_memory_id)
+    );
+  } else if (conflict && input.state === "resolved" && input.resolution === "use_old") {
+    statements.push(
+      env.DB.prepare(
+        `UPDATE sb_memories
+         SET claim_status = 'deprecated',
+             invalid_at = COALESCE(invalid_at, ?),
+             valid_to = COALESCE(valid_to, ?)
+         WHERE entry_id = ?
+           AND claim_status NOT IN ('superseded', 'deprecated')`
+      ).bind(now, now, conflict.new_memory_id),
+      env.DB.prepare(
+        `UPDATE sb_memories
+         SET claim_status = 'confirmed'
+         WHERE entry_id = ?
+           AND claim_status IN ('supported', 'contested', 'unsupported')`
+      ).bind(conflict.old_memory_id)
+    );
+  }
+  statements.push(auditEvent.statement);
+  const results = await env.DB.batch(statements);
   return Number(results[0]?.meta?.changes ?? 0) > 0;
 }
 
@@ -8298,7 +8460,7 @@ interface ObservationExtractionRow {
 type ObservationExtractionProcessResult =
   | { status: "succeeded"; observationId: string; result: CaptureResult }
   | { status: "fallback"; observationId: string; result: CaptureResult; error: string }
-  | { status: "failed"; observationId: string; error: string; final: boolean }
+  | { status: "failed"; observationId: string; error: string; final: boolean; result?: CaptureResult }
   | { status: "skipped"; observationId: string };
 
 type AtomicWriteResult =
@@ -8488,14 +8650,54 @@ async function prepareObservationParentVersionForProcessing(
   return { ...row, metadata_json: metadataJson };
 }
 
-async function activateObservationParentVersion(env: Env, row: Pick<ObservationExtractionRow, "metadata_json">): Promise<void> {
+async function assertParentVersionReadyForActivation(
+  env: Env,
+  versionId: string,
+  requireComplete: boolean
+): Promise<void> {
+  if (!requireComplete) return;
+  const counts = await env.DB.prepare(
+    `SELECT
+       COUNT(*) AS memory_count,
+       SUM(CASE WHEN EXISTS (
+         SELECT 1
+         FROM sb_memory_sources s
+         WHERE s.memory_id = m.id
+       ) THEN 1 ELSE 0 END) AS sourced_memory_count
+     FROM sb_memories m
+     WHERE m.parent_version_id = ?
+       AND m.invalid_at IS NULL
+       AND m.expired_at IS NULL`
+  ).bind(versionId).first<{ memory_count: number; sourced_memory_count: number | null }>();
+  const memoryCount = Number(counts?.memory_count ?? 0);
+  const sourcedMemoryCount = Number(counts?.sourced_memory_count ?? 0);
+  if (memoryCount <= 0) {
+    throw new Error(`parent_version_activation_empty:${versionId}`);
+  }
+  if (sourcedMemoryCount !== memoryCount) {
+    throw new Error(`parent_version_activation_missing_provenance:${versionId}`);
+  }
+}
+
+async function activateObservationParentVersion(
+  env: Env,
+  row: Pick<ObservationExtractionRow, "metadata_json">,
+  options: { state?: "active" | "active_degraded"; requireComplete?: boolean } = {}
+): Promise<void> {
   const parent = parentVersionFromObservationMetadata(row.metadata_json);
   if (!parent) return;
-  await env.DB.batch(prepareParentVersionActivation(env.DB, {
+  await assertParentVersionReadyForActivation(env, parent.versionId, options.requireComplete !== false);
+  const results = await env.DB.batch(prepareParentVersionActivation(env.DB, {
     parentId: parent.parentId,
     versionId: parent.versionId,
+    state: options.state ?? "active",
     updatedAt: Date.now(),
   }));
+  const activated = Number(results[1]?.meta?.changes ?? 0);
+  const parentUnitUpdated = Number(results[2]?.meta?.changes ?? 0);
+  if (activated !== 1 || parentUnitUpdated !== 1) {
+    throw new Error(`parent_version_activation_failed:${parent.versionId}`);
+  }
 }
 
 async function failObservationParentVersion(env: Env, row: Pick<ObservationExtractionRow, "metadata_json">): Promise<void> {
@@ -8714,6 +8916,17 @@ async function processObservationExtraction(
         env,
         ctx
       );
+      const failures = captureResultFailures(result);
+      if (failures.length) {
+        await failObservationParentVersion(env, processingRow);
+        return {
+          status: "failed",
+          observationId: row.id,
+          error: failures[0].reason,
+          final: false,
+          result,
+        };
+      }
       await markObservationExtractionFailure(env, {
         id: row.id,
         startedAt: processingStartedAt,
@@ -8723,7 +8936,7 @@ async function processObservationExtraction(
         processedAt: now,
         needsReprocess: true,
       });
-      await activateObservationParentVersion(env, processingRow);
+      await activateObservationParentVersion(env, processingRow, { state: "active_degraded" });
       return { status: "fallback", observationId: row.id, result, error: message };
     }
 
@@ -8742,6 +8955,17 @@ async function processObservationExtraction(
   }
 
   const result = await captureExtractedFactsFromObservation(processingRow, facts, env, ctx);
+  const failures = captureResultFailures(result);
+  if (failures.length) {
+    await failObservationParentVersion(env, processingRow);
+    return {
+      status: "failed",
+      observationId: row.id,
+      error: failures[0].reason,
+      final: false,
+      result,
+    };
+  }
   await markObservationExtractionSucceeded(env, {
     id: row.id,
     startedAt: processingStartedAt,
@@ -9243,6 +9467,17 @@ async function captureSingleFact(
         error: atomicWrite.error,
         processedAt: Date.now(),
       });
+      await deprecateEntry(
+        id,
+        env,
+        `Atomic memory write failed for observation ${options.observationId}: ${atomicWrite.error}`,
+        "system"
+      );
+      return {
+        status: "failed",
+        id,
+        reason: atomicWrite.error,
+      };
     }
   }
 
@@ -9462,7 +9697,7 @@ export async function captureEntry(
               contentHash: wholeHash,
               sourceChannel: source,
               sourceIdentity: `${source}:${observationId}`,
-              authorType: source === "system" ? "system" : "user",
+              authorType: evidenceAuthorTypeForSource(source, baseTags),
               sourceTimestamp: observedAt,
               revision: 1,
               rootEvidenceId: parentRef.evidenceRootId,
@@ -9486,7 +9721,10 @@ export async function captureEntry(
             evidenceRootId: parentRef.evidenceRootId,
             createdAt: observedAt,
           });
-          await activateObservationParentVersion(env, { metadata_json: JSON.stringify(metadata) });
+          await activateObservationParentVersion(env, { metadata_json: JSON.stringify(metadata) }, {
+            state: "active_degraded",
+            requireComplete: false,
+          });
           return {
             status: "sourced",
             id: exactId,
@@ -9537,7 +9775,7 @@ export async function captureEntry(
         contentHash: observationHash,
         sourceChannel: source,
         sourceIdentity: `${source}:${observationId}`,
-        authorType: source === "system" ? "system" : "user",
+        authorType: evidenceAuthorTypeForSource(source, baseTags),
         sourceTimestamp: observedAt,
         revision: 1,
         rootEvidenceId: parentRef.evidenceRootId,
@@ -9552,8 +9790,8 @@ export async function captureEntry(
       }),
     ]);
   } catch (e) {
-    console.error("Observation insert failed; falling back to single capture:", e);
-    return captureSingleFact(c, baseTags, source, env, ctx, { skipExtract: true });
+    console.error("Observation insert failed; refusing evidence-less capture:", e);
+    throw new Error("observation_insert_failed");
   }
 
   const processed = await processObservationExtraction(
@@ -9579,6 +9817,10 @@ export async function captureEntry(
   );
   if (processed.status === "succeeded" || processed.status === "fallback") {
     return processed.result;
+  }
+  if (processed.status === "failed") {
+    if (processed.result) return processed.result;
+    throw new Error(processed.error || "atomic_extraction_failed");
   }
 
   return captureSingleFact(c, baseTags, source, env, ctx, {
@@ -10321,6 +10563,14 @@ const defaultHandler = {
           score: parseFloat((result.score * 100).toFixed(1)),
           message: "Exact duplicate detected — not stored",
         });
+      }
+      if (result.status === "failed") {
+        return json({
+          ok: false,
+          id: result.id,
+          error: result.reason,
+          message: formatCaptureResultMessage(result),
+        }, 500);
       }
       if (result.status === "batch") {
         const ids = captureResultEntryIds(result);

@@ -67,7 +67,7 @@ export interface AtomicFactDraft {
 }
 
 export const ATOMIC_EXTRACTION_MAX_FACTS = 12;
-export const ATOMIC_EXTRACTION_MAX_TOKENS = 500;
+export const ATOMIC_EXTRACTION_MAX_TOKENS = 1000;
 export const ATOMIC_EXTRACTION_CONTENT_LIMIT = 4_000;
 export const ATOMIC_EXTRACTION_VERSION = 1;
 
@@ -147,13 +147,14 @@ export function buildAtomicExtractionPrompt(content: string): string {
   const sample = content.slice(0, ATOMIC_EXTRACTION_CONTENT_LIMIT);
   return (
     `Split this memory input into independent atomic facts. Respond with ONLY one JSON object.\n` +
-    `{"facts":[{"content":"...","subject":null,"predicate":null,"object":null,"scope_id":null,"polarity":"positive|negative|neutral","modality":"asserted|confirmed|inferred|hypothetical","status":"supported|confirmed|contested|superseded|unsupported|deprecated","kind":"episodic|semantic|procedural","memory_class":"fact|preference|project|task|decision|plan|event|milestone|problem|solution|document|procedure|inference|summary","importance":1-5,"confidence":0-1,"observed_at":null,"valid_from":null,"valid_to":null,"reference_time":null,"entities":[{"name":"...","type":"person|project|organization|place|product|concept|other"}],"relations":[{"from":"...","to":"...","type":"uses|part_of|owns|works_on|depends_on|related_to|located_in","fact":"..."}]}]}\n` +
+    `{"facts":[{"content":"...","subject":null,"predicate":null,"object":null,"scope_id":null,"polarity":"positive|negative|neutral","modality":"asserted|confirmed|inferred|hypothetical","kind":"episodic|semantic|procedural","memory_class":"fact|preference|project|task|decision|plan|event|milestone|problem|solution|document|procedure|inference|summary","importance":1-5,"confidence":0-1,"observed_at":null,"valid_from":null,"valid_to":null,"reference_time":null,"entities":[{"name":"...","type":"person|project|organization|place|product|concept|other"}],"relations":[{"from":"...","to":"...","type":"uses|part_of|owns|works_on|depends_on|related_to|located_in","fact":"..."}]}]}\n` +
     `Rules:\n` +
     `- One fact per object; do not merge unrelated claims.\n` +
     `- Preserve the user's language.\n` +
     `- If the input is already a single fact, return exactly one fact.\n` +
     `- Skip pure greetings / empty chatter.\n` +
     `- Max ${ATOMIC_EXTRACTION_MAX_FACTS} facts.\n` +
+    `- Do not decide global claim lifecycle status such as confirmed, contested, superseded, or deprecated; only extract what this input states.\n` +
     `- entities: named things in that fact only.\n` +
     `- relations: entity-to-entity fact edges when the fact states a relationship; omit if none.\n` +
     `- valid_from/valid_to/reference_time: unix ms or ISO when the fact has a time window; else null.\n\n` +
@@ -200,7 +201,7 @@ export function parseAtomicExtraction(text: string): AtomicFactDraft[] {
       scopeId: optionalText((item as any).scope_id ?? (item as any).scopeId),
       polarity: normalizeClaimPolarity((item as any).polarity),
       modality: normalizeClaimModality((item as any).modality),
-      status: normalizeClaimStatus((item as any).status),
+      status: "supported",
       kind: normalizeAtomicKind((item as any).kind),
       memoryClass: normalizeMemoryClass(
         (item as any).memory_class ?? (item as any).memoryClass ?? (item as any).category

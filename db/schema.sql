@@ -391,7 +391,7 @@ CREATE TABLE IF NOT EXISTS sb_parent_versions (
   summary_vector_ids TEXT NOT NULL DEFAULT '[]',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
-  CHECK (state IN ('building', 'active', 'superseded', 'failed')),
+  CHECK (state IN ('building', 'active', 'active_degraded', 'superseded', 'failed')),
   UNIQUE(parent_id, version_number)
 );
 CREATE INDEX IF NOT EXISTS idx_parent_versions_parent

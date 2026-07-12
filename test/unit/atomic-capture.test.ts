@@ -143,7 +143,7 @@ describe("captureEntry atomic dual-write", () => {
       scope_id: "singularity",
       polarity: "positive",
       modality: "confirmed",
-      claim_status: "confirmed",
+      claim_status: "supported",
     });
     expect(JSON.parse(db.memories[0].scores_json)).toMatchObject({
       evidenceQuality: 0.92,
@@ -178,7 +178,37 @@ describe("captureEntry atomic dual-write", () => {
     expect(db.memorySources).toHaveLength(1);
     expect(db.parentVersions[0]).toMatchObject({
       source_observation_id: db.observations[0].id,
-      state: "active",
+      state: "active_degraded",
+    });
+  });
+
+  it("marks assistant-origin evidence as assistant instead of user", async () => {
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({ matches: [] }),
+      }),
+      AI: makeExtractionAI({
+        facts: [
+          {
+            content: "Claude 总结了 Singularity 的 Evidence 设计。",
+            kind: "semantic",
+            memory_class: "summary",
+            importance: 3,
+            confidence: 0.86,
+          },
+        ],
+      }),
+    });
+    const { ctx, drain } = makeCtx();
+
+    const result = await captureEntry("Claude 总结了 Singularity 的 Evidence 设计。", [], "claude", env, ctx);
+    await drain();
+
+    expect(result.status).not.toBe("blocked");
+    expect(db.observations).toHaveLength(1);
+    expect(db.observations[0]).toMatchObject({
+      source_channel: "claude",
+      author_type: "assistant",
     });
   });
 
@@ -423,9 +453,13 @@ describe("captureEntry atomic dual-write", () => {
     );
     await ctx.drain();
 
-    expect(result.status).toBe("stored");
+    expect(result.status).toBe("failed");
     expect(db.entries).toHaveLength(1);
+    expect(JSON.parse(db.entries[0].tags)).toContain("status:deprecated");
     expect(db.memories).toHaveLength(0);
+    expect(db.parentVersions[0]).toMatchObject({
+      state: "failed",
+    });
     expect(db.observations).toHaveLength(1);
     expect(db.observations[0]).toMatchObject({
       extraction_status: "partial_error",

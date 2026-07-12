@@ -136,6 +136,100 @@ describe("GET /recall", () => {
     expect(options.filter).toEqual({ embedding_fingerprint: expect.any(String) });
   });
 
+  it("does not hydrate entries whose only parent version is superseded", async () => {
+    const now = Date.now();
+    db.entries.push(
+      {
+        id: "entry-old-parent",
+        content: "parent invariant old claim",
+        tags: "[]",
+        source: "api",
+        created_at: now - 1000,
+        vector_ids: "[]",
+        recall_count: 0,
+        importance_score: 0,
+      },
+      {
+        id: "entry-active-parent",
+        content: "parent invariant active claim",
+        tags: "[]",
+        source: "api",
+        created_at: now,
+        vector_ids: "[]",
+        recall_count: 0,
+        importance_score: 0,
+      }
+    );
+    db.parentUnits.push({
+      parent_id: "parent-invariant",
+      active_version_id: "pv-active",
+      scope_id: null,
+      created_at: now - 2000,
+      updated_at: now,
+    });
+    db.parentVersions.push(
+      {
+        version_id: "pv-old",
+        parent_id: "parent-invariant",
+        version_number: 1,
+        source_observation_id: "obs-old",
+        source_snapshot_hash: "hash-old",
+        summary: null,
+        state: "superseded",
+        summary_vector_ids: "[]",
+        created_at: now - 2000,
+        updated_at: now - 1000,
+      },
+      {
+        version_id: "pv-active",
+        parent_id: "parent-invariant",
+        version_number: 2,
+        source_observation_id: "obs-active",
+        source_snapshot_hash: "hash-active",
+        summary: null,
+        state: "active",
+        summary_vector_ids: "[]",
+        created_at: now - 1000,
+        updated_at: now,
+      }
+    );
+    db.memories.push(
+      {
+        id: "mem-old-parent",
+        entry_id: "entry-old-parent",
+        content: "parent invariant old claim",
+        parent_version_id: "pv-old",
+        claim_status: "supported",
+        confidence: 0.9,
+        invalid_at: null,
+        expired_at: null,
+        created_at: now - 1000,
+      },
+      {
+        id: "mem-active-parent",
+        entry_id: "entry-active-parent",
+        content: "parent invariant active claim",
+        parent_version_id: "pv-active",
+        claim_status: "supported",
+        confidence: 0.9,
+        invalid_at: null,
+        expired_at: null,
+        created_at: now,
+      }
+    );
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({ matches: [] }),
+      }),
+    });
+
+    const res = await worker.fetch(req("GET", "/recall?query=parent%20invariant"), env, ctx);
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.results.map((row: any) => row.id)).toEqual(["entry-active-parent"]);
+  });
+
   it("uses current D1 tags for rerank instead of stale vector metadata", async () => {
     const now = Date.now();
     db.entries.push(
@@ -1240,6 +1334,70 @@ describe("GET /recall", () => {
     expect(data.results[0].score_details.temporal).toBe(0.8);
     expect(data.results[0].time_basis).toBe("explicit_start");
     expect(data.results[0].matched_entities).toContain("Singularity");
+  });
+
+  it("recalls graph facts that were invalidated after the requested historical window", async () => {
+    const now = Date.now();
+    const entryCreatedAt = now - 120 * 86_400_000;
+    const invalidAt = now - 5 * 86_400_000;
+    const after = now - 30 * 86_400_000;
+    const before = now - 10 * 86_400_000;
+    db.entries.push({
+      id: "historical-invalidated-entry",
+      content: "Singularity used storage plan A before it was replaced.",
+      tags: "[]",
+      source: "api",
+      created_at: entryCreatedAt,
+      vector_ids: "[]",
+      recall_count: 0,
+      importance_score: 0,
+    });
+    db.memories.push({
+      id: "memory-historical-invalidated",
+      entry_id: "historical-invalidated-entry",
+      content: "Singularity used storage plan A before it was replaced.",
+      kind: "semantic",
+      memory_class: "fact",
+      importance: 4,
+      confidence: 0.9,
+      valid_from: entryCreatedAt,
+      valid_to: null,
+      invalid_at: invalidAt,
+      expired_at: null,
+      created_at: entryCreatedAt,
+    });
+    db.entities.push({
+      id: "entity-singularity",
+      name: "Singularity",
+      name_normalized: "singularity",
+      entity_type: "project",
+      mention_count: 1,
+      updated_at: now,
+    });
+    db.memoryEntities.push({
+      id: "me-historical-invalidated",
+      memory_id: "memory-historical-invalidated",
+      entity_id: "entity-singularity",
+      role: "mentions",
+      score: 0.94,
+      created_at: entryCreatedAt,
+    });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({ matches: [] }),
+      }),
+    });
+
+    const res = await worker.fetch(
+      req("GET", `/recall?query=${encodeURIComponent("Singularity historical storage")}&after=${after}&before=${before}`),
+      env,
+      ctx
+    );
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.results).toHaveLength(1);
+    expect(data.results[0].id).toBe("historical-invalidated-entry");
   });
 
   it("continues graph-only recall when query embedding fails", async () => {

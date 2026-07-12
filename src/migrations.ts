@@ -352,6 +352,72 @@ const OBSIDIAN_V2_STATEMENTS = [
 
 const MEMORY_QUALITY_REVIEW_STATEMENTS = [...MEMORY_QUALITY_SCHEMA_STATEMENTS];
 
+// ── Parent version state expansion ───────────────────────────────────────────
+
+async function parentVersionsActiveDegradedPrecheck(
+  db: D1Database
+): Promise<{ ok: true; skip?: boolean } | { ok: false; recovery: "rebuild" | "rename-only" }> {
+  const current = await db.prepare(
+    `SELECT sql FROM sqlite_master
+     WHERE type = 'table' AND name = 'sb_parent_versions'
+     LIMIT 1`
+  ).first<{ sql: string }>();
+  if (!current?.sql) return { ok: true, skip: true };
+  return current.sql.includes("active_degraded") ? { ok: true, skip: true } : { ok: true };
+}
+
+async function parentVersionsActiveDegradedExecute(db: D1Database): Promise<void> {
+  const currentExists = await tableExists(db, "sb_parent_versions");
+  const nextExists = await tableExists(db, "sb_parent_versions_next");
+  if (!currentExists && nextExists) {
+    await db.exec(`ALTER TABLE sb_parent_versions_next RENAME TO sb_parent_versions`);
+    return;
+  }
+  if (!currentExists) return;
+  if (nextExists) {
+    await db.exec(`DROP TABLE sb_parent_versions_next`);
+  }
+  await db.exec(
+    `CREATE TABLE sb_parent_versions_next (
+      version_id TEXT PRIMARY KEY,
+      parent_id TEXT NOT NULL,
+      version_number INTEGER NOT NULL,
+      source_observation_id TEXT,
+      source_snapshot_hash TEXT,
+      summary TEXT,
+      state TEXT NOT NULL DEFAULT 'building',
+      summary_vector_ids TEXT NOT NULL DEFAULT '[]',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      CHECK (state IN ('building', 'active', 'active_degraded', 'superseded', 'failed')),
+      UNIQUE(parent_id, version_number)
+    )`
+  );
+  await db.exec(
+    `INSERT INTO sb_parent_versions_next (
+      version_id, parent_id, version_number, source_observation_id,
+      source_snapshot_hash, summary, state, summary_vector_ids, created_at, updated_at
+    )
+    SELECT version_id, parent_id, version_number, source_observation_id,
+           source_snapshot_hash, summary, state, summary_vector_ids, created_at, updated_at
+    FROM sb_parent_versions`
+  );
+  await db.exec(`DROP TABLE sb_parent_versions`);
+  await db.exec(`ALTER TABLE sb_parent_versions_next RENAME TO sb_parent_versions`);
+  await db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_parent_versions_parent
+     ON sb_parent_versions(parent_id, version_number DESC)`
+  );
+  await db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_parent_versions_source
+     ON sb_parent_versions(source_observation_id)`
+  );
+  await db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_parent_versions_state
+     ON sb_parent_versions(state, updated_at DESC)`
+  );
+}
+
 // ── Registry ─────────────────────────────────────────────────────────────────
 
 export const MIGRATIONS: Migration[] = [
@@ -381,5 +447,13 @@ export const MIGRATIONS: Migration[] = [
     name: "Memory quality review queues and compliance audit events",
     checksum: "memory-quality-review-audit-v1",
     statements: MEMORY_QUALITY_REVIEW_STATEMENTS,
+  },
+  {
+    id: "20260713_parent_versions_active_degraded",
+    name: "Allow active_degraded parent versions",
+    checksum: "parent-versions-active-degraded-v1",
+    statements: [],
+    precheck: parentVersionsActiveDegradedPrecheck,
+    execute: parentVersionsActiveDegradedExecute,
   },
 ];

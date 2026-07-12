@@ -11,7 +11,7 @@ export const CLAIM_POLARITIES = ["positive", "negative", "neutral"] as const;
 export const CLAIM_MODALITIES = ["asserted", "confirmed", "inferred", "hypothetical"] as const;
 export const EVIDENCE_AUTHOR_TYPES = ["user", "assistant", "system", "import", "tool", "unknown"] as const;
 export const PROVENANCE_RELATIONS = ["supports", "contradicts", "derived_from"] as const;
-export const PARENT_VERSION_STATES = ["building", "active", "superseded", "failed"] as const;
+export const PARENT_VERSION_STATES = ["building", "active", "active_degraded", "superseded", "failed"] as const;
 
 export type ClaimStatus = (typeof CLAIM_STATUSES)[number];
 export type ClaimPolarity = (typeof CLAIM_POLARITIES)[number];
@@ -19,6 +19,7 @@ export type ClaimModality = (typeof CLAIM_MODALITIES)[number];
 export type EvidenceAuthorType = (typeof EVIDENCE_AUTHOR_TYPES)[number];
 export type ProvenanceRelation = (typeof PROVENANCE_RELATIONS)[number];
 export type ParentVersionState = (typeof PARENT_VERSION_STATES)[number];
+export type ActiveParentVersionState = Extract<ParentVersionState, "active" | "active_degraded">;
 
 export const EVIDENCE_CONTRACT_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS sb_scopes (
@@ -58,7 +59,7 @@ export const EVIDENCE_CONTRACT_SCHEMA_STATEMENTS = [
     summary_vector_ids TEXT NOT NULL DEFAULT '[]',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    CHECK (state IN ('building', 'active', 'superseded', 'failed')),
+    CHECK (state IN ('building', 'active', 'active_degraded', 'superseded', 'failed')),
     UNIQUE(parent_id, version_number)
   )`,
   `CREATE INDEX IF NOT EXISTS idx_parent_versions_parent
@@ -214,7 +215,7 @@ export function prepareParentVersionInsert(
   }
 ): D1PreparedStatement {
   return db.prepare(
-    `INSERT OR IGNORE INTO sb_parent_versions (
+    `INSERT INTO sb_parent_versions (
        version_id, parent_id, version_number, source_observation_id,
        source_snapshot_hash, summary, state, summary_vector_ids, created_at, updated_at
      ) VALUES (?, ?, ?, ?, ?, NULL, ?, '[]', ?, ?)`
@@ -235,23 +236,25 @@ export function prepareParentVersionActivation(
   input: {
     parentId: string;
     versionId: string;
+    state?: ActiveParentVersionState;
     updatedAt: number;
   }
 ): D1PreparedStatement[] {
+  const nextState = input.state ?? "active";
   return [
     db.prepare(
       `UPDATE sb_parent_versions
        SET state = 'superseded', updated_at = ?
        WHERE parent_id = ?
-         AND state = 'active'
+         AND state IN ('active', 'active_degraded')
          AND version_id <> ?`
     ).bind(input.updatedAt, input.parentId, input.versionId),
     db.prepare(
       `UPDATE sb_parent_versions
-       SET state = 'active', updated_at = ?
+       SET state = ?, updated_at = ?
        WHERE parent_id = ?
          AND version_id = ?`
-    ).bind(input.updatedAt, input.parentId, input.versionId),
+    ).bind(nextState, input.updatedAt, input.parentId, input.versionId),
     db.prepare(
       `UPDATE sb_parent_units
        SET active_version_id = ?, updated_at = ?
