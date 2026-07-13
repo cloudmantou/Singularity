@@ -24,7 +24,11 @@ describe("Health Matrix", () => {
         source TEXT NOT NULL DEFAULT 'api',
         created_at INTEGER NOT NULL,
         vector_ids TEXT NOT NULL DEFAULT '[]',
-        classification_status TEXT NOT NULL DEFAULT 'pending'
+        classification_status TEXT NOT NULL DEFAULT 'pending',
+        classification_attempts INTEGER NOT NULL DEFAULT 0,
+        classification_next_attempt_at INTEGER,
+        classification_started_at INTEGER,
+        classification_version INTEGER NOT NULL DEFAULT 1
       );
       CREATE TABLE sb_external_links (
         id TEXT PRIMARY KEY,
@@ -101,6 +105,46 @@ describe("Health Matrix", () => {
       checked: 1,
     });
     expect(matrix.status).toBe("unhealthy");
+  });
+
+  it("uses production queue semantics for recoverable, deferred, and exhausted work", async () => {
+    const now = Date.now();
+    raw.prepare(
+      `INSERT INTO sb_observations (
+         id, content, source, extraction_status, extraction_attempts,
+         next_attempt_at, needs_reprocess, created_at
+       ) VALUES
+         ('obs-partial', 'partial', 'api', 'partial_error', 1, NULL, 1, 1),
+         ('obs-fallback', 'fallback', 'api', 'fallback', 1, NULL, 1, 2),
+         ('obs-deferred', 'deferred', 'api', 'retryable_error', 1, ?, 0, 3),
+         ('obs-terminal', 'terminal', 'api', 'terminal_error', 3, NULL, 0, 4)`
+    ).run(now + 60_000);
+    raw.prepare(
+      `INSERT INTO entries (
+         id, content, tags, source, created_at, vector_ids,
+         classification_status, classification_attempts, classification_next_attempt_at,
+         classification_version
+       ) VALUES
+         ('class-deferred', 'deferred', '[]', 'api', 1, '[]', 'retryable_error', 1, ?, 2),
+         ('class-terminal', 'terminal', '[]', 'api', 2, '[]', 'terminal_error', 3, NULL, 2)`
+    ).run(now + 60_000);
+
+    const matrix = await collectHealthMatrix({
+      db,
+      vectorize: { describe: vi.fn().mockResolvedValue({ dimensions: 384 }) },
+      mode: "selfhost",
+      llmConfigured: true,
+      embeddingConfigured: true,
+      providers: [],
+    });
+
+    expect(matrix.queueDetails).toMatchObject({
+      extraction: { due: 2, deferred: 1, exhausted: 1 },
+      classification: { due: 0, deferred: 1, exhausted: 1 },
+    });
+    expect(matrix.queues.extraction).toBe(4);
+    expect(matrix.queues.classification).toBe(2);
+    expect(matrix.status).toBe("degraded");
   });
 
   it("accepts valid predecessor links even when equal timestamps sort by random ids", async () => {

@@ -401,6 +401,8 @@ CREATE TABLE IF NOT EXISTS sb_parent_versions (
   summary_vector_ids TEXT NOT NULL DEFAULT '[]',
   activated_at INTEGER,
   superseded_at INTEGER,
+  activation_time_source TEXT,
+  superseded_time_source TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   CHECK (state IN ('building', 'active', 'active_degraded', 'superseded', 'failed')),
@@ -437,12 +439,36 @@ CREATE TABLE IF NOT EXISTS sb_association_edges (
   weight REAL NOT NULL DEFAULT 0.5,
   provenance TEXT NOT NULL,
   metadata_json TEXT NOT NULL DEFAULT '{}',
+  directed INTEGER NOT NULL DEFAULT 0,
+  valid_from INTEGER,
+  valid_to INTEGER,
+  deleted_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   UNIQUE(source_parent_id, target_parent_id, edge_type)
 );
 CREATE INDEX IF NOT EXISTS idx_association_edges_target
   ON sb_association_edges(target_parent_id, weight DESC, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_association_edges_validity
+  ON sb_association_edges(valid_from, valid_to, deleted_at);
+
+CREATE TABLE IF NOT EXISTS sb_association_edge_history (
+  id TEXT PRIMARY KEY,
+  source_parent_id TEXT NOT NULL,
+  target_parent_id TEXT NOT NULL,
+  edge_type TEXT NOT NULL,
+  weight REAL NOT NULL,
+  provenance TEXT NOT NULL,
+  metadata_json TEXT NOT NULL,
+  directed INTEGER NOT NULL,
+  valid_from INTEGER,
+  valid_to INTEGER,
+  deleted_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_association_edge_history_endpoints
+  ON sb_association_edge_history(source_parent_id, target_parent_id, deleted_at);
 
 CREATE TABLE IF NOT EXISTS sb_memories (
   id TEXT PRIMARY KEY,
@@ -671,6 +697,7 @@ CREATE TABLE IF NOT EXISTS sb_fact_resolutions (
   source_memory_id TEXT,
   target_memory_id TEXT,
   created_at INTEGER NOT NULL,
+  CHECK (target_relation_id IS NULL OR target_relation_id <> relation_id),
   CHECK (resolution_type IN ('duplicate', 'supports', 'elaborates', 'coexists', 'supersedes', 'contradicts', 'uncertain'))
 );
 CREATE INDEX IF NOT EXISTS idx_fact_resolutions_relation ON sb_fact_resolutions(relation_id, created_at DESC);

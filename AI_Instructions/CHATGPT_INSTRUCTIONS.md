@@ -26,3 +26,5 @@ link / unlink — create or remove navigation associations only
 append — add to existing entry
 update — replace existing entry
 forget — delete by ID (explicit user request only)
+
+Recall labels direct Evidence as `E*` and Association-only context as `R*`. Cite only `E*`; an answer supported only by `R*` is insufficient evidence.

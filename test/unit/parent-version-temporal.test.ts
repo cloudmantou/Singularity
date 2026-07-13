@@ -57,4 +57,42 @@ describe("Parent version temporal lifecycle", () => {
       `SELECT active_version_id FROM sb_parent_units WHERE parent_id = 'parent-1'`
     ).get()).toEqual({ active_version_id: "version-2" });
   });
+
+  it("backfills legacy temporal windows and labels inferred timestamps", async () => {
+    raw.prepare(
+      `UPDATE sb_parent_versions
+       SET state = 'superseded', activated_at = NULL, superseded_at = NULL,
+           created_at = 100, updated_at = 180
+       WHERE version_id = 'version-1'`
+    ).run();
+    raw.prepare(
+      `UPDATE sb_parent_versions
+       SET state = 'active', activated_at = NULL, superseded_at = NULL,
+           created_at = 200, updated_at = 200
+       WHERE version_id = 'version-2'`
+    ).run();
+
+    await ensureMemoryDataModel(db);
+
+    expect(raw.prepare(
+      `SELECT version_id, activated_at, superseded_at,
+              activation_time_source, superseded_time_source
+       FROM sb_parent_versions ORDER BY version_number`
+    ).all()).toEqual([
+      {
+        version_id: "version-1",
+        activated_at: 100,
+        superseded_at: 200,
+        activation_time_source: "inferred",
+        superseded_time_source: "inferred",
+      },
+      {
+        version_id: "version-2",
+        activated_at: 200,
+        superseded_at: null,
+        activation_time_source: "inferred",
+        superseded_time_source: null,
+      },
+    ]);
+  });
 });

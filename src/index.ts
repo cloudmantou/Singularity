@@ -100,8 +100,16 @@ import {
   createAssociationEdge,
   deleteAssociationEdge,
   listAssociationConnections,
+  ASSOCIATION_DIRECTIONS,
+  type AssociationDirection,
   type AssociationEdgeType,
 } from "./memory/associations";
+import {
+  normalizeInsightContext,
+  validateInsightEvidenceReferences,
+  type InsightContextPackage,
+  type InsightEvidenceRow,
+} from "./memory/recall-context";
 import {
   prepareMemoryRevision,
   type MemoryRevisionEvent,
@@ -183,6 +191,11 @@ import {
   type EvidenceProvenance,
 } from "./integrations";
 import {
+  developmentSessionMessagesMatchTranscript,
+  normalizeDevelopmentSessionMessages,
+  planDevelopmentSessionEvidence,
+} from "./integrations/session-distiller";
+import {
   isMcpToolsListRequest,
   sanitizeToolsListResponse,
 } from "./mcp/tools-list-sanitize";
@@ -190,6 +203,18 @@ import {
   collectHealthMatrix,
   type ProviderHealthSummary,
 } from "./operations/health";
+import {
+  CLASSIFICATION_LEASE_MS as CLASSIFICATION_PROCESSING_LEASE_MS,
+  CLASSIFICATION_MAX_ATTEMPTS,
+  CURRENT_CLASSIFICATION_VERSION,
+  EXTRACTION_LEASE_MS as ATOMIC_EXTRACTION_LEASE_MS,
+  EXTRACTION_MAX_ATTEMPTS as ATOMIC_EXTRACTION_MAX_ATTEMPTS,
+  classificationDueWhereSql,
+  readClassificationQueueSnapshot,
+  readExtractionQueueSnapshot,
+} from "./operations/queue-health";
+
+export { CURRENT_CLASSIFICATION_VERSION } from "./operations/queue-health";
 
 export interface Env {
   DB: D1Database;
@@ -249,6 +274,8 @@ const AssociationLinkBodySchema = z.object({
   target_id: z.string().trim().min(1).max(512).optional(),
   type: AssociationEdgeTypeSchema.default("related_to"),
   weight: z.number().min(0).max(1).optional(),
+  validFrom: z.number().int().nonnegative().optional(),
+  validTo: z.number().int().nonnegative().optional(),
   metadata: z.record(z.string(), z.unknown()).optional(),
 }).strict().superRefine((value, context) => {
   if (!(value.sourceId ?? value.source_id)) {
@@ -264,6 +291,7 @@ const AssociationUnlinkBodySchema = z.object({
   source_id: z.string().trim().min(1).max(512).optional(),
   target_id: z.string().trim().min(1).max(512).optional(),
   type: AssociationEdgeTypeSchema.optional(),
+  effectiveAt: z.number().int().nonnegative().optional(),
 }).strict().superRefine((value, context) => {
   if (!(value.sourceId ?? value.source_id)) {
     context.addIssue({ code: "custom", message: "sourceId/source_id is required" });
@@ -278,9 +306,26 @@ const DevelopmentSessionCaptureSchema = z.object({
   branch: z.string().trim().min(1).max(256),
   sessionId: z.string().trim().min(1).max(256),
   transcript: z.string().trim().min(1).max(200_000),
+  messages: z.array(z.object({
+    role: z.enum(["user", "assistant"]),
+    content: z.string().trim().min(1).max(50_000),
+    messageId: z.string().trim().min(1).max(256).optional(),
+  }).strict()).min(1).max(100).optional(),
   capturedAt: z.number().int().nonnegative().optional(),
   revision: z.number().int().min(1).optional(),
-}).strict();
+}).strict().superRefine((value, context) => {
+  const totalMessageLength = (value.messages ?? []).reduce(
+    (total, message) => total + message.content.length,
+    0
+  );
+  if (totalMessageLength > 200_000) {
+    context.addIssue({
+      code: "custom",
+      path: ["messages"],
+      message: "structured message content exceeds 200000 characters",
+    });
+  }
+});
 
 function graceMs(env: Env): number {
   return parseInt(env.VECTORIZE_GRACE_MS ?? "300000", 10) || 300000;
@@ -4107,14 +4152,10 @@ export interface EntryClassification {
 }
 
 const CLASSIFICATION_SAMPLE_MAX_CHARS = 6_000;
-const CLASSIFICATION_MAX_ATTEMPTS = 3;
 const CLASSIFICATION_SELFHOST_BATCH_LIMIT = 14;
 const CLASSIFICATION_CLOUDFLARE_BATCH_LIMIT = 1;
 const CLOUDFLARE_IMPORT_MAX_ROWS = 4;
 const CLASSIFICATION_RETRY_BASE_MS = 60_000;
-const CLASSIFICATION_PROCESSING_LEASE_MS = 10 * 60_000;
-/** Bump when the classify prompt/schema changes so succeeded rows re-enter the queue. */
-export const CURRENT_CLASSIFICATION_VERSION = 2;
 
 /** Convert a normalized rank score (0–1, top=1) into a human label — not a probability. */
 export function formatRelevanceLabel(score: number): string {
@@ -6532,13 +6573,20 @@ async function appendToEntry(
 
 export async function synthesizeInsight(
   query: string,
-  rows: { id: string; content: string; claims?: RecallClaimContext[] }[],
+  contextInput:
+    | InsightContextPackage<RecallClaimContext>
+    | InsightEvidenceRow<RecallClaimContext>[],
   env: Env,
   conflicts: RecallConflictContext[] = []
 ): Promise<string> {
-  if (!rows.length) return "";
+  const context = normalizeInsightContext(contextInput);
+  if (!context.directEvidence.length && !context.relatedContext.length) return "";
+  if (!context.directEvidence.length) {
+    return validateInsightEvidenceReferences("", 0) ||
+      "Retrieved direct evidence is insufficient for a verified answer.";
+  }
 
-  const memoriesList = rows
+  const memoriesList = context.directEvidence
     .map((r, i) => {
       const claimLines = (r.claims ?? []).map((claim) =>
         `[Claim ${claim.id}] status=${claim.status}; verification=${claim.verificationStatus}; ` +
@@ -6547,6 +6595,12 @@ export async function synthesizeInsight(
       return `[E${i + 1}]\n${r.content}${claimLines.length ? `\n${claimLines.join("\n")}` : ""}`;
     })
     .join("\n\n");
+  const relatedContextList = context.relatedContext.length
+    ? context.relatedContext.map((row, index) =>
+      `[R${index + 1}] association=${row.associationType}; hop=${row.hop}; ` +
+      "content=withheld because Association context is navigation-only"
+    ).join("\n\n")
+    : "None";
   const conflictsList = conflicts.length
     ? conflicts.map((conflict) =>
       `[Conflict ${conflict.id}] state=${conflict.state}; reason=${conflict.reason ?? "unspecified"}; ` +
@@ -6558,8 +6612,11 @@ export async function synthesizeInsight(
 
 Query: "${query}"
 
-Memories:
+Direct Evidence:
 ${memoriesList}
+
+Related Association Context (navigation only; not factual Evidence):
+${relatedContextList}
 
 Unresolved conflicts:
 ${conflictsList}
@@ -6567,6 +6624,8 @@ ${conflictsList}
 Rules:
 - Use ONLY the information in the memories above. Do not add, infer, guess, or speculate, and do not use hedging language like "might" or "it seems".
 - Cite supporting evidence with the local references like E1 or E2 when you state a fact.
+- R* references are navigation hints only. They cannot support a factual statement and must never be cited in the answer.
+- Related Association Context may only help identify missing direct Evidence or explain where to search next.
 - Never silently choose one side of an unresolved conflict. Explicitly state that the Claims conflict and identify both sides.
 - These memories are a retrieved subset, not the user's full memory store.
 - If the memories do not support answering the query, say the retrieved evidence is insufficient and briefly state only what the evidence does contain.
@@ -6583,7 +6642,7 @@ Write a brief insight (2-4 sentences).`;
     console.error("synthesizeInsight LLM call failed (non-fatal):", e);
   }
 
-  return insight.trim();
+  return validateInsightEvidenceReferences(insight, context.directEvidence.length);
 }
 
 // ─── Async pattern derivation ─────────────────────────────────────────────────
@@ -6914,6 +6973,8 @@ export interface RecallMatch {
 
 export interface RecallSearchResult {
   matches: RecallMatch[];
+  directEvidence?: RecallMatch[];
+  relatedContext?: RecallMatch[];
   insight: string;
   conflicts?: RecallConflictContext[];
   degraded?: boolean;
@@ -7629,13 +7690,23 @@ function fuseDenseAndKeyword(
 }
 
 export async function recallEntries(
-  params: { query: string; topK: number; tag?: string; after?: number; before?: number; kind?: MemoryKind; hops?: number },
+  params: {
+    query: string;
+    topK: number;
+    tag?: string;
+    after?: number;
+    before?: number;
+    kind?: MemoryKind;
+    hops?: number;
+    associationDirection?: AssociationDirection;
+  },
   env: Env,
   ctx: ExecutionContext,
   vaultFilter: string | null = null
 ): Promise<RecallSearchResult> {
   const { query, topK } = params;
   const associationHops = Math.max(0, Math.min(2, Math.trunc(params.hops ?? 0)));
+  const associationDirection = params.associationDirection ?? "outgoing";
   let { tag, after, before, kind } = params;
   if (tag && !isD1SafeTag(tag)) return { matches: [], insight: "" };
   const now = Date.now();
@@ -8049,13 +8120,19 @@ export async function recallEntries(
   for (const m of matches) {
     m.scoreDetails = roundScoreDetails(mergeScoreDetails(m.scoreDetails, { final: m.score }));
   }
+  const directMatches = [...matches];
 
   if (associationHops > 0 && matches.length) {
     try {
       let associationRows = await associationRecallExpansion(
         env.DB,
         matches.map((match) => ({ entryId: match.id, score: match.score })),
-        { hops: associationHops, asOf: recallAsOf, limit: topK }
+        {
+          hops: associationHops,
+          direction: associationDirection,
+          asOf: recallAsOf,
+          limit: topK,
+        }
       );
       associationRows = associationRows.filter((row) => {
         if (row.tags.includes("auto-pattern") || row.tags.includes("status:deprecated")) return false;
@@ -8123,37 +8200,48 @@ export async function recallEntries(
     }, "recall");
   }
 
-  const insightRows = matches.map((match) => ({
+  const directInsightRows = directMatches.map((match) => ({
     id: match.id,
     content: match.content,
     claims: match.claims,
   }));
+  const relatedInsightRows = matches.flatMap((match) => match.association ? [{
+    id: match.id,
+    content: match.content,
+    associationType: match.association.viaType,
+    hop: match.association.hop,
+  }] : []);
 
   const conflictContext = await loadRecallConflictContext(
     env.DB,
-    matches.map((match) => match.id),
+    directMatches.map((match) => match.id),
     recallAsOf
   );
-  for (const match of matches) {
+  for (const match of directMatches) {
     match.claims = conflictContext.claimsByEntry.get(match.id) ?? [];
   }
-  for (const row of insightRows) {
+  for (const row of directInsightRows) {
     row.claims = conflictContext.claimsByEntry.get(row.id) ?? [];
   }
 
-  const insight = insightRows.length > 1
-    ? await synthesizeInsight(embedQuery, insightRows, env, conflictContext.conflicts)
+  const insight = directInsightRows.length + relatedInsightRows.length > 1
+    ? await synthesizeInsight(embedQuery, {
+        directEvidence: directInsightRows,
+        relatedContext: relatedInsightRows,
+      }, env, conflictContext.conflicts)
     : "";
 
-  if (insightRows.length >= 5) {
+  if (directInsightRows.length >= 5) {
     ctx.waitUntil(
-      derivePattern(insightRows, env, ctx)
+      derivePattern(directInsightRows, env, ctx)
         .catch(e => console.error("derivePattern failed (non-fatal):", e))
     );
   }
 
   return {
     matches,
+    directEvidence: directMatches,
+    relatedContext: matches.filter((match) => Boolean(match.association)),
     insight,
     conflicts: conflictContext.conflicts,
     degraded: embeddingFailed || vectorQueryDegraded,
@@ -8361,26 +8449,6 @@ export interface ClassificationQueueResult {
   exhausted: number;
 }
 
-function classificationDueWhereSql(now: number, leaseCutoff: number): string {
-  return (
-    `tags NOT LIKE '%"status:deprecated"%' ` +
-    `AND (` +
-      `(` +
-        `COALESCE(classification_attempts, 0) < ${CLASSIFICATION_MAX_ATTEMPTS} ` +
-        `AND (` +
-          `classification_status IS NULL OR classification_status = 'pending' ` +
-          `OR (classification_status = 'retryable_error' AND COALESCE(classification_next_attempt_at, 0) <= ${now}) ` +
-          `OR (classification_status = 'processing' AND COALESCE(classification_started_at, 0) <= ${leaseCutoff})` +
-        `)` +
-      `)` +
-      ` OR (` +
-        `classification_status = 'succeeded' ` +
-        `AND COALESCE(classification_version, 0) < ${CURRENT_CLASSIFICATION_VERSION}` +
-      `)` +
-    `)`
-  );
-}
-
 /** Process due classification queue rows (pending, retryable, lease-expired, stale version). */
 export async function processClassificationQueue(
   env: Env,
@@ -8422,27 +8490,15 @@ export async function processClassificationQueue(
     }
   }
 
-  const remaining = await env.DB.prepare(
-    `SELECT COUNT(*) as count FROM entries WHERE ${DUE_WHERE}`
-  ).first() as Record<string, any> | null;
-  const deferred = await env.DB.prepare(
-    `SELECT COUNT(*) as count FROM entries
-     WHERE classification_status = 'retryable_error'
-       AND COALESCE(classification_attempts, 0) < ${CLASSIFICATION_MAX_ATTEMPTS}
-       AND classification_next_attempt_at > ${now}`
-  ).first() as Record<string, any> | null;
-  const exhausted = await env.DB.prepare(
-    `SELECT COUNT(*) as count FROM entries
-     WHERE classification_status = 'terminal_error'`
-  ).first() as Record<string, any> | null;
+  const queue = await readClassificationQueueSnapshot(env.DB, now);
 
   return {
     processed,
     failed,
     skipped,
-    remaining: (remaining?.count as number) ?? 0,
-    deferred: (deferred?.count as number) ?? 0,
-    exhausted: (exhausted?.count as number) ?? 0,
+    remaining: queue.due,
+    deferred: queue.deferred,
+    exhausted: queue.exhausted,
   };
 }
 
@@ -8997,8 +9053,6 @@ export async function extractAtomicFacts(
   }
 }
 
-const ATOMIC_EXTRACTION_MAX_ATTEMPTS = 3;
-const ATOMIC_EXTRACTION_LEASE_MS = 5 * 60_000;
 const ATOMIC_EXTRACTION_BASE_BACKOFF_MS = 60_000;
 const ATOMIC_EXTRACTION_DEFAULT_LIMIT = 10;
 const ATOMIC_EXTRACTION_SELFHOST_LIMIT = 50;
@@ -9692,44 +9746,16 @@ export async function processExtractionQueue(
     }
   }
 
-  const remaining = await env.DB.prepare(
-    `SELECT COUNT(*) as count FROM sb_observations
-     WHERE COALESCE(extraction_attempts, 0) < ?
-       AND (
-         extraction_status = 'pending'
-         OR (extraction_status = 'retryable_error' AND COALESCE(next_attempt_at, 0) <= ?)
-         OR (extraction_status = 'processing' AND COALESCE(processing_started_at, 0) <= ?)
-         OR (extraction_status = 'fallback' AND COALESCE(needs_reprocess, 0) = 1)
-         OR (extraction_status = 'partial_error' AND COALESCE(needs_reprocess, 0) = 1)
-         OR COALESCE(extraction_version, 0) < ?
-       )`
-  )
-    .bind(ATOMIC_EXTRACTION_MAX_ATTEMPTS, now, leaseCutoff, ATOMIC_EXTRACTION_VERSION)
-    .first<{ count: number }>();
-
-  const deferred = await env.DB.prepare(
-    `SELECT COUNT(*) as count FROM sb_observations
-     WHERE extraction_status = 'retryable_error'
-       AND COALESCE(extraction_attempts, 0) < ?
-       AND COALESCE(next_attempt_at, 0) > ?`
-  )
-    .bind(ATOMIC_EXTRACTION_MAX_ATTEMPTS, now)
-    .first<{ count: number }>();
-
-  const exhausted = await env.DB.prepare(
-    `SELECT COUNT(*) as count FROM sb_observations
-     WHERE extraction_status = 'terminal_error'`
-  )
-    .first<{ count: number }>();
+  const queue = await readExtractionQueueSnapshot(env.DB, now);
 
   return {
     processed,
     failed,
     skipped,
     fallback,
-    remaining: Number(remaining?.count ?? 0),
-    deferred: Number(deferred?.count ?? 0),
-    exhausted: Number(exhausted?.count ?? 0),
+    remaining: queue.due,
+    deferred: queue.deferred,
+    exhausted: queue.exhausted,
   };
 }
 
@@ -9748,35 +9774,7 @@ export async function inspectExtractionQueue(
   const leaseCutoff = now - ATOMIC_EXTRACTION_LEASE_MS;
   const boundedLimit = boundedExtractionLimit(env, limit);
 
-  const due = await env.DB.prepare(
-    `SELECT COUNT(*) as count FROM sb_observations
-     WHERE COALESCE(extraction_attempts, 0) < ?
-       AND (
-         extraction_status = 'pending'
-         OR (extraction_status = 'retryable_error' AND COALESCE(next_attempt_at, 0) <= ?)
-         OR (extraction_status = 'processing' AND COALESCE(processing_started_at, 0) <= ?)
-         OR (extraction_status = 'fallback' AND COALESCE(needs_reprocess, 0) = 1)
-         OR (extraction_status = 'partial_error' AND COALESCE(needs_reprocess, 0) = 1)
-         OR COALESCE(extraction_version, 0) < ?
-       )`
-  )
-    .bind(ATOMIC_EXTRACTION_MAX_ATTEMPTS, now, leaseCutoff, ATOMIC_EXTRACTION_VERSION)
-    .first<{ count: number }>();
-
-  const deferred = await env.DB.prepare(
-    `SELECT COUNT(*) as count FROM sb_observations
-     WHERE extraction_status = 'retryable_error'
-       AND COALESCE(extraction_attempts, 0) < ?
-       AND COALESCE(next_attempt_at, 0) > ?`
-  )
-    .bind(ATOMIC_EXTRACTION_MAX_ATTEMPTS, now)
-    .first<{ count: number }>();
-
-  const exhausted = await env.DB.prepare(
-    `SELECT COUNT(*) as count FROM sb_observations
-     WHERE extraction_status = 'terminal_error'`
-  )
-    .first<{ count: number }>();
+  const queue = await readExtractionQueueSnapshot(env.DB, now);
 
   const orphanPending = await env.DB.prepare(
     `SELECT COUNT(*) as count FROM sb_observations
@@ -9828,9 +9826,9 @@ export async function inspectExtractionQueue(
   return {
     dryRun: true,
     limit: boundedLimit,
-    due: Number(due?.count ?? 0),
-    deferred: Number(deferred?.count ?? 0),
-    exhausted: Number(exhausted?.count ?? 0),
+    due: queue.due,
+    deferred: queue.deferred,
+    exhausted: queue.exhausted,
     orphanPending: Number(orphanPending?.count ?? 0),
     fallbackReprocess: Number(fallbackReprocess?.count ?? 0),
     partialError: Number(partialError?.count ?? 0),
@@ -10967,17 +10965,37 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
         before: z.number().int().optional().describe("Only return entries before this Unix ms timestamp"),
         kind: z.enum([...KIND_VALUES] as [string, ...string[]]).optional().describe("Filter to episodic (events), semantic (facts/knowledge), or procedural (workflows/how-to)"),
         hops: z.number().int().min(0).max(2).default(0).describe("Association expansion depth. Related context is always ranked below direct evidence."),
+        associationDirection: z.enum([...ASSOCIATION_DIRECTIONS] as [AssociationDirection, ...AssociationDirection[]])
+          .default("outgoing")
+          .describe("Traverse directed associations as outgoing, incoming, or both."),
       },
     },
-    async ({ query, topK, tag, after, before, kind, hops }) => {
-      const { matches, insight, conflicts = [], degraded, degradedReason } = await recallEntries({ query, topK, tag, after, before, kind: kind as MemoryKind | undefined, hops }, env, ctx);
+    async ({ query, topK, tag, after, before, kind, hops, associationDirection }) => {
+      const {
+        matches,
+        directEvidence = matches.filter((match) => !match.association),
+        relatedContext = matches.filter((match) => Boolean(match.association)),
+        insight,
+        conflicts = [],
+        degraded,
+        degradedReason,
+      } = await recallEntries({
+        query,
+        topK,
+        tag,
+        after,
+        before,
+        kind: kind as MemoryKind | undefined,
+        hops,
+        associationDirection: associationDirection as AssociationDirection,
+      }, env, ctx);
 
       if (!matches.length) {
         const degradedText = degraded ? ` (${degradedReason ?? "degraded"})` : "";
         return { content: [{ type: "text", text: `Nothing found matching that query.${degradedText}` }] };
       }
 
-      const text = matches.map((m, i) => {
+      const formatMatch = (m: RecallMatch, ref: string) => {
         const date = new Date(m.createdAt).toLocaleDateString();
         const tagList = m.tags.length ? ` [${m.tags.join(", ")}]` : "";
         const src = m.source ? ` · ${m.source}` : "";
@@ -10991,8 +11009,17 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
             `${claim.id}=${claim.verificationStatus}${claim.conflictIds.length ? ` conflicts:${claim.conflictIds.join(",")}` : ""}`
           ).join("; ")}`
           : "";
-        return `${i + 1}. [${date}${src}${tagList}] (${relevance})${updateLabel}${associationLabel}\n${m.content}${claimState}`;
-      }).join("\n\n");
+        return `[${ref}] [${date}${src}${tagList}] (${relevance})${updateLabel}${associationLabel}\n${m.content}${claimState}`;
+      };
+      const directText = directEvidence
+        .map((match, index) => formatMatch(match, `E${index + 1}`))
+        .join("\n\n");
+      const relatedText = relatedContext
+        .map((match, index) => formatMatch(match, `R${index + 1}`))
+        .join("\n\n");
+      const text = relatedText
+        ? `**Direct Evidence:**\n${directText}\n\n**Related Context (not Evidence):**\n${relatedText}`
+        : directText;
 
       const degradedText = degraded ? `**Recall degraded:** ${degradedReason ?? "partial recall"}\n\n---\n\n` : "";
       const conflictText = conflicts.length
@@ -11069,9 +11096,11 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
         source_id: z.string().min(1).max(512).describe("Source entry ID from recall or list_recent"),
         target_id: z.string().min(1).max(512).describe("Target entry ID from recall or list_recent"),
         type: AssociationEdgeTypeSchema.default("related_to").describe("Association type"),
+        valid_from: z.number().int().nonnegative().optional().describe("Association validity start in Unix ms"),
+        valid_to: z.number().int().nonnegative().optional().describe("Association validity end in Unix ms"),
       },
     },
-    async ({ source_id, target_id, type }) => {
+    async ({ source_id, target_id, type, valid_from, valid_to }) => {
       try {
         const edge = await createAssociationEdge(env.DB, {
           source: source_id,
@@ -11079,6 +11108,8 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
           edgeType: type,
           weight: 1,
           provenance: "manual",
+          validFrom: valid_from,
+          validTo: valid_to,
         });
         await safeRecordComplianceAuditEvent(env, {
           actorType: "mcp",
@@ -11116,14 +11147,16 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
         source_id: z.string().min(1).max(512),
         target_id: z.string().min(1).max(512),
         type: AssociationEdgeTypeSchema.optional(),
+        effective_at: z.number().int().nonnegative().optional(),
       },
     },
-    async ({ source_id, target_id, type }) => {
+    async ({ source_id, target_id, type, effective_at }) => {
       try {
         const deleted = await deleteAssociationEdge(env.DB, {
           source: source_id,
           target: target_id,
           edgeType: type,
+          asOf: effective_at,
         });
         await safeRecordComplianceAuditEvent(env, {
           actorType: "mcp",
@@ -11158,14 +11191,19 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
       inputSchema: {
         id: z.string().min(1).max(512).describe("Entry ID from recall or list_recent"),
         type: AssociationEdgeTypeSchema.optional(),
+        direction: z.enum([...ASSOCIATION_DIRECTIONS] as [AssociationDirection, ...AssociationDirection[]])
+          .default("both"),
         limit: z.number().int().min(1).max(100).default(50),
+        as_of: z.number().int().nonnegative().optional().describe("Historical query time in Unix ms"),
       },
     },
-    async ({ id, type, limit }) => {
+    async ({ id, type, direction, limit, as_of }) => {
       try {
         const connections = await listAssociationConnections(env.DB, id, {
           edgeType: type,
+          direction: direction as AssociationDirection,
           limit,
+          asOf: as_of,
         });
         if (!connections.length) {
           return { content: [{ type: "text", text: `No associations found for ${id}.` }] };
@@ -11558,8 +11596,27 @@ const defaultHandler = {
         }, 400);
       }
       const body = parsed.data;
+      const sessionMessages = normalizeDevelopmentSessionMessages(
+        body.messages,
+        body.transcript
+      );
+      if (
+        body.messages &&
+        !developmentSessionMessagesMatchTranscript(sessionMessages, body.transcript)
+      ) {
+        return json({
+          ok: false,
+          error: "development_session_transcript_mismatch",
+        }, 400);
+      }
       const sourceIdentity = `${body.client}:${body.repository}:${body.branch}:${body.sessionId}`;
       const contentHash = await contentFingerprint(body.transcript);
+      const structuredMessagesHash = sessionMessages.length
+        ? await contentFingerprint(JSON.stringify(sessionMessages))
+        : null;
+      const auditAfterHash = structuredMessagesHash
+        ? await contentFingerprint(JSON.stringify({ contentHash, structuredMessagesHash }))
+        : contentHash;
       const previous = await env.DB.prepare(
         `SELECT id, content_hash, revision
          FROM sb_observations
@@ -11600,10 +11657,19 @@ const defaultHandler = {
       });
       const observationId = crypto.randomUUID();
       const createdAt = Date.now();
+      const messagePlans = planDevelopmentSessionEvidence(sessionMessages, {
+        sourceIdentity,
+        revision,
+        capturedAt: provenance.sourceTimestamp ?? createdAt,
+      });
       const metadata = {
         content_stage: "raw_evidence",
         evidence_type: provenance.evidenceType,
-        extraction_skipped_reason: "mixed_author_transcript",
+        extraction_skipped_reason: messagePlans.length
+          ? "structured_messages_distilled"
+          : "mixed_author_transcript",
+        structured_message_count: messagePlans.length,
+        structured_messages_hash: structuredMessagesHash,
         repository: body.repository,
         branch: body.branch,
         session_id: body.sessionId,
@@ -11614,14 +11680,83 @@ const defaultHandler = {
         action: "evidence.development_session_captured",
         objectType: "observation",
         objectId: observationId,
-        afterHash: contentHash,
+        afterHash: auditAfterHash,
         success: true,
         metadata: {
           sourceChannel: provenance.sourceChannel,
           sourceIdentity: provenance.sourceIdentity,
           revision,
+          transcriptContentHash: contentHash,
+          structuredMessagesHash,
         },
       });
+      const plannedMessages = await Promise.all(messagePlans.map(async (plan) => {
+        const id = crypto.randomUUID();
+        const contentHash = await contentFingerprint(plan.content);
+        const previousMessage = await env.DB.prepare(
+          `SELECT id
+           FROM sb_observations
+           WHERE source_channel = ? AND source_identity = ?
+           ORDER BY revision DESC, created_at DESC
+           LIMIT 1`
+        ).bind(body.client, plan.sourceIdentity).first<{ id: string }>();
+        const parent = plan.role === "user" ? {
+          parentId: `development:${plan.sourceIdentity}`,
+          versionId: crypto.randomUUID(),
+          versionNumber: revision,
+          evidenceRootId: plan.rootEvidenceId,
+        } : null;
+        const messageMetadata = {
+          content_stage: plan.role === "user" ? "message_evidence" : "ai_projection",
+          evidence_type: plan.evidenceType,
+          message_role: plan.role,
+          message_id: plan.messageId ?? null,
+          message_index: plan.messageIndex,
+          session_observation_id: observationId,
+          repository: body.repository,
+          branch: body.branch,
+          session_id: body.sessionId,
+          client: body.client,
+          extraction_skipped_reason: plan.extractionSkippedReason,
+          tags: ["development-session", `session-role:${plan.role}`],
+          ...(parent ? observationParentVersionMetadata(parent) : {}),
+        };
+        return {
+          plan,
+          id,
+          contentHash,
+          previousEvidenceId: previousMessage?.id ?? null,
+          parent,
+          metadataJson: JSON.stringify(messageMetadata),
+          metadata: messageMetadata,
+        };
+      }));
+      const messageStatements = plannedMessages.flatMap((message) => [
+        ...(message.parent ? prepareObservationParentVersionStatements(env.DB, {
+          ...message.parent,
+          observationId: message.id,
+          contentHash: message.contentHash,
+          createdAt,
+        }) : []),
+        prepareObservationInsert(env.DB, {
+          id: message.id,
+          content: message.plan.content,
+          source: body.client,
+          metadata: message.metadata,
+          contentHash: message.contentHash,
+          sourceChannel: body.client,
+          sourceIdentity: message.plan.sourceIdentity,
+          authorType: message.plan.authorType,
+          sourceUri: null,
+          sourceTimestamp: message.plan.capturedAt,
+          revision,
+          rootEvidenceId: message.plan.rootEvidenceId,
+          previousEvidenceId: message.previousEvidenceId,
+          extractionStatus: message.plan.extractionStatus,
+          processedAt: message.plan.extractionStatus === "succeeded" ? createdAt : null,
+          createdAt,
+        }),
+      ]);
       await env.DB.batch([
         prepareObservationInsert(env.DB, {
           id: observationId,
@@ -11641,14 +11776,50 @@ const defaultHandler = {
           processedAt: createdAt,
           createdAt,
         }),
+        ...messageStatements,
         auditEvent.statement,
       ]);
+      const userMessages = plannedMessages.filter((message) => message.plan.role === "user");
+      if (userMessages.length) {
+        ctx.waitUntil(
+          Promise.all(userMessages.map(async (message) => {
+            const result = await processObservationExtraction({
+              id: message.id,
+              content: message.plan.content,
+              source: body.client,
+              metadata_json: message.metadataJson,
+              created_at: createdAt,
+              content_hash: message.contentHash,
+              extraction_status: "pending",
+              extraction_version: ATOMIC_EXTRACTION_VERSION,
+              extraction_attempts: 0,
+              extraction_error: null,
+              next_attempt_at: null,
+              processing_started_at: null,
+              processed_at: null,
+              needs_reprocess: 0,
+              previous_evidence_id: message.previousEvidenceId,
+              root_evidence_id: message.plan.rootEvidenceId,
+              source_identity: message.plan.sourceIdentity,
+              source_channel: body.client,
+              revision,
+            }, env, ctx);
+            if (result.status === "failed") {
+              console.error("Development session message distillation failed:", result.error);
+            }
+          })).then(() => undefined)
+        );
+      }
       return json({
         ok: true,
         source: body.client,
         status: "stored_raw_evidence",
         observationId,
         revision,
+        distillation: {
+          userMessagesQueued: userMessages.length,
+          assistantMessagesArchived: plannedMessages.length - userMessages.length,
+        },
       });
     }
 
@@ -12377,8 +12548,30 @@ const defaultHandler = {
 
       const topK = Math.min(Math.max(parseInt(url.searchParams.get("topK") ?? "5", 10), 1), 20);
       const hops = Math.min(Math.max(parseInt(url.searchParams.get("hops") ?? "0", 10), 0), 2);
+      const directionParam = url.searchParams.get("associationDirection") ?? "outgoing";
+      if (!(ASSOCIATION_DIRECTIONS as readonly string[]).includes(directionParam)) {
+        return json({ ok: false, error: "invalid_association_direction" }, 400);
+      }
+      const associationDirection = directionParam as AssociationDirection;
 
-      const { matches, insight, conflicts = [], degraded, degradedReason } = await recallEntries({ query, topK, tag, after, before, kind, hops }, env, ctx, vaultId);
+      const {
+        matches,
+        directEvidence = matches.filter((match) => !match.association),
+        relatedContext = matches.filter((match) => Boolean(match.association)),
+        insight,
+        conflicts = [],
+        degraded,
+        degradedReason,
+      } = await recallEntries({
+        query,
+        topK,
+        tag,
+        after,
+        before,
+        kind,
+        hops,
+        associationDirection,
+      }, env, ctx, vaultId);
 
       if (!matches.length) {
         return json({
@@ -12412,6 +12605,18 @@ const defaultHandler = {
           claims: m.claims ?? [],
           association: m.association ?? null,
         })),
+        directEvidence: directEvidence.map((match, index) => ({
+          ref: `E${index + 1}`,
+          id: match.id,
+          content: match.content,
+          claims: match.claims ?? [],
+        })),
+        relatedContext: relatedContext.map((match, index) => ({
+          ref: `R${index + 1}`,
+          id: match.id,
+          content: match.content,
+          association: match.association,
+        })),
         conflicts,
         insight: insight || null,
       });
@@ -12441,6 +12646,8 @@ const defaultHandler = {
           weight: parsed.data.weight ?? 1,
           provenance: "manual",
           metadata: parsed.data.metadata,
+          validFrom: parsed.data.validFrom,
+          validTo: parsed.data.validTo,
         });
         await safeRecordComplianceAuditEvent(env, {
           ...auditActorFromPrincipal(auth.principal),
@@ -12485,6 +12692,7 @@ const defaultHandler = {
           source,
           target,
           edgeType: parsed.data.type,
+          asOf: parsed.data.effectiveAt,
         });
         await safeRecordComplianceAuditEvent(env, {
           ...auditActorFromPrincipal(auth.principal),
@@ -12515,10 +12723,21 @@ const defaultHandler = {
       if (parsedType && !parsedType.success) {
         return json({ ok: false, error: "invalid_association_type" }, 400);
       }
+      const rawDirection = url.searchParams.get("direction")?.trim() ?? "both";
+      if (!(ASSOCIATION_DIRECTIONS as readonly string[]).includes(rawDirection)) {
+        return json({ ok: false, error: "invalid_association_direction" }, 400);
+      }
+      const rawAsOf = url.searchParams.get("asOf");
+      const asOf = rawAsOf == null ? undefined : Number(rawAsOf);
+      if (asOf != null && (!Number.isFinite(asOf) || asOf < 0)) {
+        return json({ ok: false, error: "invalid_association_as_of" }, 400);
+      }
       try {
         const connections = await listAssociationConnections(env.DB, id, {
           edgeType: parsedType?.success ? parsedType.data : undefined,
+          direction: rawDirection as AssociationDirection,
           limit: Number.parseInt(url.searchParams.get("limit") ?? "50", 10),
+          asOf,
         });
         return json({ ok: true, id, connections });
       } catch (error) {

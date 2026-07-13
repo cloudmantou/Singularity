@@ -7,18 +7,14 @@ export function activeMemoryClaimPredicate(
   const parentVersionEligibleAt = (parentVersionRef: string): string => `(
     (
       ${parentVersionRef}.state = 'superseded'
-      AND ${parentVersionRef}.activated_at IS NOT NULL
-      AND ${parentVersionRef}.activated_at <= ${asOfExpression}
+      AND COALESCE(${parentVersionRef}.activated_at, ${parentVersionRef}.created_at) <= ${asOfExpression}
       AND ${parentVersionRef}.superseded_at IS NOT NULL
       AND ${parentVersionRef}.superseded_at > ${asOfExpression}
     )
     OR (
       ${parentVersionRef}.state IN ('active', 'active_degraded')
       AND ${parentVersionRef}.superseded_at IS NULL
-      AND (
-        ${parentVersionRef}.activated_at IS NULL
-        OR ${parentVersionRef}.activated_at <= ${asOfExpression}
-      )
+      AND COALESCE(${parentVersionRef}.activated_at, ${parentVersionRef}.created_at) <= ${asOfExpression}
       AND EXISTS (
         SELECT 1
         FROM sb_parent_units pu_current

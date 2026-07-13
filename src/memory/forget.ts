@@ -435,6 +435,11 @@ function prepareDatabaseErase(
          WHERE source_parent_id NOT IN (SELECT parent_id FROM sb_parent_units)
             OR target_parent_id NOT IN (SELECT parent_id FROM sb_parent_units)`
       ),
+      db.prepare(
+        `DELETE FROM sb_association_edge_history
+         WHERE source_parent_id NOT IN (SELECT parent_id FROM sb_parent_units)
+            OR target_parent_id NOT IN (SELECT parent_id FROM sb_parent_units)`
+      ),
       db.prepare(`DELETE FROM sb_memories WHERE id IN (${inList})`).bind(...batch),
     ];
   });

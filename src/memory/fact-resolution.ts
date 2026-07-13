@@ -20,6 +20,7 @@ export const FACT_RESOLUTION_SCHEMA_STATEMENTS = [
     source_memory_id TEXT,
     target_memory_id TEXT,
     created_at INTEGER NOT NULL,
+    CHECK (target_relation_id IS NULL OR target_relation_id <> relation_id),
     CHECK (resolution_type IN ('duplicate', 'supports', 'elaborates', 'coexists', 'supersedes', 'contradicts', 'uncertain'))
   )`,
   `CREATE INDEX IF NOT EXISTS idx_fact_resolutions_relation

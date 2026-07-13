@@ -161,6 +161,42 @@ describe("Association Graph", () => {
     })).toBe(0);
   });
 
+  it("preserves closed validity intervals when an association is linked again", async () => {
+    await createAssociationEdge(db, {
+      source: "entry-a",
+      target: "entry-b",
+      edgeType: "references",
+      provenance: "manual",
+      createdAt: 200,
+    });
+    expect(await deleteAssociationEdge(db, {
+      source: "entry-a",
+      target: "entry-b",
+      edgeType: "references",
+      asOf: 500,
+    })).toBe(1);
+    await createAssociationEdge(db, {
+      source: "entry-a",
+      target: "entry-b",
+      edgeType: "references",
+      provenance: "manual",
+      createdAt: 700,
+    });
+
+    expect(await listAssociationConnections(db, "entry-b", {
+      direction: "incoming",
+      asOf: 499,
+    })).toMatchObject([{ entryId: "entry-a" }]);
+    expect(await listAssociationConnections(db, "entry-b", {
+      direction: "incoming",
+      asOf: 600,
+    })).toEqual([]);
+    expect(await listAssociationConnections(db, "entry-b", {
+      direction: "incoming",
+      asOf: 700,
+    })).toMatchObject([{ entryId: "entry-a" }]);
+  });
+
   it("rejects missing, inactive, and self endpoints", async () => {
     raw.prepare(`UPDATE sb_parent_units SET active_version_id = NULL WHERE parent_id = 'parent-c'`).run();
 
@@ -239,5 +275,51 @@ describe("Association Graph", () => {
       .rejects.toBeInstanceOf(AssociationEndpointUnavailableError);
     await expect(listAssociationConnections(db, "parent-a", { asOf: 250 }))
       .resolves.toMatchObject([{ parentId: "parent-b", entryId: "entry-b" }]);
+  });
+
+  it("respects directed traversal and edge validity windows", async () => {
+    await createAssociationEdge(db, {
+      source: "entry-a",
+      target: "entry-b",
+      edgeType: "references",
+      provenance: "manual",
+      createdAt: 200,
+    });
+
+    expect(await expandAssociationGraph(db, ["parent-b"], {
+      hops: 1,
+      direction: "outgoing",
+      asOf: 250,
+    })).toEqual([]);
+    await expect(expandAssociationGraph(db, ["parent-b"], {
+      hops: 1,
+      direction: "incoming",
+      asOf: 250,
+    })).resolves.toMatchObject([{ parentId: "parent-a", viaType: "references" }]);
+    expect(await expandAssociationGraph(db, ["parent-a"], {
+      hops: 1,
+      direction: "outgoing",
+      asOf: 199,
+    })).toEqual([]);
+
+    expect(await deleteAssociationEdge(db, {
+      source: "entry-a",
+      target: "entry-b",
+      edgeType: "references",
+      asOf: 300,
+    })).toBe(1);
+    await expect(expandAssociationGraph(db, ["parent-a"], {
+      hops: 1,
+      direction: "outgoing",
+      asOf: 250,
+    })).resolves.toHaveLength(1);
+    expect(await expandAssociationGraph(db, ["parent-a"], {
+      hops: 1,
+      direction: "outgoing",
+      asOf: 300,
+    })).toEqual([]);
+    expect(raw.prepare(
+      `SELECT directed, valid_from, deleted_at FROM sb_association_edges WHERE edge_type = 'references'`
+    ).get()).toEqual({ directed: 1, valid_from: 200, deleted_at: 300 });
   });
 });

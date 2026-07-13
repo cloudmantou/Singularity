@@ -181,7 +181,11 @@ describe("Entity Merge Executor", () => {
     expect(raw.prepare(
       `SELECT relation_id, target_relation_id FROM sb_fact_resolutions
        WHERE id = 'resolution-duplicate'`
-    ).get()).toEqual({ relation_id: "relation-target", target_relation_id: "relation-target" });
+    ).get()).toBeUndefined();
+    expect(raw.prepare(
+      `SELECT COUNT(*) AS count FROM sb_fact_resolutions
+       WHERE relation_id = target_relation_id`
+    ).get()).toEqual({ count: 0 });
     expect(raw.prepare(
       `SELECT target_relation_id, requires_review FROM sb_fact_resolutions
        WHERE id = 'resolution-self-target'`

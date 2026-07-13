@@ -2,7 +2,11 @@
 'use strict';
 
 const crypto = require('node:crypto');
-const { formatTranscript, readProjectContext } = require('./context.cjs');
+const {
+  extractTranscriptMessages,
+  formatTranscript,
+  readProjectContext,
+} = require('./context.cjs');
 
 async function main() {
   const baseUrl = process.env.SECOND_BRAIN_URL;
@@ -33,6 +37,7 @@ async function main() {
   if (!Array.isArray(messages) || messages.length === 0) return;
 
   const content = formatTranscript(messages);
+  const structuredMessages = extractTranscriptMessages(messages);
   if (content.length < 50) return;
   const project = readProjectContext(process.cwd());
   const sessionId = String(
@@ -53,6 +58,7 @@ async function main() {
         sessionId,
         capturedAt: Date.now(),
         transcript: content,
+        messages: structuredMessages,
       }),
     });
   } catch {

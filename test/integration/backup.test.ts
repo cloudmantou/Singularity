@@ -129,8 +129,9 @@ describe("full memory backup import/export", () => {
     db.prepare(
       `INSERT INTO sb_association_edges (
          id, source_parent_id, target_parent_id, edge_type, weight,
-         provenance, metadata_json, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         provenance, metadata_json, directed, valid_from, valid_to, deleted_at,
+         created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       "association-1",
       "parent-1",
@@ -139,16 +140,42 @@ describe("full memory backup import/export", () => {
       0.8,
       "manual",
       "{}",
+      1,
+      now - 500,
+      now + 500,
+      null,
       now - 500,
       now - 500
+    );
+    db.prepare(
+      `INSERT INTO sb_association_edge_history (
+         id, source_parent_id, target_parent_id, edge_type, weight,
+         provenance, metadata_json, directed, valid_from, valid_to, deleted_at,
+         created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      "association-history-1",
+      "parent-1",
+      "parent-2",
+      "references",
+      0.6,
+      "manual",
+      "{}",
+      1,
+      now - 2000,
+      null,
+      now - 1000,
+      now - 2000,
+      now - 1000
     );
     db.prepare(
       `INSERT INTO sb_parent_versions
        (version_id, parent_id, version_number, source_observation_id,
         source_snapshot_hash, summary, state, summary_vector_ids,
-        activated_at, superseded_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run("parent-version-1", "parent-1", 1, "obs-1", "hash-entry-1", "Singularity uses SQLite", "active", "[]", now - 1500, null, now - 2000, now);
+        activated_at, superseded_at, activation_time_source,
+        superseded_time_source, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run("parent-version-1", "parent-1", 1, "obs-1", "hash-entry-1", "Singularity uses SQLite", "active", "[]", now - 1500, null, "recorded", null, now - 2000, now);
     db.prepare(
       `INSERT INTO sb_memories
        (id, content, kind, memory_class, importance, confidence, entry_id,
@@ -298,7 +325,7 @@ describe("full memory backup import/export", () => {
     const backup = await exportResponse.json() as any;
 
     expect(backup.backupFormat).toBe("singularity-memory-backup");
-    expect(backup.schemaVersion).toBe(11);
+    expect(backup.schemaVersion).toBe(12);
     expect(backup.features).toEqual(
       expect.arrayContaining([
         "atomic-memory",
@@ -325,6 +352,7 @@ describe("full memory backup import/export", () => {
       parentVersions: 1,
       parentVersionClaims: 1,
       associationEdges: 1,
+      associationEdgeHistory: 1,
       entries: 2,
       observations: 1,
       memories: 1,
@@ -357,6 +385,8 @@ describe("full memory backup import/export", () => {
       state: "active",
       activated_at: now - 1500,
       superseded_at: null,
+      activation_time_source: "recorded",
+      superseded_time_source: null,
     });
     expect(backup.parentVersionClaims[0]).toMatchObject({
       parent_version_id: "parent-version-1",
@@ -369,6 +399,17 @@ describe("full memory backup import/export", () => {
       target_parent_id: "parent-2",
       edge_type: "part_of_project",
       provenance: "manual",
+      directed: 1,
+      valid_from: now - 500,
+      valid_to: now + 500,
+      deleted_at: null,
+    });
+    expect(backup.associationEdgeHistory[0]).toMatchObject({
+      id: "association-history-1",
+      edge_type: "references",
+      directed: 1,
+      valid_from: now - 2000,
+      deleted_at: now - 1000,
     });
     expect(backup.observations[0]).toMatchObject({
       root_evidence_id: "evidence-root-1",
@@ -411,13 +452,14 @@ describe("full memory backup import/export", () => {
     );
     expect(importResponse.status).toBe(200);
     const imported = await importResponse.json() as any;
-    expect(imported.schemaVersion).toBe(11);
+    expect(imported.schemaVersion).toBe(12);
     expect(imported.inserted).toBe(2);
     expect(imported.graph.scopes.imported).toBe(1);
     expect(imported.graph.parentUnits.imported).toBe(2);
     expect(imported.graph.parentVersions.imported).toBe(1);
     expect(imported.graph.parentVersionClaims.imported).toBe(1);
     expect(imported.graph.associationEdges.imported).toBe(1);
+    expect(imported.graph.associationEdgeHistory.imported).toBe(1);
     expect(imported.graph.memories.imported).toBe(1);
     expect(imported.graph.entityRelations.imported).toBe(1);
     expect(imported.graph.entityAliases.imported).toBe(1);
@@ -443,6 +485,17 @@ describe("full memory backup import/export", () => {
     expect(restoredBackup.parentVersions[0]).toMatchObject({
       activated_at: now - 1500,
       superseded_at: null,
+      activation_time_source: "recorded",
+    });
+    expect(restoredBackup.associationEdges[0]).toMatchObject({
+      directed: 1,
+      valid_from: now - 500,
+      valid_to: now + 500,
+      deleted_at: null,
+    });
+    expect(restoredBackup.associationEdgeHistory[0]).toMatchObject({
+      id: "association-history-1",
+      deleted_at: now - 1000,
     });
     expect(restoredBackup.entities[0]).toMatchObject({
       lifecycle_state: "active",
@@ -496,7 +549,7 @@ describe("full memory backup import/export", () => {
     );
     expect(legacyImportResponse.status).toBe(200);
     const legacyImported = await legacyImportResponse.json() as any;
-    expect(legacyImported.schemaVersion).toBe(11);
+    expect(legacyImported.schemaVersion).toBe(12);
     expect(legacyImported.graph.factSources.total).toBe(0);
     expect(legacyImported.graph.parentVersionClaims.total).toBe(1);
 
@@ -515,14 +568,14 @@ describe("full memory backup import/export", () => {
     const futureImportResponse = await worker.fetch(
       auth("/import", {
         method: "POST",
-        body: JSON.stringify({ ...backup, schemaVersion: 12 }),
+        body: JSON.stringify({ ...backup, schemaVersion: 13 }),
       }),
       legacyRestored.env,
       createExecutionContext()
     );
     expect(futureImportResponse.status).toBe(400);
     const futureImported = await futureImportResponse.json() as any;
-    expect(futureImported.error).toMatch(/schemaVersion 12/);
+    expect(futureImported.error).toMatch(/schemaVersion 13/);
 
     db.close();
     restored.db.close();

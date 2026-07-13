@@ -59,6 +59,8 @@ export const EVIDENCE_CONTRACT_SCHEMA_STATEMENTS = [
     summary_vector_ids TEXT NOT NULL DEFAULT '[]',
     activated_at INTEGER,
     superseded_at INTEGER,
+    activation_time_source TEXT,
+    superseded_time_source TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     CHECK (state IN ('building', 'active', 'active_degraded', 'superseded', 'failed')),
@@ -86,6 +88,33 @@ export const EVIDENCE_CONTRACT_SCHEMA_STATEMENTS = [
 export const PARENT_VERSION_TEMPORAL_MIGRATIONS = [
   { column: "activated_at", statement: `ALTER TABLE sb_parent_versions ADD COLUMN activated_at INTEGER` },
   { column: "superseded_at", statement: `ALTER TABLE sb_parent_versions ADD COLUMN superseded_at INTEGER` },
+  { column: "activation_time_source", statement: `ALTER TABLE sb_parent_versions ADD COLUMN activation_time_source TEXT` },
+  { column: "superseded_time_source", statement: `ALTER TABLE sb_parent_versions ADD COLUMN superseded_time_source TEXT` },
+] as const;
+
+export const PARENT_VERSION_TEMPORAL_BACKFILL_STATEMENTS = [
+  `UPDATE sb_parent_versions
+   SET activated_at = COALESCE(activated_at, created_at),
+       activation_time_source = COALESCE(
+         activation_time_source,
+         CASE WHEN activated_at IS NULL THEN 'inferred' ELSE 'recorded' END
+       )
+   WHERE state IN ('active', 'active_degraded', 'superseded')
+     AND (activated_at IS NULL OR activation_time_source IS NULL)`,
+  `UPDATE sb_parent_versions
+   SET superseded_time_source = COALESCE(
+         superseded_time_source,
+         CASE WHEN superseded_at IS NULL THEN 'inferred' ELSE 'recorded' END
+       ),
+       superseded_at = COALESCE(superseded_at,
+         (SELECT MIN(COALESCE(next_version.activated_at, next_version.created_at))
+          FROM sb_parent_versions next_version
+          WHERE next_version.parent_id = sb_parent_versions.parent_id
+            AND next_version.version_number > sb_parent_versions.version_number
+            AND next_version.state IN ('active', 'active_degraded', 'superseded')),
+         updated_at)
+   WHERE state = 'superseded'
+     AND (superseded_at IS NULL OR superseded_time_source IS NULL)`,
 ] as const;
 
 export const OBSERVATION_EVIDENCE_MIGRATIONS = [
@@ -286,8 +315,15 @@ export function prepareParentVersionActivation(
   return [
     db.prepare(
       `UPDATE sb_parent_versions
-       SET state = ?, activated_at = COALESCE(activated_at, ?),
-           superseded_at = NULL, updated_at = ?
+       SET state = ?,
+           activation_time_source = CASE
+             WHEN activated_at IS NULL THEN 'recorded'
+             ELSE COALESCE(activation_time_source, 'recorded')
+           END,
+           activated_at = COALESCE(activated_at, ?),
+           superseded_at = NULL,
+           superseded_time_source = NULL,
+           updated_at = ?
        WHERE parent_id = ?
          AND version_id = ?
          AND state = 'building'`
@@ -306,7 +342,16 @@ export function prepareParentVersionActivation(
     ).bind(input.versionId, input.updatedAt, input.parentId, input.versionId, input.parentId),
     db.prepare(
       `UPDATE sb_parent_versions
-       SET state = 'superseded', activated_at = COALESCE(activated_at, created_at),
+       SET state = 'superseded',
+           activation_time_source = COALESCE(
+             activation_time_source,
+             CASE WHEN activated_at IS NULL THEN 'inferred' ELSE 'recorded' END
+           ),
+           activated_at = COALESCE(activated_at, created_at),
+           superseded_time_source = CASE
+             WHEN superseded_at IS NULL THEN 'recorded'
+             ELSE COALESCE(superseded_time_source, 'recorded')
+           END,
            superseded_at = COALESCE(superseded_at, ?),
            updated_at = ?
        WHERE parent_id = ?

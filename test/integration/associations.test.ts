@@ -87,6 +87,83 @@ describe("Association Graph API", () => {
     }
   });
 
+  it("preserves directed traversal and historical validity through the API", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      seed(db, "entry-a", "parent-a", "A", 100);
+      seed(db, "entry-b", "parent-b", "B", 110);
+
+      const linked = await worker.fetch(request("/associations/link", {
+        method: "POST",
+        body: JSON.stringify({
+          sourceId: "entry-a",
+          targetId: "entry-b",
+          type: "references",
+          validFrom: 200,
+        }),
+      }), env, ctx());
+      expect(linked.status).toBe(200);
+      const linkedBody = await linked.json() as any;
+      expect(linkedBody).toMatchObject({
+        association: { directed: true, validFrom: 200 },
+      });
+      const createdAt = Number(linkedBody.association.createdAt);
+
+      const beforeCreation = await worker.fetch(
+        request(`/connections?id=entry-b&direction=incoming&asOf=${createdAt - 1}`), env, ctx()
+      );
+      expect(await beforeCreation.json()).toMatchObject({ connections: [] });
+
+      const outgoingFromTarget = await worker.fetch(
+        request(`/connections?id=entry-b&direction=outgoing&asOf=${createdAt}`), env, ctx()
+      );
+      expect(await outgoingFromTarget.json()).toMatchObject({ connections: [] });
+
+      const incomingToTarget = await worker.fetch(
+        request(`/connections?id=entry-b&direction=incoming&asOf=${createdAt}`), env, ctx()
+      );
+      expect(await incomingToTarget.json()).toMatchObject({
+        connections: [{ entryId: "entry-a", direction: "incoming" }],
+      });
+
+      const prematureUnlink = await worker.fetch(request("/associations/unlink", {
+        method: "POST",
+        body: JSON.stringify({
+          sourceId: "entry-a",
+          targetId: "entry-b",
+          type: "references",
+          effectiveAt: createdAt - 1,
+        }),
+      }), env, ctx());
+      expect(await prematureUnlink.json()).toEqual({ ok: true, deleted: 0 });
+
+      const unlinked = await worker.fetch(request("/associations/unlink", {
+        method: "POST",
+        body: JSON.stringify({
+          sourceId: "entry-a",
+          targetId: "entry-b",
+          type: "references",
+          effectiveAt: createdAt + 500,
+        }),
+      }), env, ctx());
+      expect(await unlinked.json()).toEqual({ ok: true, deleted: 1 });
+
+      const beforeDeletion = await worker.fetch(
+        request(`/connections?id=entry-b&direction=incoming&asOf=${createdAt + 499}`), env, ctx()
+      );
+      expect(await beforeDeletion.json()).toMatchObject({
+        connections: [{ entryId: "entry-a" }],
+      });
+      const afterDeletion = await worker.fetch(
+        request(`/connections?id=entry-b&direction=incoming&asOf=${createdAt + 500}`), env, ctx()
+      );
+      expect(await afterDeletion.json()).toMatchObject({ connections: [] });
+    } finally {
+      db.close();
+    }
+  });
+
   function seed(
     db: ReturnType<typeof createSelfhostEnv>["db"],
     entryId: string,

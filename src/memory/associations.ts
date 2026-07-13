@@ -19,6 +19,8 @@ export const ASSOCIATION_PROVENANCE_VALUES = [
 ] as const;
 
 export type AssociationProvenance = (typeof ASSOCIATION_PROVENANCE_VALUES)[number];
+export const ASSOCIATION_DIRECTIONS = ["outgoing", "incoming", "both"] as const;
+export type AssociationDirection = (typeof ASSOCIATION_DIRECTIONS)[number];
 
 const SYMMETRIC_EDGE_TYPES = new Set<AssociationEdgeType>(["related_to", "manual"]);
 const DEFAULT_WEIGHT = 0.5;
@@ -36,12 +38,52 @@ export const ASSOCIATION_SCHEMA_STATEMENTS = [
     weight REAL NOT NULL DEFAULT 0.5,
     provenance TEXT NOT NULL,
     metadata_json TEXT NOT NULL DEFAULT '{}',
+    directed INTEGER NOT NULL DEFAULT 0,
+    valid_from INTEGER,
+    valid_to INTEGER,
+    deleted_at INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     UNIQUE(source_parent_id, target_parent_id, edge_type)
   )`,
   `CREATE INDEX IF NOT EXISTS idx_association_edges_target
     ON sb_association_edges(target_parent_id, weight DESC, updated_at DESC)`,
+  `CREATE TABLE IF NOT EXISTS sb_association_edge_history (
+    id TEXT PRIMARY KEY,
+    source_parent_id TEXT NOT NULL,
+    target_parent_id TEXT NOT NULL,
+    edge_type TEXT NOT NULL,
+    weight REAL NOT NULL,
+    provenance TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    directed INTEGER NOT NULL,
+    valid_from INTEGER,
+    valid_to INTEGER,
+    deleted_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_association_edge_history_endpoints
+    ON sb_association_edge_history(source_parent_id, target_parent_id, deleted_at)`,
+] as const;
+
+const ASSOCIATION_EDGE_TIMELINE_SQL = `(
+  SELECT id, source_parent_id, target_parent_id, edge_type, weight,
+         provenance, metadata_json, directed, valid_from, valid_to, deleted_at,
+         created_at, updated_at
+  FROM sb_association_edges
+  UNION ALL
+  SELECT id, source_parent_id, target_parent_id, edge_type, weight,
+         provenance, metadata_json, directed, valid_from, valid_to, deleted_at,
+         created_at, updated_at
+  FROM sb_association_edge_history
+)`;
+
+const ASSOCIATION_COLUMN_MIGRATIONS = [
+  { column: "directed", statement: `ALTER TABLE sb_association_edges ADD COLUMN directed INTEGER NOT NULL DEFAULT 0` },
+  { column: "valid_from", statement: `ALTER TABLE sb_association_edges ADD COLUMN valid_from INTEGER` },
+  { column: "valid_to", statement: `ALTER TABLE sb_association_edges ADD COLUMN valid_to INTEGER` },
+  { column: "deleted_at", statement: `ALTER TABLE sb_association_edges ADD COLUMN deleted_at INTEGER` },
 ] as const;
 
 const initializedAssociationDatabases = new WeakSet<object>();
@@ -62,6 +104,8 @@ export interface AssociationEdgeInput {
   metadata?: Record<string, unknown>;
   createdAt?: number;
   asOf?: number;
+  validFrom?: number | null;
+  validTo?: number | null;
 }
 
 export interface AssociationEdgeRecord {
@@ -72,6 +116,10 @@ export interface AssociationEdgeRecord {
   weight: number;
   provenance: AssociationProvenance;
   metadata: Record<string, unknown>;
+  directed: boolean;
+  validFrom: number;
+  validTo: number | null;
+  deletedAt: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -119,6 +167,10 @@ interface AssociationEdgeRow {
   weight: number;
   provenance: AssociationProvenance;
   metadata_json: string;
+  directed: number;
+  valid_from: number | null;
+  valid_to: number | null;
+  deleted_at: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -174,6 +226,31 @@ function safeAsOf(value: number | undefined): number {
 export async function ensureAssociationDataModel(db: D1Database): Promise<void> {
   if (initializedAssociationDatabases.has(db as object)) return;
   for (const statement of ASSOCIATION_SCHEMA_STATEMENTS) await db.exec(statement);
+  const { results: columnRows } = await db.prepare(
+    `PRAGMA table_info(sb_association_edges)`
+  ).all<{ name: string }>();
+  const columns = new Set(columnRows.map((row) => row.name));
+  for (const migration of ASSOCIATION_COLUMN_MIGRATIONS) {
+    if (columns.has(migration.column)) continue;
+    try {
+      await db.exec(migration.statement);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/duplicate column name|already exists/i.test(message)) throw error;
+    }
+  }
+  await db.exec(
+    `UPDATE sb_association_edges
+     SET directed = CASE
+       WHEN edge_type IN ('related_to', 'manual') THEN 0
+       ELSE 1
+     END,
+         valid_from = COALESCE(valid_from, created_at)`
+  );
+  await db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_association_edges_validity
+     ON sb_association_edges(valid_from, valid_to, deleted_at)`
+  );
   initializedAssociationDatabases.add(db as object);
 }
 
@@ -250,15 +327,52 @@ export async function createAssociationEdge(
     input.edgeType
   );
   const createdAt = safeAsOf(input.createdAt);
+  const validFrom = safeAsOf(input.validFrom ?? createdAt);
+  const validTo = input.validTo == null ? null : safeAsOf(input.validTo);
+  if (validTo != null && validTo <= validFrom) {
+    throw new Error("Association validTo must be later than validFrom");
+  }
   const weight = normalizeWeight(input.weight);
   const id = crypto.randomUUID();
   const metadata = { ...(input.metadata ?? {}) };
+  const directed = SYMMETRIC_EDGE_TYPES.has(input.edgeType) ? 0 : 1;
+
+  const closedEdge = await db.prepare(
+    `SELECT id, deleted_at
+     FROM sb_association_edges
+     WHERE source_parent_id = ? AND target_parent_id = ? AND edge_type = ?
+       AND deleted_at IS NOT NULL`
+  ).bind(sourceParentId, targetParentId, input.edgeType).first<{
+    id: string;
+    deleted_at: number;
+  }>();
+  if (closedEdge) {
+    await db.batch([
+      db.prepare(
+        `INSERT OR IGNORE INTO sb_association_edge_history (
+           id, source_parent_id, target_parent_id, edge_type, weight,
+           provenance, metadata_json, directed, valid_from, valid_to, deleted_at,
+           created_at, updated_at
+         )
+         SELECT id, source_parent_id, target_parent_id, edge_type, weight,
+                provenance, metadata_json, directed, valid_from, valid_to, deleted_at,
+                created_at, updated_at
+         FROM sb_association_edges
+         WHERE id = ? AND deleted_at = ?`
+      ).bind(closedEdge.id, closedEdge.deleted_at),
+      db.prepare(
+        `DELETE FROM sb_association_edges
+         WHERE id = ? AND deleted_at = ?`
+      ).bind(closedEdge.id, closedEdge.deleted_at),
+    ]);
+  }
 
   await db.prepare(
     `INSERT INTO sb_association_edges (
        id, source_parent_id, target_parent_id, edge_type, weight,
-       provenance, metadata_json, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       provenance, metadata_json, directed, valid_from, valid_to, deleted_at,
+       created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
      ON CONFLICT(source_parent_id, target_parent_id, edge_type) DO UPDATE SET
        weight = MAX(sb_association_edges.weight, excluded.weight),
        provenance = CASE
@@ -271,6 +385,13 @@ export async function createAssociationEdge(
          WHEN excluded.weight >= sb_association_edges.weight THEN excluded.metadata_json
          ELSE sb_association_edges.metadata_json
        END,
+       directed = excluded.directed,
+       valid_from = CASE
+         WHEN sb_association_edges.deleted_at IS NOT NULL THEN excluded.valid_from
+         ELSE MIN(COALESCE(sb_association_edges.valid_from, excluded.valid_from), excluded.valid_from)
+       END,
+       valid_to = excluded.valid_to,
+       deleted_at = NULL,
        updated_at = excluded.updated_at`
   ).bind(
     id,
@@ -280,13 +401,17 @@ export async function createAssociationEdge(
     weight,
     input.provenance,
     JSON.stringify(metadata),
+    directed,
+    validFrom,
+    validTo,
     createdAt,
     createdAt
   ).run();
 
   const row = await db.prepare(
     `SELECT id, source_parent_id, target_parent_id, edge_type, weight,
-            provenance, metadata_json, created_at, updated_at
+            provenance, metadata_json, directed, valid_from, valid_to, deleted_at,
+            created_at, updated_at
      FROM sb_association_edges
      WHERE source_parent_id = ? AND target_parent_id = ? AND edge_type = ?`
   ).bind(sourceParentId, targetParentId, input.edgeType).first<AssociationEdgeRow>();
@@ -299,6 +424,10 @@ export async function createAssociationEdge(
     weight: Number(row.weight),
     provenance: row.provenance,
     metadata: parseObject(row.metadata_json),
+    directed: Boolean(row.directed),
+    validFrom: Number(row.valid_from ?? row.created_at),
+    validTo: row.valid_to == null ? null : Number(row.valid_to),
+    deletedAt: row.deleted_at == null ? null : Number(row.deleted_at),
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
   };
@@ -356,17 +485,33 @@ export async function hydrateAssociationParents(
 export async function listAssociationConnections(
   db: D1Database,
   endpoint: string,
-  options: { edgeType?: AssociationEdgeType; limit?: number; asOf?: number } = {}
+  options: {
+    edgeType?: AssociationEdgeType;
+    direction?: AssociationDirection;
+    limit?: number;
+    asOf?: number;
+  } = {}
 ): Promise<AssociationConnection[]> {
   await ensureAssociationDataModel(db);
   const asOf = safeAsOf(options.asOf);
   const parentId = await resolveActiveAssociationParent(db, endpoint, asOf);
   const limit = Math.max(1, Math.min(Math.trunc(options.limit ?? 50), 100));
+  const direction = options.direction ?? "both";
+  const directionSql = direction === "outgoing"
+    ? `(source_parent_id = ? OR (directed = 0 AND target_parent_id = ?))`
+    : direction === "incoming"
+      ? `(target_parent_id = ? OR (directed = 0 AND source_parent_id = ?))`
+      : `(source_parent_id = ? OR target_parent_id = ?)`;
   let sql = `SELECT id, source_parent_id, target_parent_id, edge_type, weight,
-                    provenance, metadata_json, created_at, updated_at
-             FROM sb_association_edges
-             WHERE (source_parent_id = ? OR target_parent_id = ?)`;
-  const bindings: Array<string | number> = [parentId, parentId];
+                    provenance, metadata_json, directed, valid_from, valid_to, deleted_at,
+                    created_at, updated_at
+             FROM ${ASSOCIATION_EDGE_TIMELINE_SQL} association_timeline
+             WHERE ${directionSql}
+               AND created_at <= ?
+               AND COALESCE(valid_from, created_at) <= ?
+               AND (valid_to IS NULL OR valid_to > ?)
+               AND (deleted_at IS NULL OR deleted_at > ?)`;
+  const bindings: Array<string | number> = [parentId, parentId, asOf, asOf, asOf, asOf];
   if (options.edgeType) {
     sql += ` AND edge_type = ?`;
     bindings.push(options.edgeType);
@@ -406,19 +551,30 @@ export async function deleteAssociationEdge(
     resolveActiveAssociationParent(db, input.target, asOf),
   ]);
   const edgeType = input.edgeType;
-  const symmetric = edgeType ? SYMMETRIC_EDGE_TYPES.has(edgeType) : true;
   const [sourceParentId, targetParentId] = edgeType
     ? normalizeEndpoints(resolvedSource, resolvedTarget, edgeType)
     : [resolvedSource, resolvedTarget];
-  let sql = symmetric
-    ? `DELETE FROM sb_association_edges
-       WHERE ((source_parent_id = ? AND target_parent_id = ?)
-          OR (source_parent_id = ? AND target_parent_id = ?))`
-    : `DELETE FROM sb_association_edges
-       WHERE source_parent_id = ? AND target_parent_id = ?`;
-  const bindings: string[] = symmetric
-    ? [sourceParentId, targetParentId, targetParentId, sourceParentId]
-    : [sourceParentId, targetParentId];
+  let sql = `UPDATE sb_association_edges
+             SET deleted_at = ?, updated_at = ?
+             WHERE deleted_at IS NULL
+               AND created_at <= ?
+               AND COALESCE(valid_from, created_at) <= ?
+               AND (valid_to IS NULL OR valid_to > ?)
+               AND (
+                 (source_parent_id = ? AND target_parent_id = ?)
+                 OR (directed = 0 AND source_parent_id = ? AND target_parent_id = ?)
+               )`;
+  const bindings: Array<string | number> = [
+    asOf,
+    asOf,
+    asOf,
+    asOf,
+    asOf,
+    sourceParentId,
+    targetParentId,
+    targetParentId,
+    sourceParentId,
+  ];
   if (edgeType) {
     sql += ` AND edge_type = ?`;
     bindings.push(edgeType);
@@ -430,7 +586,13 @@ export async function deleteAssociationEdge(
 export async function expandAssociationGraph(
   db: D1Database,
   seedParentIds: string[],
-  options: { hops: number; fanoutCap?: number; maxNodes?: number; asOf?: number }
+  options: {
+    hops: number;
+    direction?: AssociationDirection;
+    fanoutCap?: number;
+    maxNodes?: number;
+    asOf?: number;
+  }
 ): Promise<AssociationExpansion[]> {
   const hops = Math.max(0, Math.min(MAX_HOPS, Math.trunc(options.hops)));
   const seeds = [...new Set(seedParentIds.map((id) => id.trim()).filter(Boolean))];
@@ -439,6 +601,7 @@ export async function expandAssociationGraph(
   const fanoutCap = Math.max(1, Math.min(Math.trunc(options.fanoutCap ?? DEFAULT_FANOUT), 20));
   const maxNodes = Math.max(1, Math.min(Math.trunc(options.maxNodes ?? DEFAULT_MAX_NODES), 100));
   const asOf = safeAsOf(options.asOf);
+  const direction = options.direction ?? "outgoing";
   const activeSeeds = await hydrateAssociationParents(db, seeds, asOf);
   const visited = new Set(activeSeeds.keys());
   const output: AssociationExpansion[] = [];
@@ -453,32 +616,49 @@ export async function expandAssociationGraph(
     const placeholders = frontierIds.map(() => "?").join(", ");
     const { results } = await db.prepare(
       `SELECT id, source_parent_id, target_parent_id, edge_type, weight,
-              provenance, metadata_json, created_at, updated_at
-       FROM sb_association_edges
-       WHERE source_parent_id IN (${placeholders})
-          OR target_parent_id IN (${placeholders})
+              provenance, metadata_json, directed, valid_from, valid_to, deleted_at,
+              created_at, updated_at
+       FROM ${ASSOCIATION_EDGE_TIMELINE_SQL} association_timeline
+       WHERE (source_parent_id IN (${placeholders})
+          OR target_parent_id IN (${placeholders}))
+         AND created_at <= ?
+         AND COALESCE(valid_from, created_at) <= ?
+         AND (valid_to IS NULL OR valid_to > ?)
+         AND (deleted_at IS NULL OR deleted_at > ?)
        ORDER BY weight DESC, updated_at DESC`
-    ).bind(...frontierIds, ...frontierIds).all<AssociationEdgeRow>();
+    ).bind(...frontierIds, ...frontierIds, asOf, asOf, asOf, asOf).all<AssociationEdgeRow>();
     const frontierById = new Map(frontier.map((item) => [item.parentId, item]));
     const perNode = new Map<string, number>();
     const candidates: AssociationExpansion[] = [];
     for (const row of results) {
+      const transitions: Array<{ from: typeof frontier[number]; nextId: string }> = [];
       const sourceFrontier = frontierById.get(row.source_parent_id);
       const targetFrontier = frontierById.get(row.target_parent_id);
-      const from = sourceFrontier ?? targetFrontier;
-      const nextId = sourceFrontier ? row.target_parent_id : row.source_parent_id;
-      if (!from || visited.has(nextId)) continue;
-      const used = perNode.get(from.parentId) ?? 0;
-      if (used >= fanoutCap) continue;
-      perNode.set(from.parentId, used + 1);
-      candidates.push({
-        parentId: nextId,
-        seedParentId: from.seedParentId,
-        hop,
-        viaType: row.edge_type,
-        viaWeight: Number(row.weight),
-        pathWeight: from.pathWeight * Number(row.weight),
-      });
+      if (Boolean(row.directed)) {
+        if (sourceFrontier && direction !== "incoming") {
+          transitions.push({ from: sourceFrontier, nextId: row.target_parent_id });
+        }
+        if (targetFrontier && direction !== "outgoing") {
+          transitions.push({ from: targetFrontier, nextId: row.source_parent_id });
+        }
+      } else {
+        if (sourceFrontier) transitions.push({ from: sourceFrontier, nextId: row.target_parent_id });
+        if (targetFrontier) transitions.push({ from: targetFrontier, nextId: row.source_parent_id });
+      }
+      for (const transition of transitions) {
+        if (visited.has(transition.nextId)) continue;
+        const used = perNode.get(transition.from.parentId) ?? 0;
+        if (used >= fanoutCap) continue;
+        perNode.set(transition.from.parentId, used + 1);
+        candidates.push({
+          parentId: transition.nextId,
+          seedParentId: transition.from.seedParentId,
+          hop,
+          viaType: row.edge_type,
+          viaWeight: Number(row.weight),
+          pathWeight: transition.from.pathWeight * Number(row.weight),
+        });
+      }
     }
     const activeCandidates = await hydrateAssociationParents(
       db,
@@ -505,7 +685,7 @@ export async function expandAssociationGraph(
 export async function associationRecallExpansion(
   db: D1Database,
   directMatches: Array<{ entryId: string; score: number }>,
-  options: { hops: number; limit?: number; asOf?: number }
+  options: { hops: number; direction?: AssociationDirection; limit?: number; asOf?: number }
 ): Promise<AssociationRecallResult[]> {
   const hops = Math.max(0, Math.min(MAX_HOPS, Math.trunc(options.hops)));
   if (!hops || !directMatches.length) return [];
@@ -517,6 +697,7 @@ export async function associationRecallExpansion(
   const seedParentIds = [...new Set(resolvedSeeds.map((seed) => seed.parentId))];
   const expanded = await expandAssociationGraph(db, seedParentIds, {
     hops,
+    direction: options.direction,
     asOf: options.asOf,
     maxNodes: Math.max(1, Math.min(Math.trunc(options.limit ?? 20), 40)),
   });

@@ -270,6 +270,7 @@ export async function resolveAndInsertEntityRelation(
     resolution.type === "elaborates"
   ) && resolution.targetRelationId != null;
   const relationId = reuseCanonical ? resolution.targetRelationId as string : crypto.randomUUID();
+  const targetRelationId = reuseCanonical ? null : resolution.targetRelationId;
   const statements: D1PreparedStatement[] = [];
   if (!reuseCanonical) statements.push(prepareNewRelation(db, relationId, input, resolution));
   statements.push(prepareFactSource(db, relationId, input));
@@ -333,7 +334,7 @@ export async function resolveAndInsertEntityRelation(
          source_memory_id, target_memory_id, created_at
        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
-      crypto.randomUUID(), relationId, resolution.targetRelationId,
+      crypto.randomUUID(), relationId, targetRelationId,
       resolution.type, resolution.confidence, JSON.stringify(resolution.reasonCodes),
       resolution.requiresReview ? 1 : 0, resolution.applyInvalidation ? 1 : 0,
       input.memoryId ?? null, resolution.targetMemoryId, input.createdAt

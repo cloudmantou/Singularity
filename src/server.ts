@@ -28,6 +28,10 @@ import { getEffectiveModelSettings } from "./settings/store";
 import { isDevLocalProvider } from "./settings/model-settings";
 import { flushTelemetry } from "./telemetry";
 import { createFixedWindowRateLimiter } from "./selfhost/rate-limit";
+import {
+  isKnownWorkerRoute,
+  resolvePublicAssetPath,
+} from "./selfhost/request-routing";
 
 dotenv.config();
 
@@ -67,13 +71,18 @@ const MIME: Record<string, string> = {
 async function tryServePublic(
   urlPath: string
 ): Promise<{ body: Buffer; contentType: string } | null> {
-  let rel = decodeURIComponent(urlPath.split("?")[0] || "/");
-  if (rel === "/") rel = "/index.html";
-  const resolved = path.normalize(path.join(PUBLIC_DIR, rel));
-  if (!resolved.startsWith(PUBLIC_DIR)) return null;
+  const resolved = resolvePublicAssetPath(urlPath, PUBLIC_DIR);
+  if (!resolved) return null;
   try {
-    const body = await fs.readFile(resolved);
-    const ext = path.extname(resolved).toLowerCase();
+    const [realRoot, realResolved] = await Promise.all([
+      fs.realpath(PUBLIC_DIR),
+      fs.realpath(resolved),
+    ]);
+    if (realResolved !== realRoot && !realResolved.startsWith(`${realRoot}${path.sep}`)) {
+      return null;
+    }
+    const body = await fs.readFile(realResolved);
+    const ext = path.extname(realResolved).toLowerCase();
     return { body, contentType: MIME[ext] || "application/octet-stream" };
   } catch {
     return null;
@@ -108,6 +117,7 @@ async function main() {
 
   const app = Fastify({
     logger: true,
+    disableRequestLogging: true,
     // Keep the control plane narrow by default. Import and MCP receive explicit
     // route-level limits below.
     bodyLimit: 256 * 1024,
@@ -131,6 +141,11 @@ async function main() {
     limit: 30,
     windowMs: 60_000,
   });
+  const unknownRouteLimiter = createFixedWindowRateLimiter({
+    limit: 120,
+    windowMs: 60_000,
+  });
+  let rejectedUnknownRoutes = 0;
 
   function oauthRateLimitPreHandler(
     ...limiters: Array<ReturnType<typeof createFixedWindowRateLimiter>>
@@ -265,32 +280,10 @@ async function main() {
   );
 
   app.all("/*", async (req, reply) => {
+    const urlPath = req.url.split("?")[0] || "/";
+    const knownWorkerRoute = isKnownWorkerRoute(req.method, urlPath);
     if (req.method === "GET" || req.method === "HEAD") {
-      const urlPath = req.url.split("?")[0] || "/";
-      const isApi =
-        urlPath.startsWith("/mcp") ||
-        urlPath.startsWith("/oauth") ||
-        urlPath.startsWith("/capture") ||
-        urlPath.startsWith("/recall") ||
-        urlPath.startsWith("/relations") ||
-        urlPath.startsWith("/list") ||
-        urlPath.startsWith("/count") ||
-        urlPath.startsWith("/stats") ||
-        urlPath.startsWith("/chat") ||
-        urlPath.startsWith("/digest") ||
-        urlPath.startsWith("/append") ||
-        urlPath.startsWith("/update") ||
-        urlPath.startsWith("/forget") ||
-        urlPath.startsWith("/tags") ||
-        urlPath.startsWith("/settings") ||
-        urlPath.startsWith("/import") ||
-        urlPath.startsWith("/export") ||
-        urlPath.startsWith("/analytics") ||
-        urlPath.startsWith("/config") ||
-        urlPath.startsWith("/health") ||
-        urlPath.startsWith("/.well-known");
-
-      if (!isApi) {
+      if (!knownWorkerRoute) {
         const file = await tryServePublic(urlPath);
         if (file) {
           reply.header("content-type", file.contentType);
@@ -298,6 +291,24 @@ async function main() {
           return reply.send(file.body);
         }
       }
+    }
+    if (!knownWorkerRoute) {
+      const rate = unknownRouteLimiter.consume(req.ip || "unknown");
+      if (!rate.allowed) {
+        return reply
+          .code(429)
+          .header("Retry-After", String(rate.retryAfterSeconds))
+          .header("Cache-Control", "no-store")
+          .send({ ok: false, error: "Too many unknown requests." });
+      }
+      rejectedUnknownRoutes += 1;
+      if (rejectedUnknownRoutes === 1 || rejectedUnknownRoutes % 100 === 0) {
+        app.log.warn({ rejectedUnknownRoutes }, "rejected unknown routes before Worker dispatch");
+      }
+      return reply
+        .code(404)
+        .header("Cache-Control", "no-store")
+        .send({ ok: false, error: "Not found" });
     }
     await handleWithWorker(req, reply, env);
   });

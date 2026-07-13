@@ -11,6 +11,7 @@ import {
   MEMORY_CLAIM_MIGRATIONS,
   MEMORY_SOURCE_PROVENANCE_MIGRATIONS,
   OBSERVATION_EVIDENCE_MIGRATIONS,
+  PARENT_VERSION_TEMPORAL_BACKFILL_STATEMENTS,
   PARENT_VERSION_TEMPORAL_MIGRATIONS,
 } from "./evidence-contract";
 
@@ -86,6 +87,9 @@ export async function ensureMemoryDataModel(db: D1Database): Promise<void> {
   await applyColumnMigrations(db, "sb_memories", MEMORY_CLAIM_MIGRATIONS);
   await applyColumnMigrations(db, "sb_memory_sources", MEMORY_SOURCE_PROVENANCE_MIGRATIONS);
   await applyColumnMigrations(db, "sb_parent_versions", PARENT_VERSION_TEMPORAL_MIGRATIONS);
+  for (const statement of PARENT_VERSION_TEMPORAL_BACKFILL_STATEMENTS) {
+    await db.exec(statement);
+  }
   for (const statement of ATOMIC_POST_MIGRATION_INDEX_STATEMENTS) {
     await db.exec(statement);
   }

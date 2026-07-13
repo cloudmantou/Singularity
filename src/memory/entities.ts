@@ -324,6 +324,13 @@ export async function ensureEntityResolutionDataModel(db: D1Database): Promise<v
     await db.exec(
       [...ENTITY_RESOLUTION_SCHEMA_STATEMENTS, ...FACT_RESOLUTION_SCHEMA_STATEMENTS].join(";\n")
     );
+  } else {
+    await db.exec(
+      `UPDATE sb_fact_resolutions
+       SET target_relation_id = NULL,
+           requires_review = 1
+       WHERE target_relation_id = relation_id`
+    );
   }
 }
 

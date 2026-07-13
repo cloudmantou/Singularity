@@ -250,6 +250,14 @@ describe("resolution persistence", () => {
       .toEqual({ count: 1 });
     expect(raw.prepare(`SELECT COUNT(*) AS count FROM sb_fact_sources WHERE relation_id = ?`).get(first.relationId))
       .toEqual({ count: 2 });
+    expect(raw.prepare(
+      `SELECT relation_id, target_relation_id
+       FROM sb_fact_resolutions
+       WHERE source_memory_id = 'claim-support-2'`
+    ).get()).toEqual({
+      relation_id: first.relationId,
+      target_relation_id: null,
+    });
   });
 
   it("counts revisions of one Evidence root as one independent Fact source", async () => {

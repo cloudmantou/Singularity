@@ -43,6 +43,7 @@ Tool guidance:
 - **forget** — permanently delete an entry by ID. Requires explicit user instruction.
 
 Use `recall` with `hops: 1` only when related project context is useful. Direct Claim matches always outrank Association expansion; do not cite an Association-only result as factual evidence.
+Recall labels direct Evidence as `E*` and Association-only context as `R*`. Cite only `E*`; an answer supported only by `R*` must be treated as insufficient evidence.
 
 Tags to use:
 - personal — life, preferences, habits, health, relationships

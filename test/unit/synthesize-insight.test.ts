@@ -25,13 +25,13 @@ describe("synthesizeInsight()", () => {
   });
 
   it("returns LLM response on happy path", async () => {
-    const env = makeTestEnv(undefined, { AI: aiMock("Use JWT with short expiry and refresh tokens.") });
+    const env = makeTestEnv(undefined, { AI: aiMock("Use JWT with short expiry [E1].") });
     const result = await synthesizeInsight(
       "auth strategy",
       [{ id: "1", content: "We chose JWT with 1hr expiry" }],
       env
     );
-    expect(result).toBe("Use JWT with short expiry and refresh tokens.");
+    expect(result).toBe("Use JWT with short expiry [E1].");
   });
 
   it("returns empty string when LLM throws — does not propagate error", async () => {
@@ -49,9 +49,9 @@ describe("synthesizeInsight()", () => {
   });
 
   it("trims whitespace from LLM response", async () => {
-    const env = makeTestEnv(undefined, { AI: aiMock("  padded insight  ") });
+    const env = makeTestEnv(undefined, { AI: aiMock("  padded insight [E1]  ") });
     const result = await synthesizeInsight("query", [{ id: "1", content: "content" }], env);
-    expect(result).toBe("padded insight");
+    expect(result).toBe("padded insight [E1]");
   });
 
   it("includes the query in the prompt sent to LLM", async () => {
@@ -134,5 +134,88 @@ describe("synthesizeInsight()", () => {
     expect(prompt).toContain("claim-old");
     expect(prompt).toContain("claim-new");
     expect(prompt.toLowerCase()).toMatch(/unresolved|未解决/);
+  });
+
+  it("separates direct Evidence refs from non-citable Association context refs", async () => {
+    const env = makeTestEnv(undefined, { AI: aiMock("The project uses SQLite [E1].") });
+    const result = await synthesizeInsight(
+      "project database",
+      {
+        directEvidence: [{ id: "entry-direct", content: "The project uses SQLite" }],
+        relatedContext: [{
+          id: "entry-related",
+          content: "A related project uses Postgres",
+          associationType: "references",
+          hop: 1,
+        }],
+      },
+      env
+    );
+
+    expect(result).toBe("The project uses SQLite [E1].");
+    const [, { messages }] = (env.AI.run as ReturnType<typeof vi.fn>).mock.calls[0];
+    const prompt = messages[0].content as string;
+    expect(prompt).toContain("[E1]\nThe project uses SQLite");
+    expect(prompt).toContain("[R1] association=references; hop=1");
+    expect(prompt).not.toContain("A related project uses Postgres");
+    expect(prompt).toMatch(/R\*.*cannot|R1.*cannot|not factual evidence/i);
+  });
+
+  it("rejects model output that cites Association context as Evidence", async () => {
+    const env = makeTestEnv(undefined, { AI: aiMock("The project uses Postgres [R1].") });
+    const result = await synthesizeInsight(
+      "project database",
+      {
+        directEvidence: [{ id: "entry-direct", content: "The project uses SQLite" }],
+        relatedContext: [{
+          id: "entry-related",
+          content: "A related project uses Postgres",
+          associationType: "references",
+          hop: 1,
+        }],
+      },
+      env
+    );
+
+    expect(result).toContain("insufficient");
+    expect(result).not.toContain("Postgres");
+  });
+
+  it("does not let an insufficient-evidence phrase bypass Association ref validation", async () => {
+    const env = makeTestEnv(undefined, {
+      AI: aiMock("Evidence is insufficient, but the project uses Postgres [R1]."),
+    });
+    const result = await synthesizeInsight(
+      "project database",
+      {
+        directEvidence: [{ id: "entry-direct", content: "The project uses SQLite" }],
+        relatedContext: [{
+          id: "entry-related",
+          content: "A related project uses Postgres",
+          associationType: "references",
+          hop: 1,
+        }],
+      },
+      env
+    );
+
+    expect(result).toBe("Retrieved direct evidence is insufficient for a verified answer.");
+    expect(result).not.toContain("Postgres");
+  });
+
+  it("rejects missing and unknown direct Evidence refs", async () => {
+    const missingRefEnv = makeTestEnv(undefined, { AI: aiMock("The project uses SQLite.") });
+    const unknownRefEnv = makeTestEnv(undefined, { AI: aiMock("The project uses SQLite [E2].") });
+
+    await expect(synthesizeInsight(
+      "project database",
+      [{ id: "entry-direct", content: "The project uses SQLite" }],
+      missingRefEnv
+    )).resolves.toBe("Retrieved direct evidence is insufficient for a verified answer.");
+    await expect(synthesizeInsight(
+      "project database",
+      [{ id: "entry-direct", content: "The project uses SQLite" }],
+      unknownRefEnv
+    )).resolves.toBe("Retrieved direct evidence is insufficient for a verified answer.");
   });
 });

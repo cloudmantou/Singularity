@@ -4247,6 +4247,9 @@
         if (!grid) return
         const components = matrix.components || {}
         const queues = matrix.queues || {}
+        const queueDetails = matrix.queueDetails || {}
+        const extractionQueue = queueDetails.extraction || {}
+        const classificationQueue = queueDetails.classification || {}
         const providers = components.providers || []
         const statusText = (component) => component?.status || 'unknown'
         const configHint = (component) => component?.configured ? 'configured' : 'not configured'
@@ -4274,7 +4277,7 @@
           {
             label: 'Processing queues',
             value: obsFmtNum((queues.extraction || 0) + (queues.classification || 0)),
-            hint: `extract ${obsFmtNum(queues.extraction || 0)} · classify ${obsFmtNum(queues.classification || 0)}`,
+            hint: `due ${obsFmtNum((extractionQueue.due || 0) + (classificationQueue.due || 0))} · deferred ${obsFmtNum((extractionQueue.deferred || 0) + (classificationQueue.deferred || 0))} · exhausted ${obsFmtNum((extractionQueue.exhausted || 0) + (classificationQueue.exhausted || 0))}`,
           },
           {
             label: 'Review queues',

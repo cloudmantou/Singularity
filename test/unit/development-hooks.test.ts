@@ -3,9 +3,15 @@ import { describe, expect, it } from "vitest";
 
 const require = createRequire(import.meta.url);
 const {
+  extractTranscriptMessages,
   formatTranscript,
   readProjectContext,
 } = require("../../integrations/claude-code-hooks/context.cjs") as {
+  extractTranscriptMessages(messages: unknown[], maxChars?: number): Array<{
+    role: "user" | "assistant";
+    content: string;
+    messageId?: string;
+  }>;
   formatTranscript(messages: unknown[], maxChars?: number): string;
   readProjectContext(cwd?: string): { repository: string; branch: string; root: string };
 };
@@ -19,6 +25,13 @@ describe("development session hook context", () => {
     ])).toBe(
       "User: Keep Evidence immutable\n\nAssistant: Use Association for navigation"
     );
+    expect(extractTranscriptMessages([
+      { role: "user", content: "Decision", uuid: "message-1" },
+      { role: "assistant", content: "Summary" },
+    ])).toEqual([
+      { role: "user", content: "Decision", messageId: "message-1" },
+      { role: "assistant", content: "Summary" },
+    ]);
   });
 
   it("clips from the oldest side so the latest decisions survive", () => {
@@ -28,6 +41,12 @@ describe("development session hook context", () => {
     ], 32);
     expect(result).toContain("latest decision");
     expect(result.length).toBeLessThanOrEqual(32);
+  });
+
+  it("never submits a truncated fragment of an oversized message", () => {
+    expect(extractTranscriptMessages([
+      { role: "user", content: "Do not treat the trailing clause as a standalone decision." },
+    ], 24)).toEqual([]);
   });
 
   it("derives the repository and branch from the current worktree", () => {

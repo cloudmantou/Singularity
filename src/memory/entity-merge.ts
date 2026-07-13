@@ -676,13 +676,30 @@ export class D1EntityMergeExecutor {
          WHERE relation_id = ? AND ${guardSql()}`
       ).bind(canonical.id, relation.id, ...guardBindings(lock)));
       statements.push(this.db.prepare(
-        `UPDATE sb_fact_resolutions SET relation_id = ?
+        `DELETE FROM sb_fact_resolutions
+         WHERE relation_id = ?
+           AND target_relation_id = ?
+           AND ${guardSql()}`
+      ).bind(relation.id, canonical.id, ...guardBindings(lock)));
+      statements.push(this.db.prepare(
+        `UPDATE sb_fact_resolutions
+         SET relation_id = ?
          WHERE relation_id = ? AND ${guardSql()}`
       ).bind(canonical.id, relation.id, ...guardBindings(lock)));
       statements.push(this.db.prepare(
-        `UPDATE sb_fact_resolutions SET target_relation_id = ?
-         WHERE target_relation_id = ? AND ${guardSql()}`
+        `UPDATE sb_fact_resolutions
+         SET target_relation_id = NULL, requires_review = 1
+         WHERE relation_id = ?
+           AND target_relation_id = ?
+           AND ${guardSql()}`
       ).bind(canonical.id, relation.id, ...guardBindings(lock)));
+      statements.push(this.db.prepare(
+        `UPDATE sb_fact_resolutions
+         SET target_relation_id = ?
+         WHERE target_relation_id = ?
+           AND relation_id <> ?
+           AND ${guardSql()}`
+      ).bind(canonical.id, relation.id, canonical.id, ...guardBindings(lock)));
       statements.push(this.db.prepare(
         `UPDATE sb_entity_relations SET supersedes_relation_id = ?
          WHERE supersedes_relation_id = ? AND ${guardSql()}`
@@ -703,5 +720,10 @@ export class D1EntityMergeExecutor {
          WHERE id = ? AND ${guardSql()}`
       ).bind(relationId, relationId, ...guardBindings(lock)));
     }
+    statements.push(this.db.prepare(
+      `DELETE FROM sb_fact_resolutions
+       WHERE relation_id = target_relation_id
+         AND ${guardSql()}`
+    ).bind(...guardBindings(lock)));
   }
 }

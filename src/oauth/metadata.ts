@@ -52,11 +52,12 @@ export function buildProtectedResourceMetadata(
 /** Path-suffixed well-known: /.well-known/oauth-protected-resource/mcp → resource path /mcp */
 export function resourcePathFromProtectedWellKnown(pathname: string): string {
   const prefix = "/.well-known/oauth-protected-resource";
-  if (pathname === prefix || pathname === `${prefix}/`) return "/mcp";
-  if (pathname.startsWith(prefix + "/")) {
-    const suffix = pathname.slice(prefix.length);
-    return suffix.startsWith("/") ? suffix : `/${suffix}`;
-  }
+  if (
+    pathname === prefix ||
+    pathname === `${prefix}/` ||
+    pathname === `${prefix}/mcp` ||
+    pathname === `${prefix}/mcp/`
+  ) return "/mcp";
   return "/mcp";
 }
 
@@ -68,10 +69,11 @@ export function isOAuthAuthorizationServerWellKnown(pathname: string): boolean {
 }
 
 export function isOAuthProtectedResourceWellKnown(pathname: string): boolean {
-  return (
-    pathname === "/.well-known/oauth-protected-resource" ||
-    pathname.startsWith("/.well-known/oauth-protected-resource/")
-  );
+  const prefix = "/.well-known/oauth-protected-resource";
+  return pathname === prefix ||
+    pathname === `${prefix}/` ||
+    pathname === `${prefix}/mcp` ||
+    pathname === `${prefix}/mcp/`;
 }
 
 export function jsonResponse(body: unknown, status = 200): Response {

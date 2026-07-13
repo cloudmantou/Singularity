@@ -2965,7 +2965,7 @@ export class D1Mock {
           return { count: rows.length };
         }
         if (s.includes("COUNT(*) as count") && s.includes("classification_status = 'retryable_error'") && s.includes("classification_next_attempt_at >")) {
-          const now = Number(s.match(/classification_next_attempt_at > (\d+)/)?.[1] ?? 0);
+          const now = Number(args[1] ?? s.match(/classification_next_attempt_at > (\d+)/)?.[1] ?? 0);
           const count = db.entries.filter((e: any) =>
             e.classification_status === "retryable_error" &&
             Number(e.classification_attempts ?? 0) < 3 &&
@@ -3433,6 +3433,16 @@ export class D1Mock {
             ].map((name) => ({ name })),
           };
         }
+        if (s === "PRAGMA table_info(sb_parent_versions)") {
+          return {
+            results: [
+              "version_id", "parent_id", "version_number", "source_observation_id",
+              "source_snapshot_hash", "summary", "state", "summary_vector_ids",
+              "activated_at", "superseded_at", "activation_time_source",
+              "superseded_time_source", "created_at", "updated_at",
+            ].map((name) => ({ name })),
+          };
+        }
         if (s === "PRAGMA table_info(sb_entity_relations)") {
           return {
             results: [
@@ -3441,6 +3451,15 @@ export class D1Mock {
               "valid_from", "valid_to", "invalid_at", "expired_at", "reference_time",
               "scope_id", "polarity", "modality", "resolution_type", "resolution_state",
               "supersedes_relation_id", "metadata_json", "created_at",
+            ].map((name) => ({ name })),
+          };
+        }
+        if (s === "PRAGMA table_info(sb_association_edges)") {
+          return {
+            results: [
+              "id", "source_parent_id", "target_parent_id", "edge_type", "weight",
+              "provenance", "metadata_json", "directed", "valid_from", "valid_to",
+              "deleted_at", "created_at", "updated_at",
             ].map((name) => ({ name })),
           };
         }

@@ -3,9 +3,9 @@ import { ensureEntityResolutionDataModel } from "./entities";
 import { ensureConflictClaimSchema } from "./quality";
 import { ensureAssociationDataModel } from "./associations";
 
-export const MEMORY_BACKUP_SCHEMA_VERSION = 11;
+export const MEMORY_BACKUP_SCHEMA_VERSION = 12;
 const MEMORY_BACKUP_FORMAT = "singularity-memory-backup";
-const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7, 8, 9, 10, 11]);
+const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7, 8, 9, 10, 11, 12]);
 const MEMORY_BACKUP_FEATURES = [
   "atomic-memory",
   "temporal-facts",
@@ -17,11 +17,13 @@ const MEMORY_BACKUP_FEATURES = [
   "parent-versions",
   "parent-version-claims",
   "parent-version-time-windows",
+  "parent-version-time-provenance",
   "entity-resolution",
   "entity-merge-execution",
   "fact-resolution",
   "claim-level-conflicts",
   "association-graph",
+  "association-validity-windows",
 ] as const;
 
 const GRAPH_ARRAY_KEYS = [
@@ -30,6 +32,7 @@ const GRAPH_ARRAY_KEYS = [
   "parentVersions",
   "parentVersionClaims",
   "associationEdges",
+  "associationEdgeHistory",
   "observations",
   "memories",
   "memorySources",
@@ -69,7 +72,7 @@ export interface BackupIntegrityReport {
 
 export interface MemoryBackup {
   backupFormat: typeof MEMORY_BACKUP_FORMAT;
-  schemaVersion: 11;
+  schemaVersion: 12;
   features: Array<(typeof MEMORY_BACKUP_FEATURES)[number]>;
   exportedAt: string;
   source: string;
@@ -80,6 +83,7 @@ export interface MemoryBackup {
   parentVersions: BackupRow[];
   parentVersionClaims: BackupRow[];
   associationEdges: BackupRow[];
+  associationEdgeHistory: BackupRow[];
   entries: BackupRow[];
   observations: BackupRow[];
   memories: BackupRow[];
@@ -104,7 +108,7 @@ export interface MemoryBackup {
 }
 
 export interface MemoryBackupImportResult extends ImportResult {
-  schemaVersion: 11;
+  schemaVersion: 12;
   graph: Record<GraphArrayKey, TableImportStats>;
   integrity: BackupIntegrityReport;
 }
@@ -181,6 +185,12 @@ export async function inspectMemoryBackupIntegrity(db: D1Database): Promise<Back
        (SELECT COUNT(*) FROM sb_association_edges ae
         LEFT JOIN sb_parent_units pu ON pu.parent_id = ae.target_parent_id
         WHERE pu.parent_id IS NULL) as association_edges_missing_target_parent,
+       (SELECT COUNT(*) FROM sb_association_edge_history ae
+        LEFT JOIN sb_parent_units pu ON pu.parent_id = ae.source_parent_id
+        WHERE pu.parent_id IS NULL) as association_history_missing_source_parent,
+       (SELECT COUNT(*) FROM sb_association_edge_history ae
+        LEFT JOIN sb_parent_units pu ON pu.parent_id = ae.target_parent_id
+        WHERE pu.parent_id IS NULL) as association_history_missing_target_parent,
        (SELECT COUNT(*) FROM sb_entity_aliases a
         LEFT JOIN sb_entities e ON e.id = a.entity_id
         WHERE e.id IS NULL) as entity_aliases_missing_entity,
@@ -251,6 +261,8 @@ export async function inspectMemoryBackupIntegrity(db: D1Database): Promise<Back
         LEFT JOIN sb_entity_relations er ON er.id = fr.target_relation_id
         WHERE fr.target_relation_id IS NOT NULL AND er.id IS NULL) as fact_resolutions_missing_target_relation,
        (SELECT COUNT(*) FROM sb_fact_resolutions fr
+        WHERE fr.target_relation_id = fr.relation_id) as fact_resolutions_self_referential,
+       (SELECT COUNT(*) FROM sb_fact_resolutions fr
         LEFT JOIN sb_memories m ON m.id = fr.source_memory_id
         WHERE fr.source_memory_id IS NOT NULL AND m.id IS NULL) as fact_resolutions_missing_source_memory,
        (SELECT COUNT(*) FROM sb_fact_resolutions fr
@@ -307,6 +319,7 @@ export async function exportMemoryBackup(
     parentVersions,
     parentVersionClaims,
     associationEdges,
+    associationEdgeHistory,
     entries,
     observations,
     memories,
@@ -338,15 +351,22 @@ export async function exportMemoryBackup(
                 ORDER BY updated_at DESC, parent_id DESC`),
     allRows(db, `SELECT version_id, parent_id, version_number, source_observation_id,
                        source_snapshot_hash, summary, state, summary_vector_ids,
-                       activated_at, superseded_at, created_at, updated_at
+                       activated_at, superseded_at, activation_time_source,
+                       superseded_time_source, created_at, updated_at
                 FROM sb_parent_versions
                 ORDER BY created_at DESC, version_id DESC`),
     allRows(db, `SELECT parent_version_id, memory_id, relation, created_at
                 FROM sb_parent_version_claims
                 ORDER BY created_at DESC, parent_version_id DESC, memory_id DESC`),
     allRows(db, `SELECT id, source_parent_id, target_parent_id, edge_type,
-                       weight, provenance, metadata_json, created_at, updated_at
+                       weight, provenance, metadata_json, directed, valid_from,
+                       valid_to, deleted_at, created_at, updated_at
                 FROM sb_association_edges
+                ORDER BY updated_at DESC, id DESC`),
+    allRows(db, `SELECT id, source_parent_id, target_parent_id, edge_type,
+                       weight, provenance, metadata_json, directed, valid_from,
+                       valid_to, deleted_at, created_at, updated_at
+                FROM sb_association_edge_history
                 ORDER BY updated_at DESC, id DESC`),
     allRows(db, `SELECT id, content, tags, source, created_at, vector_ids,
                        recall_count, importance_score, classification_confidence,
@@ -466,6 +486,7 @@ export async function exportMemoryBackup(
       parentVersions: countRows(parentVersions),
       parentVersionClaims: countRows(parentVersionClaims),
       associationEdges: countRows(associationEdges),
+      associationEdgeHistory: countRows(associationEdgeHistory),
       entries: countRows(entries),
       observations: countRows(observations),
       memories: countRows(memories),
@@ -494,6 +515,7 @@ export async function exportMemoryBackup(
     parentVersions,
     parentVersionClaims,
     associationEdges,
+    associationEdgeHistory,
     entries,
     observations,
     memories,
@@ -670,13 +692,21 @@ export async function importMemoryBackup(
     )
   );
 
-  graph.parentVersions = await importTable(db, rowsFor(body, "parentVersions"), (row) =>
-    db.prepare(
+  graph.parentVersions = await importTable(db, rowsFor(body, "parentVersions"), (row) => {
+    const state = textOrDefault(row, "state", "building");
+    const createdAt = intOrDefault(row, "created_at", Date.now());
+    const updatedAt = intOrDefault(row, "updated_at", createdAt);
+    const isActivated = ["active", "active_degraded", "superseded"].includes(state);
+    const isSuperseded = state === "superseded";
+    const recordedActivatedAt = numberOrNull(row, "activated_at");
+    const recordedSupersededAt = numberOrNull(row, "superseded_at");
+    return db.prepare(
       `${insertVerb(mode)} INTO sb_parent_versions (
          version_id, parent_id, version_number, source_observation_id,
          source_snapshot_hash, summary, state, summary_vector_ids,
-         activated_at, superseded_at, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         activated_at, superseded_at, activation_time_source,
+         superseded_time_source, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       requiredText(row, "version_id"),
       requiredText(row, "parent_id"),
@@ -684,21 +714,24 @@ export async function importMemoryBackup(
       textOrNull(row, "source_observation_id"),
       textOrNull(row, "source_snapshot_hash"),
       textOrNull(row, "summary"),
-      textOrDefault(row, "state", "building"),
+      state,
       jsonText(row, "summary_vector_ids", "[]"),
-      numberOrNull(row, "activated_at"),
-      numberOrNull(row, "superseded_at"),
-      intOrDefault(row, "created_at", Date.now()),
-      intOrDefault(row, "updated_at", Date.now())
-    )
-  );
+      recordedActivatedAt ?? (isActivated ? createdAt : null),
+      recordedSupersededAt ?? (isSuperseded ? updatedAt : null),
+      textOrNull(row, "activation_time_source") ?? (isActivated ? (recordedActivatedAt === null ? "inferred" : "recorded") : null),
+      textOrNull(row, "superseded_time_source") ?? (isSuperseded ? (recordedSupersededAt === null ? "inferred" : "recorded") : null),
+      createdAt,
+      updatedAt
+    );
+  });
 
   graph.associationEdges = await importTable(db, rowsFor(body, "associationEdges"), (row) =>
     db.prepare(
       `${insertVerb(mode)} INTO sb_association_edges (
          id, source_parent_id, target_parent_id, edge_type, weight,
-         provenance, metadata_json, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         provenance, metadata_json, directed, valid_from, valid_to, deleted_at,
+         created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       requiredText(row, "id"),
       requiredText(row, "source_parent_id"),
@@ -707,6 +740,36 @@ export async function importMemoryBackup(
       numberOrDefault(row, "weight", 0.5),
       textOrDefault(row, "provenance", "system"),
       jsonText(row, "metadata_json", "{}"),
+      intOrDefault(row, "directed", ["related_to", "manual"].includes(textOrDefault(row, "edge_type", "related_to")) ? 0 : 1),
+      numberOrNull(row, "valid_from") ?? intOrDefault(row, "created_at", Date.now()),
+      numberOrNull(row, "valid_to"),
+      numberOrNull(row, "deleted_at"),
+      intOrDefault(row, "created_at", Date.now()),
+      intOrDefault(row, "updated_at", Date.now())
+    )
+  );
+
+  graph.associationEdgeHistory = await importTable(
+    db,
+    rowsFor(body, "associationEdgeHistory"),
+    (row) => db.prepare(
+      `${insertVerb(mode)} INTO sb_association_edge_history (
+         id, source_parent_id, target_parent_id, edge_type, weight,
+         provenance, metadata_json, directed, valid_from, valid_to, deleted_at,
+         created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "id"),
+      requiredText(row, "source_parent_id"),
+      requiredText(row, "target_parent_id"),
+      textOrDefault(row, "edge_type", "related_to"),
+      numberOrDefault(row, "weight", 0.5),
+      textOrDefault(row, "provenance", "system"),
+      jsonText(row, "metadata_json", "{}"),
+      intOrDefault(row, "directed", ["related_to", "manual"].includes(textOrDefault(row, "edge_type", "related_to")) ? 0 : 1),
+      numberOrNull(row, "valid_from") ?? intOrDefault(row, "created_at", Date.now()),
+      numberOrNull(row, "valid_to"),
+      intOrDefault(row, "deleted_at", intOrDefault(row, "updated_at", Date.now())),
       intOrDefault(row, "created_at", Date.now()),
       intOrDefault(row, "updated_at", Date.now())
     )
@@ -1015,17 +1078,19 @@ export async function importMemoryBackup(
     )
   );
 
-  graph.factResolutions = await importTable(db, rowsFor(body, "factResolutions"), (row) =>
-    db.prepare(
+  graph.factResolutions = await importTable(db, rowsFor(body, "factResolutions"), (row) => {
+    const relationId = requiredText(row, "relation_id");
+    const importedTargetRelationId = textOrNull(row, "target_relation_id");
+    return db.prepare(
       `${insertVerb(mode)} INTO sb_fact_resolutions (
          id, relation_id, target_relation_id, resolution_type, confidence,
          reason_codes_json, requires_review, applied_invalidation,
          source_memory_id, target_memory_id, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       requiredText(row, "id"),
-      requiredText(row, "relation_id"),
-      textOrNull(row, "target_relation_id"),
+      relationId,
+      importedTargetRelationId === relationId ? null : importedTargetRelationId,
       textOrDefault(row, "resolution_type", "uncertain"),
       numberOrNull(row, "confidence"),
       jsonText(row, "reason_codes_json", "[]"),
@@ -1034,8 +1099,8 @@ export async function importMemoryBackup(
       textOrNull(row, "source_memory_id"),
       textOrNull(row, "target_memory_id"),
       intOrDefault(row, "created_at", Date.now())
-    )
-  );
+    );
+  });
 
   graph.factSources = await importTable(db, rowsFor(body, "factSources"), (row) =>
     db.prepare(

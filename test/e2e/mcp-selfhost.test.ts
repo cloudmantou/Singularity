@@ -5,6 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -15,6 +16,7 @@ const ROOT = process.cwd();
 let child: ChildProcess | undefined;
 let baseUrl = "";
 let tempDir = "";
+let databasePath = "";
 let serverOutput = "";
 
 function delay(ms: number): Promise<void> {
@@ -88,6 +90,7 @@ beforeAll(async () => {
   const port = await reservePort();
   baseUrl = `http://127.0.0.1:${port}`;
   tempDir = await mkdtemp(path.join(os.tmpdir(), "singularity-mcp-e2e-"));
+  databasePath = path.join(tempDir, "memory.db");
 
   child = spawn(
     process.execPath,
@@ -103,7 +106,7 @@ beforeAll(async () => {
       env: {
         ...process.env,
         AUTH_TOKEN,
-        DATABASE_PATH: path.join(tempDir, "memory.db"),
+        DATABASE_PATH: databasePath,
         ALLOW_DEV_EMBEDDING: "true",
         EMBEDDING_PROVIDER: "local-hash-dev",
         OAUTH_ALLOWED_REDIRECT_ORIGINS: "https://chatgpt.com,http://127.0.0.1,http://localhost",
@@ -129,6 +132,29 @@ afterAll(async () => {
 });
 
 describe("self-host MCP and personal OAuth", () => {
+  it("rejects scanner routes before Worker telemetry", async () => {
+    const beforeDb = new Database(databasePath, { readonly: true });
+    const before = Number((beforeDb.prepare(
+      `SELECT COUNT(*) AS count FROM sb_request_logs`
+    ).get() as { count: number }).count);
+    beforeDb.close();
+
+    const responses = await Promise.all([
+      fetch(`${baseUrl}/wp-json/gravitysmtp/v1/tests/mock-data`),
+      fetch(`${baseUrl}/robots.txt`),
+      fetch(`${baseUrl}/api/graphql`, { method: "POST" }),
+    ]);
+    expect(responses.map((response) => response.status)).toEqual([404, 404, 404]);
+    await delay(100);
+
+    const afterDb = new Database(databasePath, { readonly: true });
+    const after = Number((afterDb.prepare(
+      `SELECT COUNT(*) AS count FROM sb_request_logs`
+    ).get() as { count: number }).count);
+    afterDb.close();
+    expect(after).toBe(before);
+  });
+
   it("keeps OAuth issuer and resource consistent behind forwarded proxy headers", async () => {
     const proxyHeaders = {
       "X-Forwarded-Proto": "https",

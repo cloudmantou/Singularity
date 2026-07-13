@@ -47,6 +47,9 @@ describe("OAuth metadata", () => {
     expect(resourcePathFromProtectedWellKnown("/.well-known/oauth-protected-resource")).toBe(
       "/mcp"
     );
+    expect(isOAuthProtectedResourceWellKnown(
+      "/.well-known/oauth-protected-resource/owa"
+    )).toBe(false);
   });
 });
 

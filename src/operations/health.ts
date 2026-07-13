@@ -1,4 +1,10 @@
 import { verifyComplianceAuditChain } from "../memory/quality";
+import {
+  queueAttentionCount,
+  readClassificationQueueSnapshot,
+  readExtractionQueueSnapshot,
+  type QueueSnapshot,
+} from "./queue-health";
 
 export type HealthStatus = "healthy" | "degraded" | "unhealthy";
 
@@ -50,6 +56,10 @@ export interface HealthMatrix {
     factReview: number;
     degradedParents: number;
   };
+  queueDetails: {
+    extraction: QueueSnapshot;
+    classification: QueueSnapshot;
+  };
 }
 
 function safeError(error: unknown): string {
@@ -97,24 +107,16 @@ export async function collectHealthMatrix(input: HealthMatrixInput): Promise<Hea
   }
 
   const [
-    extraction,
-    classification,
+    extractionDetails,
+    classificationDetails,
     conflicts,
     entityMerge,
     factReview,
     degradedParents,
     auditChain,
   ] = await Promise.all([
-    countQuery(
-      input.db,
-      `SELECT COUNT(*) AS count FROM sb_observations
-       WHERE extraction_status IN ('pending', 'retryable_error', 'failed')`
-    ),
-    countQuery(
-      input.db,
-      `SELECT COUNT(*) AS count FROM entries
-       WHERE classification_status IN ('pending', 'retryable_error', 'failed')`
-    ),
+    readExtractionQueueSnapshot(input.db),
+    readClassificationQueueSnapshot(input.db),
     countQuery(input.db, `SELECT COUNT(*) AS count FROM sb_conflict_cases WHERE state = 'pending'`),
     countQuery(
       input.db,
@@ -133,6 +135,8 @@ export async function collectHealthMatrix(input: HealthMatrixInput): Promise<Hea
   ]);
 
   const graphReviewPending = conflicts + entityMerge + factReview;
+  const extraction = queueAttentionCount(extractionDetails);
+  const classification = queueAttentionCount(classificationDetails);
   const auditStatus: HealthStatus = !auditChain.valid
     ? "unhealthy"
     : auditChain.complete
@@ -145,6 +149,7 @@ export async function collectHealthMatrix(input: HealthMatrixInput): Promise<Hea
     input.llmConfigured ? "healthy" : "degraded",
     input.embeddingConfigured ? "healthy" : "degraded",
     graphReviewPending > 0 ? "degraded" : "healthy",
+    extraction + classification > 0 ? "degraded" : "healthy",
     auditStatus,
     ...providers.map((provider) => provider.status),
   ];
@@ -190,6 +195,10 @@ export async function collectHealthMatrix(input: HealthMatrixInput): Promise<Hea
       entityMerge,
       factReview,
       degradedParents,
+    },
+    queueDetails: {
+      extraction: extractionDetails,
+      classification: classificationDetails,
     },
   };
 }
