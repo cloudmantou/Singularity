@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker, { initializeDatabase } from "../../src/index";
+import { ensureEntityResolutionDataModel } from "../../src/memory/entities";
 import { createSelfhostEnv } from "../../src/selfhost/env";
 import { resetSettingsCache } from "../../src/settings/store";
 
@@ -96,6 +97,7 @@ describe("Obsidian integration", () => {
     const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
     try {
       await initializeDatabase(env);
+      await ensureEntityResolutionDataModel(env.DB);
       const ruleTable = db.prepare(
         `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sb_automation_rules'`
       ).get() as any;
@@ -162,6 +164,63 @@ describe("Obsidian integration", () => {
       expect(memoryLinkRow.sync_etag).toEqual(expect.any(String));
       expect(memoryLinkRow.last_synced_sync_etag).toBe(memoryLinkRow.sync_etag);
 
+      const atomicMemory = db.prepare(
+        `SELECT s.memory_id AS id, s.observation_id
+         FROM sb_memory_sources s
+         JOIN sb_memories m ON m.id = s.memory_id
+         WHERE m.entry_id = ?
+         LIMIT 1`
+      ).get(pushedEntryId) as any;
+      db.prepare(
+        `INSERT INTO sb_entities (
+           id, name, name_normalized, entity_type, aliases_json, metadata_json,
+           mention_count, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, '[]', '{}', 1, ?, ?)`
+      ).run("entity-mtzs", "mtzs", "mtzs", "project", 1, 1);
+      db.prepare(
+        `INSERT INTO sb_entities (
+           id, name, name_normalized, entity_type, aliases_json, metadata_json,
+           mention_count, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, '[]', '{}', 1, ?, ?)`
+      ).run("entity-installer", "installation_proxy", "installation_proxy", "product", 1, 1);
+      db.prepare(
+        `INSERT INTO sb_memory_entities (id, memory_id, entity_id, role, score, created_at)
+         VALUES (?, ?, ?, 'mentions', 1, ?)`
+      ).run("mention-mtzs", atomicMemory.id, "entity-mtzs", 1);
+      db.prepare(
+        `INSERT INTO sb_memory_entities (id, memory_id, entity_id, role, score, created_at)
+         VALUES (?, ?, ?, 'mentions', 1, ?)`
+      ).run("mention-installer", atomicMemory.id, "entity-installer", 1);
+      db.prepare(
+        `INSERT INTO sb_entity_relations (
+           id, from_entity_id, to_entity_id, relation_type, fact, fact_hash,
+           evidence_count, memory_id, observation_id, score, scope_id, polarity,
+           modality, resolution_type, resolution_state, metadata_json, created_at
+         ) VALUES (?, ?, ?, 'uses', ?, ?, 1, ?, ?, 1, ?, 'positive',
+                   'confirmed', 'supports', 'active', '{}', ?)`
+      ).run(
+        "relation-uses",
+        "entity-mtzs",
+        "entity-installer",
+        "mtzs uses installation_proxy",
+        "fact-hash",
+        atomicMemory.id,
+        atomicMemory.observation_id,
+        "mtzs/ios/production",
+        2
+      );
+      db.prepare(
+        `INSERT INTO sb_fact_sources (id, relation_id, memory_id, observation_id, created_at)
+         VALUES (?, ?, ?, ?, ?)`
+      ).run("fact-source-uses", "relation-uses", atomicMemory.id, atomicMemory.observation_id, 2);
+      db.prepare(
+        `INSERT INTO sb_fact_resolutions (
+           id, relation_id, target_relation_id, resolution_type, confidence,
+           reason_codes_json, requires_review, applied_invalidation,
+           source_memory_id, target_memory_id, created_at
+         ) VALUES (?, ?, NULL, 'supports', 0.9, '["same_structure"]', 0, 0, ?, NULL, ?)`
+      ).run("fact-resolution-uses", "relation-uses", atomicMemory.id, 2);
+
       const pullResponse = await fetchAndDrainWaitUntil(
         auth("/integrations/obsidian/pull?vaultId=work-vault"),
         env
@@ -175,7 +234,8 @@ describe("Obsidian integration", () => {
       });
       expect(pulled.results[0].syncEtag).toEqual(expect.any(String));
       expect(pulled.results[0].syncEtag).toMatch(/^sync2_/);
-      expect(pulled.results[0].lastSyncedSyncEtag).toBe(pulled.results[0].syncEtag);
+      expect(pulled.results[0].lastSyncedSyncEtag).not.toBe(pulled.results[0].syncEtag);
+      expect(pulled.results[0].syncStatus).toBe("remote_changed");
       expect(pulled.results[0].path).toContain("Singularity/10 提炼知识/");
       expect(pulled.results[0].markdown).toContain("singularity_id:");
       expect(pulled.results[0].markdown).toContain("singularity_type:");
@@ -184,6 +244,16 @@ describe("Obsidian integration", () => {
       expect(pulled.results[0].markdown).toContain("source_file: \"Singularity/Projects/mtzs.md\"");
       expect(pulled.results[0].markdown).toContain("project/mtzs");
       expect(pulled.results[0].markdown).toContain("installation_proxy");
+      expect(pulled.results[0].markdown).toContain("## 关联实体");
+      expect(pulled.results[0].markdown).toContain("[[mtzs]]");
+      expect(pulled.results[0].markdown).toContain("## 事实解析");
+      expect(pulled.results[0].properties.singularity_entities).toEqual([
+        "installation_proxy",
+        "mtzs",
+      ]);
+      expect(pulled.results[0].properties.singularity_fact_resolutions).toEqual([
+        "mtzs uses installation_proxy [supports]",
+      ]);
 
       const statusResponse = await fetchAndDrainWaitUntil(
         auth("/integrations/obsidian/status?vaultId=work-vault"),

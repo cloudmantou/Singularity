@@ -35,6 +35,22 @@ describe("entity parsers", () => {
     expect(entities[1].entityType).toBe("product");
   });
 
+  it("preserves explicit aliases and stable external ids for resolution", () => {
+    const [entity] = parseEntityList([
+      {
+        name: "馒头助手",
+        type: "product",
+        aliases: ["mtzs"],
+        external_ids: [{ provider: "github", value: "cloudmantou/mtzs" }],
+      },
+    ]);
+
+    expect(entity.aliases).toEqual(["mtzs"]);
+    expect(entity.externalIds).toEqual([
+      { provider: "github", value: "cloudmantou/mtzs" },
+    ]);
+  });
+
   it("parses entity relation drafts", () => {
     const rels = parseEntityRelationList([
       { from: "Singularity", to: "SQLite", type: "uses", fact: "Singularity uses SQLite" },

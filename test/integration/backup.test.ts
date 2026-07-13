@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import worker, { initializeDatabase } from "../../src/index";
+import { ensureEntityResolutionDataModel } from "../../src/memory/entities";
 import { createExecutionContext, createSelfhostEnv } from "../../src/selfhost/env";
 
 function auth(path: string, init: RequestInit = {}) {
@@ -17,6 +18,7 @@ describe("full memory backup import/export", () => {
   it("exports and restores four-layer memory graph data with integrity checks", async () => {
     const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
     await initializeDatabase(env);
+    await ensureEntityResolutionDataModel(env.DB);
     const now = Date.now();
 
     db.prepare(
@@ -188,6 +190,44 @@ describe("full memory backup import/export", () => {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run("entity-2", "SQLite", "sqlite", "product", "[]", "{}", 1, now - 2000, now);
     db.prepare(
+      `INSERT INTO sb_entity_aliases
+       (id, entity_id, alias, alias_normalized, source_observation_id,
+        confidence, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run("alias-1", "entity-1", "SB", "sb", "obs-1", 1, now - 2000, now);
+    db.prepare(
+      `INSERT INTO sb_entity_alias_sources
+       (id, alias_id, observation_id, relation, created_at)
+       VALUES (?, ?, ?, 'supports', ?)`
+    ).run("alias-source-1", "alias-1", "obs-1", now);
+    db.prepare(
+      `INSERT INTO sb_entity_external_ids
+       (id, entity_id, provider, external_id, source_observation_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run("external-1", "entity-1", "github", "cloudmantou/Singularity", "obs-1", now - 2000, now);
+    db.prepare(
+      `INSERT INTO sb_entity_external_id_sources
+       (id, external_id_id, observation_id, relation, created_at)
+       VALUES (?, ?, ?, 'supports', ?)`
+    ).run("external-source-1", "external-1", "obs-1", now);
+    db.prepare(
+      `INSERT INTO sb_entity_embeddings
+       (entity_id, embedding_fingerprint, embedding_json, dimensions, updated_at)
+       VALUES (?, ?, ?, ?, ?)`
+    ).run("entity-1", "test-v1", "[1,0]", 2, now);
+    db.prepare(
+      `INSERT INTO sb_entity_merge_candidates
+       (id, source_entity_id, target_entity_id, matched_by, score, reason_json,
+        state, source_observation_id, reviewed_by, reviewed_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL, ?, ?)`
+    ).run("entity-candidate-1", "entity-2", "entity-1", "semantic", 0.9, "[]", "obs-1", now, now);
+    db.prepare(
+      `INSERT INTO sb_entity_merge_history
+       (id, source_entity_id, target_entity_id, candidate_id, actor_type,
+        reason, snapshot_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run("entity-history-1", "entity-2", "entity-1", "entity-candidate-1", "user", "reviewed", "{}", now);
+    db.prepare(
       `INSERT INTO sb_memory_entities
        (id, memory_id, entity_id, role, score, created_at)
        VALUES (?, ?, ?, ?, ?, ?)`
@@ -205,6 +245,13 @@ describe("full memory backup import/export", () => {
        VALUES (?, ?, ?, ?, ?)`
     ).run("fact-source-1", "fact-1", "mem-1", "obs-1", now - 2000);
     db.prepare(
+      `INSERT INTO sb_fact_resolutions
+       (id, relation_id, target_relation_id, resolution_type, confidence,
+        reason_codes_json, requires_review, applied_invalidation,
+        source_memory_id, target_memory_id, created_at)
+       VALUES (?, ?, NULL, 'supports', 0.91, '[]', 0, 0, ?, NULL, ?)`
+    ).run("fact-resolution-1", "fact-1", "mem-1", now - 2000);
+    db.prepare(
       `INSERT INTO sb_memory_relations
        (id, from_memory_id, to_memory_id, relation_type, score, metadata_json, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)`
@@ -221,7 +268,7 @@ describe("full memory backup import/export", () => {
     const backup = await exportResponse.json() as any;
 
     expect(backup.backupFormat).toBe("singularity-memory-backup");
-    expect(backup.schemaVersion).toBe(7);
+    expect(backup.schemaVersion).toBe(8);
     expect(backup.features).toEqual(
       expect.arrayContaining([
         "atomic-memory",
@@ -231,6 +278,8 @@ describe("full memory backup import/export", () => {
         "evidence-claim-provenance",
         "parent-versions",
         "parent-version-claims",
+        "entity-resolution",
+        "fact-resolution",
       ])
     );
     expect(backup.features).not.toContain("vector-rebuild-state");
@@ -246,8 +295,16 @@ describe("full memory backup import/export", () => {
       memories: 1,
       memorySources: 1,
       entities: 2,
+      entityAliases: 1,
+      entityAliasSources: 1,
+      entityExternalIds: 1,
+      entityExternalIdSources: 1,
+      entityEmbeddings: 1,
+      entityMergeCandidates: 1,
+      entityMergeHistory: 1,
       memoryEntities: 1,
       entityRelations: 1,
+      factResolutions: 1,
       factSources: 1,
       memoryRelations: 1,
       revisions: 1,
@@ -296,7 +353,7 @@ describe("full memory backup import/export", () => {
     );
     expect(importResponse.status).toBe(200);
     const imported = await importResponse.json() as any;
-    expect(imported.schemaVersion).toBe(7);
+    expect(imported.schemaVersion).toBe(8);
     expect(imported.inserted).toBe(2);
     expect(imported.graph.scopes.imported).toBe(1);
     expect(imported.graph.parentUnits.imported).toBe(1);
@@ -304,6 +361,14 @@ describe("full memory backup import/export", () => {
     expect(imported.graph.parentVersionClaims.imported).toBe(1);
     expect(imported.graph.memories.imported).toBe(1);
     expect(imported.graph.entityRelations.imported).toBe(1);
+    expect(imported.graph.entityAliases.imported).toBe(1);
+    expect(imported.graph.entityAliasSources.imported).toBe(1);
+    expect(imported.graph.entityExternalIds.imported).toBe(1);
+    expect(imported.graph.entityExternalIdSources.imported).toBe(1);
+    expect(imported.graph.entityEmbeddings.imported).toBe(1);
+    expect(imported.graph.entityMergeCandidates.imported).toBe(1);
+    expect(imported.graph.entityMergeHistory.imported).toBe(1);
+    expect(imported.graph.factResolutions.imported).toBe(1);
     expect(imported.graph.factSources.imported).toBe(1);
     expect(imported.integrity.ok).toBe(true);
 
@@ -321,6 +386,14 @@ describe("full memory backup import/export", () => {
       schemaVersion: 4,
       features: undefined,
       factSources: undefined,
+      entityAliases: undefined,
+      entityAliasSources: undefined,
+      entityExternalIds: undefined,
+      entityExternalIdSources: undefined,
+      entityEmbeddings: undefined,
+      entityMergeCandidates: undefined,
+      entityMergeHistory: undefined,
+      factResolutions: undefined,
     };
     const legacyRestored = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
     await initializeDatabase(legacyRestored.env);
@@ -334,7 +407,7 @@ describe("full memory backup import/export", () => {
     );
     expect(legacyImportResponse.status).toBe(200);
     const legacyImported = await legacyImportResponse.json() as any;
-    expect(legacyImported.schemaVersion).toBe(7);
+    expect(legacyImported.schemaVersion).toBe(8);
     expect(legacyImported.graph.factSources.total).toBe(0);
     expect(legacyImported.graph.parentVersionClaims.total).toBe(1);
 
@@ -353,14 +426,14 @@ describe("full memory backup import/export", () => {
     const futureImportResponse = await worker.fetch(
       auth("/import", {
         method: "POST",
-        body: JSON.stringify({ ...backup, schemaVersion: 8 }),
+        body: JSON.stringify({ ...backup, schemaVersion: 9 }),
       }),
       legacyRestored.env,
       createExecutionContext()
     );
     expect(futureImportResponse.status).toBe(400);
     const futureImported = await futureImportResponse.json() as any;
-    expect(futureImported.error).toMatch(/schemaVersion 8/);
+    expect(futureImported.error).toMatch(/schemaVersion 9/);
 
     db.close();
     restored.db.close();

@@ -70,7 +70,111 @@ export interface AtomicFactDraft {
   relations: EntityRelationDraft[];
 }
 
+export interface EvidenceRevisionInput {
+  id: string;
+  content: string;
+  sourceTimestamp?: number | null;
+  rootEvidenceId?: string | null;
+  sourceIdentity?: string | null;
+  sourceChannel?: string | null;
+  revision?: number | null;
+  vaultId?: string | null;
+}
+
+export interface AtomicExtractionInput extends EvidenceRevisionInput {
+  previousEvidence?: EvidenceRevisionInput[];
+}
+
+export interface AtomicExtractor {
+  extract(input: AtomicExtractionInput): Promise<AtomicFactDraft[]>;
+}
+
+export function isValidEvidenceRevisionLink(
+  current: EvidenceRevisionInput,
+  previous: EvidenceRevisionInput
+): boolean {
+  const sameOptional = (left: string | null | undefined, right: string | null | undefined) =>
+    !left || !right || left === right;
+  const revisionsContinuous =
+    current.revision == null || previous.revision == null ||
+    Number(previous.revision) === Number(current.revision) - 1;
+  return (
+    sameOptional(current.rootEvidenceId, previous.rootEvidenceId) &&
+    sameOptional(current.sourceIdentity, previous.sourceIdentity) &&
+    sameOptional(current.sourceChannel, previous.sourceChannel) &&
+    sameOptional(current.vaultId, previous.vaultId) &&
+    revisionsContinuous
+  );
+}
+
+export class PromptAtomicExtractor implements AtomicExtractor {
+  constructor(
+    private readonly complete: (prompt: string, maxTokens: number) => Promise<string>
+  ) {}
+
+  async extract(input: AtomicExtractionInput): Promise<AtomicFactDraft[]> {
+    const text = await this.complete(
+      buildAtomicExtractionPrompt(input.content, input.previousEvidence ?? []),
+      ATOMIC_EXTRACTION_MAX_TOKENS
+    );
+    return applyEntityResolutionBudget(
+      constrainEntityIdentityToEvidence(parseAtomicExtraction(text), input.content)
+    );
+  }
+}
+
+function evidenceContainsIdentity(evidence: string, value: string): boolean {
+  const normalizedEvidence = evidence.trim().replace(/\s+/g, " ").toLowerCase();
+  const normalizedValue = value.trim().replace(/\s+/g, " ").toLowerCase();
+  return normalizedValue.length >= 2 && normalizedEvidence.includes(normalizedValue);
+}
+
+export function constrainEntityIdentityToEvidence(
+  facts: AtomicFactDraft[],
+  evidenceContent: string
+): AtomicFactDraft[] {
+  return facts.map((fact) => ({
+    ...fact,
+    entities: fact.entities.map((entity) => ({
+      ...entity,
+      aliases: (entity.aliases ?? []).filter((alias) =>
+        evidenceContainsIdentity(evidenceContent, alias)
+      ),
+      externalIds: (entity.externalIds ?? []).filter((externalId) =>
+        evidenceContainsIdentity(evidenceContent, externalId.value)
+      ),
+    })),
+  }));
+}
+
+export function applyEntityResolutionBudget(
+  facts: AtomicFactDraft[],
+  budget = ATOMIC_ENTITY_RESOLUTION_BUDGET
+): AtomicFactDraft[] {
+  const allowed = new Set<string>();
+  const keyFor = (name: string) => name.trim().replace(/\s+/g, " ").toLowerCase();
+  const reserve = (name: string): boolean => {
+    const key = keyFor(name);
+    if (!key) return false;
+    if (allowed.has(key)) return true;
+    if (allowed.size >= budget) return false;
+    allowed.add(key);
+    return true;
+  };
+  return facts.map((fact) => {
+    const entities = fact.entities.filter((entity) => reserve(entity.name));
+    const relations = fact.relations.filter((relation) => {
+      const missing = [keyFor(relation.from), keyFor(relation.to)]
+        .filter((key) => key && !allowed.has(key));
+      if (allowed.size + new Set(missing).size > budget) return false;
+      return reserve(relation.from) && reserve(relation.to);
+    });
+    return { ...fact, entities, relations };
+  });
+}
+
 export const ATOMIC_EXTRACTION_MAX_FACTS = 12;
+export const ATOMIC_ENTITY_RESOLUTION_BUDGET = 32;
 export const ATOMIC_EXTRACTION_MAX_TOKENS = 1000;
 export const ATOMIC_EXTRACTION_CONTENT_LIMIT = 4_000;
 export const ATOMIC_EXTRACTION_VERSION = 1;
@@ -147,11 +251,21 @@ function optionalText(raw: unknown, max = 512): string | null {
   return text ? text.slice(0, max) : null;
 }
 
-export function buildAtomicExtractionPrompt(content: string): string {
+export function buildAtomicExtractionPrompt(
+  content: string,
+  previousEvidence: EvidenceRevisionInput[] = []
+): string {
   const sample = content.slice(0, ATOMIC_EXTRACTION_CONTENT_LIMIT);
+  const history = previousEvidence
+    .slice(0, 5)
+    .map((evidence) => ({
+      id: evidence.id,
+      source_timestamp: evidence.sourceTimestamp ?? null,
+      content: evidence.content.slice(0, 1_000),
+    }));
   return (
     `Split this memory input into independent atomic facts. Respond with ONLY one JSON object.\n` +
-    `{"facts":[{"content":"...","subject":null,"predicate":null,"object":null,"scope_id":null,"polarity":"positive|negative|neutral","modality":"asserted|confirmed|inferred|hypothetical","kind":"episodic|semantic|procedural","memory_class":"fact|preference|project|task|decision|plan|event|milestone|problem|solution|document|procedure|inference|summary","importance":1-5,"confidence":0-1,"observed_at":null,"valid_from":null,"valid_to":null,"reference_time":null,"entities":[{"name":"...","type":"person|project|organization|place|product|concept|other"}],"relations":[{"from":"...","to":"...","type":"uses|part_of|owns|works_on|depends_on|related_to|located_in","fact":"..."}]}]}\n` +
+    `{"facts":[{"content":"...","subject":null,"predicate":null,"object":null,"scope_id":null,"polarity":"positive|negative|neutral","modality":"asserted|confirmed|inferred|hypothetical","kind":"episodic|semantic|procedural","memory_class":"fact|preference|project|task|decision|plan|event|milestone|problem|solution|document|procedure|inference|summary","importance":1-5,"confidence":0-1,"observed_at":null,"valid_from":null,"valid_to":null,"reference_time":null,"entities":[{"name":"...","type":"person|project|organization|place|product|concept|other","aliases":[],"external_ids":[{"provider":"github","value":"owner/repo"}]}],"relations":[{"from":"...","to":"...","type":"uses|part_of|owns|works_on|depends_on|related_to|located_in","fact":"..."}]}]}\n` +
     `Rules:\n` +
     `- One fact per object; do not merge unrelated claims.\n` +
     `- Preserve the user's language.\n` +
@@ -159,9 +273,12 @@ export function buildAtomicExtractionPrompt(content: string): string {
     `- Skip pure greetings / empty chatter.\n` +
     `- Max ${ATOMIC_EXTRACTION_MAX_FACTS} facts.\n` +
     `- Do not decide global claim lifecycle status such as confirmed, contested, superseded, or deprecated; only extract what this input states.\n` +
-    `- entities: named things in that fact only.\n` +
+    `- entities: named things in that fact only; aliases/external_ids only when explicitly present in the source.\n` +
     `- relations: entity-to-entity fact edges when the fact states a relationship; omit if none.\n` +
     `- valid_from/valid_to/reference_time: unix ms or ISO when the fact has a time window; else null.\n\n` +
+    (history.length > 0
+      ? `Previous Evidence Revisions (context only; never copy claims not stated by the current input):\n${JSON.stringify(history)}\n\n`
+      : "") +
     `Input:\n${sample}`
   );
 }
@@ -738,18 +855,51 @@ async function replaceEntryAtomicMemoryOnce(
       .prepare(
         `UPDATE sb_entity_relations
          SET invalid_at = ?, expired_at = ?, valid_to = COALESCE(valid_to, ?)
-         WHERE invalid_at IS NULL
+       WHERE invalid_at IS NULL
            AND expired_at IS NULL
-           AND memory_id IN (
-             SELECT id
-             FROM sb_memories
-             WHERE entry_id = ?
-               AND id != ?
-               AND invalid_at = ?
-               AND expired_at = ?
+           AND id IN (
+             SELECT fs_target.relation_id
+             FROM sb_fact_sources fs_target
+             JOIN sb_memories m_target ON m_target.id = fs_target.memory_id
+             WHERE m_target.entry_id = ?
+               AND m_target.id != ?
+               AND m_target.invalid_at = ?
+               AND m_target.expired_at = ?
+             UNION
+             SELECT legacy.id
+             FROM sb_entity_relations legacy
+             JOIN sb_memories m_legacy ON m_legacy.id = legacy.memory_id
+             WHERE m_legacy.entry_id = ?
+               AND m_legacy.id != ?
+               AND m_legacy.invalid_at = ?
+               AND m_legacy.expired_at = ?
+               AND NOT EXISTS (
+                 SELECT 1 FROM sb_fact_sources fs_any
+                 WHERE fs_any.relation_id = legacy.id
+               )
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM sb_fact_sources fs_keep
+             JOIN sb_memories m_keep ON m_keep.id = fs_keep.memory_id
+             WHERE fs_keep.relation_id = sb_entity_relations.id
+               AND m_keep.invalid_at IS NULL
+               AND m_keep.expired_at IS NULL
            )`
       )
-      .bind(input.createdAt, input.createdAt, input.createdAt, input.entryId, memoryId, input.createdAt, input.createdAt)
+      .bind(
+        input.createdAt,
+        input.createdAt,
+        input.createdAt,
+        input.entryId,
+        memoryId,
+        input.createdAt,
+        input.createdAt,
+        input.entryId,
+        memoryId,
+        input.createdAt,
+        input.createdAt
+      )
   );
 
   const results = await db.batch(statements);
@@ -776,12 +926,36 @@ export async function deprecateEntryAtomicMemory(
          SET invalid_at = ?, valid_to = COALESCE(valid_to, ?)
          WHERE invalid_at IS NULL
            AND expired_at IS NULL
-           AND memory_id IN (
-             SELECT id FROM sb_memories
-             WHERE entry_id = ? AND invalid_at IS NULL AND expired_at IS NULL
+           AND id IN (
+             SELECT fs_target.relation_id
+             FROM sb_fact_sources fs_target
+             JOIN sb_memories m_target ON m_target.id = fs_target.memory_id
+             WHERE m_target.entry_id = ?
+               AND m_target.invalid_at IS NULL
+               AND m_target.expired_at IS NULL
+             UNION
+             SELECT legacy.id
+             FROM sb_entity_relations legacy
+             JOIN sb_memories m_legacy ON m_legacy.id = legacy.memory_id
+             WHERE m_legacy.entry_id = ?
+               AND m_legacy.invalid_at IS NULL
+               AND m_legacy.expired_at IS NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM sb_fact_sources fs_any
+                 WHERE fs_any.relation_id = legacy.id
+               )
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM sb_fact_sources fs_keep
+             JOIN sb_memories m_keep ON m_keep.id = fs_keep.memory_id
+             WHERE fs_keep.relation_id = sb_entity_relations.id
+               AND m_keep.entry_id <> ?
+               AND m_keep.invalid_at IS NULL
+               AND m_keep.expired_at IS NULL
            )`
       )
-      .bind(input.invalidAt, input.invalidAt, input.entryId),
+      .bind(input.invalidAt, input.invalidAt, input.entryId, input.entryId, input.entryId),
     db
       .prepare(
         `UPDATE sb_memories

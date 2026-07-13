@@ -968,8 +968,23 @@ export class D1Mock {
           return { meta: { changes: row ? 1 : 0 } };
         }
         if (s.startsWith("UPDATE sb_entity_relations SET invalid_at")) {
+          if (s.includes("WHERE id = ?")) {
+            const [invalid_at, expired_at, valid_to, id] = args;
+            const row = db.entityRelations.find((relation: any) => relation.id === id);
+            if (row && row.invalid_at == null && row.expired_at == null) {
+              row.invalid_at = invalid_at;
+              row.expired_at = expired_at;
+              if (row.valid_to == null) row.valid_to = valid_to;
+              row.resolution_state = "superseded";
+              return { meta: { changes: 1 } };
+            }
+            return { meta: { changes: 0 } };
+          }
           const hasExpiredAt = s.startsWith("UPDATE sb_entity_relations SET invalid_at = ?, expired_at = ?");
-          if (hasExpiredAt && s.includes("AND invalid_at = ?")) {
+          if (
+            hasExpiredAt &&
+            (s.includes("AND invalid_at = ?") || s.includes("m_target.invalid_at = ?"))
+          ) {
             const [invalid_at, expired_at, valid_to, entry_id, excluded_id, invalidated_at, expired_match] = args;
             const invalidatedMemoryIds = new Set(
               db.memories
@@ -1084,6 +1099,16 @@ export class D1Mock {
           }
           return { meta: { changes } };
         }
+        if (s.startsWith("UPDATE sb_entities SET aliases_json")) {
+          const [aliases_json, metadata_json, updated_at, id] = args;
+          const row = db.entities.find((e: any) => e.id === id);
+          if (row) {
+            row.aliases_json = aliases_json;
+            row.metadata_json = metadata_json;
+            row.updated_at = updated_at;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
         if (s.startsWith("UPDATE sb_entities")) {
           const [entity_type, updated_at, id] = args;
           const row = db.entities.find((e: any) => e.id === id);
@@ -1133,7 +1158,30 @@ export class D1Mock {
           let reference_time: any;
           let metadata_json: any;
           let created_at: any;
-          if (args.length >= 17) {
+          if (args.length >= 22) {
+            let scope_id: any;
+            let polarity: any;
+            let modality: any;
+            let resolution_type: any;
+            let resolution_state: any;
+            let supersedes_relation_id: any;
+            [
+              id, from_entity_id, to_entity_id, relation_type, fact,
+              fact_hash, memory_id, observation_id, score,
+              valid_from, valid_to, invalid_at, expired_at, reference_time,
+              scope_id, polarity, modality, resolution_type, resolution_state,
+              supersedes_relation_id, metadata_json, created_at,
+            ] = args;
+            evidence_count = 1;
+            db.entityRelations.push({
+              id, from_entity_id, to_entity_id, relation_type, fact,
+              fact_hash, evidence_count, memory_id, observation_id, score,
+              valid_from, valid_to, invalid_at, expired_at, reference_time,
+              scope_id, polarity, modality, resolution_type, resolution_state,
+              supersedes_relation_id, metadata_json, created_at,
+            });
+            return { meta: { changes: 1 } };
+          } else if (args.length >= 17) {
             [
               id, from_entity_id, to_entity_id, relation_type, fact,
               fact_hash, evidence_count, memory_id, observation_id, score,
@@ -1424,6 +1472,27 @@ export class D1Mock {
           return { meta: { changes: before - db.factSources.length } };
         }
         if (s.startsWith("UPDATE sb_entity_relations SET evidence_count")) {
+          if (s.includes("SELECT COUNT(*) FROM sb_fact_sources WHERE relation_id = ?")) {
+            const [relationId, scoreA, scoreB, scoreC,
+              validFromA, validFromB, validFromC,
+              validToA, validToB, validToC, referenceTime, id] = args;
+            const relation = db.entityRelations.find((row: any) => row.id === id);
+            if (relation) {
+              relation.evidence_count = Math.max(
+                1,
+                db.factSources.filter((source: any) => source.relation_id === relationId).length
+              );
+              if (scoreA != null && (relation.score == null || Number(relation.score) < Number(scoreB))) {
+                relation.score = scoreC;
+              }
+              if (relation.valid_from == null) relation.valid_from = validFromA ?? null;
+              else if (validFromB != null) relation.valid_from = Math.min(Number(relation.valid_from), Number(validFromC));
+              if (relation.valid_to == null) relation.valid_to = validToA ?? null;
+              else if (validToB != null) relation.valid_to = Math.max(Number(relation.valid_to), Number(validToC));
+              relation.reference_time = relation.reference_time ?? referenceTime ?? null;
+            }
+            return { meta: { changes: relation ? 1 : 0 } };
+          }
           const memoryIds = new Set(args.map(String));
           const affectedRelationIds = new Set(
             db.factSources
@@ -2954,6 +3023,53 @@ export class D1Mock {
       },
       async all() {
         db.statementCount += 1;
+        if (
+          s.includes("SELECT id, name, name_normalized, entity_type, aliases_json") &&
+          s.includes("FROM sb_entities") &&
+          s.includes("ORDER BY mention_count DESC")
+        ) {
+          const limit = Number(args[0] ?? 1000);
+          return {
+            results: [...db.entities]
+              .sort((a: any, b: any) =>
+                Number(b.mention_count ?? 0) - Number(a.mention_count ?? 0) ||
+                Number(b.updated_at ?? 0) - Number(a.updated_at ?? 0)
+              )
+              .slice(0, limit),
+          };
+        }
+        if (
+          s.includes("SELECT id, from_entity_id, to_entity_id, relation_type, fact,") &&
+          s.includes("FROM sb_entity_relations") &&
+          s.includes("WHERE from_entity_id = ?")
+        ) {
+          const [fromEntityId, relationType] = args.map(String);
+          return {
+            results: db.entityRelations
+              .filter((relation: any) =>
+                String(relation.from_entity_id) === fromEntityId &&
+                String(relation.relation_type) === relationType &&
+                relation.invalid_at == null && relation.expired_at == null
+              )
+              .map((relation: any) => {
+                const activeSources = db.factSources
+                  .filter((source: any) => source.relation_id === relation.id && source.memory_id)
+                  .filter((source: any) => {
+                    const memory = db.memories.find((item: any) => item.id === source.memory_id);
+                    return memory && memory.invalid_at == null && memory.expired_at == null;
+                  });
+                return {
+                  ...relation,
+                  memory_id: activeSources.at(-1)?.memory_id ?? relation.memory_id,
+                  evidence_count: db.factSources.some((source: any) => source.relation_id === relation.id)
+                    ? activeSources.length
+                    : relation.evidence_count,
+                };
+              })
+              .sort((a: any, b: any) => Number(b.created_at ?? 0) - Number(a.created_at ?? 0))
+              .slice(0, 20),
+          };
+        }
         if (!s.includes(" LIMIT ") && s.includes("ORDER BY") && !s.includes("json_each")) {
           if (s.includes("FROM sb_scopes")) return { results: [...db.scopes] };
           if (s.includes("FROM sb_parent_units")) return { results: [...db.parentUnits] };
@@ -3153,6 +3269,17 @@ export class D1Mock {
             ].map((name) => ({ name })),
           };
         }
+        if (s === "PRAGMA table_info(sb_entity_relations)") {
+          return {
+            results: [
+              "id", "from_entity_id", "to_entity_id", "relation_type", "fact",
+              "fact_hash", "evidence_count", "memory_id", "observation_id", "score",
+              "valid_from", "valid_to", "invalid_at", "expired_at", "reference_time",
+              "scope_id", "polarity", "modality", "resolution_type", "resolution_state",
+              "supersedes_relation_id", "metadata_json", "created_at",
+            ].map((name) => ({ name })),
+          };
+        }
         if (
           s.includes("SELECT id, from_memory_id, to_memory_id, relation_type") &&
           s.includes("FROM sb_memory_relations")
@@ -3288,7 +3415,10 @@ export class D1Mock {
         }
         if (
           s.includes("FROM sb_entity_relations r") &&
-          s.includes("JOIN sb_memories m ON m.id = r.memory_id") &&
+          (
+            s.includes("JOIN sb_memories m ON m.id = r.memory_id") ||
+            s.includes("JOIN sb_memories m ON m.id = COALESCE(rfs.memory_id, r.memory_id)")
+          ) &&
           s.includes("JOIN sb_entities fe ON fe.id = r.from_entity_id")
         ) {
           const inMatch = s.match(/r\.from_entity_id IN \(([^)]*)\)/);
@@ -3302,11 +3432,19 @@ export class D1Mock {
               fromIds.has(String(relation.from_entity_id)) ||
               toIds.has(String(relation.to_entity_id))
             )
-            .map((relation: any) => {
-              const memory = db.memories.find((m: any) => m.id === relation.memory_id);
+            .flatMap((relation: any) => {
+              const sourceMemoryIds = db.factSources
+                .filter((source: any) => source.relation_id === relation.id && source.memory_id)
+                .map((source: any) => source.memory_id);
+              const memoryIds = sourceMemoryIds.length > 0 ? sourceMemoryIds : [relation.memory_id];
               const from = db.entities.find((e: any) => e.id === relation.from_entity_id);
               const to = db.entities.find((e: any) => e.id === relation.to_entity_id);
-              return { relation, memory, from, to };
+              return memoryIds.map((memoryId: string) => ({
+                relation,
+                memory: db.memories.find((m: any) => m.id === memoryId),
+                from,
+                to,
+              }));
             })
             .filter(({ relation, memory }: any) =>
               memory &&

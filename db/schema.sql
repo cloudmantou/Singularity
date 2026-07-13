@@ -487,6 +487,97 @@ CREATE TABLE IF NOT EXISTS sb_entities (
 CREATE INDEX IF NOT EXISTS idx_sb_entities_name ON sb_entities(name_normalized);
 CREATE INDEX IF NOT EXISTS idx_sb_entities_type ON sb_entities(entity_type, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS sb_entity_aliases (
+  id TEXT PRIMARY KEY,
+  entity_id TEXT NOT NULL,
+  alias TEXT NOT NULL,
+  alias_normalized TEXT NOT NULL,
+  source_observation_id TEXT,
+  confidence REAL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(entity_id, alias_normalized)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_aliases_lookup ON sb_entity_aliases(alias_normalized, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_entity_aliases_entity ON sb_entity_aliases(entity_id, updated_at DESC);
+CREATE TABLE IF NOT EXISTS sb_entity_alias_sources (
+  id TEXT PRIMARY KEY,
+  alias_id TEXT NOT NULL,
+  observation_id TEXT NOT NULL,
+  relation TEXT NOT NULL DEFAULT 'supports',
+  created_at INTEGER NOT NULL,
+  UNIQUE(alias_id, observation_id, relation)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_alias_sources_alias ON sb_entity_alias_sources(alias_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_entity_alias_sources_observation ON sb_entity_alias_sources(observation_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS sb_entity_external_ids (
+  id TEXT PRIMARY KEY,
+  entity_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  external_id TEXT NOT NULL,
+  source_observation_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(entity_id, provider, external_id)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_external_ids_lookup ON sb_entity_external_ids(provider, external_id, updated_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_external_ids_identity ON sb_entity_external_ids(provider, external_id);
+CREATE INDEX IF NOT EXISTS idx_entity_external_ids_entity ON sb_entity_external_ids(entity_id, updated_at DESC);
+CREATE TABLE IF NOT EXISTS sb_entity_external_id_sources (
+  id TEXT PRIMARY KEY,
+  external_id_id TEXT NOT NULL,
+  observation_id TEXT NOT NULL,
+  relation TEXT NOT NULL DEFAULT 'supports',
+  created_at INTEGER NOT NULL,
+  UNIQUE(external_id_id, observation_id, relation)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_external_id_sources_external ON sb_entity_external_id_sources(external_id_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_entity_external_id_sources_observation ON sb_entity_external_id_sources(observation_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS sb_entity_embeddings (
+  entity_id TEXT NOT NULL,
+  embedding_fingerprint TEXT NOT NULL,
+  embedding_json TEXT NOT NULL,
+  dimensions INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(entity_id, embedding_fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_embeddings_profile ON sb_entity_embeddings(embedding_fingerprint, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS sb_entity_merge_candidates (
+  id TEXT PRIMARY KEY,
+  source_entity_id TEXT NOT NULL,
+  target_entity_id TEXT NOT NULL,
+  matched_by TEXT NOT NULL,
+  score REAL,
+  reason_json TEXT NOT NULL DEFAULT '[]',
+  state TEXT NOT NULL DEFAULT 'pending',
+  source_observation_id TEXT,
+  reviewed_by TEXT,
+  reviewed_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  CHECK (state IN ('pending', 'accepted', 'rejected', 'merged')),
+  UNIQUE(source_entity_id, target_entity_id, state)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_merge_candidates_state ON sb_entity_merge_candidates(state, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_entity_merge_candidates_source ON sb_entity_merge_candidates(source_entity_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_entity_merge_candidates_target ON sb_entity_merge_candidates(target_entity_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS sb_entity_merge_history (
+  id TEXT PRIMARY KEY,
+  source_entity_id TEXT NOT NULL,
+  target_entity_id TEXT NOT NULL,
+  candidate_id TEXT,
+  actor_type TEXT NOT NULL,
+  reason TEXT,
+  snapshot_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_entity_merge_history_source ON sb_entity_merge_history(source_entity_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_entity_merge_history_target ON sb_entity_merge_history(target_entity_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS sb_memory_entities (
   id TEXT PRIMARY KEY,
   memory_id TEXT NOT NULL,
@@ -515,6 +606,12 @@ CREATE TABLE IF NOT EXISTS sb_entity_relations (
   invalid_at INTEGER,
   expired_at INTEGER,
   reference_time INTEGER,
+  scope_id TEXT,
+  polarity TEXT NOT NULL DEFAULT 'positive',
+  modality TEXT NOT NULL DEFAULT 'asserted',
+  resolution_type TEXT NOT NULL DEFAULT 'coexists',
+  resolution_state TEXT NOT NULL DEFAULT 'active',
+  supersedes_relation_id TEXT,
   metadata_json TEXT NOT NULL DEFAULT '{}',
   created_at INTEGER NOT NULL
 );
@@ -525,6 +622,26 @@ CREATE INDEX IF NOT EXISTS idx_sb_entity_relations_to
 CREATE INDEX IF NOT EXISTS idx_sb_entity_relations_memory ON sb_entity_relations(memory_id);
 CREATE INDEX IF NOT EXISTS idx_sb_entity_relations_fact_hash
   ON sb_entity_relations(from_entity_id, to_entity_id, relation_type, fact_hash);
+CREATE INDEX IF NOT EXISTS idx_sb_entity_relations_resolution
+  ON sb_entity_relations(from_entity_id, relation_type, scope_id, resolution_state, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS sb_fact_resolutions (
+  id TEXT PRIMARY KEY,
+  relation_id TEXT NOT NULL,
+  target_relation_id TEXT,
+  resolution_type TEXT NOT NULL,
+  confidence REAL,
+  reason_codes_json TEXT NOT NULL DEFAULT '[]',
+  requires_review INTEGER NOT NULL DEFAULT 0,
+  applied_invalidation INTEGER NOT NULL DEFAULT 0,
+  source_memory_id TEXT,
+  target_memory_id TEXT,
+  created_at INTEGER NOT NULL,
+  CHECK (resolution_type IN ('duplicate', 'supports', 'elaborates', 'coexists', 'supersedes', 'contradicts', 'uncertain'))
+);
+CREATE INDEX IF NOT EXISTS idx_fact_resolutions_relation ON sb_fact_resolutions(relation_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_fact_resolutions_target ON sb_fact_resolutions(target_relation_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_fact_resolutions_review ON sb_fact_resolutions(requires_review, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS sb_fact_sources (
   id TEXT PRIMARY KEY,

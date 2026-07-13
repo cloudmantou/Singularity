@@ -1,8 +1,9 @@
 import { importEntries, type ImportMode, type ImportOptions, type ImportResult } from "../import-entries";
+import { ensureEntityResolutionDataModel } from "./entities";
 
-export const MEMORY_BACKUP_SCHEMA_VERSION = 7;
+export const MEMORY_BACKUP_SCHEMA_VERSION = 8;
 const MEMORY_BACKUP_FORMAT = "singularity-memory-backup";
-const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7]);
+const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7, 8]);
 const MEMORY_BACKUP_FEATURES = [
   "atomic-memory",
   "temporal-facts",
@@ -13,6 +14,8 @@ const MEMORY_BACKUP_FEATURES = [
   "evidence-claim-provenance",
   "parent-versions",
   "parent-version-claims",
+  "entity-resolution",
+  "fact-resolution",
 ] as const;
 
 const GRAPH_ARRAY_KEYS = [
@@ -24,8 +27,16 @@ const GRAPH_ARRAY_KEYS = [
   "memories",
   "memorySources",
   "entities",
+  "entityAliases",
+  "entityAliasSources",
+  "entityExternalIds",
+  "entityExternalIdSources",
+  "entityEmbeddings",
+  "entityMergeCandidates",
+  "entityMergeHistory",
   "memoryEntities",
   "entityRelations",
+  "factResolutions",
   "factSources",
   "memoryRelations",
   "revisions",
@@ -51,7 +62,7 @@ export interface BackupIntegrityReport {
 
 export interface MemoryBackup {
   backupFormat: typeof MEMORY_BACKUP_FORMAT;
-  schemaVersion: 7;
+  schemaVersion: 8;
   features: Array<(typeof MEMORY_BACKUP_FEATURES)[number]>;
   exportedAt: string;
   source: string;
@@ -66,8 +77,16 @@ export interface MemoryBackup {
   memories: BackupRow[];
   memorySources: BackupRow[];
   entities: BackupRow[];
+  entityAliases: BackupRow[];
+  entityAliasSources: BackupRow[];
+  entityExternalIds: BackupRow[];
+  entityExternalIdSources: BackupRow[];
+  entityEmbeddings: BackupRow[];
+  entityMergeCandidates: BackupRow[];
+  entityMergeHistory: BackupRow[];
   memoryEntities: BackupRow[];
   entityRelations: BackupRow[];
+  factResolutions: BackupRow[];
   factSources: BackupRow[];
   memoryRelations: BackupRow[];
   revisions: BackupRow[];
@@ -77,7 +96,7 @@ export interface MemoryBackup {
 }
 
 export interface MemoryBackupImportResult extends ImportResult {
-  schemaVersion: 7;
+  schemaVersion: 8;
   graph: Record<GraphArrayKey, TableImportStats>;
   integrity: BackupIntegrityReport;
 }
@@ -148,6 +167,39 @@ export async function inspectMemoryBackupIntegrity(db: D1Database): Promise<Back
        (SELECT COUNT(*) FROM sb_parent_version_claims pvc
         LEFT JOIN sb_memories m ON m.id = pvc.memory_id
         WHERE m.id IS NULL) as parent_version_claims_missing_memory,
+       (SELECT COUNT(*) FROM sb_entity_aliases a
+        LEFT JOIN sb_entities e ON e.id = a.entity_id
+        WHERE e.id IS NULL) as entity_aliases_missing_entity,
+       (SELECT COUNT(*) FROM sb_entity_alias_sources s
+        LEFT JOIN sb_entity_aliases a ON a.id = s.alias_id
+        WHERE a.id IS NULL) as entity_alias_sources_missing_alias,
+       (SELECT COUNT(*) FROM sb_entity_alias_sources s
+        LEFT JOIN sb_observations o ON o.id = s.observation_id
+        WHERE o.id IS NULL) as entity_alias_sources_missing_observation,
+       (SELECT COUNT(*) FROM sb_entity_external_ids x
+        LEFT JOIN sb_entities e ON e.id = x.entity_id
+        WHERE e.id IS NULL) as entity_external_ids_missing_entity,
+       (SELECT COUNT(*) FROM sb_entity_external_id_sources s
+        LEFT JOIN sb_entity_external_ids x ON x.id = s.external_id_id
+        WHERE x.id IS NULL) as entity_external_id_sources_missing_external_id,
+       (SELECT COUNT(*) FROM sb_entity_external_id_sources s
+        LEFT JOIN sb_observations o ON o.id = s.observation_id
+        WHERE o.id IS NULL) as entity_external_id_sources_missing_observation,
+       (SELECT COUNT(*) FROM sb_entity_embeddings x
+        LEFT JOIN sb_entities e ON e.id = x.entity_id
+        WHERE e.id IS NULL) as entity_embeddings_missing_entity,
+       (SELECT COUNT(*) FROM sb_entity_merge_candidates c
+        LEFT JOIN sb_entities e ON e.id = c.source_entity_id
+        WHERE e.id IS NULL) as entity_merge_candidates_missing_source,
+       (SELECT COUNT(*) FROM sb_entity_merge_candidates c
+        LEFT JOIN sb_entities e ON e.id = c.target_entity_id
+        WHERE e.id IS NULL) as entity_merge_candidates_missing_target,
+       (SELECT COUNT(*) FROM sb_entity_merge_history h
+        LEFT JOIN sb_entities e ON e.id = h.source_entity_id
+        WHERE e.id IS NULL) as entity_merge_history_missing_source,
+       (SELECT COUNT(*) FROM sb_entity_merge_history h
+        LEFT JOIN sb_entities e ON e.id = h.target_entity_id
+        WHERE e.id IS NULL) as entity_merge_history_missing_target,
        (SELECT COUNT(*) FROM sb_memory_entities me
         LEFT JOIN sb_memories m ON m.id = me.memory_id
         WHERE m.id IS NULL) as memory_entities_missing_memory,
@@ -166,6 +218,9 @@ export async function inspectMemoryBackupIntegrity(db: D1Database): Promise<Back
        (SELECT COUNT(*) FROM sb_entity_relations er
         LEFT JOIN sb_observations o ON o.id = er.observation_id
         WHERE er.observation_id IS NOT NULL AND o.id IS NULL) as entity_relations_missing_observation,
+       (SELECT COUNT(*) FROM sb_entity_relations er
+        LEFT JOIN sb_entity_relations superseded ON superseded.id = er.supersedes_relation_id
+        WHERE er.supersedes_relation_id IS NOT NULL AND superseded.id IS NULL) as entity_relations_missing_superseded_relation,
        (SELECT COUNT(*) FROM sb_fact_sources fs
         LEFT JOIN sb_entity_relations er ON er.id = fs.relation_id
         WHERE er.id IS NULL) as fact_sources_missing_relation,
@@ -175,6 +230,18 @@ export async function inspectMemoryBackupIntegrity(db: D1Database): Promise<Back
        (SELECT COUNT(*) FROM sb_fact_sources fs
         LEFT JOIN sb_observations o ON o.id = fs.observation_id
         WHERE fs.observation_id IS NOT NULL AND o.id IS NULL) as fact_sources_missing_observation,
+       (SELECT COUNT(*) FROM sb_fact_resolutions fr
+        LEFT JOIN sb_entity_relations er ON er.id = fr.relation_id
+        WHERE er.id IS NULL) as fact_resolutions_missing_relation,
+       (SELECT COUNT(*) FROM sb_fact_resolutions fr
+        LEFT JOIN sb_entity_relations er ON er.id = fr.target_relation_id
+        WHERE fr.target_relation_id IS NOT NULL AND er.id IS NULL) as fact_resolutions_missing_target_relation,
+       (SELECT COUNT(*) FROM sb_fact_resolutions fr
+        LEFT JOIN sb_memories m ON m.id = fr.source_memory_id
+        WHERE fr.source_memory_id IS NOT NULL AND m.id IS NULL) as fact_resolutions_missing_source_memory,
+       (SELECT COUNT(*) FROM sb_fact_resolutions fr
+        LEFT JOIN sb_memories m ON m.id = fr.target_memory_id
+        WHERE fr.target_memory_id IS NOT NULL AND m.id IS NULL) as fact_resolutions_missing_target_memory,
        (SELECT COUNT(*) FROM sb_memory_relations r
         LEFT JOIN entries e ON e.id = r.from_memory_id
         WHERE e.id IS NULL) as memory_relations_missing_from_entry,
@@ -211,6 +278,7 @@ export async function exportMemoryBackup(
   db: D1Database,
   input: { source: string }
 ): Promise<MemoryBackup> {
+  await ensureEntityResolutionDataModel(db);
   const [
     scopes,
     parentUnits,
@@ -221,8 +289,16 @@ export async function exportMemoryBackup(
     memories,
     memorySources,
     entities,
+    entityAliases,
+    entityAliasSources,
+    entityExternalIds,
+    entityExternalIdSources,
+    entityEmbeddings,
+    entityMergeCandidates,
+    entityMergeHistory,
     memoryEntities,
     entityRelations,
+    factResolutions,
     factSources,
     memoryRelations,
     revisions,
@@ -278,14 +354,49 @@ export async function exportMemoryBackup(
                        metadata_json, mention_count, created_at, updated_at
                 FROM sb_entities
                 ORDER BY updated_at DESC, id DESC`),
+    allRows(db, `SELECT id, entity_id, alias, alias_normalized,
+                       source_observation_id, confidence, created_at, updated_at
+                FROM sb_entity_aliases
+                ORDER BY updated_at DESC, id DESC`),
+    allRows(db, `SELECT id, alias_id, observation_id, relation, created_at
+                FROM sb_entity_alias_sources
+                ORDER BY created_at DESC, id DESC`),
+    allRows(db, `SELECT id, entity_id, provider, external_id,
+                       source_observation_id, created_at, updated_at
+                FROM sb_entity_external_ids
+                ORDER BY updated_at DESC, id DESC`),
+    allRows(db, `SELECT id, external_id_id, observation_id, relation, created_at
+                FROM sb_entity_external_id_sources
+                ORDER BY created_at DESC, id DESC`),
+    allRows(db, `SELECT entity_id, embedding_fingerprint, embedding_json,
+                       dimensions, updated_at
+                FROM sb_entity_embeddings
+                ORDER BY updated_at DESC, entity_id DESC`),
+    allRows(db, `SELECT id, source_entity_id, target_entity_id, matched_by,
+                       score, reason_json, state, source_observation_id,
+                       reviewed_by, reviewed_at, created_at, updated_at
+                FROM sb_entity_merge_candidates
+                ORDER BY created_at DESC, id DESC`),
+    allRows(db, `SELECT id, source_entity_id, target_entity_id, candidate_id,
+                       actor_type, reason, snapshot_json, created_at
+                FROM sb_entity_merge_history
+                ORDER BY created_at DESC, id DESC`),
     allRows(db, `SELECT id, memory_id, entity_id, role, score, created_at
                 FROM sb_memory_entities
                 ORDER BY created_at DESC, id DESC`),
     allRows(db, `SELECT id, from_entity_id, to_entity_id, relation_type, fact,
                        fact_hash, evidence_count, memory_id, observation_id,
                        score, valid_from, valid_to, invalid_at, expired_at,
-                       reference_time, metadata_json, created_at
+                       reference_time, scope_id, polarity, modality,
+                       resolution_type, resolution_state, supersedes_relation_id,
+                       metadata_json, created_at
                 FROM sb_entity_relations
+                ORDER BY created_at DESC, id DESC`),
+    allRows(db, `SELECT id, relation_id, target_relation_id, resolution_type,
+                       confidence, reason_codes_json, requires_review,
+                       applied_invalidation, source_memory_id, target_memory_id,
+                       created_at
+                FROM sb_fact_resolutions
                 ORDER BY created_at DESC, id DESC`),
     allRows(db, `SELECT id, relation_id, memory_id, observation_id, created_at
                 FROM sb_fact_sources
@@ -331,8 +442,16 @@ export async function exportMemoryBackup(
       memories: countRows(memories),
       memorySources: countRows(memorySources),
       entities: countRows(entities),
+      entityAliases: countRows(entityAliases),
+      entityAliasSources: countRows(entityAliasSources),
+      entityExternalIds: countRows(entityExternalIds),
+      entityExternalIdSources: countRows(entityExternalIdSources),
+      entityEmbeddings: countRows(entityEmbeddings),
+      entityMergeCandidates: countRows(entityMergeCandidates),
+      entityMergeHistory: countRows(entityMergeHistory),
       memoryEntities: countRows(memoryEntities),
       entityRelations: countRows(entityRelations),
+      factResolutions: countRows(factResolutions),
       factSources: countRows(factSources),
       memoryRelations: countRows(memoryRelations),
       revisions: countRows(revisions),
@@ -350,8 +469,16 @@ export async function exportMemoryBackup(
     memories,
     memorySources,
     entities,
+    entityAliases,
+    entityAliasSources,
+    entityExternalIds,
+    entityExternalIdSources,
+    entityEmbeddings,
+    entityMergeCandidates,
+    entityMergeHistory,
     memoryEntities,
     entityRelations,
+    factResolutions,
     factSources,
     memoryRelations,
     revisions,
@@ -429,15 +556,13 @@ async function importTable(
     skipped: 0,
     failed: 0,
   };
-  for (const row of rows) {
-    try {
-      const result = await prepare(row).run();
-      const changes = Number(result.meta?.changes ?? 0);
-      if (changes > 0) stats.imported += 1;
-      else stats.skipped += 1;
-    } catch {
-      stats.failed += 1;
-    }
+  if (rows.length === 0) return stats;
+  const statements = rows.map(prepare);
+  const results = await db.batch(statements);
+  for (const result of results) {
+    const changes = Number(result.meta?.changes ?? 0);
+    if (changes > 0) stats.imported += 1;
+    else stats.skipped += 1;
   }
   return stats;
 }
@@ -451,6 +576,7 @@ export async function importMemoryBackup(
   body: Record<string, unknown>,
   options: ImportOptions = {}
 ): Promise<MemoryBackupImportResult> {
+  await ensureEntityResolutionDataModel(db);
   const rawSchemaVersion = body.schemaVersion == null ? 4 : Number(body.schemaVersion);
   if (!Number.isFinite(rawSchemaVersion) || rawSchemaVersion < 4) {
     throw new Error("Unsupported memory backup schemaVersion");
@@ -652,6 +778,124 @@ export async function importMemoryBackup(
     )
   );
 
+  graph.entityAliases = await importTable(db, rowsFor(body, "entityAliases"), (row) =>
+    db.prepare(
+      `${insertVerb(mode)} INTO sb_entity_aliases (
+         id, entity_id, alias, alias_normalized, source_observation_id,
+         confidence, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "id"),
+      requiredText(row, "entity_id"),
+      requiredText(row, "alias"),
+      textOrDefault(row, "alias_normalized", requiredText(row, "alias").toLowerCase()),
+      textOrNull(row, "source_observation_id"),
+      numberOrNull(row, "confidence"),
+      intOrDefault(row, "created_at", Date.now()),
+      intOrDefault(row, "updated_at", Date.now())
+    )
+  );
+
+  graph.entityAliasSources = await importTable(db, rowsFor(body, "entityAliasSources"), (row) =>
+    db.prepare(
+      `${insertVerb(mode)} INTO sb_entity_alias_sources (
+         id, alias_id, observation_id, relation, created_at
+       ) VALUES (?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "id"),
+      requiredText(row, "alias_id"),
+      requiredText(row, "observation_id"),
+      textOrDefault(row, "relation", "supports"),
+      intOrDefault(row, "created_at", Date.now())
+    )
+  );
+
+  graph.entityExternalIds = await importTable(db, rowsFor(body, "entityExternalIds"), (row) =>
+    db.prepare(
+      `${insertVerb(mode)} INTO sb_entity_external_ids (
+         id, entity_id, provider, external_id, source_observation_id,
+         created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "id"),
+      requiredText(row, "entity_id"),
+      requiredText(row, "provider"),
+      requiredText(row, "external_id"),
+      textOrNull(row, "source_observation_id"),
+      intOrDefault(row, "created_at", Date.now()),
+      intOrDefault(row, "updated_at", Date.now())
+    )
+  );
+
+  graph.entityExternalIdSources = await importTable(db, rowsFor(body, "entityExternalIdSources"), (row) =>
+    db.prepare(
+      `${insertVerb(mode)} INTO sb_entity_external_id_sources (
+         id, external_id_id, observation_id, relation, created_at
+       ) VALUES (?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "id"),
+      requiredText(row, "external_id_id"),
+      requiredText(row, "observation_id"),
+      textOrDefault(row, "relation", "supports"),
+      intOrDefault(row, "created_at", Date.now())
+    )
+  );
+
+  graph.entityEmbeddings = await importTable(db, rowsFor(body, "entityEmbeddings"), (row) =>
+    db.prepare(
+      `${insertVerb(mode)} INTO sb_entity_embeddings (
+         entity_id, embedding_fingerprint, embedding_json, dimensions, updated_at
+       ) VALUES (?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "entity_id"),
+      requiredText(row, "embedding_fingerprint"),
+      jsonText(row, "embedding_json", "[]"),
+      intOrDefault(row, "dimensions", 0),
+      intOrDefault(row, "updated_at", Date.now())
+    )
+  );
+
+  graph.entityMergeCandidates = await importTable(db, rowsFor(body, "entityMergeCandidates"), (row) =>
+    db.prepare(
+      `${insertVerb(mode)} INTO sb_entity_merge_candidates (
+         id, source_entity_id, target_entity_id, matched_by, score,
+         reason_json, state, source_observation_id, reviewed_by, reviewed_at,
+         created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "id"),
+      requiredText(row, "source_entity_id"),
+      requiredText(row, "target_entity_id"),
+      textOrDefault(row, "matched_by", "semantic"),
+      numberOrNull(row, "score"),
+      jsonText(row, "reason_json", "[]"),
+      textOrDefault(row, "state", "pending"),
+      textOrNull(row, "source_observation_id"),
+      textOrNull(row, "reviewed_by"),
+      numberOrNull(row, "reviewed_at"),
+      intOrDefault(row, "created_at", Date.now()),
+      intOrDefault(row, "updated_at", Date.now())
+    )
+  );
+
+  graph.entityMergeHistory = await importTable(db, rowsFor(body, "entityMergeHistory"), (row) =>
+    db.prepare(
+      `${insertVerb(mode)} INTO sb_entity_merge_history (
+         id, source_entity_id, target_entity_id, candidate_id, actor_type,
+         reason, snapshot_json, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "id"),
+      requiredText(row, "source_entity_id"),
+      requiredText(row, "target_entity_id"),
+      textOrNull(row, "candidate_id"),
+      textOrDefault(row, "actor_type", "import"),
+      textOrNull(row, "reason"),
+      jsonText(row, "snapshot_json", "{}"),
+      intOrDefault(row, "created_at", Date.now())
+    )
+  );
+
   graph.memoryEntities = await importTable(db, rowsFor(body, "memoryEntities"), (row) =>
     db.prepare(
       `${insertVerb(mode)} INTO sb_memory_entities (
@@ -672,9 +916,10 @@ export async function importMemoryBackup(
       `${insertVerb(mode)} INTO sb_entity_relations (
          id, from_entity_id, to_entity_id, relation_type, fact, fact_hash,
          evidence_count, memory_id, observation_id, score,
-         valid_from, valid_to, invalid_at, expired_at,
-         reference_time, metadata_json, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         valid_from, valid_to, invalid_at, expired_at, reference_time,
+         scope_id, polarity, modality, resolution_type, resolution_state,
+         supersedes_relation_id, metadata_json, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       requiredText(row, "id"),
       requiredText(row, "from_entity_id"),
@@ -691,7 +936,35 @@ export async function importMemoryBackup(
       numberOrNull(row, "invalid_at"),
       numberOrNull(row, "expired_at"),
       numberOrNull(row, "reference_time"),
+      textOrNull(row, "scope_id"),
+      textOrDefault(row, "polarity", "positive"),
+      textOrDefault(row, "modality", "asserted"),
+      textOrDefault(row, "resolution_type", "coexists"),
+      textOrDefault(row, "resolution_state", "active"),
+      textOrNull(row, "supersedes_relation_id"),
       jsonText(row, "metadata_json", "{}"),
+      intOrDefault(row, "created_at", Date.now())
+    )
+  );
+
+  graph.factResolutions = await importTable(db, rowsFor(body, "factResolutions"), (row) =>
+    db.prepare(
+      `${insertVerb(mode)} INTO sb_fact_resolutions (
+         id, relation_id, target_relation_id, resolution_type, confidence,
+         reason_codes_json, requires_review, applied_invalidation,
+         source_memory_id, target_memory_id, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "id"),
+      requiredText(row, "relation_id"),
+      textOrNull(row, "target_relation_id"),
+      textOrDefault(row, "resolution_type", "uncertain"),
+      numberOrNull(row, "confidence"),
+      jsonText(row, "reason_codes_json", "[]"),
+      intOrDefault(row, "requires_review", 0),
+      intOrDefault(row, "applied_invalidation", 0),
+      textOrNull(row, "source_memory_id"),
+      textOrNull(row, "target_memory_id"),
       intOrDefault(row, "created_at", Date.now())
     )
   );
@@ -815,10 +1088,18 @@ export async function importMemoryBackup(
     )
   );
 
+  const integrity = await inspectMemoryBackupIntegrity(db);
+  if (!integrity.ok) {
+    const broken = Object.entries(integrity.issues)
+      .filter(([, count]) => count > 0)
+      .map(([key, count]) => `${key}=${count}`)
+      .join(", ");
+    throw new Error(`Imported backup failed integrity validation: ${broken}`);
+  }
   return {
     ...entryResult,
     schemaVersion: MEMORY_BACKUP_SCHEMA_VERSION,
     graph,
-    integrity: await inspectMemoryBackupIntegrity(db),
+    integrity,
   };
 }

@@ -98,10 +98,13 @@ import {
   prepareAtomicMemoryInsert,
   prepareMemorySourceInsert,
   prepareObservationInsert,
+  PromptAtomicExtractor,
+  isValidEvidenceRevisionLink,
   replaceEntryAtomicMemory,
   ATOMIC_EXTRACTION_MAX_TOKENS,
   ATOMIC_EXTRACTION_VERSION,
   type AtomicFactDraft,
+  type EvidenceRevisionInput,
   type ObservationExtractionStatus,
 } from "./memory/atomic";
 import {
@@ -112,6 +115,7 @@ import {
 } from "./memory/backup";
 import {
   attachEntitiesToMemory,
+  ensureEntityResolutionDataModel,
   getEntityGraph,
   listActiveEntityRelations,
   listEntities,
@@ -1203,6 +1207,26 @@ interface ObsidianLinkedEntryRow extends ObsidianLinkRow {
   classification_version: number | null;
   revision_id: string | null;
   memory_status: MemoryStatus | null;
+  knowledge_entities: ObsidianKnowledgeEntity[];
+  knowledge_facts: ObsidianKnowledgeFact[];
+  knowledge_projection_hash: string | null;
+}
+
+interface ObsidianKnowledgeEntity {
+  id: string;
+  name: string;
+  entityType: string | null;
+}
+
+interface ObsidianKnowledgeFact {
+  relationId: string;
+  statement: string;
+  fromName: string;
+  predicate: string;
+  toName: string;
+  scopeId: string | null;
+  resolutionType: string;
+  requiresReview: boolean;
 }
 
 interface AutomationRuleRow {
@@ -1450,6 +1474,24 @@ function yamlScalar(value: unknown): string {
   return JSON.stringify(String(value ?? ""));
 }
 
+export function sanitizeObsidianGeneratedText(
+  value: unknown,
+  mode: "text" | "wikilink" = "text"
+): string {
+  const singleLine = String(value ?? "")
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 500);
+  if (mode === "wikilink") {
+    return singleLine.replace(/[\[\]|#^]/g, "").replace(/[<>]/g, "").trim();
+  }
+  return singleLine
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/([\\`*_{}\[\]()#+.!|-])/g, "\\$1");
+}
+
 function obsidianFrontmatter(input: {
   type: string;
   entryId: string;
@@ -1461,6 +1503,8 @@ function obsidianFrontmatter(input: {
   tags: string[];
   path: string;
   sourceFile?: string | null;
+  entities?: string[];
+  factResolutions?: string[];
 }): string {
   const lines = [
     "---",
@@ -1475,6 +1519,15 @@ function obsidianFrontmatter(input: {
     `singularity_path: ${yamlScalar(input.path)}`,
     `source_file: ${yamlScalar(input.sourceFile ?? input.path)}`,
     "managed_by: singularity",
+    ...(input.entities?.length
+      ? ["singularity_entities:", ...input.entities.map((entity) => `- ${yamlScalar(entity)}`)]
+      : []),
+    ...(input.factResolutions?.length
+      ? [
+          "singularity_fact_resolutions:",
+          ...input.factResolutions.map((resolution) => `- ${yamlScalar(resolution)}`),
+        ]
+      : []),
     "tags:",
     ...input.tags.map((tag) => `- ${yamlScalar(tag)}`),
     "---",
@@ -1495,6 +1548,7 @@ async function buildObsidianSyncEtag(input: {
   metadataHash?: string | null;
   status?: MemoryStatus | null;
   classificationVersion?: number | null;
+  knowledgeProjectionHash?: string | null;
 }): Promise<string> {
   const payload = JSON.stringify({
     objectType: input.objectType,
@@ -1504,6 +1558,7 @@ async function buildObsidianSyncEtag(input: {
     metadataHash: input.metadataHash ?? "",
     status: input.status ?? "",
     classificationVersion: input.classificationVersion ?? "",
+    knowledgeProjectionHash: input.knowledgeProjectionHash ?? "",
   });
   return `sync2_${await contentFingerprint(payload)}`;
 }
@@ -1522,8 +1577,31 @@ function markdownForObsidian(row: ObsidianLinkedEntryRow, syncEtag?: string | nu
     tags: ["singularity", ...tags],
     path: row.external_path,
     sourceFile: row.external_file_id,
+    entities: row.knowledge_entities.map((entity) => entity.name),
+    factResolutions: row.knowledge_facts.map(
+      (fact) => `${fact.statement} [${fact.resolutionType}]`
+    ),
   });
-  return `${frontmatter}${row.content}`;
+  const sections: string[] = [];
+  if (row.knowledge_entities.length > 0) {
+    sections.push(
+      "## 关联实体",
+      ...row.knowledge_entities.map((entity) =>
+        `- [[${sanitizeObsidianGeneratedText(entity.name, "wikilink")}]]`
+      )
+    );
+  }
+  if (row.knowledge_facts.length > 0) {
+    sections.push(
+      "## 事实解析",
+      ...row.knowledge_facts.map((fact) =>
+        `- ${sanitizeObsidianGeneratedText(fact.statement)} [${sanitizeObsidianGeneratedText(fact.resolutionType)}]${fact.requiresReview ? " (待审核)" : ""}`
+      )
+    );
+  }
+  return sections.length > 0
+    ? `${frontmatter}${row.content}\n\n${sections.join("\n")}`
+    : `${frontmatter}${row.content}`;
 }
 
 async function latestMemoryRevisionId(
@@ -1553,6 +1631,7 @@ async function memorySyncEtagFromRow(row: {
   memory_status?: MemoryStatus | null;
   status?: MemoryStatus | null;
   classification_version?: string | number | null;
+  knowledge_projection_hash?: string | null;
 }): Promise<string> {
   const classificationVersion =
     row.classification_version == null ? null : Number(row.classification_version);
@@ -1564,6 +1643,7 @@ async function memorySyncEtagFromRow(row: {
     metadataHash: row.metadata_hash ?? null,
     status: row.memory_status ?? row.status ?? null,
     classificationVersion: Number.isFinite(classificationVersion) ? classificationVersion : null,
+    knowledgeProjectionHash: row.knowledge_projection_hash ?? null,
   });
 }
 
@@ -1985,6 +2065,10 @@ async function serializeObsidianPullRow(row: ObsidianLinkedEntryRow): Promise<Re
       singularity_kind: "semantic",
       singularity_source: row.source,
       singularity_synced_at: new Date(row.updated_at).toISOString(),
+      singularity_entities: row.knowledge_entities.map((entity) => entity.name),
+      singularity_fact_resolutions: row.knowledge_facts.map(
+        (fact) => `${fact.statement} [${fact.resolutionType}]`
+      ),
       tags: entryTags,
     },
   };
@@ -2252,6 +2336,8 @@ async function processQueuedObsidianObservation(
 ): Promise<void> {
   const row = await env.DB.prepare(
     `SELECT id, content, source, metadata_json, created_at, content_hash,
+            previous_evidence_id, root_evidence_id, source_identity,
+            source_channel, revision,
             extraction_status, extraction_version, extraction_attempts,
             extraction_error, next_attempt_at, processing_started_at,
             processed_at, needs_reprocess
@@ -2716,6 +2802,127 @@ async function handleObsidianPush(
   });
 }
 
+type ObsidianKnowledgeProjection = {
+  entities: ObsidianKnowledgeEntity[];
+  facts: ObsidianKnowledgeFact[];
+  hash: string | null;
+};
+
+async function loadObsidianKnowledgeProjections(
+  env: Env,
+  entryIds: string[]
+): Promise<Map<string, ObsidianKnowledgeProjection>> {
+  const ids = [...new Set(entryIds.filter(Boolean))];
+  const projections = new Map<string, ObsidianKnowledgeProjection>();
+  if (ids.length === 0) return projections;
+  await ensureEntityResolutionDataModel(env.DB);
+  const placeholders = ids.map(() => "?").join(",");
+  const activeClaimPredicate = `
+    m.invalid_at IS NULL
+    AND m.expired_at IS NULL
+    AND m.claim_status IN ('supported', 'confirmed', 'contested')
+    AND (m.content_hash IS NULL OR en.content_hash IS NULL OR m.content_hash = en.content_hash)
+    AND EXISTS (
+      SELECT 1
+      FROM sb_parent_version_claims pvc
+      JOIN sb_parent_versions pv ON pv.version_id = pvc.parent_version_id
+      JOIN sb_parent_units pu
+        ON pu.parent_id = pv.parent_id
+       AND pu.active_version_id = pv.version_id
+      WHERE pvc.memory_id = m.id
+        AND pvc.relation = 'supports'
+        AND pv.state IN ('active', 'active_degraded')
+    )
+    AND EXISTS (
+      SELECT 1
+      FROM sb_memory_sources ms
+      WHERE ms.memory_id = m.id
+        AND ms.relation IN ('supports', 'derived_from')
+    )`;
+  const entityRows = await env.DB.prepare(
+    `SELECT DISTINCT en.id AS entry_id, e.id, e.name, e.entity_type
+     FROM entries en
+     JOIN sb_memories m ON m.entry_id = en.id
+     JOIN sb_memory_entities me ON me.memory_id = m.id
+     JOIN sb_entities e ON e.id = me.entity_id
+     WHERE en.id IN (${placeholders})
+       AND ${activeClaimPredicate}
+     ORDER BY en.id ASC, lower(e.name) ASC, e.id ASC`
+  ).bind(...ids).all<{ entry_id: string; id: string; name: string; entity_type: string | null }>();
+  const factRows = await env.DB.prepare(
+    `SELECT en.id AS entry_id, r.id, r.fact, r.relation_type, r.scope_id,
+            r.resolution_type AS stored_resolution_type,
+            fe.name AS from_name, te.name AS to_name,
+            fr.resolution_type, fr.requires_review
+     FROM entries en
+     JOIN sb_memories m ON m.entry_id = en.id
+     JOIN sb_fact_sources rfs ON rfs.memory_id = m.id
+     JOIN sb_entity_relations r ON r.id = rfs.relation_id
+     JOIN sb_entities fe ON fe.id = r.from_entity_id
+     JOIN sb_entities te ON te.id = r.to_entity_id
+     LEFT JOIN sb_fact_resolutions fr ON fr.id = (
+       SELECT latest.id
+       FROM sb_fact_resolutions latest
+       WHERE latest.relation_id = r.id
+       ORDER BY latest.created_at DESC, latest.id DESC
+       LIMIT 1
+     )
+     WHERE en.id IN (${placeholders})
+       AND r.invalid_at IS NULL
+       AND r.expired_at IS NULL
+       AND r.resolution_state = 'active'
+       AND ${activeClaimPredicate}
+     ORDER BY en.id ASC, r.created_at DESC, r.id ASC`
+  ).bind(...ids).all<{
+    entry_id: string;
+    id: string;
+    fact: string | null;
+    relation_type: string;
+    scope_id: string | null;
+    stored_resolution_type: string | null;
+    from_name: string;
+    to_name: string;
+    resolution_type: string | null;
+    requires_review: number | null;
+  }>();
+  for (const entryId of ids) {
+    const entities = (entityRows.results ?? [])
+      .filter((entity) => entity.entry_id === entryId)
+      .slice(0, 100)
+      .map((entity) => ({
+        id: entity.id,
+        name: entity.name,
+        entityType: entity.entity_type,
+      }));
+    const facts = (factRows.results ?? [])
+      .filter((fact) => fact.entry_id === entryId)
+      .slice(0, 100)
+      .map((fact) => ({
+        relationId: fact.id,
+        statement: fact.fact?.trim() || `${fact.from_name} ${fact.relation_type} ${fact.to_name}`,
+        fromName: fact.from_name,
+        predicate: fact.relation_type,
+        toName: fact.to_name,
+        scopeId: fact.scope_id,
+        resolutionType: fact.resolution_type ?? fact.stored_resolution_type ?? "coexists",
+        requiresReview: Number(fact.requires_review ?? 0) === 1,
+      }));
+    const hash = entities.length || facts.length
+      ? await contentFingerprint(JSON.stringify({ entities, facts }))
+      : null;
+    projections.set(entryId, { entities, facts, hash });
+  }
+  return projections;
+}
+
+async function loadObsidianKnowledgeProjection(
+  env: Env,
+  entryId: string
+): Promise<ObsidianKnowledgeProjection> {
+  const projections = await loadObsidianKnowledgeProjections(env, [entryId]);
+  return projections.get(entryId) ?? { entities: [], facts: [], hash: null };
+}
+
 async function loadObsidianLinkedEntryByLink(
   env: Env,
   link: ObsidianLinkRow
@@ -2744,9 +2951,13 @@ async function loadObsidianLinkedEntryByLink(
   ).bind(link.id, OBSIDIAN_PROVIDER).first<Record<string, any>>();
   if (!row) return null;
   const tags = parseEntryTagsJson(row.tags as string | null);
+  const projection = await loadObsidianKnowledgeProjection(env, String(row.entry_id));
   return {
     ...(row as ObsidianLinkedEntryRow),
     memory_status: getStatus(tags),
+    knowledge_entities: projection.entities,
+    knowledge_facts: projection.facts,
+    knowledge_projection_hash: projection.hash,
   };
 }
 
@@ -7115,7 +7326,8 @@ async function buildGraphRecallSignals(
             COALESCE(r.reference_time, m.reference_time) AS reference_time,
             fe.name AS from_name, te.name AS to_name
      FROM sb_entity_relations r
-     JOIN sb_memories m ON m.id = r.memory_id
+     LEFT JOIN sb_fact_sources rfs ON rfs.relation_id = r.id
+     JOIN sb_memories m ON m.id = COALESCE(rfs.memory_id, r.memory_id)
      JOIN sb_entities fe ON fe.id = r.from_entity_id
      JOIN sb_entities te ON te.id = r.to_entity_id
      WHERE (r.from_entity_id IN (${relationWhere}) OR r.to_entity_id IN (${relationWhere}))
@@ -7123,6 +7335,7 @@ async function buildGraphRecallSignals(
        AND (r.expired_at IS NULL OR r.expired_at > ?)
        AND (r.valid_from IS NULL OR r.valid_from <= ?)
        AND (r.valid_to IS NULL OR r.valid_to > ?)
+       AND COALESCE(r.resolution_state, 'active') = 'active'
        AND m.entry_id IS NOT NULL
        AND (m.invalid_at IS NULL OR m.invalid_at > ?)
        AND (m.expired_at IS NULL OR m.expired_at > ?)
@@ -8568,17 +8781,33 @@ async function listAuditEvents(
   }));
 }
 
-export async function extractAtomicFacts(content: string, env: Env): Promise<AtomicFactDraft[]> {
-  let text: string;
+export async function extractAtomicFacts(
+  content: string,
+  env: Env,
+  input: { evidenceId?: string; previousEvidence?: EvidenceRevisionInput[] } = {}
+): Promise<AtomicFactDraft[]> {
+  const extractor = new PromptAtomicExtractor(async (prompt, maxTokens) => {
+    let text: string;
+    try {
+      text = await (await createLLM(env)).chat(
+        [{ role: "user", content: prompt }],
+        { max_tokens: maxTokens }
+      );
+    } catch {
+      throw new Error("provider_error");
+    }
+    return text;
+  });
   try {
-    text = await (await createLLM(env)).chat(
-      [{ role: "user", content: buildAtomicExtractionPrompt(content) }],
-      { max_tokens: ATOMIC_EXTRACTION_MAX_TOKENS }
-    );
-  } catch {
-    throw new Error("provider_error");
+    return await extractor.extract({
+      id: input.evidenceId ?? "unbound-evidence",
+      content,
+      previousEvidence: input.previousEvidence ?? [],
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message === "provider_error") throw error;
+    throw error;
   }
-  return parseAtomicExtraction(text);
 }
 
 const ATOMIC_EXTRACTION_MAX_ATTEMPTS = 3;
@@ -8603,6 +8832,11 @@ interface ObservationExtractionRow {
   processing_started_at: number | null;
   processed_at: number | null;
   needs_reprocess: number;
+  previous_evidence_id?: string | null;
+  root_evidence_id?: string | null;
+  source_identity?: string | null;
+  source_channel?: string | null;
+  revision?: number | null;
 }
 
 type ObservationExtractionProcessResult =
@@ -9038,6 +9272,82 @@ async function captureExtractedFactsFromObservation(
   return { status: "batch", observationId: row.id, results };
 }
 
+async function loadPreviousEvidenceRevisions(
+  env: Env,
+  current: ObservationExtractionRow,
+  limit = 5
+): Promise<EvidenceRevisionInput[]> {
+  const revisions: EvidenceRevisionInput[] = [];
+  const seen = new Set<string>();
+  let cursor = current.previous_evidence_id ?? null;
+  const vaultIdFromMetadata = (metadataJson: string | null | undefined): string | null => {
+    try {
+      const value = JSON.parse(metadataJson || "{}") as Record<string, unknown>;
+      return typeof value.vault_id === "string" ? value.vault_id : null;
+    } catch {
+      return null;
+    }
+  };
+  let currentLink: EvidenceRevisionInput = {
+    id: current.id,
+    content: current.content,
+    rootEvidenceId: current.root_evidence_id ?? current.id,
+    sourceIdentity: current.source_identity ?? null,
+    sourceChannel: current.source_channel ?? current.source,
+    revision: current.revision ?? null,
+    vaultId: vaultIdFromMetadata(current.metadata_json),
+  };
+  while (cursor && revisions.length < limit && !seen.has(cursor)) {
+    seen.add(cursor);
+    const row = await env.DB.prepare(
+      `SELECT id, content, content_hash, source_timestamp, previous_evidence_id,
+              root_evidence_id, source_identity, source_channel, revision, metadata_json
+       FROM sb_observations
+       WHERE id = ?
+       LIMIT 1`
+    ).bind(cursor).first<{
+      id: string;
+      content: string;
+      source_timestamp: number | null;
+      previous_evidence_id: string | null;
+      content_hash: string | null;
+      root_evidence_id: string | null;
+      source_identity: string | null;
+      source_channel: string | null;
+      revision: number | null;
+      metadata_json: string;
+    }>();
+    if (!row) break;
+    const previousLink: EvidenceRevisionInput = {
+      id: row.id,
+      content: row.content,
+      sourceTimestamp: row.source_timestamp,
+      rootEvidenceId: row.root_evidence_id,
+      sourceIdentity: row.source_identity,
+      sourceChannel: row.source_channel,
+      revision: row.revision,
+      vaultId: vaultIdFromMetadata(row.metadata_json),
+    };
+    if (!isValidEvidenceRevisionLink(currentLink, previousLink)) {
+      console.warn("Evidence revision lineage mismatch; previous context ignored", {
+        currentEvidenceId: currentLink.id,
+        previousEvidenceId: row.id,
+      });
+      break;
+    }
+    if (row.content_hash && await contentFingerprint(row.content) !== row.content_hash) {
+      console.warn("Evidence revision content hash mismatch; previous context ignored", {
+        previousEvidenceId: row.id,
+      });
+      break;
+    }
+    revisions.push(previousLink);
+    currentLink = previousLink;
+    cursor = row.previous_evidence_id;
+  }
+  return revisions;
+}
+
 async function processObservationExtraction(
   row: ObservationExtractionRow,
   env: Env,
@@ -9056,7 +9366,10 @@ async function processObservationExtraction(
 
   let facts: AtomicFactDraft[];
   try {
-    facts = await extractAtomicFacts(processingRow.content, env);
+    facts = await extractAtomicFacts(processingRow.content, env, {
+      evidenceId: processingRow.id,
+      previousEvidence: await loadPreviousEvidenceRevisions(env, processingRow),
+    });
   } catch (error) {
     const message = atomicExtractionErrorMessage(error);
     const now = Date.now();
@@ -9145,6 +9458,8 @@ export async function processExtractionQueue(
 
   const { results } = await env.DB.prepare(
     `SELECT id, content, source, metadata_json, created_at, content_hash,
+            previous_evidence_id, root_evidence_id, source_identity,
+            source_channel, revision,
             extraction_status, extraction_version, extraction_attempts,
             extraction_error, next_attempt_at, processing_started_at,
             processed_at, needs_reprocess
@@ -9415,6 +9730,7 @@ async function dualWriteAtomicMemory(
 
     // Entity graph dual-write (mentions + optional temporal fact edges).
     if (input.atomic?.entities?.length || input.atomic?.relations?.length) {
+      let entityEmbeddingSnapshot: Promise<ActiveEmbeddingSnapshot> | null = null;
       await attachEntitiesToMemory(env.DB, {
         memoryId,
         observationId: input.observationId,
@@ -9424,6 +9740,21 @@ async function dualWriteAtomicMemory(
         validFrom: input.atomic.validFrom ?? null,
         validTo: input.atomic.validTo ?? null,
         referenceTime: input.atomic.referenceTime ?? null,
+        scopeId: input.atomic.scopeId ?? null,
+        polarity: input.atomic.polarity ?? "positive",
+        modality: input.atomic.modality ?? "asserted",
+        resolveEntityEmbeddings: async (names) => {
+          entityEmbeddingSnapshot ??= loadActiveEmbeddingSnapshot(env);
+          const snapshot = await entityEmbeddingSnapshot;
+          const vectors = await embedManyWithProvider(snapshot.provider, names, "document");
+          if (vectors.length !== names.length) {
+            throw new Error("Entity embedding batch size mismatch");
+          }
+          return {
+            embeddings: new Map(names.map((name, index) => [name, vectors[index]])),
+            fingerprint: snapshot.fingerprint,
+          };
+        },
         createdAt: input.createdAt,
       });
     }
@@ -11103,11 +11434,23 @@ const defaultHandler = {
          LIMIT ?`
       ).bind(...bindings).all();
       const pageRows = ((results ?? []) as Record<string, any>[]).slice(0, limit);
+      const knowledgeByEntry = await loadObsidianKnowledgeProjections(
+        env,
+        pageRows.map((row) => String(row.entry_id ?? "")).filter(Boolean)
+      );
       const items = await Promise.all(pageRows.map((row) => {
         const tags = parseEntryTagsJson(row.tags as string | null);
+        const projection = knowledgeByEntry.get(String(row.entry_id)) ?? {
+          entities: [],
+          facts: [],
+          hash: null,
+        };
         return serializeObsidianPullRow({
           ...(row as ObsidianLinkedEntryRow),
           memory_status: getStatus(tags),
+          knowledge_entities: projection.entities,
+          knowledge_facts: projection.facts,
+          knowledge_projection_hash: projection.hash,
         });
       }));
       const hasMore = (results ?? []).length > limit;

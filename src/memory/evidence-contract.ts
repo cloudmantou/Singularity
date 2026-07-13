@@ -94,6 +94,7 @@ export const OBSERVATION_EVIDENCE_MIGRATIONS = [
 ] as const;
 
 export const MEMORY_CLAIM_MIGRATIONS = [
+  { column: "expired_at", statement: `ALTER TABLE sb_memories ADD COLUMN expired_at INTEGER` },
   { column: "parent_version_id", statement: `ALTER TABLE sb_memories ADD COLUMN parent_version_id TEXT` },
   { column: "claim_subject", statement: `ALTER TABLE sb_memories ADD COLUMN claim_subject TEXT` },
   { column: "claim_predicate", statement: `ALTER TABLE sb_memories ADD COLUMN claim_predicate TEXT` },

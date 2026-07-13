@@ -5,6 +5,20 @@
  *                              → EntityRelation (fact edges with validity)
  */
 
+import {
+  D1EntityResolver,
+  ENTITY_RESOLUTION_SCHEMA_STATEMENTS,
+  type EntityExternalId,
+} from "./entity-resolution";
+import {
+  FACT_RESOLUTION_SCHEMA_STATEMENTS,
+} from "./fact-resolution";
+import { insertEntityRelation as insertResolvedEntityRelation } from "./fact-resolution-store";
+export {
+  normalizeEntityFactKey,
+  temporalWindowsOverlap,
+} from "./fact-resolution-store";
+
 export const ENTITY_TYPE_VALUES = [
   "person",
   "project",
@@ -42,81 +56,6 @@ export function normalizeEntityName(name: string): string {
     .toLowerCase();
 }
 
-export function normalizeEntityFactKey(fact: string | null | undefined): string {
-  return (fact ?? "")
-    .trim()
-    .replace(/\s+/g, " ")
-    .toLowerCase()
-    .slice(0, 500);
-}
-
-function stableHash(input: string): string {
-  let h1 = 0xdeadbeef;
-  let h2 = 0x41c6ce57;
-  for (let i = 0; i < input.length; i++) {
-    const ch = input.charCodeAt(i);
-    h1 = Math.imul(h1 ^ ch, 2654435761);
-    h2 = Math.imul(h2 ^ ch, 1597334677);
-  }
-  h1 =
-    Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^
-    Math.imul(h2 ^ (h2 >>> 13), 3266489909);
-  h2 =
-    Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^
-    Math.imul(h1 ^ (h1 >>> 13), 3266489909);
-  return `${(h2 >>> 0).toString(16).padStart(8, "0")}${(h1 >>> 0)
-    .toString(16)
-    .padStart(8, "0")}`;
-}
-
-function entityRelationFactHash(input: {
-  fromEntityId: string;
-  toEntityId: string;
-  relationType: EntityRelationType;
-  fact?: string | null;
-}): string {
-  return stableHash(
-    [
-      input.fromEntityId,
-      input.toEntityId,
-      input.relationType,
-      normalizeEntityFactKey(input.fact),
-    ].join("\u001f")
-  );
-}
-
-function finiteOrNull(value: number | null | undefined): number | null {
-  return value == null || !Number.isFinite(Number(value)) ? null : Number(value);
-}
-
-function temporalPointOrNull(input: {
-  validFrom?: number | null;
-  validTo?: number | null;
-  referenceTime?: number | null;
-}): { from: number | null; to: number | null } {
-  const validFrom = finiteOrNull(input.validFrom);
-  const validTo = finiteOrNull(input.validTo);
-  const referenceTime = finiteOrNull(input.referenceTime);
-  if (validFrom == null && validTo == null && referenceTime != null) {
-    return { from: referenceTime, to: referenceTime };
-  }
-  return { from: validFrom, to: validTo };
-}
-
-export function temporalWindowsOverlap(
-  aFrom: number | null | undefined,
-  aTo: number | null | undefined,
-  bFrom: number | null | undefined,
-  bTo: number | null | undefined,
-  toleranceMs = 86_400_000
-): boolean {
-  const aStart = finiteOrNull(aFrom) ?? Number.NEGATIVE_INFINITY;
-  const aEnd = finiteOrNull(aTo) ?? Number.POSITIVE_INFINITY;
-  const bStart = finiteOrNull(bFrom) ?? Number.NEGATIVE_INFINITY;
-  const bEnd = finiteOrNull(bTo) ?? Number.POSITIVE_INFINITY;
-  return aStart <= bEnd + toleranceMs && bStart <= aEnd + toleranceMs;
-}
-
 export function normalizeEntityType(raw: unknown): EntityType | null {
   if (typeof raw !== "string") return null;
   const v = raw.trim().toLowerCase().replace(/\s+/g, "_");
@@ -144,6 +83,8 @@ export function normalizeEntityRelationType(raw: unknown): EntityRelationType {
 export interface EntityDraft {
   name: string;
   entityType: EntityType | null;
+  aliases?: string[];
+  externalIds?: EntityExternalId[];
 }
 
 export interface EntityRelationDraft {
@@ -176,6 +117,17 @@ export function parseEntityList(raw: unknown): EntityDraft[] {
       out.push({
         name,
         entityType: normalizeEntityType((item as any).type ?? (item as any).entity_type),
+        aliases: Array.isArray((item as any).aliases)
+          ? (item as any).aliases.map(String).map((alias: string) => alias.trim()).filter(Boolean).slice(0, 16)
+          : [],
+        externalIds: Array.isArray((item as any).external_ids)
+          ? (item as any).external_ids.flatMap((externalId: unknown) => {
+              if (!externalId || typeof externalId !== "object") return [];
+              const provider = String((externalId as any).provider ?? "").trim();
+              const value = String((externalId as any).value ?? (externalId as any).id ?? "").trim();
+              return provider && value ? [{ provider, value }] : [];
+            }).slice(0, 16)
+          : [],
       });
     }
     if (out.length >= 16) break;
@@ -250,6 +202,12 @@ export const ENTITY_SCHEMA_STATEMENTS = [
     invalid_at INTEGER,
     expired_at INTEGER,
     reference_time INTEGER,
+    scope_id TEXT,
+    polarity TEXT NOT NULL DEFAULT 'positive',
+    modality TEXT NOT NULL DEFAULT 'asserted',
+    resolution_type TEXT NOT NULL DEFAULT 'coexists',
+    resolution_state TEXT NOT NULL DEFAULT 'active',
+    supersedes_relation_id TEXT,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     created_at INTEGER NOT NULL
   )`,
@@ -297,16 +255,24 @@ export async function ensureEntityDataModel(db: D1Database): Promise<void> {
        COALESCE(observation_id, '')
      )`
   );
-  for (const alter of [
-    `ALTER TABLE sb_memories ADD COLUMN reference_time INTEGER`,
-    `ALTER TABLE sb_memories ADD COLUMN invalid_at INTEGER`,
-    `ALTER TABLE sb_memories ADD COLUMN expired_at INTEGER`,
-    `ALTER TABLE sb_entity_relations ADD COLUMN expired_at INTEGER`,
-    `ALTER TABLE sb_entity_relations ADD COLUMN fact_hash TEXT`,
-    `ALTER TABLE sb_entity_relations ADD COLUMN evidence_count INTEGER NOT NULL DEFAULT 1`,
+  const relationColumns = await db.prepare(
+    `PRAGMA table_info(sb_entity_relations)`
+  ).all<{ name: string }>();
+  const existingColumns = new Set((relationColumns.results ?? []).map((row) => row.name));
+  for (const migration of [
+    { column: "expired_at", sql: `ALTER TABLE sb_entity_relations ADD COLUMN expired_at INTEGER` },
+    { column: "fact_hash", sql: `ALTER TABLE sb_entity_relations ADD COLUMN fact_hash TEXT` },
+    { column: "evidence_count", sql: `ALTER TABLE sb_entity_relations ADD COLUMN evidence_count INTEGER NOT NULL DEFAULT 1` },
+    { column: "scope_id", sql: `ALTER TABLE sb_entity_relations ADD COLUMN scope_id TEXT` },
+    { column: "polarity", sql: `ALTER TABLE sb_entity_relations ADD COLUMN polarity TEXT NOT NULL DEFAULT 'positive'` },
+    { column: "modality", sql: `ALTER TABLE sb_entity_relations ADD COLUMN modality TEXT NOT NULL DEFAULT 'asserted'` },
+    { column: "resolution_type", sql: `ALTER TABLE sb_entity_relations ADD COLUMN resolution_type TEXT NOT NULL DEFAULT 'coexists'` },
+    { column: "resolution_state", sql: `ALTER TABLE sb_entity_relations ADD COLUMN resolution_state TEXT NOT NULL DEFAULT 'active'` },
+    { column: "supersedes_relation_id", sql: `ALTER TABLE sb_entity_relations ADD COLUMN supersedes_relation_id TEXT` },
   ]) {
+    if (existingColumns.has(migration.column)) continue;
     try {
-      await db.exec(alter);
+      await db.exec(migration.sql);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (!/duplicate column name|already exists/i.test(message)) throw error;
@@ -316,48 +282,47 @@ export async function ensureEntityDataModel(db: D1Database): Promise<void> {
     `CREATE INDEX IF NOT EXISTS idx_sb_entity_relations_fact_hash
       ON sb_entity_relations(from_entity_id, to_entity_id, relation_type, fact_hash)`
   );
+  await db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_sb_entity_relations_resolution
+      ON sb_entity_relations(from_entity_id, relation_type, scope_id, resolution_state, created_at DESC)`
+  );
+}
+
+/** Heavy resolver tables are initialized only when resolution-backed features run. */
+export async function ensureEntityResolutionDataModel(db: D1Database): Promise<void> {
+  const resolutionSchemaExists = await db.prepare(
+    `SELECT 1 FROM sqlite_master
+     WHERE type = 'table' AND name = 'sb_entity_aliases'
+     LIMIT 1`
+  ).first<{ "1": number }>();
+  if (!resolutionSchemaExists) {
+    await db.exec(
+      [...ENTITY_RESOLUTION_SCHEMA_STATEMENTS, ...FACT_RESOLUTION_SCHEMA_STATEMENTS].join(";\n")
+    );
+  }
 }
 
 export async function upsertEntity(
   db: D1Database,
   draft: EntityDraft,
-  now: number
+  now: number,
+  context: {
+    observationId?: string | null;
+    embedding?: number[] | null;
+    embeddingFingerprint?: string | null;
+  } = {}
 ): Promise<{ id: string; name: string; created: boolean }> {
-  const name = draft.name.trim();
-  const nameNormalized = normalizeEntityName(name);
-  const existing = await db
-    .prepare(
-      `SELECT id, name, entity_type, mention_count FROM sb_entities WHERE name_normalized = ?`
-    )
-    .bind(nameNormalized)
-    .first<{ id: string; name: string; entity_type: string | null; mention_count: number }>();
-
-  if (existing) {
-    const nextType = draft.entityType ?? existing.entity_type;
-    await db
-      .prepare(
-        `UPDATE sb_entities
-         SET mention_count = COALESCE(mention_count, 0) + 1,
-             entity_type = COALESCE(?, entity_type),
-             updated_at = ?
-         WHERE id = ?`
-      )
-      .bind(nextType, now, existing.id)
-      .run();
-    return { id: existing.id, name: existing.name, created: false };
-  }
-
-  const id = crypto.randomUUID();
-  await db
-    .prepare(
-      `INSERT INTO sb_entities (
-         id, name, name_normalized, entity_type, aliases_json, metadata_json,
-         mention_count, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, '[]', '{}', 1, ?, ?)`
-    )
-    .bind(id, name, nameNormalized, draft.entityType, now, now)
-    .run();
-  return { id, name, created: true };
+  const resolved = await new D1EntityResolver(db).resolve(draft, {
+    now,
+    observationId: context.observationId ?? null,
+    embedding: context.embedding ?? null,
+    embeddingFingerprint: context.embeddingFingerprint ?? null,
+  });
+  return {
+    id: resolved.entityId,
+    name: resolved.canonicalName,
+    created: resolved.created,
+  };
 }
 
 export async function linkMemoryEntity(
@@ -388,181 +353,6 @@ export async function linkMemoryEntity(
     .run();
 }
 
-async function insertFactSource(
-  db: D1Database,
-  input: {
-    relationId: string;
-    memoryId?: string | null;
-    observationId?: string | null;
-    createdAt: number;
-  }
-): Promise<boolean> {
-  const result = await db
-    .prepare(
-      `INSERT OR IGNORE INTO sb_fact_sources (
-         id, relation_id, memory_id, observation_id, created_at
-       ) VALUES (?, ?, ?, ?, ?)`
-    )
-    .bind(
-      crypto.randomUUID(),
-      input.relationId,
-      input.memoryId ?? null,
-      input.observationId ?? null,
-      input.createdAt
-    )
-    .run();
-  return Number(result.meta?.changes ?? 0) > 0;
-}
-
-export async function insertEntityRelation(
-  db: D1Database,
-  input: {
-    fromEntityId: string;
-    toEntityId: string;
-    relationType: EntityRelationType;
-    fact?: string | null;
-    memoryId?: string | null;
-    observationId?: string | null;
-    score?: number | null;
-    validFrom?: number | null;
-    validTo?: number | null;
-    invalidAt?: number | null;
-    expiredAt?: number | null;
-    referenceTime?: number | null;
-    metadata?: Record<string, unknown>;
-    createdAt: number;
-  }
-): Promise<string> {
-  const factKey = normalizeEntityFactKey(input.fact);
-  const factHash = entityRelationFactHash(input);
-  const inputWindow = temporalPointOrNull(input);
-  const existingRows = await db
-    .prepare(
-      `SELECT id, valid_from, valid_to, reference_time
-       FROM sb_entity_relations
-       WHERE from_entity_id = ?
-         AND to_entity_id = ?
-         AND relation_type = ?
-         AND (
-           fact_hash = ?
-           OR (fact_hash IS NULL AND lower(trim(COALESCE(fact, ''))) = ?)
-         )
-         AND invalid_at IS NULL
-         AND expired_at IS NULL
-       ORDER BY created_at DESC
-       LIMIT 20`
-    )
-    .bind(
-      input.fromEntityId,
-      input.toEntityId,
-      input.relationType,
-      factHash,
-      factKey
-    )
-    .all<{ id: string; valid_from: number | null; valid_to: number | null; reference_time: number | null }>();
-  const existing = (existingRows.results ?? []).find((row) => {
-    const rowWindow = temporalPointOrNull({
-      validFrom: row.valid_from,
-      validTo: row.valid_to,
-      referenceTime: row.reference_time,
-    });
-    return temporalWindowsOverlap(
-      rowWindow.from,
-      rowWindow.to,
-      inputWindow.from,
-      inputWindow.to
-    );
-  });
-  if (existing?.id) {
-    const sourceInserted = await insertFactSource(db, {
-      relationId: existing.id,
-      memoryId: input.memoryId ?? null,
-      observationId: input.observationId ?? null,
-      createdAt: input.createdAt,
-    });
-    await db
-      .prepare(
-        `UPDATE sb_entity_relations
-         SET fact_hash = COALESCE(fact_hash, ?),
-             evidence_count = CASE
-               WHEN ? = 1 THEN COALESCE(evidence_count, 1) + 1
-               ELSE COALESCE(evidence_count, 1)
-             END,
-             score = CASE
-               WHEN ? IS NULL THEN score
-               WHEN score IS NULL OR score < ? THEN ?
-               ELSE score
-             END,
-             valid_from = CASE
-               WHEN valid_from IS NULL THEN ?
-               WHEN ? IS NULL THEN valid_from
-               ELSE MIN(valid_from, ?)
-             END,
-             valid_to = CASE
-               WHEN valid_to IS NULL THEN ?
-               WHEN ? IS NULL THEN valid_to
-               ELSE MAX(valid_to, ?)
-             END,
-             reference_time = COALESCE(reference_time, ?)
-         WHERE id = ?`
-      )
-      .bind(
-        factHash,
-        sourceInserted ? 1 : 0,
-        input.score ?? null,
-        input.score ?? null,
-        input.score ?? null,
-        input.validFrom ?? null,
-        input.validFrom ?? null,
-        input.validFrom ?? null,
-        input.validTo ?? null,
-        input.validTo ?? null,
-        input.validTo ?? null,
-        input.referenceTime ?? null,
-        existing.id
-      )
-      .run();
-    return existing.id;
-  }
-
-  const id = crypto.randomUUID();
-  await db
-    .prepare(
-      `INSERT INTO sb_entity_relations (
-         id, from_entity_id, to_entity_id, relation_type, fact, fact_hash, evidence_count,
-         memory_id, observation_id, score,
-         valid_from, valid_to, invalid_at, expired_at, reference_time,
-         metadata_json, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .bind(
-      id,
-      input.fromEntityId,
-      input.toEntityId,
-      input.relationType,
-      input.fact?.trim() || null,
-      factHash,
-      1,
-      input.memoryId ?? null,
-      input.observationId ?? null,
-      input.score ?? null,
-      input.validFrom ?? null,
-      input.validTo ?? null,
-      input.invalidAt ?? null,
-      input.expiredAt ?? null,
-      input.referenceTime ?? null,
-      JSON.stringify(input.metadata ?? {}),
-      input.createdAt
-    )
-    .run();
-  await insertFactSource(db, {
-    relationId: id,
-    memoryId: input.memoryId ?? null,
-    observationId: input.observationId ?? null,
-    createdAt: input.createdAt,
-  });
-  return id;
-}
 
 /** Upsert entities, link to memory, and write optional fact edges. */
 export async function attachEntitiesToMemory(
@@ -576,15 +366,41 @@ export async function attachEntitiesToMemory(
     validFrom?: number | null;
     validTo?: number | null;
     referenceTime?: number | null;
+    scopeId?: string | null;
+    polarity?: string | null;
+    modality?: string | null;
+    resolveEntityEmbeddings?: (names: string[]) => Promise<{
+      embeddings: Map<string, number[]>;
+      fingerprint: string;
+    } | null>;
     createdAt: number;
   }
 ): Promise<{ entityIds: string[]; relationIds: string[] }> {
+  await ensureEntityResolutionDataModel(db);
   const entityIds: string[] = [];
   const byNormalized = new Map<string, string>();
+  const entityResolver = new D1EntityResolver(db);
+  const names = [...new Set(input.entities.map((draft) => draft.name.trim()).filter(Boolean))];
+  const embeddingBatch = input.resolveEntityEmbeddings
+    ? await input.resolveEntityEmbeddings(names).catch(() => null)
+    : null;
 
   for (const draft of input.entities) {
-    const upserted = await upsertEntity(db, draft, input.createdAt);
+    const resolved = await entityResolver.resolve(draft, {
+      now: input.createdAt,
+      observationId: input.observationId ?? null,
+      embedding: embeddingBatch?.embeddings.get(draft.name.trim()) ?? null,
+      embeddingFingerprint: embeddingBatch?.fingerprint ?? null,
+    });
+    const upserted = {
+      id: resolved.entityId,
+      name: resolved.canonicalName,
+      created: resolved.created,
+    };
     byNormalized.set(normalizeEntityName(draft.name), upserted.id);
+    for (const alias of draft.aliases ?? []) {
+      byNormalized.set(normalizeEntityName(alias), upserted.id);
+    }
     entityIds.push(upserted.id);
     await linkMemoryEntity(db, {
       memoryId: input.memoryId,
@@ -628,7 +444,7 @@ export async function attachEntitiesToMemory(
       });
     }
     if (fromId === toId) continue;
-    const relationId = await insertEntityRelation(db, {
+    const relationId = await insertResolvedEntityRelation(db, {
       fromEntityId: fromId,
       toEntityId: toId,
       relationType: rel.relationType,
@@ -639,6 +455,9 @@ export async function attachEntitiesToMemory(
       validFrom: input.validFrom ?? null,
       validTo: input.validTo ?? null,
       referenceTime: input.referenceTime ?? null,
+      scopeId: input.scopeId ?? null,
+      polarity: input.polarity ?? "positive",
+      modality: input.modality ?? "asserted",
       createdAt: input.createdAt,
     });
     relationIds.push(relationId);
@@ -650,7 +469,7 @@ export async function attachEntitiesToMemory(
     const unique = [...new Set(entityIds)];
     for (let i = 0; i < unique.length; i++) {
       for (let j = i + 1; j < unique.length; j++) {
-        const relationId = await insertEntityRelation(db, {
+        const relationId = await insertResolvedEntityRelation(db, {
           fromEntityId: unique[i],
           toEntityId: unique[j],
           relationType: "related_to",
@@ -661,6 +480,9 @@ export async function attachEntitiesToMemory(
           validFrom: input.validFrom ?? null,
           validTo: input.validTo ?? null,
           referenceTime: input.referenceTime ?? null,
+          scopeId: input.scopeId ?? null,
+          polarity: input.polarity ?? "positive",
+          modality: input.modality ?? "asserted",
           metadata: { automatic: true, co_mention: true },
           createdAt: input.createdAt,
         });
@@ -779,6 +601,15 @@ export async function listActiveEntityRelations(
          WHERE (r.from_entity_id = ? OR r.to_entity_id = ?)
            AND r.invalid_at IS NULL
            AND r.expired_at IS NULL
+           AND r.resolution_state = 'active'
+           AND EXISTS (
+             SELECT 1
+             FROM sb_fact_sources fs
+             JOIN sb_memories m ON m.id = fs.memory_id
+             WHERE fs.relation_id = r.id
+               AND m.invalid_at IS NULL
+               AND m.expired_at IS NULL
+           )
            AND (r.valid_from IS NULL OR r.valid_from <= ?)
            AND (r.valid_to IS NULL OR r.valid_to > ?)
          ORDER BY r.created_at DESC
@@ -796,6 +627,15 @@ export async function listActiveEntityRelations(
        JOIN sb_entities te ON te.id = r.to_entity_id
        WHERE r.invalid_at IS NULL
          AND r.expired_at IS NULL
+         AND r.resolution_state = 'active'
+         AND EXISTS (
+           SELECT 1
+           FROM sb_fact_sources fs
+           JOIN sb_memories m ON m.id = fs.memory_id
+           WHERE fs.relation_id = r.id
+             AND m.invalid_at IS NULL
+             AND m.expired_at IS NULL
+         )
          AND (r.valid_from IS NULL OR r.valid_from <= ?)
          AND (r.valid_to IS NULL OR r.valid_to > ?)
        ORDER BY r.created_at DESC
