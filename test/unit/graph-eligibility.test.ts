@@ -101,6 +101,13 @@ describe("graph Claim eligibility", () => {
     await seedFact({ suffix: "review", targetId: "entity-review", parentState: "active", entryHash: "hash-review", claimHash: "hash-review" });
     await seedFact({ suffix: "terminal", targetId: "entity-terminal", parentState: "active", entryHash: "hash-terminal", claimHash: "hash-terminal" });
     await seedFact({ suffix: "orphan", targetId: "entity-orphan", parentState: null, entryHash: "hash-orphan", claimHash: "hash-orphan" });
+    await seedFact({ suffix: "orphan-active", targetId: "entity-orphan", parentState: "active", entryHash: "hash-orphan-active", claimHash: "hash-orphan-active" });
+    raw.prepare(
+      `UPDATE sb_parent_versions SET activated_at = 1 WHERE version_id = 'version-orphan-active'`
+    ).run();
+    raw.prepare(
+      `UPDATE sb_parent_units SET active_version_id = NULL WHERE parent_id = 'parent-orphan-active'`
+    ).run();
     raw.prepare(`UPDATE sb_entity_relations SET resolution_state = 'review' WHERE id = 'relation-review'`).run();
     raw.prepare(`UPDATE sb_memories SET claim_status = 'superseded' WHERE id = 'claim-terminal'`).run();
 
@@ -113,5 +120,39 @@ describe("graph Claim eligibility", () => {
       "claim-active",
       "claim-review",
     ]);
+  });
+
+  it("selects the Parent version that was active at the requested time", async () => {
+    await seedFact({ suffix: "history-old", targetId: "entity-active", parentState: "active", entryHash: "hash-old", claimHash: "hash-old" });
+    await seedFact({ suffix: "history-new", targetId: "entity-review", parentState: "active", entryHash: "hash-new", claimHash: "hash-new" });
+
+    raw.prepare(
+      `UPDATE sb_parent_versions
+       SET version_number = 2, activated_at = 200
+       WHERE version_id = 'version-history-new'`
+    ).run();
+    raw.prepare(
+      `UPDATE sb_parent_versions
+       SET parent_id = 'parent-history-new', state = 'superseded',
+           activated_at = 100, superseded_at = 200
+       WHERE version_id = 'version-history-old'`
+    ).run();
+    raw.prepare(`DELETE FROM sb_parent_units WHERE parent_id = 'parent-history-old'`).run();
+    raw.prepare(
+      `UPDATE sb_memories
+       SET claim_status = 'superseded', invalid_at = 200
+       WHERE id = 'claim-history-old'`
+    ).run();
+    raw.prepare(
+      `UPDATE sb_entity_relations
+       SET resolution_state = 'superseded', invalid_at = 200
+       WHERE id = 'relation-history-old'`
+    ).run();
+
+    const beforeSupersession = await listActiveEntityRelations(db, { asOf: 150, limit: 20 });
+    expect(beforeSupersession.map((fact) => fact.id)).toEqual(["relation-history-old"]);
+
+    const afterSupersession = await listActiveEntityRelations(db, { asOf: 250, limit: 20 });
+    expect(afterSupersession.map((fact) => fact.id)).toEqual(["relation-history-new"]);
   });
 });

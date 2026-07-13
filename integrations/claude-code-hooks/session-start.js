@@ -1,21 +1,22 @@
 #!/usr/bin/env node
 'use strict';
 
+const { readProjectContext } = require('./context.cjs');
+
 async function main() {
   const baseUrl = process.env.SECOND_BRAIN_URL;
   const token = process.env.SECOND_BRAIN_TOKEN;
   if (!baseUrl || !token) return;
 
-  const cwd = process.cwd();
-  const parts = cwd.replace(/\\/g, '/').split('/').filter(Boolean);
-  const projectName = parts[parts.length - 1] ?? 'project';
-  const query = `${projectName} recent context decisions and facts`;
+  const project = readProjectContext(process.cwd());
+  const query = `User is continuing work on ${project.repository} branch ${project.branch}. Recall current project status, confirmed decisions, unresolved problems, and established workflows.`;
 
   let data;
   try {
     const url = new URL('/recall', baseUrl);
     url.searchParams.set('q', query);
-    url.searchParams.set('topK', '5');
+    url.searchParams.set('topK', '8');
+    url.searchParams.set('hops', '1');
     const res = await fetch(url.toString(), {
       headers: { Authorization: `Bearer ${token}` },
     });
@@ -29,13 +30,21 @@ async function main() {
   if (!results.length) return;
 
   const formatted = results
-    .slice(0, 5)
-    .map((r, i) => `${i + 1}. ${String(r.content ?? '').trim()}`)
+    .slice(0, 8)
+    .map((r, i) => {
+      const association = r.association
+        ? ` [association:${r.association.viaType || r.association.via_type}, ${r.association.hop} hop]`
+        : '';
+      return `${i + 1}.${association} ${String(r.content ?? '').trim()}`;
+    })
     .filter(line => line.length > 3)
     .join('\n');
 
   if (formatted) {
-    process.stdout.write(`[Singularity] Context recalled:\n${formatted}\n`);
+    const conflicts = Array.isArray(data?.conflicts) && data.conflicts.length
+      ? `\nUnresolved conflicts: ${data.conflicts.map((item) => item.id).join(', ')}`
+      : '';
+    process.stdout.write(`[Singularity] ${project.repository}@${project.branch} context:\n${formatted}${conflicts}\n`);
   }
 }
 

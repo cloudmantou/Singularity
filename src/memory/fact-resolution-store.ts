@@ -354,6 +354,11 @@ export async function resolveAndInsertEntityRelation(
       effectiveAt: input.createdAt,
       actorType: "system",
       actorId: "fact-resolver",
+    }, {
+      pendingSourcePair: {
+        claimId: input.memoryId,
+        relationId,
+      },
     }));
   }
   if (
@@ -371,6 +376,7 @@ export async function resolveAndInsertEntityRelation(
     const oldEntryId = entryByClaim.get(resolution.targetMemoryId);
     const newEntryId = entryByClaim.get(input.memoryId);
     if (oldEntryId && newEntryId) {
+      const conflictId = crypto.randomUUID();
       statements.push(
         db.prepare(
           `INSERT OR IGNORE INTO sb_conflict_cases (
@@ -379,9 +385,23 @@ export async function resolveAndInsertEntityRelation(
              resolved_by, resolved_at, created_at
            ) VALUES (?, ?, ?, ?, ?, 'fact_resolution', ?, ?, 'pending', NULL, NULL, NULL, ?)`
         ).bind(
-          crypto.randomUUID(), oldEntryId, newEntryId,
+          conflictId, oldEntryId, newEntryId,
           resolution.targetMemoryId, input.memoryId,
           resolution.reasonCodes.join(","), resolution.confidence, input.createdAt
+        ),
+        db.prepare(
+          `UPDATE sb_memories
+           SET claim_status = 'contested'
+           WHERE id IN (?, ?)
+             AND claim_status IN ('supported', 'confirmed', 'contested')
+             AND EXISTS (
+               SELECT 1 FROM sb_conflict_cases pending_conflict
+               WHERE pending_conflict.id = ? AND pending_conflict.state = 'pending'
+             )`
+        ).bind(
+          resolution.targetMemoryId,
+          input.memoryId,
+          conflictId
         )
       );
     }

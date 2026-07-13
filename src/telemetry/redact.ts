@@ -54,6 +54,8 @@ export function shouldSuppressRequestBodyTelemetry(pathname: string): boolean {
     p.startsWith("/settings/oauth/") ||
     p === "/import" ||
     p === "/capture" ||
+    p === "/integrations/development-session/capture" ||
+    p === "/integrations/obsidian/push" ||
     p === "/append" ||
     p === "/update" ||
     p === "/chat"
@@ -71,6 +73,21 @@ function simpleHash(s: string): string {
 
 export function routeToOperation(method: string, pathname: string): string {
   const p = pathname.replace(/\/+$/, "") || "/";
+  if (p === "/integrations/development-session/capture" && method === "POST") {
+    return "integration.development_session.capture";
+  }
+  if (p === "/integrations/obsidian/push" && method === "POST") return "integration.obsidian.push";
+  if (p === "/integrations/obsidian/pull" && method === "GET") return "integration.obsidian.pull";
+  if (p === "/integrations/providers" && method === "GET") return "integration.providers";
+  if ((p === "/link" || p === "/associations/link") && method === "POST") {
+    return "association.link";
+  }
+  if ((p === "/unlink" || p === "/associations/unlink") && method === "POST") {
+    return "association.unlink";
+  }
+  if ((p === "/connections" || p === "/associations/connections") && method === "GET") {
+    return "association.connections";
+  }
   if (p === "/capture" && method === "POST") return "memory.capture";
   if (p === "/recall" && method === "GET") return "memory.recall";
   if (p === "/append" && method === "POST") return "memory.append";
@@ -90,5 +107,6 @@ export function routeToOperation(method: string, pathname: string): string {
   if (p === "/count") return "memory.count";
   if (p === "/stats") return "memory.stats";
   if (p === "/health") return "health";
+  if (p === "/health/details") return "health.details";
   return `${method.toLowerCase()}${p.replace(/\//g, ".")}`;
 }

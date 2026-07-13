@@ -210,6 +210,14 @@ export interface PreparedComplianceAuditEvent {
   statement: D1PreparedStatement;
 }
 
+export interface ComplianceAuditChainVerification {
+  valid: boolean;
+  complete: boolean;
+  events: number;
+  checked: number;
+  error?: string;
+}
+
 function boundedText(value: unknown, max = 512): string | null {
   if (value == null) return null;
   const text = String(value).trim();
@@ -255,6 +263,65 @@ async function latestAuditEventHash(db: D1Database): Promise<string | null> {
      LIMIT 1`
   ).first<{ event_hash: string }>();
   return boundedText(row?.event_hash, 128);
+}
+
+export async function verifyComplianceAuditChain(
+  db: D1Database,
+  maxEvents = 256
+): Promise<ComplianceAuditChainVerification> {
+  const events = Number((await db.prepare(
+    `SELECT COUNT(*) AS count FROM sb_audit_events`
+  ).first<{ count: number }>())?.count ?? 0);
+  const limit = Math.max(1, Math.min(Math.trunc(maxEvents), 1000));
+  const rows = (await db.prepare(
+    `SELECT id, occurred_at, trace_id, actor_type, actor_id, token_id,
+            action, object_type, object_id, vault_id, before_hash, after_hash,
+            success, error_code, metadata_json, previous_event_hash, event_hash
+     FROM sb_audit_events
+     ORDER BY occurred_at DESC, id DESC
+     LIMIT ?`
+  ).bind(limit).all<PreparedComplianceAuditEvent["record"]>()).results ?? [];
+
+  for (let index = 0; index < rows.length; index++) {
+    const row = rows[index];
+    const expected = await sha256Hex(stableJson({ ...row, event_hash: "" }));
+    if (expected !== row.event_hash) {
+      return {
+        valid: false,
+        complete: events <= rows.length,
+        events,
+        checked: index + 1,
+        error: "event_hash_mismatch",
+      };
+    }
+  }
+
+  const knownHashes = new Set(rows.map((row) => row.event_hash));
+  const missingPredecessors = [...new Set(rows
+    .map((row) => row.previous_event_hash)
+    .filter((hash): hash is string => Boolean(hash) && !knownHashes.has(hash!)))];
+  for (let offset = 0; offset < missingPredecessors.length; offset += 80) {
+    const batch = missingPredecessors.slice(offset, offset + 80);
+    const placeholders = batch.map(() => "?").join(", ");
+    const existing = await db.prepare(
+      `SELECT event_hash FROM sb_audit_events WHERE event_hash IN (${placeholders})`
+    ).bind(...batch).all<{ event_hash: string }>();
+    for (const row of existing.results ?? []) knownHashes.add(row.event_hash);
+  }
+  const invalidPredecessor = rows.find((row) =>
+    row.previous_event_hash === row.event_hash ||
+    (row.previous_event_hash !== null && !knownHashes.has(row.previous_event_hash))
+  );
+  if (invalidPredecessor) {
+    return {
+      valid: false,
+      complete: events <= rows.length,
+      events,
+      checked: rows.indexOf(invalidPredecessor) + 1,
+      error: "previous_event_hash_missing",
+    };
+  }
+  return { valid: true, complete: events <= rows.length, events, checked: rows.length };
 }
 
 export function prepareMemoryMergeCandidate(

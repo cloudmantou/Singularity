@@ -341,6 +341,10 @@ describe("resolution persistence", () => {
       old_claim_id: "claim-old",
       new_claim_id: "claim-new",
     });
+    expect(raw.prepare(`SELECT id, claim_status FROM sb_memories ORDER BY id`).all()).toEqual([
+      { id: "claim-new", claim_status: "contested" },
+      { id: "claim-old", claim_status: "contested" },
+    ]);
   });
 
   it("does not auto-invalidate from an ordinary high-confidence user-written note", async () => {

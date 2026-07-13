@@ -57,6 +57,8 @@ export const EVIDENCE_CONTRACT_SCHEMA_STATEMENTS = [
     summary TEXT,
     state TEXT NOT NULL DEFAULT 'building',
     summary_vector_ids TEXT NOT NULL DEFAULT '[]',
+    activated_at INTEGER,
+    superseded_at INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     CHECK (state IN ('building', 'active', 'active_degraded', 'superseded', 'failed')),
@@ -68,7 +70,6 @@ export const EVIDENCE_CONTRACT_SCHEMA_STATEMENTS = [
     ON sb_parent_versions(source_observation_id)`,
   `CREATE INDEX IF NOT EXISTS idx_parent_versions_state
     ON sb_parent_versions(state, updated_at DESC)`,
-
   `CREATE TABLE IF NOT EXISTS sb_parent_version_claims (
     parent_version_id TEXT NOT NULL,
     memory_id TEXT NOT NULL,
@@ -80,6 +81,11 @@ export const EVIDENCE_CONTRACT_SCHEMA_STATEMENTS = [
     ON sb_parent_version_claims(memory_id, parent_version_id)`,
   `CREATE INDEX IF NOT EXISTS idx_parent_version_claims_parent
     ON sb_parent_version_claims(parent_version_id, relation, created_at DESC)`,
+] as const;
+
+export const PARENT_VERSION_TEMPORAL_MIGRATIONS = [
+  { column: "activated_at", statement: `ALTER TABLE sb_parent_versions ADD COLUMN activated_at INTEGER` },
+  { column: "superseded_at", statement: `ALTER TABLE sb_parent_versions ADD COLUMN superseded_at INTEGER` },
 ] as const;
 
 export const OBSERVATION_EVIDENCE_MIGRATIONS = [
@@ -117,6 +123,8 @@ export const MEMORY_SOURCE_PROVENANCE_MIGRATIONS = [
 ] as const;
 
 export const EVIDENCE_CONTRACT_INDEX_STATEMENTS = [
+  `CREATE INDEX IF NOT EXISTS idx_parent_versions_active_window
+    ON sb_parent_versions(parent_id, activated_at, superseded_at)`,
   `CREATE INDEX IF NOT EXISTS idx_observations_evidence_root
     ON sb_observations(root_evidence_id, revision DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_observations_source_identity
@@ -278,11 +286,12 @@ export function prepareParentVersionActivation(
   return [
     db.prepare(
       `UPDATE sb_parent_versions
-       SET state = ?, updated_at = ?
+       SET state = ?, activated_at = COALESCE(activated_at, ?),
+           superseded_at = NULL, updated_at = ?
        WHERE parent_id = ?
          AND version_id = ?
          AND state = 'building'`
-    ).bind(nextState, input.updatedAt, input.parentId, input.versionId),
+    ).bind(nextState, input.updatedAt, input.updatedAt, input.parentId, input.versionId),
     db.prepare(
       `UPDATE sb_parent_units
        SET active_version_id = ?, updated_at = ?
@@ -297,7 +306,9 @@ export function prepareParentVersionActivation(
     ).bind(input.versionId, input.updatedAt, input.parentId, input.versionId, input.parentId),
     db.prepare(
       `UPDATE sb_parent_versions
-       SET state = 'superseded', updated_at = ?
+       SET state = 'superseded', activated_at = COALESCE(activated_at, created_at),
+           superseded_at = COALESCE(superseded_at, ?),
+           updated_at = ?
        WHERE parent_id = ?
          AND state IN ('active', 'active_degraded')
          AND version_id <> ?
@@ -307,7 +318,7 @@ export function prepareParentVersionActivation(
            WHERE parent_id = ?
              AND active_version_id = ?
          )`
-    ).bind(input.updatedAt, input.parentId, input.versionId, input.parentId, input.versionId),
+    ).bind(input.updatedAt, input.updatedAt, input.parentId, input.versionId, input.parentId, input.versionId),
   ];
 }
 

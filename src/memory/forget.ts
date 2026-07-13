@@ -1,4 +1,5 @@
 import { prepareMemoryRevision } from "./revisions";
+import { ensureAssociationDataModel } from "./associations";
 
 const DERIVED_RELATION_TYPES = ["digest_of", "derived_from"] as const;
 const QUERY_BATCH_SIZE = 100;
@@ -313,6 +314,25 @@ function prepareDatabaseErase(
     const inList = placeholders(batch.length);
     return [
       db.prepare(
+        `DELETE FROM sb_conflict_cases
+         WHERE old_claim_id IN (${inList}) OR new_claim_id IN (${inList})`
+      ).bind(...batch, ...batch),
+      db.prepare(
+        `DELETE FROM sb_fact_resolutions
+         WHERE source_memory_id IN (${inList})
+            OR target_memory_id IN (${inList})
+            OR relation_id IN (
+              SELECT relation_id FROM sb_fact_sources WHERE memory_id IN (${inList})
+              UNION
+              SELECT id FROM sb_entity_relations WHERE memory_id IN (${inList})
+            )
+            OR target_relation_id IN (
+              SELECT relation_id FROM sb_fact_sources WHERE memory_id IN (${inList})
+              UNION
+              SELECT id FROM sb_entity_relations WHERE memory_id IN (${inList})
+            )`
+      ).bind(...batch, ...batch, ...batch, ...batch, ...batch, ...batch),
+      db.prepare(
         `UPDATE sb_entity_relations
          SET evidence_count = (
                SELECT COUNT(*) FROM sb_fact_sources
@@ -410,13 +430,75 @@ function prepareDatabaseErase(
              SELECT parent_id FROM sb_parent_versions
            )`
       ),
+      db.prepare(
+        `DELETE FROM sb_association_edges
+         WHERE source_parent_id NOT IN (SELECT parent_id FROM sb_parent_units)
+            OR target_parent_id NOT IN (SELECT parent_id FROM sb_parent_units)`
+      ),
       db.prepare(`DELETE FROM sb_memories WHERE id IN (${inList})`).bind(...batch),
     ];
   });
-  const observationStatements = chunks(atomicGraph.observationIds, DELETE_BATCH_SIZE).map(batch => {
+  const observationStatements = chunks(atomicGraph.observationIds, DELETE_BATCH_SIZE).flatMap(batch => {
     const inList = placeholders(batch.length);
-    return db
-      .prepare(
+    return [
+      db.prepare(
+        `DELETE FROM sb_entity_aliases
+         WHERE source_observation_id IN (${inList})
+           AND NOT EXISTS (
+             SELECT 1 FROM sb_entity_alias_sources source_keep
+             WHERE source_keep.alias_id = sb_entity_aliases.id
+               AND source_keep.observation_id NOT IN (${inList})
+           )`
+      ).bind(...batch, ...batch),
+      db.prepare(
+        `UPDATE sb_entity_aliases
+         SET source_observation_id = (
+           SELECT source_keep.observation_id
+           FROM sb_entity_alias_sources source_keep
+           WHERE source_keep.alias_id = sb_entity_aliases.id
+             AND source_keep.observation_id NOT IN (${inList})
+           ORDER BY source_keep.created_at ASC
+           LIMIT 1
+         )
+         WHERE source_observation_id IN (${inList})`
+      ).bind(...batch, ...batch),
+      db.prepare(
+        `DELETE FROM sb_entity_alias_sources WHERE observation_id IN (${inList})`
+      ).bind(...batch),
+      db.prepare(
+        `DELETE FROM sb_entity_external_ids
+         WHERE source_observation_id IN (${inList})
+           AND NOT EXISTS (
+             SELECT 1 FROM sb_entity_external_id_sources source_keep
+             WHERE source_keep.external_id_id = sb_entity_external_ids.id
+               AND source_keep.observation_id NOT IN (${inList})
+           )`
+      ).bind(...batch, ...batch),
+      db.prepare(
+        `UPDATE sb_entity_external_ids
+         SET source_observation_id = (
+           SELECT source_keep.observation_id
+           FROM sb_entity_external_id_sources source_keep
+           WHERE source_keep.external_id_id = sb_entity_external_ids.id
+             AND source_keep.observation_id NOT IN (${inList})
+           ORDER BY source_keep.created_at ASC
+           LIMIT 1
+         )
+         WHERE source_observation_id IN (${inList})`
+      ).bind(...batch, ...batch),
+      db.prepare(
+        `DELETE FROM sb_entity_external_id_sources WHERE observation_id IN (${inList})`
+      ).bind(...batch),
+      db.prepare(
+        `DELETE FROM sb_entity_merge_candidates
+         WHERE source_observation_id IN (${inList}) AND state = 'pending'`
+      ).bind(...batch),
+      db.prepare(
+        `UPDATE sb_entity_merge_candidates
+         SET source_observation_id = NULL, updated_at = ?
+         WHERE source_observation_id IN (${inList})`
+      ).bind(Date.now(), ...batch),
+      db.prepare(
         `DELETE FROM sb_observations
          WHERE id IN (${inList})
            AND NOT EXISTS (
@@ -424,11 +506,20 @@ function prepareDatabaseErase(
              WHERE s.observation_id = sb_observations.id
            )`
       )
-      .bind(...batch);
+      .bind(...batch),
+    ];
   });
   const eraseStatements = chunks(ids, DELETE_BATCH_SIZE).flatMap(batch => {
     const inList = placeholders(batch.length);
     return [
+      db.prepare(
+        `DELETE FROM sb_memory_merge_candidates
+         WHERE source_memory_id IN (${inList}) OR target_memory_id IN (${inList})`
+      ).bind(...batch, ...batch),
+      db.prepare(
+        `DELETE FROM sb_conflict_cases
+         WHERE old_memory_id IN (${inList}) OR new_memory_id IN (${inList})`
+      ).bind(...batch, ...batch),
       db
         .prepare(
           `DELETE FROM sb_memory_relations
@@ -459,6 +550,12 @@ export async function forgetMemoryGraph(
   if (!memoryId) return { status: "not_found" };
   const root = await loadTrackedEntry(db, memoryId);
   if (!root) return { status: "not_found" };
+  try {
+    await ensureAssociationDataModel(db);
+  } catch (error) {
+    console.error("Association cleanup preparation failed:", error);
+    return { status: "delete_failed" };
+  }
 
   const closure = await findDerivedClosure(db, memoryId);
   if (!closure) return { status: "delete_failed" };

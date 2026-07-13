@@ -54,13 +54,29 @@ function memoryHasEvidenceSource(db: D1Mock, memory: any): boolean {
   });
 }
 
-function parentVersionIsActivePointer(db: D1Mock, versionId: string | null | undefined): boolean {
+function parentVersionIsEligibleAt(
+  db: D1Mock,
+  versionId: string | null | undefined,
+  asOf: number
+): boolean {
   if (!versionId) return false;
   const parentVersion = db.parentVersions.find((version: any) =>
-    version.version_id === versionId &&
-    (version.state === "active" || version.state === "active_degraded")
+    version.version_id === versionId
   );
   if (!parentVersion) return false;
+  const activatedAt = finiteTime(parentVersion.activated_at);
+  const supersededAt = finiteTime(parentVersion.superseded_at);
+  if (parentVersion.state === "superseded") {
+    return activatedAt != null && activatedAt <= asOf &&
+      supersededAt != null && supersededAt > asOf;
+  }
+  if (
+    supersededAt != null ||
+    !["active", "active_degraded"].includes(String(parentVersion.state)) ||
+    (activatedAt != null && activatedAt > asOf)
+  ) {
+    return false;
+  }
   return db.parentUnits.some((unit: any) =>
     unit.parent_id === parentVersion.parent_id &&
     unit.active_version_id === parentVersion.version_id
@@ -76,15 +92,18 @@ function memoryPassesActiveParentFilter(
   if (!memory) return false;
   if (!isActiveAt(memory, asOf)) return false;
   if (requireSourceEvidence && !memoryHasEvidenceSource(db, memory)) return false;
-  if (!["supported", "confirmed", "contested"].includes(String(memory.claim_status ?? "supported"))) {
+  const claimStatus = String(memory.claim_status ?? "supported");
+  const historicalTerminalClaim = ["superseded", "deprecated"].includes(claimStatus) &&
+    finiteTime(memory.invalid_at) != null && Number(memory.invalid_at) > asOf;
+  if (!["supported", "confirmed", "contested"].includes(claimStatus) && !historicalTerminalClaim) {
     return false;
   }
   const links = db.parentVersionClaims.filter((claim: any) => claim.memory_id === memory.id);
   if (links.length) {
-    return links.some((claim: any) => parentVersionIsActivePointer(db, claim.parent_version_id));
+    return links.some((claim: any) => parentVersionIsEligibleAt(db, claim.parent_version_id, asOf));
   }
   if (memory.parent_version_id == null) return true;
-  return parentVersionIsActivePointer(db, memory.parent_version_id);
+  return parentVersionIsEligibleAt(db, memory.parent_version_id, asOf);
 }
 
 function entryPassesActiveParentFilter(
@@ -531,7 +550,15 @@ export class D1Mock {
           let summary_vector_ids: any = "[]";
           let created_at: any;
           let updated_at: any;
-          if (args.length >= 10) {
+          let activated_at: any = null;
+          let superseded_at: any = null;
+          if (args.length >= 12) {
+            [
+              version_id, parent_id, version_number, source_observation_id,
+              source_snapshot_hash, summary, state, summary_vector_ids,
+              activated_at, superseded_at, created_at, updated_at,
+            ] = args;
+          } else if (args.length >= 10) {
             [
               version_id, parent_id, version_number, source_observation_id,
               source_snapshot_hash, summary, state, summary_vector_ids, created_at, updated_at,
@@ -550,7 +577,8 @@ export class D1Mock {
             if (s.startsWith("INSERT OR REPLACE")) {
               Object.assign(existing, {
                 version_id, parent_id, version_number, source_observation_id,
-                source_snapshot_hash, summary, state, summary_vector_ids, created_at, updated_at,
+                source_snapshot_hash, summary, state, summary_vector_ids,
+                activated_at, superseded_at, created_at, updated_at,
               });
               return { meta: { changes: 1 } };
             }
@@ -559,12 +587,16 @@ export class D1Mock {
           }
           db.parentVersions.push({
             version_id, parent_id, version_number, source_observation_id,
-            source_snapshot_hash, summary, state, summary_vector_ids, created_at, updated_at,
+            source_snapshot_hash, summary, state, summary_vector_ids,
+            activated_at, superseded_at, created_at, updated_at,
           });
           return { meta: { changes: 1 } };
         }
         if (s.startsWith("UPDATE sb_parent_versions SET state = 'superseded'")) {
-          const [updated_at, parent_id, version_id, guard_parent_id, guard_version_id] = args;
+          const hasTemporalWindow = s.includes("superseded_at");
+          const [superseded_at, updated_at, parent_id, version_id, guard_parent_id, guard_version_id] = hasTemporalWindow
+            ? args
+            : [null, ...args];
           if (
             s.includes("EXISTS") &&
             !db.parentUnits.some((unit: any) =>
@@ -582,6 +614,8 @@ export class D1Mock {
               row.version_id !== version_id
             ) {
               row.state = "superseded";
+              if (hasTemporalWindow && row.activated_at == null) row.activated_at = row.created_at;
+              if (hasTemporalWindow && row.superseded_at == null) row.superseded_at = superseded_at;
               row.updated_at = updated_at;
               changes++;
             }
@@ -589,7 +623,10 @@ export class D1Mock {
           return { meta: { changes } };
         }
         if (s.startsWith("UPDATE sb_parent_versions SET state = ?")) {
-          const [state, updated_at, parent_id, version_id] = args;
+          const hasTemporalWindow = s.includes("activated_at");
+          const [state, activated_at, updated_at, parent_id, version_id] = hasTemporalWindow
+            ? args
+            : [args[0], null, args[1], args[2], args[3]];
           const row = db.parentVersions.find((item: any) =>
             item.parent_id === parent_id &&
             item.version_id === version_id &&
@@ -597,6 +634,8 @@ export class D1Mock {
           );
           if (row) {
             row.state = state;
+            if (hasTemporalWindow && row.activated_at == null) row.activated_at = activated_at;
+            if (hasTemporalWindow) row.superseded_at = null;
             row.updated_at = updated_at;
           }
           return { meta: { changes: row ? 1 : 0 } };
@@ -1080,7 +1119,7 @@ export class D1Mock {
           const keepsActiveParentSupport = (memoryId: string) =>
             db.parentVersionClaims.some((claim: any) =>
               String(claim.memory_id) === String(memoryId) &&
-              parentVersionIsActivePointer(db, claim.parent_version_id)
+              parentVersionIsEligibleAt(db, claim.parent_version_id, Number(invalid_at))
             );
           let changes = 0;
           for (const memory of db.memories) {
@@ -1351,6 +1390,41 @@ export class D1Mock {
             Object.assign(row, { state, resolution, resolved_by, resolved_at });
           }
           return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE sb_conflict_cases SET old_claim_id = ?")) {
+          const [old_claim_id, new_claim_id, old_memory_id, new_memory_id] = args;
+          const row = db.conflictCases.find((conflict: any) =>
+            conflict.old_memory_id === old_memory_id &&
+            conflict.new_memory_id === new_memory_id &&
+            conflict.state === "pending" &&
+            conflict.old_claim_id == null &&
+            conflict.new_claim_id == null
+          );
+          if (row) Object.assign(row, { old_claim_id, new_claim_id });
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE sb_memories SET claim_status = 'contested'")) {
+          const [oldClaimId, newClaimId] = args;
+          const conflict = s.includes("old_memory_id = ?")
+            ? db.conflictCases.find((item: any) =>
+                item.old_memory_id === args[2] &&
+                item.new_memory_id === args[3] &&
+                item.old_claim_id === args[4] &&
+                item.new_claim_id === args[5] &&
+                item.state === "pending"
+              )
+            : db.conflictCases.find((item: any) =>
+                item.id === args[2] && item.state === "pending"
+              );
+          if (!conflict) return { meta: { changes: 0 } };
+          let changes = 0;
+          for (const memory of db.memories) {
+            if (memory.id === oldClaimId || memory.id === newClaimId) {
+              memory.claim_status = "contested";
+              changes += 1;
+            }
+          }
+          return { meta: { changes } };
         }
         if (s.startsWith("UPDATE sb_memories SET claim_status = 'superseded'")) {
           const [invalid_at, valid_to, entry_id] = args;
@@ -3102,6 +3176,64 @@ export class D1Mock {
               .slice(0, 20),
           };
         }
+        if (
+          s.includes("SELECT m.id, m.entry_id, m.content, m.claim_status") &&
+          s.includes("FROM sb_memories m") &&
+          (s.includes("WHERE m.entry_id IN") || s.includes("WHERE m.id IN"))
+        ) {
+          const wanted = new Set(args.map(String));
+          const byEntry = s.includes("WHERE m.entry_id IN");
+          const asOf = activePredicateAsOfFromSql(s);
+          return {
+            results: db.memories
+              .filter((memory: any) => wanted.has(String(byEntry ? memory.entry_id : memory.id)))
+              .filter((memory: any) => {
+                const entry = db.entries.find((item: any) => String(item.id) === String(memory.entry_id));
+                return entry &&
+                  entry.content_hash != null &&
+                  memory.content_hash != null &&
+                  String(entry.content_hash) === String(memory.content_hash) &&
+                  memoryPassesActiveParentFilter(db, memory, asOf, true);
+              })
+              .sort((a: any, b: any) =>
+                Number(a.created_at ?? 0) - Number(b.created_at ?? 0) ||
+                String(a.id).localeCompare(String(b.id))
+              )
+              .map((memory: any) => ({
+                id: memory.id,
+                entry_id: memory.entry_id,
+                content: memory.content,
+                claim_status: memory.claim_status ?? "supported",
+              })),
+          };
+        }
+        if (
+          s.includes("SELECT id, old_claim_id, new_claim_id, reason") &&
+          s.includes("FROM sb_conflict_cases") &&
+          s.includes("state = 'pending'")
+        ) {
+          const half = Math.floor(args.length / 2);
+          const wanted = new Set(args.slice(0, half).map(String));
+          return {
+            results: db.conflictCases
+              .filter((conflict: any) =>
+                conflict.state === "pending" &&
+                conflict.old_claim_id != null &&
+                conflict.new_claim_id != null &&
+                (wanted.has(String(conflict.old_claim_id)) || wanted.has(String(conflict.new_claim_id)))
+              )
+              .sort((a: any, b: any) =>
+                Number(a.created_at ?? 0) - Number(b.created_at ?? 0) ||
+                String(a.id).localeCompare(String(b.id))
+              )
+              .map((conflict: any) => ({
+                id: conflict.id,
+                old_claim_id: conflict.old_claim_id,
+                new_claim_id: conflict.new_claim_id,
+                reason: conflict.reason ?? null,
+              })),
+          };
+        }
         if (!s.includes(" LIMIT ") && s.includes("ORDER BY") && !s.includes("json_each")) {
           if (s.includes("FROM sb_scopes")) return { results: [...db.scopes] };
           if (s.includes("FROM sb_parent_units")) return { results: [...db.parentUnits] };
@@ -3901,7 +4033,11 @@ export class D1Mock {
                 );
                 if (!memory) return null;
                 const claim = db.parentVersionClaims.find((item: any) =>
-                  item.memory_id === memory.id && parentVersionIsActivePointer(db, item.parent_version_id)
+                  item.memory_id === memory.id && parentVersionIsEligibleAt(
+                    db,
+                    item.parent_version_id,
+                    activePredicateAsOfFromSql(s)
+                  )
                 );
                 const versionId = claim?.parent_version_id ?? memory.parent_version_id;
                 const version = db.parentVersions.find((parentVersion: any) =>

@@ -209,18 +209,11 @@ async function main() {
     }
   );
 
-  app.get("/health", async () => {
-    const { effective: eff } = await getEffectiveModelSettings(env);
-    return {
-      ok: true,
-      mode: "selfhost",
-      database: databasePath,
-      llm: Boolean(eff.llm.baseURL && eff.llm.apiKey),
-      embedding: Boolean(eff.embedding.baseURL && eff.embedding.apiKey),
-      embeddingProvider: eff.embedding.provider,
-      devEmbedding: isDevLocalProvider(eff.embedding.provider),
-    };
-  });
+  app.get("/health", async () => ({
+    ok: true,
+    status: "healthy",
+    mode: "selfhost",
+  }));
 
   const forwardToWorker = async (req: FastifyRequest, reply: FastifyReply) => {
     await handleWithWorker(req, reply, env);
@@ -294,6 +287,7 @@ async function main() {
         urlPath.startsWith("/export") ||
         urlPath.startsWith("/analytics") ||
         urlPath.startsWith("/config") ||
+        urlPath.startsWith("/health") ||
         urlPath.startsWith("/.well-known");
 
       if (!isApi) {

@@ -94,6 +94,10 @@ describe("memory quality review queues", () => {
         `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sb_parent_versions'`
       ).get() as { sql: string };
       expect(schema.sql).toContain("active_degraded");
+      const parentVersionColumns = db.prepare(`PRAGMA table_info(sb_parent_versions)`).all() as Array<{ name: string }>;
+      expect(parentVersionColumns.map((column) => column.name)).toEqual(
+        expect.arrayContaining(["activated_at", "superseded_at"])
+      );
       expect(db.prepare(`SELECT state FROM sb_parent_versions WHERE version_id = ?`).get("old-version")).toEqual({
         state: "active",
       });
@@ -106,6 +110,99 @@ describe("memory quality review queues", () => {
       expect(db.prepare(`SELECT state FROM sb_parent_versions WHERE version_id = ?`).get("degraded-version")).toEqual({
         state: "active_degraded",
       });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("lists and executes reviewed entity merge candidates", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      const now = Date.now();
+      const emptyList = await json(await worker.fetch(
+        auth("/quality/entity-merge-candidates?state=pending"),
+        env,
+        testCtx()
+      ));
+      expect(emptyList).toMatchObject({ ok: true, count: 0, candidates: [] });
+      const invalidReview = await worker.fetch(
+        auth("/quality/entity-merge-candidates/resolve", {
+          method: "POST",
+          body: JSON.stringify({ id: "entity-merge-1", decision: "accept", unexpected: true }),
+        }),
+        env,
+        testCtx()
+      );
+      expect(invalidReview.status).toBe(400);
+      expect(await invalidReview.json()).toMatchObject({ error: "invalid_entity_merge_review" });
+      db.prepare(
+        `INSERT INTO sb_entities (
+           id, name, name_normalized, entity_type, aliases_json, metadata_json,
+           mention_count, lifecycle_state, created_at, updated_at
+         ) VALUES
+           ('entity-source', '馒头助手 App', '馒头助手 app', 'project', '[]', '{}', 2, 'active', ?, ?),
+           ('entity-target', 'mtzs', 'mtzs', 'project', '[]', '{}', 3, 'active', ?, ?)`
+      ).run(now, now, now, now);
+      db.prepare(
+        `INSERT INTO sb_entity_merge_candidates (
+           id, source_entity_id, target_entity_id, matched_by, score,
+           reason_json, state, created_at, updated_at
+         ) VALUES ('entity-merge-1', 'entity-source', 'entity-target', 'semantic', 0.94,
+                   '["review_required"]', 'pending', ?, ?)`
+      ).run(now, now);
+
+      const list = await json(await worker.fetch(
+        auth("/quality/entity-merge-candidates?state=pending"),
+        env,
+        testCtx()
+      ));
+      expect(list).toMatchObject({
+        ok: true,
+        count: 1,
+        candidates: [{
+          id: "entity-merge-1",
+          sourceEntityId: "entity-source",
+          targetEntityId: "entity-target",
+          state: "pending",
+          source: { name: "馒头助手 App", lifecycleState: "active" },
+          target: { name: "mtzs", lifecycleState: "active" },
+        }],
+      });
+
+      const response = await worker.fetch(
+        auth("/quality/entity-merge-candidates/resolve", {
+          method: "POST",
+          body: JSON.stringify({
+            id: "entity-merge-1",
+            decision: "accept",
+            reviewedBy: "mantou",
+            reason: "same project",
+          }),
+        }),
+        env,
+        testCtx()
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        ok: true,
+        candidateId: "entity-merge-1",
+        sourceEntityId: "entity-source",
+        targetEntityId: "entity-target",
+        state: "merged",
+        reviewedBy: "mantou",
+      });
+      expect(db.prepare(
+        `SELECT lifecycle_state, merged_into_entity_id
+         FROM sb_entities WHERE id = 'entity-source'`
+      ).get()).toEqual({ lifecycle_state: "merged", merged_into_entity_id: "entity-target" });
+      expect(db.prepare(
+        `SELECT state FROM sb_entity_merge_candidates WHERE id = 'entity-merge-1'`
+      ).get()).toEqual({ state: "merged" });
+      expect(db.prepare(
+        `SELECT actor_type, actor_id FROM sb_audit_events
+         WHERE action = 'quality.entity_merge.accept'`
+      ).get()).toEqual({ actor_type: "owner", actor_id: "owner" });
     } finally {
       db.close();
     }
@@ -322,6 +419,30 @@ describe("memory quality review queues", () => {
         testCtx()
       );
       expect(invalidPair.status).toBe(400);
+
+      db.prepare(
+        `UPDATE sb_conflict_cases
+         SET state = 'pending', resolution = NULL, resolved_by = NULL, resolved_at = NULL
+         WHERE id = 'conflict-1'`
+      ).run();
+      const manualWithoutOutcome = await worker.fetch(
+        auth("/quality/conflict-cases/resolve", {
+          method: "POST",
+          body: JSON.stringify({
+            id: "conflict-1",
+            state: "resolved",
+            resolution: "manual",
+          }),
+        }),
+        env,
+        testCtx()
+      );
+      expect(manualWithoutOutcome.status).toBe(400);
+      expect(await manualWithoutOutcome.json()).toMatchObject({
+        error: "manual_resolution_requires_outcome",
+      });
+      expect(db.prepare(`SELECT state, resolution FROM sb_conflict_cases WHERE id = 'conflict-1'`).get())
+        .toEqual({ state: "pending", resolution: null });
     } finally {
       db.close();
     }

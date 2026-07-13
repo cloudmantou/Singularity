@@ -41,6 +41,27 @@ export class ConflictClaimsUnavailableError extends Error {
   }
 }
 
+export class ManualResolutionOutcomeRequiredError extends Error {
+  constructor(readonly conflictId: string) {
+    super(`Conflict ${conflictId} cannot be closed manually without final Claim and Fact outcomes`);
+    this.name = "ManualResolutionOutcomeRequiredError";
+  }
+}
+
+export class ClaimRelationMismatchError extends Error {
+  constructor(
+    readonly claimId: string,
+    readonly relationId: string
+  ) {
+    super(`Fact Relation ${relationId} is not supported by Claim ${claimId}`);
+    this.name = "ClaimRelationMismatchError";
+  }
+}
+
+interface SupersessionPreparationOptions {
+  pendingSourcePair?: { claimId: string; relationId: string };
+}
+
 export interface ResolutionCoordinator {
   applySupersession(input: SupersessionInput): Promise<boolean>;
   applyConflictResolution(input: ConflictResolutionInput): Promise<boolean>;
@@ -49,7 +70,24 @@ export interface ResolutionCoordinator {
 export class D1ResolutionCoordinator implements ResolutionCoordinator {
   constructor(private readonly db: D1Database) {}
 
-  async prepareSupersession(input: SupersessionInput): Promise<D1PreparedStatement[]> {
+  async prepareSupersession(
+    input: SupersessionInput,
+    options: SupersessionPreparationOptions = {}
+  ): Promise<D1PreparedStatement[]> {
+    const pendingSourcePair = options.pendingSourcePair;
+    if (pendingSourcePair) {
+      if (
+        pendingSourcePair.claimId !== input.sourceClaimId ||
+        pendingSourcePair.relationId !== input.sourceRelationId
+      ) {
+        throw new ClaimRelationMismatchError(input.sourceClaimId, input.sourceRelationId);
+      }
+    } else if (!await this.relationSupportsClaim(input.sourceRelationId, input.sourceClaimId)) {
+      throw new ClaimRelationMismatchError(input.sourceClaimId, input.sourceRelationId);
+    }
+    if (!await this.relationSupportsClaim(input.targetRelationId, input.targetClaimId)) {
+      throw new ClaimRelationMismatchError(input.targetClaimId, input.targetRelationId);
+    }
     const audit = await prepareComplianceAuditEvent(this.db, {
       occurredAt: input.effectiveAt,
       actorType: input.actorType ?? "system",
@@ -146,6 +184,9 @@ export class D1ResolutionCoordinator implements ResolutionCoordinator {
   }
 
   async applyConflictResolution(input: ConflictResolutionInput): Promise<boolean> {
+    if (input.resolution === "manual") {
+      throw new ManualResolutionOutcomeRequiredError(input.conflictId);
+    }
     await ensureConflictClaimSchema(this.db);
     await this.ensureFactResolutionSchema();
     const conflict = await this.db.prepare(
@@ -157,8 +198,7 @@ export class D1ResolutionCoordinator implements ResolutionCoordinator {
 
     const oldClaimId = conflict.old_claim_id ?? await this.latestClaimId(conflict.old_memory_id);
     const newClaimId = conflict.new_claim_id ?? await this.latestClaimId(conflict.new_memory_id);
-    const requiresClaimPair = input.resolution !== "manual";
-    if (requiresClaimPair && (!oldClaimId || !newClaimId)) {
+    if (!oldClaimId || !newClaimId) {
       throw new ConflictClaimsUnavailableError(input.conflictId);
     }
     if (oldClaimId && newClaimId) {
@@ -455,6 +495,23 @@ export class D1ResolutionCoordinator implements ResolutionCoordinator {
          AND expired_at IS NULL`
     ).bind(entryId).first<{ id: string | null }>();
     return row?.id ?? null;
+  }
+
+  private async relationSupportsClaim(relationId: string, claimId: string): Promise<boolean> {
+    const row = await this.db.prepare(
+      `SELECT CASE WHEN EXISTS (
+         SELECT 1 FROM sb_fact_sources fs
+         WHERE fs.relation_id = r.id AND fs.memory_id = ?
+       ) OR (
+         NOT EXISTS (
+           SELECT 1 FROM sb_fact_sources fs_any WHERE fs_any.relation_id = r.id
+         )
+         AND r.memory_id = ?
+       ) THEN 1 ELSE 0 END AS supported
+       FROM sb_entity_relations r
+       WHERE r.id = ?`
+    ).bind(claimId, claimId, relationId).first<{ supported: number }>();
+    return Number(row?.supported ?? 0) === 1;
   }
 
   private async ensureFactResolutionSchema(): Promise<void> {

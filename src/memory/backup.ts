@@ -1,10 +1,11 @@
 import { importEntries, type ImportMode, type ImportOptions, type ImportResult } from "../import-entries";
 import { ensureEntityResolutionDataModel } from "./entities";
 import { ensureConflictClaimSchema } from "./quality";
+import { ensureAssociationDataModel } from "./associations";
 
-export const MEMORY_BACKUP_SCHEMA_VERSION = 9;
+export const MEMORY_BACKUP_SCHEMA_VERSION = 11;
 const MEMORY_BACKUP_FORMAT = "singularity-memory-backup";
-const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7, 8, 9]);
+const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7, 8, 9, 10, 11]);
 const MEMORY_BACKUP_FEATURES = [
   "atomic-memory",
   "temporal-facts",
@@ -15,9 +16,12 @@ const MEMORY_BACKUP_FEATURES = [
   "evidence-claim-provenance",
   "parent-versions",
   "parent-version-claims",
+  "parent-version-time-windows",
   "entity-resolution",
+  "entity-merge-execution",
   "fact-resolution",
   "claim-level-conflicts",
+  "association-graph",
 ] as const;
 
 const GRAPH_ARRAY_KEYS = [
@@ -25,6 +29,7 @@ const GRAPH_ARRAY_KEYS = [
   "parentUnits",
   "parentVersions",
   "parentVersionClaims",
+  "associationEdges",
   "observations",
   "memories",
   "memorySources",
@@ -64,7 +69,7 @@ export interface BackupIntegrityReport {
 
 export interface MemoryBackup {
   backupFormat: typeof MEMORY_BACKUP_FORMAT;
-  schemaVersion: 9;
+  schemaVersion: 11;
   features: Array<(typeof MEMORY_BACKUP_FEATURES)[number]>;
   exportedAt: string;
   source: string;
@@ -74,6 +79,7 @@ export interface MemoryBackup {
   parentUnits: BackupRow[];
   parentVersions: BackupRow[];
   parentVersionClaims: BackupRow[];
+  associationEdges: BackupRow[];
   entries: BackupRow[];
   observations: BackupRow[];
   memories: BackupRow[];
@@ -98,7 +104,7 @@ export interface MemoryBackup {
 }
 
 export interface MemoryBackupImportResult extends ImportResult {
-  schemaVersion: 9;
+  schemaVersion: 11;
   graph: Record<GraphArrayKey, TableImportStats>;
   integrity: BackupIntegrityReport;
 }
@@ -169,6 +175,12 @@ export async function inspectMemoryBackupIntegrity(db: D1Database): Promise<Back
        (SELECT COUNT(*) FROM sb_parent_version_claims pvc
         LEFT JOIN sb_memories m ON m.id = pvc.memory_id
         WHERE m.id IS NULL) as parent_version_claims_missing_memory,
+       (SELECT COUNT(*) FROM sb_association_edges ae
+        LEFT JOIN sb_parent_units pu ON pu.parent_id = ae.source_parent_id
+        WHERE pu.parent_id IS NULL) as association_edges_missing_source_parent,
+       (SELECT COUNT(*) FROM sb_association_edges ae
+        LEFT JOIN sb_parent_units pu ON pu.parent_id = ae.target_parent_id
+        WHERE pu.parent_id IS NULL) as association_edges_missing_target_parent,
        (SELECT COUNT(*) FROM sb_entity_aliases a
         LEFT JOIN sb_entities e ON e.id = a.entity_id
         WHERE e.id IS NULL) as entity_aliases_missing_entity,
@@ -288,11 +300,13 @@ export async function exportMemoryBackup(
 ): Promise<MemoryBackup> {
   await ensureEntityResolutionDataModel(db);
   await ensureConflictClaimSchema(db);
+  await ensureAssociationDataModel(db);
   const [
     scopes,
     parentUnits,
     parentVersions,
     parentVersionClaims,
+    associationEdges,
     entries,
     observations,
     memories,
@@ -324,12 +338,16 @@ export async function exportMemoryBackup(
                 ORDER BY updated_at DESC, parent_id DESC`),
     allRows(db, `SELECT version_id, parent_id, version_number, source_observation_id,
                        source_snapshot_hash, summary, state, summary_vector_ids,
-                       created_at, updated_at
+                       activated_at, superseded_at, created_at, updated_at
                 FROM sb_parent_versions
                 ORDER BY created_at DESC, version_id DESC`),
     allRows(db, `SELECT parent_version_id, memory_id, relation, created_at
                 FROM sb_parent_version_claims
                 ORDER BY created_at DESC, parent_version_id DESC, memory_id DESC`),
+    allRows(db, `SELECT id, source_parent_id, target_parent_id, edge_type,
+                       weight, provenance, metadata_json, created_at, updated_at
+                FROM sb_association_edges
+                ORDER BY updated_at DESC, id DESC`),
     allRows(db, `SELECT id, content, tags, source, created_at, vector_ids,
                        recall_count, importance_score, classification_confidence,
                        classification_status, classification_error, classification_attempts,
@@ -360,7 +378,8 @@ export async function exportMemoryBackup(
                 FROM sb_memory_sources
                 ORDER BY created_at DESC, id DESC`),
     allRows(db, `SELECT id, name, name_normalized, entity_type, aliases_json,
-                       metadata_json, mention_count, created_at, updated_at
+                       metadata_json, mention_count, lifecycle_state,
+                       merged_into_entity_id, merged_at, created_at, updated_at
                 FROM sb_entities
                 ORDER BY updated_at DESC, id DESC`),
     allRows(db, `SELECT id, entity_id, alias, alias_normalized,
@@ -446,6 +465,7 @@ export async function exportMemoryBackup(
       parentUnits: countRows(parentUnits),
       parentVersions: countRows(parentVersions),
       parentVersionClaims: countRows(parentVersionClaims),
+      associationEdges: countRows(associationEdges),
       entries: countRows(entries),
       observations: countRows(observations),
       memories: countRows(memories),
@@ -473,6 +493,7 @@ export async function exportMemoryBackup(
     parentUnits,
     parentVersions,
     parentVersionClaims,
+    associationEdges,
     entries,
     observations,
     memories,
@@ -515,6 +536,17 @@ function textOrNull(row: BackupRow, key: string): string | null {
 function textOrDefault(row: BackupRow, key: string, fallback: string): string {
   const value = textOrNull(row, key);
   return value == null || value === "" ? fallback : value;
+}
+
+function entityLifecycleState(row: BackupRow): "active" | "merged" {
+  const state = textOrDefault(row, "lifecycle_state", "active");
+  if (state !== "active" && state !== "merged") {
+    throw new Error("lifecycle_state must be active or merged");
+  }
+  if (state === "merged" && !textOrNull(row, "merged_into_entity_id")) {
+    throw new Error("merged entities require merged_into_entity_id");
+  }
+  return state;
 }
 
 function numberOrNull(row: BackupRow, key: string): number | null {
@@ -587,6 +619,7 @@ export async function importMemoryBackup(
 ): Promise<MemoryBackupImportResult> {
   await ensureEntityResolutionDataModel(db);
   await ensureConflictClaimSchema(db);
+  await ensureAssociationDataModel(db);
   const rawSchemaVersion = body.schemaVersion == null ? 4 : Number(body.schemaVersion);
   if (!Number.isFinite(rawSchemaVersion) || rawSchemaVersion < 4) {
     throw new Error("Unsupported memory backup schemaVersion");
@@ -642,8 +675,8 @@ export async function importMemoryBackup(
       `${insertVerb(mode)} INTO sb_parent_versions (
          version_id, parent_id, version_number, source_observation_id,
          source_snapshot_hash, summary, state, summary_vector_ids,
-         created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         activated_at, superseded_at, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       requiredText(row, "version_id"),
       requiredText(row, "parent_id"),
@@ -653,6 +686,27 @@ export async function importMemoryBackup(
       textOrNull(row, "summary"),
       textOrDefault(row, "state", "building"),
       jsonText(row, "summary_vector_ids", "[]"),
+      numberOrNull(row, "activated_at"),
+      numberOrNull(row, "superseded_at"),
+      intOrDefault(row, "created_at", Date.now()),
+      intOrDefault(row, "updated_at", Date.now())
+    )
+  );
+
+  graph.associationEdges = await importTable(db, rowsFor(body, "associationEdges"), (row) =>
+    db.prepare(
+      `${insertVerb(mode)} INTO sb_association_edges (
+         id, source_parent_id, target_parent_id, edge_type, weight,
+         provenance, metadata_json, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "id"),
+      requiredText(row, "source_parent_id"),
+      requiredText(row, "target_parent_id"),
+      textOrDefault(row, "edge_type", "related_to"),
+      numberOrDefault(row, "weight", 0.5),
+      textOrDefault(row, "provenance", "system"),
+      jsonText(row, "metadata_json", "{}"),
       intOrDefault(row, "created_at", Date.now()),
       intOrDefault(row, "updated_at", Date.now())
     )
@@ -773,8 +827,9 @@ export async function importMemoryBackup(
     db.prepare(
       `${insertVerb(mode)} INTO sb_entities (
          id, name, name_normalized, entity_type, aliases_json,
-         metadata_json, mention_count, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         metadata_json, mention_count, lifecycle_state,
+         merged_into_entity_id, merged_at, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       requiredText(row, "id"),
       requiredText(row, "name"),
@@ -783,6 +838,9 @@ export async function importMemoryBackup(
       jsonText(row, "aliases_json", "[]"),
       jsonText(row, "metadata_json", "{}"),
       intOrDefault(row, "mention_count", 0),
+      entityLifecycleState(row),
+      textOrNull(row, "merged_into_entity_id"),
+      numberOrNull(row, "merged_at"),
       intOrDefault(row, "created_at", Date.now()),
       intOrDefault(row, "updated_at", Date.now())
     )

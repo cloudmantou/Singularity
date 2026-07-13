@@ -82,4 +82,57 @@ describe("synthesizeInsight()", () => {
     expect(prompt).toContain("insufficient");
     expect(prompt).toMatch(/speculate|guess|infer/);
   });
+
+  it("instructs the model to disclose unresolved Claim conflicts", async () => {
+    const env = makeTestEnv(undefined, { AI: aiMock("ok") });
+    await synthesizeInsight(
+      "which installer is used",
+      [
+        {
+          id: "entry-old",
+          content: "mtzs uses installation_proxy",
+          claims: [{
+            id: "claim-old",
+            entryId: "entry-old",
+            statement: "mtzs uses installation_proxy",
+            status: "contested",
+            verificationStatus: "contested",
+            conflictIds: ["conflict-1"],
+            opposingClaimIds: ["claim-new"],
+          }],
+        },
+        {
+          id: "entry-new",
+          content: "mtzs uses new_installer",
+          claims: [{
+            id: "claim-new",
+            entryId: "entry-new",
+            statement: "mtzs uses new_installer",
+            status: "contested",
+            verificationStatus: "contested",
+            conflictIds: ["conflict-1"],
+            opposingClaimIds: ["claim-old"],
+          }],
+        },
+      ],
+      env,
+      [{
+        id: "conflict-1",
+        state: "pending",
+        reason: "different_object",
+        claimIds: ["claim-old", "claim-new"],
+        claims: [
+          { id: "claim-old", entryId: "entry-old", statement: "mtzs uses installation_proxy", status: "contested" },
+          { id: "claim-new", entryId: "entry-new", statement: "mtzs uses new_installer", status: "contested" },
+        ],
+      }]
+    );
+
+    const [, { messages }] = (env.AI.run as ReturnType<typeof vi.fn>).mock.calls[0];
+    const prompt = messages[0].content as string;
+    expect(prompt).toContain("conflict-1");
+    expect(prompt).toContain("claim-old");
+    expect(prompt).toContain("claim-new");
+    expect(prompt.toLowerCase()).toMatch(/unresolved|未解决/);
+  });
 });

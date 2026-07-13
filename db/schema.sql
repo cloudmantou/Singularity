@@ -399,6 +399,8 @@ CREATE TABLE IF NOT EXISTS sb_parent_versions (
   summary TEXT,
   state TEXT NOT NULL DEFAULT 'building',
   summary_vector_ids TEXT NOT NULL DEFAULT '[]',
+  activated_at INTEGER,
+  superseded_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   CHECK (state IN ('building', 'active', 'active_degraded', 'superseded', 'failed')),
@@ -410,6 +412,8 @@ CREATE INDEX IF NOT EXISTS idx_parent_versions_source
   ON sb_parent_versions(source_observation_id);
 CREATE INDEX IF NOT EXISTS idx_parent_versions_state
   ON sb_parent_versions(state, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_parent_versions_active_window
+  ON sb_parent_versions(parent_id, activated_at, superseded_at);
 
 CREATE TABLE IF NOT EXISTS sb_parent_version_claims (
   parent_version_id TEXT NOT NULL,
@@ -422,6 +426,23 @@ CREATE INDEX IF NOT EXISTS idx_parent_version_claims_memory
   ON sb_parent_version_claims(memory_id, parent_version_id);
 CREATE INDEX IF NOT EXISTS idx_parent_version_claims_parent
   ON sb_parent_version_claims(parent_version_id, relation, created_at DESC);
+
+-- Non-authoritative Parent-to-Parent navigation graph.
+-- Association edges expand context only; they never support Fact/Claim truth.
+CREATE TABLE IF NOT EXISTS sb_association_edges (
+  id TEXT PRIMARY KEY,
+  source_parent_id TEXT NOT NULL,
+  target_parent_id TEXT NOT NULL,
+  edge_type TEXT NOT NULL,
+  weight REAL NOT NULL DEFAULT 0.5,
+  provenance TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(source_parent_id, target_parent_id, edge_type)
+);
+CREATE INDEX IF NOT EXISTS idx_association_edges_target
+  ON sb_association_edges(target_parent_id, weight DESC, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS sb_memories (
   id TEXT PRIMARY KEY,
@@ -490,13 +511,16 @@ CREATE TABLE IF NOT EXISTS sb_entities (
   aliases_json TEXT NOT NULL DEFAULT '[]',
   metadata_json TEXT NOT NULL DEFAULT '{}',
   mention_count INTEGER NOT NULL DEFAULT 0,
+  lifecycle_state TEXT NOT NULL DEFAULT 'active',
+  merged_into_entity_id TEXT,
+  merged_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
+  CHECK (lifecycle_state IN ('active', 'merged')),
   UNIQUE(name_normalized)
 );
 CREATE INDEX IF NOT EXISTS idx_sb_entities_name ON sb_entities(name_normalized);
 CREATE INDEX IF NOT EXISTS idx_sb_entities_type ON sb_entities(entity_type, updated_at DESC);
-
 CREATE TABLE IF NOT EXISTS sb_entity_aliases (
   id TEXT PRIMARY KEY,
   entity_id TEXT NOT NULL,

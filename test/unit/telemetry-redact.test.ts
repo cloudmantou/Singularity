@@ -44,7 +44,17 @@ describe("telemetry redact", () => {
     expect(shouldSuppressRequestBodyTelemetry("/append")).toBe(true);
     expect(shouldSuppressRequestBodyTelemetry("/update")).toBe(true);
     expect(shouldSuppressRequestBodyTelemetry("/chat")).toBe(true);
+    expect(shouldSuppressRequestBodyTelemetry("/integrations/development-session/capture")).toBe(true);
+    expect(shouldSuppressRequestBodyTelemetry("/integrations/obsidian/push")).toBe(true);
     expect(shouldSuppressRequestBodyTelemetry("/count")).toBe(false);
+  });
+
+  it("assigns stable operations to integration and association routes", () => {
+    expect(routeToOperation("POST", "/integrations/development-session/capture"))
+      .toBe("integration.development_session.capture");
+    expect(routeToOperation("POST", "/associations/link")).toBe("association.link");
+    expect(routeToOperation("GET", "/connections")).toBe("association.connections");
+    expect(routeToOperation("GET", "/health/details")).toBe("health.details");
   });
 
   it("defaults personal telemetry to metadata-only with shorter retention", () => {

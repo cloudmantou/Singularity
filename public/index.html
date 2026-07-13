@@ -3397,6 +3397,13 @@
               <div class="obs-view" id="obs-view-system">
                 <p class="obs-privacy-note">请求内容日志可能包含私人记忆；可通过 /settings/telemetry 调整记录级别。</p>
                 <div class="obs-kpi-row" id="obs-kpi-row"></div>
+                <div class="obs-section" id="obs-health-matrix-section">
+                  <div class="obs-section-head">
+                    <h2>系统健康</h2>
+                    <span class="sub" id="obs-health-matrix-meta" style="font-size: 12px; color: var(--text-tertiary)">—</span>
+                  </div>
+                  <div class="obs-health-grid" id="obs-health-matrix-grid"></div>
+                </div>
                 <div class="obs-section" id="obs-vector-runtime-section">
                   <div class="obs-section-head">
                     <h2 data-i18n="obs.vector.title">向量运行态</h2>
@@ -4057,16 +4064,18 @@
             const memoryOverview = await obsApi('/analytics/memory-overview')
             obsRenderMemoryOverview(memoryOverview)
           } else {
-            const [overview, timeseries, vectorRuntime] = await Promise.all([
+            const [overview, timeseries, vectorRuntime, healthMatrix] = await Promise.all([
               obsApi('/analytics/overview?hours=' + hours),
               obsApi('/analytics/timeseries?hours=' + hours),
               obsApi('/analytics/vector-runtime'),
+              obsApi('/health/details'),
             ])
             data = overview
             obsRenderKpi(overview)
             obsRenderCharts(timeseries.points || [])
             obsRenderOps(overview.top_operations || [])
             obsRenderVectorRuntime(vectorRuntime.vector_runtime || {})
+            obsRenderHealthMatrix(healthMatrix)
             await obsLoadLogs()
           }
           if (status) {
@@ -4229,6 +4238,63 @@
           meta.textContent = rebuild
             ? `rebuild ${String(rebuild.id || '').slice(0, 8)} · ${obsFmtTime(rebuild.updated_at)}`
             : (lastRebuild ? `last rebuild ${String(lastRebuild.id || '').slice(0, 8)} · ${lastRebuild.state}` : (index ? `local index · remaining ${obsFmtNum(index.remaining || 0)}` : 'no local index'))
+        }
+      }
+
+      function obsRenderHealthMatrix(matrix) {
+        const grid = document.getElementById('obs-health-matrix-grid')
+        const meta = document.getElementById('obs-health-matrix-meta')
+        if (!grid) return
+        const components = matrix.components || {}
+        const queues = matrix.queues || {}
+        const providers = components.providers || []
+        const statusText = (component) => component?.status || 'unknown'
+        const configHint = (component) => component?.configured ? 'configured' : 'not configured'
+        const cards = [
+          { label: 'Database', value: statusText(components.database), hint: matrix.mode || '—' },
+          {
+            label: 'Vector index',
+            value: statusText(components.vectorIndex),
+            hint: components.vectorIndex?.dimensions
+              ? `${obsFmtNum(components.vectorIndex.dimensions)} dimensions`
+              : (components.vectorIndex?.error || 'probe unavailable'),
+          },
+          { label: 'LLM provider', value: statusText(components.llmProvider), hint: configHint(components.llmProvider) },
+          { label: 'Embedding provider', value: statusText(components.embeddingProvider), hint: configHint(components.embeddingProvider) },
+          {
+            label: 'Graph projection',
+            value: statusText(components.graphProjection),
+            hint: `review ${obsFmtNum(components.graphProjection?.reviewPending || 0)}`,
+          },
+          {
+            label: 'Audit chain',
+            value: statusText(components.auditChain),
+            hint: components.auditChain?.error || `${components.auditChain?.complete ? 'verified' : 'sampled'} · ${obsFmtNum(components.auditChain?.checked || 0)}/${obsFmtNum(components.auditChain?.events || 0)} events`,
+          },
+          {
+            label: 'Processing queues',
+            value: obsFmtNum((queues.extraction || 0) + (queues.classification || 0)),
+            hint: `extract ${obsFmtNum(queues.extraction || 0)} · classify ${obsFmtNum(queues.classification || 0)}`,
+          },
+          {
+            label: 'Review queues',
+            value: obsFmtNum((queues.conflicts || 0) + (queues.entityMerge || 0) + (queues.factReview || 0)),
+            hint: `conflict ${obsFmtNum(queues.conflicts || 0)} · entity ${obsFmtNum(queues.entityMerge || 0)} · fact ${obsFmtNum(queues.factReview || 0)}`,
+          },
+          ...providers.map((provider) => ({
+            label: `Provider · ${provider.id || 'unknown'}`,
+            value: statusText(provider),
+            hint: provider.error || (provider.configured ? 'configured' : 'not configured'),
+          })),
+        ]
+        grid.innerHTML = cards.map((card) =>
+          `<div class="obs-health-item"><div class="value">${obsEsc(card.value)}</div>` +
+          `<div class="label">${obsEsc(card.label)}</div>` +
+          `<div class="label">${obsEsc(card.hint)}</div></div>`
+        ).join('')
+        if (meta) {
+          const checked = matrix.checkedAt ? obsFmtTime(matrix.checkedAt) : '—'
+          meta.textContent = `${matrix.status || 'unknown'} · ${checked}`
         }
       }
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import worker, { initializeDatabase } from "../../src/index";
+import { ensureAssociationDataModel } from "../../src/memory/associations";
 import { ensureEntityResolutionDataModel } from "../../src/memory/entities";
 import { createExecutionContext, createSelfhostEnv } from "../../src/selfhost/env";
 
@@ -19,6 +20,7 @@ describe("full memory backup import/export", () => {
     const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
     await initializeDatabase(env);
     await ensureEntityResolutionDataModel(env.DB);
+    await ensureAssociationDataModel(env.DB);
     const now = Date.now();
 
     db.prepare(
@@ -120,11 +122,33 @@ describe("full memory backup import/export", () => {
        VALUES (?, ?, ?, ?, ?)`
     ).run("parent-1", "parent-version-1", "scope-1", now - 2000, now);
     db.prepare(
+      `INSERT INTO sb_parent_units
+       (parent_id, active_version_id, scope_id, created_at, updated_at)
+       VALUES (?, NULL, ?, ?, ?)`
+    ).run("parent-2", "scope-1", now - 1000, now);
+    db.prepare(
+      `INSERT INTO sb_association_edges (
+         id, source_parent_id, target_parent_id, edge_type, weight,
+         provenance, metadata_json, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      "association-1",
+      "parent-1",
+      "parent-2",
+      "part_of_project",
+      0.8,
+      "manual",
+      "{}",
+      now - 500,
+      now - 500
+    );
+    db.prepare(
       `INSERT INTO sb_parent_versions
        (version_id, parent_id, version_number, source_observation_id,
-        source_snapshot_hash, summary, state, summary_vector_ids, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run("parent-version-1", "parent-1", 1, "obs-1", "hash-entry-1", "Singularity uses SQLite", "active", "[]", now - 2000, now);
+        source_snapshot_hash, summary, state, summary_vector_ids,
+        activated_at, superseded_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run("parent-version-1", "parent-1", 1, "obs-1", "hash-entry-1", "Singularity uses SQLite", "active", "[]", now - 1500, null, now - 2000, now);
     db.prepare(
       `INSERT INTO sb_memories
        (id, content, kind, memory_class, importance, confidence, entry_id,
@@ -274,7 +298,7 @@ describe("full memory backup import/export", () => {
     const backup = await exportResponse.json() as any;
 
     expect(backup.backupFormat).toBe("singularity-memory-backup");
-    expect(backup.schemaVersion).toBe(9);
+    expect(backup.schemaVersion).toBe(11);
     expect(backup.features).toEqual(
       expect.arrayContaining([
         "atomic-memory",
@@ -284,9 +308,12 @@ describe("full memory backup import/export", () => {
         "evidence-claim-provenance",
         "parent-versions",
         "parent-version-claims",
+        "parent-version-time-windows",
         "entity-resolution",
+        "entity-merge-execution",
         "fact-resolution",
         "claim-level-conflicts",
+        "association-graph",
       ])
     );
     expect(backup.features).not.toContain("vector-rebuild-state");
@@ -294,9 +321,10 @@ describe("full memory backup import/export", () => {
     expect(backup.integrity.ok).toBe(true);
     expect(backup.totals).toMatchObject({
       scopes: 1,
-      parentUnits: 1,
+      parentUnits: 2,
       parentVersions: 1,
       parentVersionClaims: 1,
+      associationEdges: 1,
       entries: 2,
       observations: 1,
       memories: 1,
@@ -318,18 +346,29 @@ describe("full memory backup import/export", () => {
       conflictCases: 1,
     });
     expect(backup.scopes[0]).toMatchObject({ scope_id: "scope-1" });
-    expect(backup.parentUnits[0]).toMatchObject({
-      parent_id: "parent-1",
-      active_version_id: "parent-version-1",
-    });
+    expect(backup.parentUnits).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        parent_id: "parent-1",
+        active_version_id: "parent-version-1",
+      }),
+    ]));
     expect(backup.parentVersions[0]).toMatchObject({
       version_id: "parent-version-1",
       state: "active",
+      activated_at: now - 1500,
+      superseded_at: null,
     });
     expect(backup.parentVersionClaims[0]).toMatchObject({
       parent_version_id: "parent-version-1",
       memory_id: "mem-1",
       relation: "supports",
+    });
+    expect(backup.associationEdges[0]).toMatchObject({
+      id: "association-1",
+      source_parent_id: "parent-1",
+      target_parent_id: "parent-2",
+      edge_type: "part_of_project",
+      provenance: "manual",
     });
     expect(backup.observations[0]).toMatchObject({
       root_evidence_id: "evidence-root-1",
@@ -347,6 +386,11 @@ describe("full memory backup import/export", () => {
       relation: "supports",
       evidence_root_id: "evidence-root-1",
       extractor_model: "test-extractor",
+    });
+    expect(backup.entities[0]).toMatchObject({
+      lifecycle_state: "active",
+      merged_into_entity_id: null,
+      merged_at: null,
     });
     expect(backup.conflictCases[0]).toMatchObject({
       old_memory_id: "entry-1",
@@ -367,12 +411,13 @@ describe("full memory backup import/export", () => {
     );
     expect(importResponse.status).toBe(200);
     const imported = await importResponse.json() as any;
-    expect(imported.schemaVersion).toBe(9);
+    expect(imported.schemaVersion).toBe(11);
     expect(imported.inserted).toBe(2);
     expect(imported.graph.scopes.imported).toBe(1);
-    expect(imported.graph.parentUnits.imported).toBe(1);
+    expect(imported.graph.parentUnits.imported).toBe(2);
     expect(imported.graph.parentVersions.imported).toBe(1);
     expect(imported.graph.parentVersionClaims.imported).toBe(1);
+    expect(imported.graph.associationEdges.imported).toBe(1);
     expect(imported.graph.memories.imported).toBe(1);
     expect(imported.graph.entityRelations.imported).toBe(1);
     expect(imported.graph.entityAliases.imported).toBe(1);
@@ -395,6 +440,35 @@ describe("full memory backup import/export", () => {
     const restoredBackup = await restoredExport.json() as any;
     expect(restoredBackup.totals).toMatchObject(backup.totals);
     expect(restoredBackup.integrity.ok).toBe(true);
+    expect(restoredBackup.parentVersions[0]).toMatchObject({
+      activated_at: now - 1500,
+      superseded_at: null,
+    });
+    expect(restoredBackup.entities[0]).toMatchObject({
+      lifecycle_state: "active",
+      merged_into_entity_id: null,
+      merged_at: null,
+    });
+
+    const forgetResponse = await worker.fetch(
+      auth("/forget", {
+        method: "POST",
+        body: JSON.stringify({ id: "entry-1" }),
+      }),
+      restored.env,
+      createExecutionContext()
+    );
+    expect(forgetResponse.status).toBe(200);
+    const postForgetExport = await worker.fetch(
+      auth("/export?full=true"),
+      restored.env,
+      createExecutionContext()
+    );
+    const postForgetBackup = await postForgetExport.json() as any;
+    expect(postForgetBackup.integrity).toMatchObject({ ok: true });
+    expect(postForgetBackup.mergeCandidates).toEqual([]);
+    expect(postForgetBackup.conflictCases).toEqual([]);
+    expect(postForgetBackup.factResolutions).toEqual([]);
 
     const legacy = {
       ...backup,
@@ -422,7 +496,7 @@ describe("full memory backup import/export", () => {
     );
     expect(legacyImportResponse.status).toBe(200);
     const legacyImported = await legacyImportResponse.json() as any;
-    expect(legacyImported.schemaVersion).toBe(9);
+    expect(legacyImported.schemaVersion).toBe(11);
     expect(legacyImported.graph.factSources.total).toBe(0);
     expect(legacyImported.graph.parentVersionClaims.total).toBe(1);
 
@@ -441,14 +515,14 @@ describe("full memory backup import/export", () => {
     const futureImportResponse = await worker.fetch(
       auth("/import", {
         method: "POST",
-        body: JSON.stringify({ ...backup, schemaVersion: 10 }),
+        body: JSON.stringify({ ...backup, schemaVersion: 12 }),
       }),
       legacyRestored.env,
       createExecutionContext()
     );
     expect(futureImportResponse.status).toBe(400);
     const futureImported = await futureImportResponse.json() as any;
-    expect(futureImported.error).toMatch(/schemaVersion 10/);
+    expect(futureImported.error).toMatch(/schemaVersion 12/);
 
     db.close();
     restored.db.close();

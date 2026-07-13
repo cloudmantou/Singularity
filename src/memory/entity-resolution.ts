@@ -517,6 +517,7 @@ export class D1EntityResolver implements EntityResolver {
       `SELECT id, name, name_normalized, entity_type, aliases_json,
               metadata_json, mention_count
        FROM sb_entities
+       WHERE lifecycle_state = 'active'
        ORDER BY mention_count DESC, updated_at DESC
        LIMIT 1000`
     ).all<EntityRow>();
@@ -597,7 +598,8 @@ export class D1EntityResolver implements EntityResolver {
       `SELECT id, name, name_normalized, entity_type, aliases_json,
               metadata_json, mention_count
        FROM sb_entities
-       WHERE name_normalized = ? OR name_normalized LIKE ?
+       WHERE lifecycle_state = 'active'
+         AND (name_normalized = ? OR name_normalized LIKE ?)
        ORDER BY mention_count DESC, updated_at DESC
        LIMIT 20`
     ).bind(normalize(draft.name), `${normalize(draft.name)}\u001f%`).all<EntityRow>();
@@ -609,6 +611,7 @@ export class D1EntityResolver implements EntityResolver {
        FROM sb_entity_aliases a
        JOIN sb_entities e ON e.id = a.entity_id
        WHERE a.alias_normalized = ?
+         AND e.lifecycle_state = 'active'
        ORDER BY e.mention_count DESC, e.updated_at DESC
        LIMIT 20`
     ).bind(normalize(draft.name)).all<EntityRow>();
@@ -621,6 +624,7 @@ export class D1EntityResolver implements EntityResolver {
          FROM sb_entity_external_ids x
          JOIN sb_entities e ON e.id = x.entity_id
          WHERE x.provider = ? AND x.external_id = ?
+           AND e.lifecycle_state = 'active'
          ORDER BY e.mention_count DESC, e.updated_at DESC
          LIMIT 20`
       ).bind(normalize(externalId.provider), externalId.value).all<EntityRow>();

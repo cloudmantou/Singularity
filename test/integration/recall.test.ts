@@ -1199,6 +1199,53 @@ describe("GET /recall", () => {
     expect(data.results[1].id).toBe("shaky");
   });
 
+  it("returns pending Claim conflicts instead of presenting contested memories as ordinary facts", async () => {
+    db.entries.push(
+      { id: "entry-old", content: "mtzs uses installation_proxy", tags: '["work"]', source: "api", created_at: 1000, vector_ids: '["entry-old"]', recall_count: 0, importance_score: 4 },
+      { id: "entry-new", content: "mtzs uses new_installer", tags: '["work"]', source: "api", created_at: 2000, vector_ids: '["entry-new"]', recall_count: 0, importance_score: 4 },
+    );
+    seedActiveClaimsForEntries(db);
+    for (const claim of db.memories) claim.claim_status = "contested";
+    db.conflictCases.push({
+      id: "conflict-installer",
+      old_memory_id: "entry-old",
+      new_memory_id: "entry-new",
+      old_claim_id: "claim-entry-old",
+      new_claim_id: "claim-entry-new",
+      conflict_type: "fact_resolution",
+      reason: "different_object",
+      state: "pending",
+      created_at: 3000,
+    });
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({
+          matches: [makeMatch("entry-new", 0.9), makeMatch("entry-old", 0.85)],
+        }),
+      }),
+      AI: makeContradictionAI("The installer Claims conflict and require review."),
+    });
+
+    const res = await worker.fetch(req("GET", "/recall?query=installer"), env, ctx);
+    expect(res.status).toBe(200);
+    const data = await res.json() as any;
+    expect(data.conflicts).toEqual([expect.objectContaining({
+      id: "conflict-installer",
+      state: "pending",
+      claimIds: ["claim-entry-old", "claim-entry-new"],
+    })]);
+    expect(data.results).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "entry-old",
+        claims: [expect.objectContaining({
+          id: "claim-entry-old",
+          verificationStatus: "contested",
+          opposingClaimIds: ["claim-entry-new"],
+        })],
+      }),
+    ]));
+  });
+
   // ── End-to-end: captureEntry WRITES contradiction_wins → recallEntries READS and reranks ──
 
   it("e2e: captureEntry writes contradiction_wins=1; subsequent recall ranks the winner above a peer with imp=3,wins=0 (real rerank, not seeded)", async () => {

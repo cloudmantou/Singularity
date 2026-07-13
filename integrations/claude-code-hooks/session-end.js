@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 'use strict';
 
+const crypto = require('node:crypto');
+const { formatTranscript, readProjectContext } = require('./context.cjs');
+
 async function main() {
   const baseUrl = process.env.SECOND_BRAIN_URL;
   const token = process.env.SECOND_BRAIN_TOKEN;
@@ -11,7 +14,7 @@ async function main() {
     process.stdin.setEncoding('utf8');
     for await (const chunk of process.stdin) {
       raw += chunk;
-      if (raw.length > 200_000) break;
+      if (raw.length > 1_000_000) break;
     }
   } catch {
     return;
@@ -29,28 +32,28 @@ async function main() {
   const messages = transcript?.messages ?? transcript?.conversation ?? [];
   if (!Array.isArray(messages) || messages.length === 0) return;
 
-  const meaningful = messages
-    .filter(m => (m?.role === 'user' || m?.role === 'assistant') && typeof m?.content === 'string' && m.content.trim().length > 0)
-    .slice(-10);
-
-  if (meaningful.length === 0) return;
-
-  const content = meaningful
-    .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content.trim()}`)
-    .join('\n\n');
-
+  const content = formatTranscript(messages);
   if (content.length < 50) return;
-
-  const body = content.length > 2000 ? content.slice(0, 2000) + '...' : content;
+  const project = readProjectContext(process.cwd());
+  const sessionId = String(
+    transcript?.session_id || transcript?.sessionId || crypto.randomUUID()
+  ).slice(0, 256);
 
   try {
-    await fetch(`${baseUrl}/capture`, {
+    await fetch(`${baseUrl}/integrations/development-session/capture`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ content: body, source: 'claude-code', tags: ['session'] }),
+      body: JSON.stringify({
+        client: 'claude-code',
+        repository: project.repository,
+        branch: project.branch,
+        sessionId,
+        capturedAt: Date.now(),
+        transcript: content,
+      }),
     });
   } catch {
     // silent — hooks must not disrupt session close

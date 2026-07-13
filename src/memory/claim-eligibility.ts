@@ -4,17 +4,37 @@ export function activeMemoryClaimPredicate(
   asOfExpression: string,
   options: { requireActiveParentLink?: boolean } = {}
 ): string {
+  const parentVersionEligibleAt = (parentVersionRef: string): string => `(
+    (
+      ${parentVersionRef}.state = 'superseded'
+      AND ${parentVersionRef}.activated_at IS NOT NULL
+      AND ${parentVersionRef}.activated_at <= ${asOfExpression}
+      AND ${parentVersionRef}.superseded_at IS NOT NULL
+      AND ${parentVersionRef}.superseded_at > ${asOfExpression}
+    )
+    OR (
+      ${parentVersionRef}.state IN ('active', 'active_degraded')
+      AND ${parentVersionRef}.superseded_at IS NULL
+      AND (
+        ${parentVersionRef}.activated_at IS NULL
+        OR ${parentVersionRef}.activated_at <= ${asOfExpression}
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM sb_parent_units pu_current
+        WHERE pu_current.parent_id = ${parentVersionRef}.parent_id
+          AND pu_current.active_version_id = ${parentVersionRef}.version_id
+      )
+    )
+  )`;
   const activeParentLink = `EXISTS (
     SELECT 1
     FROM sb_parent_version_claims pvc_active
     JOIN sb_parent_versions pv_active
       ON pv_active.version_id = pvc_active.parent_version_id
-    JOIN sb_parent_units pu_active
-      ON pu_active.active_version_id = pv_active.version_id
-     AND pu_active.parent_id = pv_active.parent_id
     WHERE pvc_active.memory_id = ${memoryRef}.id
       AND pvc_active.relation = 'supports'
-      AND pv_active.state IN ('active', 'active_degraded')
+      AND ${parentVersionEligibleAt("pv_active")}
   )`;
   const parentEligibility = options.requireActiveParentLink
     ? activeParentLink
@@ -31,11 +51,8 @@ export function activeMemoryClaimPredicate(
           OR EXISTS (
             SELECT 1
             FROM sb_parent_versions pv_legacy
-            JOIN sb_parent_units pu_legacy
-              ON pu_legacy.active_version_id = pv_legacy.version_id
-             AND pu_legacy.parent_id = pv_legacy.parent_id
             WHERE pv_legacy.version_id = ${memoryRef}.parent_version_id
-              AND pv_legacy.state IN ('active', 'active_degraded')
+              AND ${parentVersionEligibleAt("pv_legacy")}
           )
         )
       )

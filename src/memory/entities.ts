@@ -169,8 +169,12 @@ export const ENTITY_SCHEMA_STATEMENTS = [
     aliases_json TEXT NOT NULL DEFAULT '[]',
     metadata_json TEXT NOT NULL DEFAULT '{}',
     mention_count INTEGER NOT NULL DEFAULT 0,
+    lifecycle_state TEXT NOT NULL DEFAULT 'active',
+    merged_into_entity_id TEXT,
+    merged_at INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
+    CHECK (lifecycle_state IN ('active', 'merged')),
     UNIQUE(name_normalized)
   )`,
   `CREATE INDEX IF NOT EXISTS idx_sb_entities_name
@@ -251,6 +255,23 @@ export async function ensureEntityDataModel(db: D1Database): Promise<void> {
          COALESCE(observation_id, '')
      )`
   );
+  const entityColumns = await db.prepare(
+    `PRAGMA table_info(sb_entities)`
+  ).all<{ name: string }>();
+  const existingEntityColumns = new Set((entityColumns.results ?? []).map((row) => row.name));
+  for (const migration of [
+    { column: "lifecycle_state", sql: `ALTER TABLE sb_entities ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT 'active'` },
+    { column: "merged_into_entity_id", sql: `ALTER TABLE sb_entities ADD COLUMN merged_into_entity_id TEXT` },
+    { column: "merged_at", sql: `ALTER TABLE sb_entities ADD COLUMN merged_at INTEGER` },
+  ]) {
+    if (existingEntityColumns.has(migration.column)) continue;
+    try {
+      await db.exec(migration.sql);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/duplicate column name|already exists/i.test(message)) throw error;
+    }
+  }
   await db.exec(
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_fact_sources_identity
      ON sb_fact_sources (
@@ -467,34 +488,6 @@ export async function attachEntitiesToMemory(
     relationIds.push(relationId);
   }
 
-  // Co-mentioned entities without explicit edges still form a weak related_to clique
-  // only when ≥2 entities and no explicit relations were provided.
-  if ((input.relations?.length ?? 0) === 0 && entityIds.length >= 2 && entityIds.length <= 6) {
-    const unique = [...new Set(entityIds)];
-    for (let i = 0; i < unique.length; i++) {
-      for (let j = i + 1; j < unique.length; j++) {
-        const relationId = await insertResolvedEntityRelation(db, {
-          fromEntityId: unique[i],
-          toEntityId: unique[j],
-          relationType: "related_to",
-          fact: null,
-          memoryId: input.memoryId,
-          observationId: input.observationId ?? null,
-          score: Math.max(0, Math.min(1, (input.score ?? 0.5) * 0.5)),
-          validFrom: input.validFrom ?? null,
-          validTo: input.validTo ?? null,
-          referenceTime: input.referenceTime ?? null,
-          scopeId: input.scopeId ?? null,
-          polarity: input.polarity ?? "positive",
-          modality: input.modality ?? "asserted",
-          metadata: { automatic: true, co_mention: true },
-          createdAt: input.createdAt,
-        });
-        relationIds.push(relationId);
-      }
-    }
-  }
-
   return { entityIds: [...new Set(entityIds)], relationIds };
 }
 
@@ -510,6 +503,7 @@ export async function listEntities(
         `SELECT id, name, name_normalized, entity_type, mention_count, created_at, updated_at
          FROM sb_entities
          WHERE name_normalized LIKE ?
+           AND lifecycle_state = 'active'
          ORDER BY mention_count DESC, updated_at DESC
          LIMIT ?`
       )
@@ -521,6 +515,7 @@ export async function listEntities(
     .prepare(
       `SELECT id, name, name_normalized, entity_type, mention_count, created_at, updated_at
        FROM sb_entities
+       WHERE lifecycle_state = 'active'
        ORDER BY mention_count DESC, updated_at DESC
        LIMIT ?`
     )
@@ -543,7 +538,7 @@ export async function getEntityGraph(
     .prepare(
       `SELECT id, name, name_normalized, entity_type, aliases_json, metadata_json,
               mention_count, created_at, updated_at
-       FROM sb_entities WHERE id = ?`
+       FROM sb_entities WHERE id = ? AND lifecycle_state = 'active'`
     )
     .bind(entityId)
     .first<Record<string, unknown>>();

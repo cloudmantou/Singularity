@@ -9,6 +9,12 @@ import {
 } from "../../src/memory/relations";
 import { forgetMemoryGraph } from "../../src/memory/forget";
 import { prepareMemoryRevision } from "../../src/memory/revisions";
+import { MEMORY_QUALITY_SCHEMA_STATEMENTS } from "../../src/memory/quality";
+import { ensureEntityResolutionDataModel } from "../../src/memory/entities";
+
+async function ensureQualityDataModel(db: D1Database) {
+  for (const statement of MEMORY_QUALITY_SCHEMA_STATEMENTS) await db.exec(statement);
+}
 
 describe("memory data model", () => {
   let raw: Database.Database;
@@ -257,6 +263,8 @@ describe("memory data model", () => {
       )
     `);
     await ensureMemoryDataModel(db);
+    await ensureEntityResolutionDataModel(db);
+    await ensureQualityDataModel(db);
     await db.batch([
       db.prepare(`INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?)`)
         .bind("source", "private fact", '["work"]', "api", 1, '["source-vector"]'),
@@ -407,6 +415,8 @@ describe("memory data model", () => {
       )
     `);
     await ensureMemoryDataModel(db);
+    await ensureEntityResolutionDataModel(db);
+    await ensureQualityDataModel(db);
     await db.batch([
       db.prepare(`INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?)`)
         .bind("primary", "shared fact source one", '["work"]', "api", 1, '["primary-vector"]'),

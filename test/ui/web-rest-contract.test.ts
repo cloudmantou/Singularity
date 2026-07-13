@@ -62,4 +62,14 @@ describe("web memory mutation API contract", () => {
     expect(html).toContain("filteredVecAvailable");
     expect(html).toContain("t('obs.vector.filteredKnn')");
   });
+
+  it("surfaces the protected dependency and provider health matrix", () => {
+    expect(html).toContain('id="obs-health-matrix-section"');
+    expect(html).toContain('id="obs-health-matrix-grid"');
+    expect(html).toContain('id="obs-health-matrix-meta"');
+    expect(html).toContain("obsApi('/health/details')");
+    expect(html).toContain("function obsRenderHealthMatrix(matrix)");
+    expect(html).toContain("matrix.components || {}");
+    expect(html).toContain("components.providers || []");
+  });
 });

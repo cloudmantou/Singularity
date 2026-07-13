@@ -1,8 +1,10 @@
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  ClaimRelationMismatchError,
   ConflictClaimsUnavailableError,
   D1ResolutionCoordinator,
+  ManualResolutionOutcomeRequiredError,
 } from "../../src/memory/resolution-coordinator";
 import { ensureMemoryDataModel } from "../../src/memory/schema";
 import { MEMORY_QUALITY_SCHEMA_STATEMENTS } from "../../src/memory/quality";
@@ -204,22 +206,40 @@ describe("ResolutionCoordinator", () => {
       .toEqual({ action: "fact.supersede.apply" });
   });
 
-  it("records a manual resolution without inferring Claim or Fact lifecycle changes", async () => {
-    const changed = await new D1ResolutionCoordinator(db).applyConflictResolution({
+  it("keeps a Conflict pending when manual resolution omits final Claim and Edge outcomes", async () => {
+    await expect(new D1ResolutionCoordinator(db).applyConflictResolution({
       conflictId: "conflict-1",
       resolution: "manual",
       resolvedBy: "mantou",
       effectiveAt: 10,
       actorType: "user",
-    });
+    })).rejects.toBeInstanceOf(ManualResolutionOutcomeRequiredError);
 
-    expect(changed).toBe(true);
     expect(raw.prepare(`SELECT claim_status FROM sb_memories ORDER BY id`).all())
       .toEqual([{ claim_status: "supported" }, { claim_status: "supported" }]);
     expect(raw.prepare(`SELECT resolution_state FROM sb_entity_relations WHERE id = 'relation-new'`).get())
       .toEqual({ resolution_state: "review" });
     expect(raw.prepare(`SELECT state, resolution FROM sb_conflict_cases WHERE id = 'conflict-1'`).get())
-      .toEqual({ state: "resolved", resolution: "manual" });
+      .toEqual({ state: "pending", resolution: null });
+    expect(raw.prepare(`SELECT COUNT(*) AS count FROM sb_audit_events WHERE object_id = 'conflict-1'`).get())
+      .toEqual({ count: 0 });
+  });
+
+  it("rejects automatic supersession when Claim and Fact Relation pairs are crossed", async () => {
+    await expect(new D1ResolutionCoordinator(db).applySupersession({
+      sourceClaimId: "claim-new",
+      targetClaimId: "claim-old",
+      sourceRelationId: "relation-old",
+      targetRelationId: "relation-new",
+      effectiveAt: 10,
+      actorType: "system",
+    })).rejects.toBeInstanceOf(ClaimRelationMismatchError);
+
+    expect(raw.prepare(`SELECT id, claim_status FROM sb_memories ORDER BY id`).all()).toEqual([
+      { id: "claim-new", claim_status: "supported" },
+      { id: "claim-old", claim_status: "supported" },
+    ]);
+    expect(raw.prepare(`SELECT COUNT(*) AS count FROM sb_audit_events`).get()).toEqual({ count: 0 });
   });
 
   it("refuses to guess a Claim when a legacy Entry has multiple active Claims", async () => {

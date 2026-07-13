@@ -233,4 +233,25 @@ describe("entity dual-write from capture", () => {
     });
     expect(db.factSources).toHaveLength(3);
   });
+
+  it("does not invent Entity-to-Entity facts from co-mentions", async () => {
+    const result = await attachEntitiesToMemory(db as unknown as D1Database, {
+      memoryId: "mem-co-mentions",
+      observationId: "obs-co-mentions",
+      entities: [
+        { name: "Singularity", entityType: "project" },
+        { name: "Obsidian", entityType: "product" },
+        { name: "SQLite", entityType: "product" },
+      ],
+      relations: [],
+      score: 0.9,
+      createdAt: Date.now(),
+    });
+
+    expect(result.entityIds).toHaveLength(3);
+    expect(result.relationIds).toEqual([]);
+    expect(db.memoryEntities).toHaveLength(3);
+    expect(db.entityRelations).toEqual([]);
+    expect(db.factSources).toEqual([]);
+  });
 });

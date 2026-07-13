@@ -78,6 +78,12 @@ import { planRecallRequest, type RecallRequestPlan } from "./query-intent";
 import { ensureMemoryDataModel } from "./memory/schema";
 import { activeMemoryClaimPredicate } from "./memory/claim-eligibility";
 import {
+  linkPendingEntryConflictClaims,
+  loadRecallConflictContext,
+  type RecallClaimContext,
+  type RecallConflictContext,
+} from "./memory/recall-conflicts";
+import {
   forgetMemoryGraph,
   type ForgetMemoryResult,
 } from "./memory/forget";
@@ -87,6 +93,15 @@ import {
   prepareMemoryRelation,
   type MemoryRelationType,
 } from "./memory/relations";
+import {
+  ASSOCIATION_EDGE_TYPES,
+  AssociationEndpointUnavailableError,
+  associationRecallExpansion,
+  createAssociationEdge,
+  deleteAssociationEdge,
+  listAssociationConnections,
+  type AssociationEdgeType,
+} from "./memory/associations";
 import {
   prepareMemoryRevision,
   type MemoryRevisionEvent,
@@ -112,6 +127,7 @@ import {
   exportMemoryBackup,
   importMemoryBackup,
   isMemoryBackupPayload,
+  MEMORY_BACKUP_SCHEMA_VERSION,
   memoryBackupRowCount,
 } from "./memory/backup";
 import {
@@ -148,9 +164,32 @@ import {
   type MergeSuggestedAction,
 } from "./memory/quality";
 import {
+  ClaimRelationMismatchError,
   ConflictClaimsUnavailableError,
   D1ResolutionCoordinator,
+  ManualResolutionOutcomeRequiredError,
 } from "./memory/resolution-coordinator";
+import {
+  D1EntityMergeExecutor,
+  ENTITY_MERGE_CANDIDATE_STATES,
+  EntityMergeCandidateUnavailableError,
+  EntityMergeEndpointUnavailableError,
+  type EntityMergeCandidateState,
+} from "./memory/entity-merge";
+import {
+  knowledgeSourceRegistry,
+  normalizeDevelopmentSessionProvenance,
+  normalizeObsidianProvenance,
+  type EvidenceProvenance,
+} from "./integrations";
+import {
+  isMcpToolsListRequest,
+  sanitizeToolsListResponse,
+} from "./mcp/tools-list-sanitize";
+import {
+  collectHealthMatrix,
+  type ProviderHealthSummary,
+} from "./operations/health";
 
 export interface Env {
   DB: D1Database;
@@ -199,6 +238,49 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
 };
+
+const AssociationEdgeTypeSchema = z.enum(
+  [...ASSOCIATION_EDGE_TYPES] as [AssociationEdgeType, ...AssociationEdgeType[]]
+);
+const AssociationLinkBodySchema = z.object({
+  sourceId: z.string().trim().min(1).max(512).optional(),
+  targetId: z.string().trim().min(1).max(512).optional(),
+  source_id: z.string().trim().min(1).max(512).optional(),
+  target_id: z.string().trim().min(1).max(512).optional(),
+  type: AssociationEdgeTypeSchema.default("related_to"),
+  weight: z.number().min(0).max(1).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+}).strict().superRefine((value, context) => {
+  if (!(value.sourceId ?? value.source_id)) {
+    context.addIssue({ code: "custom", message: "sourceId/source_id is required" });
+  }
+  if (!(value.targetId ?? value.target_id)) {
+    context.addIssue({ code: "custom", message: "targetId/target_id is required" });
+  }
+});
+const AssociationUnlinkBodySchema = z.object({
+  sourceId: z.string().trim().min(1).max(512).optional(),
+  targetId: z.string().trim().min(1).max(512).optional(),
+  source_id: z.string().trim().min(1).max(512).optional(),
+  target_id: z.string().trim().min(1).max(512).optional(),
+  type: AssociationEdgeTypeSchema.optional(),
+}).strict().superRefine((value, context) => {
+  if (!(value.sourceId ?? value.source_id)) {
+    context.addIssue({ code: "custom", message: "sourceId/source_id is required" });
+  }
+  if (!(value.targetId ?? value.target_id)) {
+    context.addIssue({ code: "custom", message: "targetId/target_id is required" });
+  }
+});
+const DevelopmentSessionCaptureSchema = z.object({
+  client: z.enum(["claude-code", "codex"]),
+  repository: z.string().trim().min(1).max(200),
+  branch: z.string().trim().min(1).max(256),
+  sessionId: z.string().trim().min(1).max(256),
+  transcript: z.string().trim().min(1).max(200_000),
+  capturedAt: z.number().int().nonnegative().optional(),
+  revision: z.number().int().min(1).optional(),
+}).strict();
 
 function graceMs(env: Env): number {
   return parseInt(env.VECTORIZE_GRACE_MS ?? "300000", 10) || 300000;
@@ -1971,11 +2053,25 @@ async function linkObsidianObservation(
   }
 ): Promise<void> {
   const observationId = crypto.randomUUID();
+  const provenance = normalizeObsidianProvenance({
+    sourceId: obsidianEvidenceIdentity(
+      input.vaultId,
+      input.externalPath,
+      input.externalBlockId ?? ""
+    ),
+    sourceRevision: Math.max(1, Math.trunc(input.revisionNumber ?? input.createdAt) || 1),
+    sourceTimestamp: input.createdAt,
+    metadata: {
+      vaultId: input.vaultId,
+      path: input.externalPath,
+      blockId: input.externalBlockId ?? "",
+    },
+  });
   const parentRef: ObservationParentVersionRef = {
     parentId: `${OBSIDIAN_PROVIDER}:memory:${input.entryId}`,
     versionId: crypto.randomUUID(),
-    versionNumber: Math.max(1, Math.trunc(input.revisionNumber ?? input.createdAt) || 1),
-    evidenceRootId: `${OBSIDIAN_PROVIDER}:memory:${input.entryId}`,
+    versionNumber: provenance.revision,
+    evidenceRootId: provenance.rootEvidenceId,
   };
   const metadata = {
     provider: OBSIDIAN_PROVIDER,
@@ -1985,6 +2081,7 @@ async function linkObsidianObservation(
     properties: input.properties,
     needs_reprocess: true,
     review_proposal: input.properties.managed_by === "singularity",
+    evidence_type: provenance.evidenceType,
     ...observationParentVersionMetadata(parentRef),
   };
   await env.DB.batch([
@@ -1994,12 +2091,12 @@ async function linkObsidianObservation(
       source: OBSIDIAN_PROVIDER,
       metadata,
       contentHash: input.contentHash,
-      sourceChannel: OBSIDIAN_PROVIDER,
-      sourceIdentity: obsidianEvidenceIdentity(input.vaultId, input.externalPath, input.externalBlockId ?? ""),
-      authorType: "user",
-      sourceUri: obsidianEvidenceUri(input.vaultId, input.externalPath, input.externalBlockId ?? ""),
-      sourceTimestamp: input.createdAt,
-      revision: parentRef.versionNumber,
+      sourceChannel: provenance.sourceChannel,
+      sourceIdentity: provenance.sourceIdentity,
+      authorType: provenance.authorType,
+      sourceUri: provenance.sourceUri,
+      sourceTimestamp: provenance.sourceTimestamp,
+      revision: provenance.revision,
       rootEvidenceId: parentRef.evidenceRootId,
       extractionStatus: "fallback",
       processedAt: input.createdAt,
@@ -2243,11 +2340,21 @@ async function createObsidianObservation(
 ): Promise<ObservationExtractionRow> {
   const observationId = crypto.randomUUID();
   const parentVersionId = crypto.randomUUID();
+  const provenance = normalizeObsidianProvenance({
+    sourceId: input.sourceId,
+    sourceRevision: input.sourceRevision,
+    sourceTimestamp: input.createdAt,
+    metadata: {
+      vaultId: input.vaultId,
+      path: input.externalPath,
+      blockId: input.externalBlockId,
+    },
+  });
   const parentRef: ObservationParentVersionRef = {
     parentId: input.sourceId,
     versionId: parentVersionId,
-    versionNumber: Math.max(1, Math.trunc(input.sourceRevision) || 1),
-    evidenceRootId: input.sourceId,
+    versionNumber: provenance.revision,
+    evidenceRootId: provenance.rootEvidenceId,
   };
   const metadata = {
     provider: OBSIDIAN_PROVIDER,
@@ -2258,6 +2365,7 @@ async function createObsidianObservation(
     properties: input.properties,
     sync_direction: input.syncDirection,
     previous_observation_id: input.previousObservationId ?? null,
+    evidence_type: provenance.evidenceType,
     ...observationParentVersionMetadata(parentRef),
   };
   await env.DB.batch([
@@ -2267,12 +2375,12 @@ async function createObsidianObservation(
       source: OBSIDIAN_PROVIDER,
       metadata,
       contentHash: input.contentHash,
-      sourceChannel: OBSIDIAN_PROVIDER,
-      sourceIdentity: obsidianEvidenceIdentity(input.vaultId, input.externalPath, input.externalBlockId),
-      authorType: "user",
-      sourceUri: obsidianEvidenceUri(input.vaultId, input.externalPath, input.externalBlockId),
-      sourceTimestamp: input.createdAt,
-      revision: parentRef.versionNumber,
+      sourceChannel: provenance.sourceChannel,
+      sourceIdentity: provenance.sourceIdentity,
+      authorType: provenance.authorType,
+      sourceUri: provenance.sourceUri,
+      sourceTimestamp: provenance.sourceTimestamp,
+      revision: provenance.revision,
       rootEvidenceId: parentRef.evidenceRootId,
       previousEvidenceId: input.previousObservationId ?? null,
       extractionStatus: "pending",
@@ -6424,14 +6532,27 @@ async function appendToEntry(
 
 export async function synthesizeInsight(
   query: string,
-  rows: { id: string; content: string }[],
-  env: Env
+  rows: { id: string; content: string; claims?: RecallClaimContext[] }[],
+  env: Env,
+  conflicts: RecallConflictContext[] = []
 ): Promise<string> {
   if (!rows.length) return "";
 
   const memoriesList = rows
-    .map((r, i) => `[E${i + 1}]\n${r.content}`)
+    .map((r, i) => {
+      const claimLines = (r.claims ?? []).map((claim) =>
+        `[Claim ${claim.id}] status=${claim.status}; verification=${claim.verificationStatus}; ` +
+        `conflicts=${claim.conflictIds.join(",") || "none"}; statement=${claim.statement}`
+      );
+      return `[E${i + 1}]\n${r.content}${claimLines.length ? `\n${claimLines.join("\n")}` : ""}`;
+    })
     .join("\n\n");
+  const conflictsList = conflicts.length
+    ? conflicts.map((conflict) =>
+      `[Conflict ${conflict.id}] state=${conflict.state}; reason=${conflict.reason ?? "unspecified"}; ` +
+      `claims=${conflict.claimIds.join(",")}`
+    ).join("\n")
+    : "None";
 
   const prompt = `You are a second brain assistant. Summarize what the user's stored memories below say in relation to their query. Base the insight ONLY on these memories.
 
@@ -6440,9 +6561,13 @@ Query: "${query}"
 Memories:
 ${memoriesList}
 
+Unresolved conflicts:
+${conflictsList}
+
 Rules:
 - Use ONLY the information in the memories above. Do not add, infer, guess, or speculate, and do not use hedging language like "might" or "it seems".
 - Cite supporting evidence with the local references like E1 or E2 when you state a fact.
+- Never silently choose one side of an unresolved conflict. Explicitly state that the Claims conflict and identify both sides.
 - These memories are a retrieved subset, not the user's full memory store.
 - If the memories do not support answering the query, say the retrieved evidence is insufficient and briefly state only what the evidence does contain.
 
@@ -6778,11 +6903,19 @@ export interface RecallMatch {
   matchedEntities?: string[];
   graphFacts?: string[];
   timeBasis?: TemporalEvidence;
+  claims?: RecallClaimContext[];
+  association?: {
+    hop: number;
+    viaType: AssociationEdgeType;
+    viaWeight: number;
+    seedParentId: string;
+  };
 }
 
 export interface RecallSearchResult {
   matches: RecallMatch[];
   insight: string;
+  conflicts?: RecallConflictContext[];
   degraded?: boolean;
   degradedReason?: string;
 }
@@ -7496,12 +7629,13 @@ function fuseDenseAndKeyword(
 }
 
 export async function recallEntries(
-  params: { query: string; topK: number; tag?: string; after?: number; before?: number; kind?: MemoryKind },
+  params: { query: string; topK: number; tag?: string; after?: number; before?: number; kind?: MemoryKind; hops?: number },
   env: Env,
   ctx: ExecutionContext,
   vaultFilter: string | null = null
 ): Promise<RecallSearchResult> {
   const { query, topK } = params;
+  const associationHops = Math.max(0, Math.min(2, Math.trunc(params.hops ?? 0)));
   let { tag, after, before, kind } = params;
   if (tag && !isD1SafeTag(tag)) return { matches: [], insight: "" };
   const now = Date.now();
@@ -7853,7 +7987,7 @@ export async function recallEntries(
 
   const d1Map = new Map(d1Rows.map((r) => [r.id as string, r]));
 
-  const matches: RecallMatch[] = deduped.flatMap((m) => {
+  let matches: RecallMatch[] = deduped.flatMap((m) => {
     const meta = m.metadata as Record<string, any>;
     const parentId = (meta?.parentId ?? m.id) as string;
     const row = d1Map.get(parentId);
@@ -7916,6 +8050,62 @@ export async function recallEntries(
     m.scoreDetails = roundScoreDetails(mergeScoreDetails(m.scoreDetails, { final: m.score }));
   }
 
+  if (associationHops > 0 && matches.length) {
+    try {
+      let associationRows = await associationRecallExpansion(
+        env.DB,
+        matches.map((match) => ({ entryId: match.id, score: match.score })),
+        { hops: associationHops, asOf: recallAsOf, limit: topK }
+      );
+      associationRows = associationRows.filter((row) => {
+        if (row.tags.includes("auto-pattern") || row.tags.includes("status:deprecated")) return false;
+        if (kind && !row.tags.includes(`kind:${kind}`)) return false;
+        if (tag && !row.tags.includes(tag)) return false;
+        if (after !== undefined && row.createdAt < after) return false;
+        if (before !== undefined && row.createdAt > before) return false;
+        return true;
+      });
+      if (vaultFilter && associationRows.length) {
+        const ids = associationRows.map((row) => row.entryId);
+        const placeholders = ids.map(() => "?").join(", ");
+        const { results } = await env.DB.prepare(
+          `SELECT DISTINCT entry_id
+           FROM sb_external_links
+           WHERE provider = 'obsidian'
+             AND object_type = 'memory'
+             AND vault_id = ?
+             AND entry_id IN (${placeholders})`
+        ).bind(vaultFilter, ...ids).all<{ entry_id: string }>();
+        const allowed = new Set(results.map((row) => row.entry_id));
+        associationRows = associationRows.filter((row) => allowed.has(row.entryId));
+      }
+      matches = [
+        ...matches,
+        ...associationRows.map((row): RecallMatch => ({
+          id: row.entryId,
+          content: row.content,
+          score: row.score,
+          createdAt: row.createdAt,
+          tags: row.tags,
+          source: row.source,
+          isUpdate: false,
+          scoreDetails: roundScoreDetails({
+            relation: row.score,
+            final: row.score,
+          }),
+          association: {
+            hop: row.hop,
+            viaType: row.viaType,
+            viaWeight: row.viaWeight,
+            seedParentId: row.seedParentId,
+          },
+        })),
+      ];
+    } catch (error) {
+      console.error("Association recall expansion failed (non-fatal):", error);
+    }
+  }
+
   // Observatory: memory.recalled events (sample top matches)
   for (let i = 0; i < Math.min(matches.length, 10); i++) {
     const m = matches[i];
@@ -7936,10 +8126,23 @@ export async function recallEntries(
   const insightRows = matches.map((match) => ({
     id: match.id,
     content: match.content,
+    claims: match.claims,
   }));
 
+  const conflictContext = await loadRecallConflictContext(
+    env.DB,
+    matches.map((match) => match.id),
+    recallAsOf
+  );
+  for (const match of matches) {
+    match.claims = conflictContext.claimsByEntry.get(match.id) ?? [];
+  }
+  for (const row of insightRows) {
+    row.claims = conflictContext.claimsByEntry.get(row.id) ?? [];
+  }
+
   const insight = insightRows.length > 1
-    ? await synthesizeInsight(embedQuery, insightRows, env)
+    ? await synthesizeInsight(embedQuery, insightRows, env, conflictContext.conflicts)
     : "";
 
   if (insightRows.length >= 5) {
@@ -7952,6 +8155,7 @@ export async function recallEntries(
   return {
     matches,
     insight,
+    conflicts: conflictContext.conflicts,
     degraded: embeddingFailed || vectorQueryDegraded,
     degradedReason: embeddingFailed
       ? "embedding_failed"
@@ -8288,6 +8492,10 @@ export interface CaptureOptions {
   evidenceRootId?: string | null;
   /** Fields produced by the atomic extractor. */
   atomic?: AtomicFactDraft;
+  /** Server-validated source adapter provenance for the immutable Observation. */
+  evidenceContext?: EvidenceProvenance & {
+    metadata?: Record<string, unknown>;
+  };
 }
 
 function evidenceAuthorTypeForSource(source: string, tags: string[] = []): EvidenceAuthorType {
@@ -8484,6 +8692,13 @@ function parseReviewId(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
+const EntityMergeReviewSchema = z.object({
+  id: z.string().trim().min(1).max(256),
+  decision: z.enum(["accept", "reject"]),
+  reviewedBy: z.string().trim().min(1).max(256).optional(),
+  reason: z.string().max(1000).optional(),
+}).strict();
+
 async function listMemoryMergeCandidates(
   env: Env,
   input: { state: MergeCandidateState | null; limit: number }
@@ -8560,6 +8775,57 @@ async function resolveMemoryMergeCandidate(
     auditEvent.statement,
   ]);
   return Number(results[0]?.meta?.changes ?? 0) > 0;
+}
+
+async function listEntityMergeCandidates(
+  env: Env,
+  input: { state: EntityMergeCandidateState | null; limit: number }
+): Promise<Record<string, unknown>[]> {
+  await ensureEntityResolutionDataModel(env.DB);
+  const stateClause = input.state ? "WHERE c.state = ?" : "";
+  const bindings: unknown[] = [];
+  if (input.state) bindings.push(input.state);
+  bindings.push(input.limit);
+  const { results } = await env.DB.prepare(
+    `SELECT c.*,
+            source.name AS source_name,
+            source.entity_type AS source_type,
+            source.lifecycle_state AS source_lifecycle_state,
+            target.name AS target_name,
+            target.entity_type AS target_type,
+            target.lifecycle_state AS target_lifecycle_state
+     FROM sb_entity_merge_candidates c
+     LEFT JOIN sb_entities source ON source.id = c.source_entity_id
+     LEFT JOIN sb_entities target ON target.id = c.target_entity_id
+     ${stateClause}
+     ORDER BY c.created_at DESC, c.id DESC
+     LIMIT ?`
+  ).bind(...bindings).all<Record<string, any>>();
+  return (results ?? []).map((row) => ({
+    id: row.id,
+    sourceEntityId: row.source_entity_id,
+    targetEntityId: row.target_entity_id,
+    matchedBy: row.matched_by,
+    score: row.score == null ? null : Number(row.score),
+    reasons: parseJsonArray(row.reason_json),
+    state: row.state,
+    sourceObservationId: row.source_observation_id,
+    reviewedBy: row.reviewed_by,
+    reviewedAt: row.reviewed_at,
+    createdAt: row.created_at,
+    source: {
+      id: row.source_entity_id,
+      name: row.source_name ?? null,
+      type: row.source_type ?? null,
+      lifecycleState: row.source_lifecycle_state ?? null,
+    },
+    target: {
+      id: row.target_entity_id,
+      name: row.target_name ?? null,
+      type: row.target_type ?? null,
+      lifecycleState: row.target_lifecycle_state ?? null,
+    },
+  }));
 }
 
 async function listConflictCases(
@@ -9893,6 +10159,17 @@ async function captureSingleFact(
         reason: atomicWrite.error,
       };
     }
+    if (contradiction.detected && contradiction.conflicting_id) {
+      try {
+        await linkPendingEntryConflictClaims(env.DB, {
+          oldEntryId: contradiction.conflicting_id,
+          newEntryId: id,
+          asOf: now,
+        });
+      } catch (error) {
+        console.error("Entry conflict Claim linking failed (non-fatal):", error);
+      }
+    }
   }
 
   logMemoryEvent(id, "created", {
@@ -10065,6 +10342,7 @@ export async function captureEntry(
   options: CaptureOptions = {}
 ): Promise<CaptureResult> {
   const raw = rawContent.trim();
+  const evidenceContext = options.evidenceContext;
   const { cleanContent, hashtags } = extractHashtags(raw);
   const c = cleanContent || raw;
   const baseTags = [...new Set([
@@ -10091,12 +10369,13 @@ export async function captureEntry(
         const parentVersionId = crypto.randomUUID();
         const observedAt = Date.now();
         const parentRef: ObservationParentVersionRef = {
-          parentId: observationId,
+          parentId: evidenceContext?.rootEvidenceId ?? observationId,
           versionId: parentVersionId,
-          versionNumber: 1,
-          evidenceRootId: observationId,
+          versionNumber: evidenceContext?.revision ?? 1,
+          evidenceRootId: evidenceContext?.rootEvidenceId ?? observationId,
         };
         const metadata = {
+          ...(evidenceContext?.metadata ?? {}),
           tags: baseTags,
           duplicate_of: exactId,
           ...observationParentVersionMetadata(parentRef),
@@ -10109,12 +10388,14 @@ export async function captureEntry(
               source,
               metadata,
               contentHash: wholeHash,
-              sourceChannel: source,
-              sourceIdentity: `${source}:${observationId}`,
-              authorType: evidenceAuthorTypeForSource(source, baseTags),
-              sourceTimestamp: observedAt,
-              revision: 1,
+              sourceChannel: evidenceContext?.sourceChannel ?? source,
+              sourceIdentity: evidenceContext?.sourceIdentity ?? `${source}:${observationId}`,
+              authorType: evidenceContext?.authorType ?? evidenceAuthorTypeForSource(source, baseTags),
+              sourceUri: evidenceContext?.sourceUri ?? null,
+              sourceTimestamp: evidenceContext?.sourceTimestamp ?? observedAt,
+              revision: evidenceContext?.revision ?? 1,
               rootEvidenceId: parentRef.evidenceRootId,
+              previousEvidenceId: evidenceContext?.previousEvidenceId ?? null,
               extractionStatus: "succeeded",
               processedAt: observedAt,
               createdAt: observedAt,
@@ -10169,12 +10450,13 @@ export async function captureEntry(
   const observedAt = Date.now();
   const observationHash = wholeHash ?? await contentFingerprint(c);
   const parentRef: ObservationParentVersionRef = {
-    parentId: observationId,
+    parentId: evidenceContext?.rootEvidenceId ?? observationId,
     versionId: parentVersionId,
-    versionNumber: 1,
-    evidenceRootId: observationId,
+    versionNumber: evidenceContext?.revision ?? 1,
+    evidenceRootId: evidenceContext?.rootEvidenceId ?? observationId,
   };
   const observationMetadata = {
+    ...(evidenceContext?.metadata ?? {}),
     tags: baseTags,
     ...observationParentVersionMetadata(parentRef),
   };
@@ -10186,12 +10468,14 @@ export async function captureEntry(
         source,
         metadata: observationMetadata,
         contentHash: observationHash,
-        sourceChannel: source,
-        sourceIdentity: `${source}:${observationId}`,
-        authorType: evidenceAuthorTypeForSource(source, baseTags),
-        sourceTimestamp: observedAt,
-        revision: 1,
+        sourceChannel: evidenceContext?.sourceChannel ?? source,
+        sourceIdentity: evidenceContext?.sourceIdentity ?? `${source}:${observationId}`,
+        authorType: evidenceContext?.authorType ?? evidenceAuthorTypeForSource(source, baseTags),
+        sourceUri: evidenceContext?.sourceUri ?? null,
+        sourceTimestamp: evidenceContext?.sourceTimestamp ?? observedAt,
+        revision: evidenceContext?.revision ?? 1,
         rootEvidenceId: parentRef.evidenceRootId,
+        previousEvidenceId: evidenceContext?.previousEvidenceId ?? null,
         extractionStatus: "pending",
         createdAt: observedAt,
       }),
@@ -10682,10 +10966,11 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
         after: z.number().int().optional().describe("Only return entries after this Unix ms timestamp"),
         before: z.number().int().optional().describe("Only return entries before this Unix ms timestamp"),
         kind: z.enum([...KIND_VALUES] as [string, ...string[]]).optional().describe("Filter to episodic (events), semantic (facts/knowledge), or procedural (workflows/how-to)"),
+        hops: z.number().int().min(0).max(2).default(0).describe("Association expansion depth. Related context is always ranked below direct evidence."),
       },
     },
-    async ({ query, topK, tag, after, before, kind }) => {
-      const { matches, insight, degraded, degradedReason } = await recallEntries({ query, topK, tag, after, before, kind: kind as MemoryKind | undefined }, env, ctx);
+    async ({ query, topK, tag, after, before, kind, hops }) => {
+      const { matches, insight, conflicts = [], degraded, degradedReason } = await recallEntries({ query, topK, tag, after, before, kind: kind as MemoryKind | undefined, hops }, env, ctx);
 
       if (!matches.length) {
         const degradedText = degraded ? ` (${degradedReason ?? "degraded"})` : "";
@@ -10698,11 +10983,24 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
         const src = m.source ? ` · ${m.source}` : "";
         const relevance = formatRelevanceLabel(m.score);
         const updateLabel = m.isUpdate ? " [updated]" : "";
-        return `${i + 1}. [${date}${src}${tagList}] (${relevance})${updateLabel}\n${m.content}`;
+        const associationLabel = m.association
+          ? ` [association:${m.association.viaType}, ${m.association.hop} hop${m.association.hop === 1 ? "" : "s"}]`
+          : "";
+        const claimState = (m.claims ?? []).length
+          ? `\nClaims: ${(m.claims ?? []).map((claim) =>
+            `${claim.id}=${claim.verificationStatus}${claim.conflictIds.length ? ` conflicts:${claim.conflictIds.join(",")}` : ""}`
+          ).join("; ")}`
+          : "";
+        return `${i + 1}. [${date}${src}${tagList}] (${relevance})${updateLabel}${associationLabel}\n${m.content}${claimState}`;
       }).join("\n\n");
 
       const degradedText = degraded ? `**Recall degraded:** ${degradedReason ?? "partial recall"}\n\n---\n\n` : "";
-      const finalText = degradedText + (insight ? `**Insight:** ${insight}\n\n---\n\n${text}` : text);
+      const conflictText = conflicts.length
+        ? `**Unresolved conflicts:**\n${conflicts.map((conflict) =>
+          `- ${conflict.id}: ${conflict.claimIds.join(" vs ")}${conflict.reason ? ` (${conflict.reason})` : ""}`
+        ).join("\n")}\n\n---\n\n`
+        : "";
+      const finalText = degradedText + conflictText + (insight ? `**Insight:** ${insight}\n\n---\n\n${text}` : text);
       return { content: [{ type: "text", text: finalText }] };
     }
   );
@@ -10764,6 +11062,128 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
   );
 
   server.registerTool(
+    "link",
+    {
+      description: "Create a non-authoritative navigation association between two recalled memories. Association links expand context but never become factual evidence.",
+      inputSchema: {
+        source_id: z.string().min(1).max(512).describe("Source entry ID from recall or list_recent"),
+        target_id: z.string().min(1).max(512).describe("Target entry ID from recall or list_recent"),
+        type: AssociationEdgeTypeSchema.default("related_to").describe("Association type"),
+      },
+    },
+    async ({ source_id, target_id, type }) => {
+      try {
+        const edge = await createAssociationEdge(env.DB, {
+          source: source_id,
+          target: target_id,
+          edgeType: type,
+          weight: 1,
+          provenance: "manual",
+        });
+        await safeRecordComplianceAuditEvent(env, {
+          actorType: "mcp",
+          actorId: "mcp",
+          action: "association.linked",
+          objectType: "association_edge",
+          objectId: edge.id,
+          success: true,
+          metadata: {
+            sourceParentId: edge.sourceParentId,
+            targetParentId: edge.targetParentId,
+            edgeType: edge.edgeType,
+          },
+        });
+        return {
+          content: [{
+            type: "text",
+            text: `Associated ${source_id} with ${target_id} (${edge.edgeType}). This is navigation context, not Fact evidence.`,
+          }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: error instanceof Error ? error.message : "Association link failed." }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    "unlink",
+    {
+      description: "Remove a navigation association between two memories without changing Claims or Fact edges.",
+      inputSchema: {
+        source_id: z.string().min(1).max(512),
+        target_id: z.string().min(1).max(512),
+        type: AssociationEdgeTypeSchema.optional(),
+      },
+    },
+    async ({ source_id, target_id, type }) => {
+      try {
+        const deleted = await deleteAssociationEdge(env.DB, {
+          source: source_id,
+          target: target_id,
+          edgeType: type,
+        });
+        await safeRecordComplianceAuditEvent(env, {
+          actorType: "mcp",
+          actorId: "mcp",
+          action: "association.unlinked",
+          objectType: "association_edge",
+          objectId: `${source_id}:${target_id}:${type ?? "*"}`,
+          success: true,
+          metadata: { deleted, edgeType: type ?? null },
+        });
+        return {
+          content: [{
+            type: "text",
+            text: deleted
+              ? `Removed ${deleted} association(s).`
+              : "No matching association was present.",
+          }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: error instanceof Error ? error.message : "Association unlink failed." }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    "connections",
+    {
+      description: "List one-hop navigation associations for a recalled memory. Use relations when you need evidence or lifecycle links.",
+      inputSchema: {
+        id: z.string().min(1).max(512).describe("Entry ID from recall or list_recent"),
+        type: AssociationEdgeTypeSchema.optional(),
+        limit: z.number().int().min(1).max(100).default(50),
+      },
+    },
+    async ({ id, type, limit }) => {
+      try {
+        const connections = await listAssociationConnections(env.DB, id, {
+          edgeType: type,
+          limit,
+        });
+        if (!connections.length) {
+          return { content: [{ type: "text", text: `No associations found for ${id}.` }] };
+        }
+        const text = connections.map((connection) =>
+          `- (${connection.edgeType}, weight ${connection.weight.toFixed(2)}) ${connection.entryId}: ${connection.content.slice(0, 160)}`
+        ).join("\n");
+        return { content: [{ type: "text", text }] };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: error instanceof Error ? error.message : "Connections lookup failed." }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
     "forget",
     {
       description: "Permanently delete an entry from your second brain by ID. Only call when the user explicitly asks to delete something. Confirm the entry ID using recall or list_recent first. This action cannot be undone.",
@@ -10808,17 +11228,67 @@ const apiHandler = {
     return withRequestTelemetry(request, env, ctx, async () => {
       await ensureDatabase(env);
       const server = buildMcpServer(env, ctx);
+      const isToolsList = await isMcpToolsListRequest(request);
       // Prefer a complete JSON-RPC response for POST requests. This is still
       // MCP Streamable HTTP, but avoids reverse proxies buffering or dropping
       // the first short-lived SSE frame during initialize/tools/list.
-      return createMcpHandler(server, { enableJsonResponse: true })(
+      const response = await createMcpHandler(server, { enableJsonResponse: true })(
         request,
         env,
         ctx
       );
+      return isToolsList ? sanitizeToolsListResponse(response) : response;
     });
   },
 };
+
+async function providerHealthSummaries(env: Env): Promise<ProviderHealthSummary[]> {
+  return Promise.all(knowledgeSourceRegistry.list().map(async (provider) => {
+    try {
+      const row = provider.id === "development-session"
+        ? await env.DB.prepare(
+          `SELECT COUNT(*) AS count FROM sb_observations
+           WHERE source_channel IN ('claude-code', 'codex')`
+        ).first<{ count: number }>()
+        : await env.DB.prepare(
+          `SELECT COUNT(*) AS count FROM sb_external_links WHERE provider = ?`
+        ).bind(provider.id).first<{ count: number }>();
+      return {
+        id: provider.id,
+        configured: Number(row?.count ?? 0) > 0,
+        status: "healthy" as const,
+      };
+    } catch {
+      return {
+        id: provider.id,
+        configured: false,
+        status: "degraded" as const,
+        error: "provider_state_unavailable",
+      };
+    }
+  }));
+}
+
+async function detailedHealth(env: Env) {
+  const { effective } = await getEffectiveModelSettings(env);
+  const devEmbeddingAllowed = isDevLocalProvider(effective.embedding.provider) &&
+    (env.ALLOW_DEV_EMBEDDING === "1" || env.ALLOW_DEV_EMBEDDING === "true");
+  return collectHealthMatrix({
+    db: env.DB,
+    vectorize: env.VECTORIZE as unknown as { describe?: () => Promise<unknown> },
+    mode: env.SELFHOST === "1" ? "selfhost" : "cloudflare",
+    llmConfigured: Boolean(
+      (effective.llm.baseURL && effective.llm.apiKey) ||
+      (env.AI && env.SELFHOST !== "1")
+    ),
+    embeddingConfigured: Boolean(
+      (effective.embedding.baseURL && effective.embedding.apiKey) ||
+      devEmbeddingAllowed ||
+      (env.AI && env.SELFHOST !== "1")
+    ),
+    providers: await providerHealthSummaries(env),
+  });
+}
 
 // ─── Default handler — all non-MCP routes ────────────────────────────────────
 
@@ -11043,6 +11513,142 @@ const defaultHandler = {
         ...cfg,
         // hint for operators
         envKeys: ["PUBLIC_URL", "PUBLIC_BASE_URL", "SITE_URL"],
+      });
+    }
+
+    // GET /health — public liveness only; operational internals stay protected.
+    if (url.pathname === "/health" && request.method === "GET") {
+      return json({
+        ok: true,
+        status: "healthy",
+        mode: env.SELFHOST === "1" ? "selfhost" : "cloudflare",
+      });
+    }
+
+    // GET /health/details — owner-only dependency and queue matrix.
+    if (url.pathname === "/health/details" && request.method === "GET") {
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
+      return json(await detailedHealth(env));
+    }
+
+    // GET /integrations/providers — public provider capabilities without secrets.
+    if (url.pathname === "/integrations/providers" && request.method === "GET") {
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
+      return json({ ok: true, providers: knowledgeSourceRegistry.list() });
+    }
+
+    // POST /integrations/development-session/capture — append-only raw session Evidence.
+    if (url.pathname === "/integrations/development-session/capture" && request.method === "POST") {
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
+      let rawBody: unknown;
+      try {
+        rawBody = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON" }, 400);
+      }
+      const parsed = DevelopmentSessionCaptureSchema.safeParse(rawBody);
+      if (!parsed.success) {
+        return json({
+          ok: false,
+          error: "invalid_development_session",
+          details: parsed.error.issues,
+        }, 400);
+      }
+      const body = parsed.data;
+      const sourceIdentity = `${body.client}:${body.repository}:${body.branch}:${body.sessionId}`;
+      const contentHash = await contentFingerprint(body.transcript);
+      const previous = await env.DB.prepare(
+        `SELECT id, content_hash, revision
+         FROM sb_observations
+         WHERE source_channel = ? AND source_identity = ?
+         ORDER BY revision DESC, created_at DESC
+         LIMIT 1`
+      ).bind(body.client, sourceIdentity).first<{
+        id: string;
+        content_hash: string | null;
+        revision: number;
+      }>();
+      if (previous?.content_hash === contentHash) {
+        return json({
+          ok: true,
+          source: body.client,
+          status: "already_captured",
+          observationId: previous.id,
+        });
+      }
+      const revision = body.revision ?? Math.max(1, Number(previous?.revision ?? 0) + 1);
+      if (previous && revision <= Number(previous.revision)) {
+        return json({
+          ok: false,
+          error: "stale_development_session_revision",
+          currentRevision: Number(previous.revision),
+        }, 409);
+      }
+      const provenance = normalizeDevelopmentSessionProvenance({
+        sourceId: sourceIdentity,
+        sourceRevision: revision,
+        sourceTimestamp: body.capturedAt ?? Date.now(),
+        metadata: {
+          client: body.client,
+          repository: body.repository,
+          branch: body.branch,
+          sessionId: body.sessionId,
+        },
+      });
+      const observationId = crypto.randomUUID();
+      const createdAt = Date.now();
+      const metadata = {
+        content_stage: "raw_evidence",
+        evidence_type: provenance.evidenceType,
+        extraction_skipped_reason: "mixed_author_transcript",
+        repository: body.repository,
+        branch: body.branch,
+        session_id: body.sessionId,
+        client: body.client,
+      };
+      const auditEvent = await prepareComplianceAuditEvent(env.DB, {
+        ...auditActorFromPrincipal(auth.principal),
+        action: "evidence.development_session_captured",
+        objectType: "observation",
+        objectId: observationId,
+        afterHash: contentHash,
+        success: true,
+        metadata: {
+          sourceChannel: provenance.sourceChannel,
+          sourceIdentity: provenance.sourceIdentity,
+          revision,
+        },
+      });
+      await env.DB.batch([
+        prepareObservationInsert(env.DB, {
+          id: observationId,
+          content: body.transcript,
+          source: body.client,
+          metadata,
+          contentHash,
+          sourceChannel: provenance.sourceChannel,
+          sourceIdentity: provenance.sourceIdentity,
+          authorType: provenance.authorType,
+          sourceUri: provenance.sourceUri,
+          sourceTimestamp: provenance.sourceTimestamp,
+          revision,
+          rootEvidenceId: provenance.rootEvidenceId,
+          previousEvidenceId: previous?.id ?? null,
+          extractionStatus: "succeeded",
+          processedAt: createdAt,
+          createdAt,
+        }),
+        auditEvent.statement,
+      ]);
+      return json({
+        ok: true,
+        source: body.client,
+        status: "stored_raw_evidence",
+        observationId,
+        revision,
       });
     }
 
@@ -11635,12 +12241,13 @@ const defaultHandler = {
       const auth = requireAuth(request, env);
       if (!auth.ok) return auth.response;
 
+      const requestedSchemaVersion = Number(url.searchParams.get("schemaVersion"));
       const fullExport =
         url.searchParams.get("full") === "1" ||
         url.searchParams.get("full") === "true" ||
-        url.searchParams.get("schemaVersion") === "4" ||
-        url.searchParams.get("schemaVersion") === "5" ||
-        url.searchParams.get("schemaVersion") === "6";
+        (Number.isInteger(requestedSchemaVersion) &&
+          requestedSchemaVersion >= 4 &&
+          requestedSchemaVersion <= MEMORY_BACKUP_SCHEMA_VERSION);
       if (fullExport) {
         return json(await exportMemoryBackup(env.DB, {
           source: env.SELFHOST === "1" ? "selfhost" : "cloudflare",
@@ -11769,8 +12376,9 @@ const defaultHandler = {
       }
 
       const topK = Math.min(Math.max(parseInt(url.searchParams.get("topK") ?? "5", 10), 1), 20);
+      const hops = Math.min(Math.max(parseInt(url.searchParams.get("hops") ?? "0", 10), 0), 2);
 
-      const { matches, insight, degraded, degradedReason } = await recallEntries({ query, topK, tag, after, before, kind }, env, ctx, vaultId);
+      const { matches, insight, conflicts = [], degraded, degradedReason } = await recallEntries({ query, topK, tag, after, before, kind, hops }, env, ctx, vaultId);
 
       if (!matches.length) {
         return json({
@@ -11801,9 +12409,124 @@ const defaultHandler = {
           matched_entities: m.matchedEntities ?? [],
           graph_facts: m.graphFacts ?? [],
           time_basis: m.timeBasis ?? null,
+          claims: m.claims ?? [],
+          association: m.association ?? null,
         })),
+        conflicts,
         insight: insight || null,
       });
+    }
+
+    // POST /link — explicit, non-authoritative Parent association.
+    if ((url.pathname === "/link" || url.pathname === "/associations/link") && request.method === "POST") {
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
+      let rawBody: unknown;
+      try {
+        rawBody = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON" }, 400);
+      }
+      const parsed = AssociationLinkBodySchema.safeParse(rawBody);
+      if (!parsed.success) {
+        return json({ ok: false, error: "invalid_association_link", details: parsed.error.issues }, 400);
+      }
+      const source = parsed.data.sourceId ?? parsed.data.source_id!;
+      const target = parsed.data.targetId ?? parsed.data.target_id!;
+      try {
+        const association = await createAssociationEdge(env.DB, {
+          source,
+          target,
+          edgeType: parsed.data.type,
+          weight: parsed.data.weight ?? 1,
+          provenance: "manual",
+          metadata: parsed.data.metadata,
+        });
+        await safeRecordComplianceAuditEvent(env, {
+          ...auditActorFromPrincipal(auth.principal),
+          action: "association.linked",
+          objectType: "association_edge",
+          objectId: association.id,
+          success: true,
+          metadata: {
+            sourceParentId: association.sourceParentId,
+            targetParentId: association.targetParentId,
+            edgeType: association.edgeType,
+          },
+        });
+        return json({ ok: true, association });
+      } catch (error) {
+        if (error instanceof AssociationEndpointUnavailableError) {
+          return json({ ok: false, error: "association_endpoint_unavailable", message: error.message }, 409);
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ ok: false, error: "association_link_failed", message }, 400);
+      }
+    }
+
+    // POST /unlink — idempotent removal from the Association Graph only.
+    if ((url.pathname === "/unlink" || url.pathname === "/associations/unlink") && request.method === "POST") {
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
+      let rawBody: unknown;
+      try {
+        rawBody = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON" }, 400);
+      }
+      const parsed = AssociationUnlinkBodySchema.safeParse(rawBody);
+      if (!parsed.success) {
+        return json({ ok: false, error: "invalid_association_unlink", details: parsed.error.issues }, 400);
+      }
+      const source = parsed.data.sourceId ?? parsed.data.source_id!;
+      const target = parsed.data.targetId ?? parsed.data.target_id!;
+      try {
+        const deleted = await deleteAssociationEdge(env.DB, {
+          source,
+          target,
+          edgeType: parsed.data.type,
+        });
+        await safeRecordComplianceAuditEvent(env, {
+          ...auditActorFromPrincipal(auth.principal),
+          action: "association.unlinked",
+          objectType: "association_edge",
+          objectId: `${source}:${target}:${parsed.data.type ?? "*"}`,
+          success: true,
+          metadata: { deleted, edgeType: parsed.data.type ?? null },
+        });
+        return json({ ok: true, deleted });
+      } catch (error) {
+        if (error instanceof AssociationEndpointUnavailableError) {
+          return json({ ok: false, error: "association_endpoint_unavailable", message: error.message }, 409);
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ ok: false, error: "association_unlink_failed", message }, 400);
+      }
+    }
+
+    // GET /connections — active Parent associations; never Fact support.
+    if ((url.pathname === "/connections" || url.pathname === "/associations/connections") && request.method === "GET") {
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
+      const id = url.searchParams.get("id")?.trim();
+      if (!id) return json({ ok: false, error: "id is required" }, 400);
+      const rawType = url.searchParams.get("type")?.trim();
+      const parsedType = rawType ? AssociationEdgeTypeSchema.safeParse(rawType) : null;
+      if (parsedType && !parsedType.success) {
+        return json({ ok: false, error: "invalid_association_type" }, 400);
+      }
+      try {
+        const connections = await listAssociationConnections(env.DB, id, {
+          edgeType: parsedType?.success ? parsedType.data : undefined,
+          limit: Number.parseInt(url.searchParams.get("limit") ?? "50", 10),
+        });
+        return json({ ok: true, id, connections });
+      } catch (error) {
+        if (error instanceof AssociationEndpointUnavailableError) {
+          return json({ ok: false, error: "association_endpoint_unavailable", message: error.message }, 409);
+        }
+        throw error;
+      }
     }
 
     // GET /relations — inspect evidence and evolution links for one memory
@@ -11818,6 +12541,58 @@ const defaultHandler = {
         : 50;
       const relations = await listMemoryRelations(env.DB, id, limit);
       return json({ ok: true, id, relations });
+    }
+
+    // GET /quality/entity-merge-candidates — entity identity review queue
+    if (url.pathname === "/quality/entity-merge-candidates" && request.method === "GET") {
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
+      const state = parseQualityState(url.searchParams.get("state"), ENTITY_MERGE_CANDIDATE_STATES);
+      if (url.searchParams.has("state") && !state) {
+        return json({
+          ok: false,
+          error: `state must be one of: ${ENTITY_MERGE_CANDIDATE_STATES.join(", ")}`,
+        }, 400);
+      }
+      const limit = boundedQualityLimit(url.searchParams.get("limit"));
+      const candidates = await listEntityMergeCandidates(env, { state, limit });
+      return json({ ok: true, count: candidates.length, candidates });
+    }
+
+    // POST /quality/entity-merge-candidates/resolve — execute or reject an entity merge
+    if (url.pathname === "/quality/entity-merge-candidates/resolve" && request.method === "POST") {
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
+      let rawBody: unknown;
+      try { rawBody = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      const parsed = EntityMergeReviewSchema.safeParse(rawBody);
+      if (!parsed.success) {
+        return json({ ok: false, error: "invalid_entity_merge_review" }, 400);
+      }
+      const { id, decision, reviewedBy: requestedReviewer, reason } = parsed.data;
+      const principalActor = auditActorFromPrincipal(auth.principal);
+      const reviewedBy = requestedReviewer ?? principalActor.actorId ?? "owner";
+      try {
+        const result = await new D1EntityMergeExecutor(env.DB).resolve({
+          candidateId: id,
+          decision,
+          actorType: principalActor.actorType,
+          actorId: principalActor.actorId ?? "owner",
+          reviewedBy,
+          tokenId: principalActor.tokenId,
+          vaultId: principalActor.vaultId,
+          reason: reason ?? null,
+        });
+        return json({ ok: true, ...result, reviewedBy });
+      } catch (error) {
+        if (error instanceof EntityMergeCandidateUnavailableError) {
+          return json({ ok: false, error: "entity_merge_candidate_unavailable", message: error.message }, 409);
+        }
+        if (error instanceof EntityMergeEndpointUnavailableError) {
+          return json({ ok: false, error: "entity_merge_endpoint_unavailable", message: error.message }, 409);
+        }
+        throw error;
+      }
     }
 
     // GET /quality/merge-candidates — human review queue for high-similarity memories
@@ -11891,6 +12666,13 @@ const defaultHandler = {
       ) {
         return json({ ok: false, error: "dismissed state requires dismissed resolution, and resolved state cannot use it" }, 400);
       }
+      if (resolution === "manual") {
+        return json({
+          ok: false,
+          error: "manual_resolution_requires_outcome",
+          message: "manual resolution cannot close a conflict without explicit final Claim and Fact outcomes",
+        }, 400);
+      }
       const resolvedBy = parseReviewId(body.resolvedBy) ?? "owner";
       let ok: boolean;
       try {
@@ -11904,6 +12686,12 @@ const defaultHandler = {
       } catch (error) {
         if (error instanceof ConflictClaimsUnavailableError) {
           return json({ ok: false, error: "conflict_claims_unavailable", message: error.message }, 409);
+        }
+        if (error instanceof ManualResolutionOutcomeRequiredError) {
+          return json({ ok: false, error: "manual_resolution_requires_outcome", message: error.message }, 400);
+        }
+        if (error instanceof ClaimRelationMismatchError) {
+          return json({ ok: false, error: "claim_relation_mismatch", message: error.message }, 409);
         }
         throw error;
       }

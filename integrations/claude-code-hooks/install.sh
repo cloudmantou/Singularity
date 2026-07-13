@@ -4,7 +4,7 @@
 #
 # After running, every Claude Code session will:
 #   - auto-recall relevant context on start
-#   - auto-save the conversation to Second Brain on end
+#   - append the role-preserving transcript as assistant-authored Evidence on end
 
 set -euo pipefail
 
@@ -75,7 +75,7 @@ NODEEOF
 
 echo
 echo "Done. Second Brain hooks installed."
-echo "  SessionStart: recalls relevant context when a session opens"
-echo "  SessionEnd:   saves the session conversation to your Second Brain"
+echo "  SessionStart: recalls direct + one-hop project context"
+echo "  SessionEnd:   stores a role-preserving transcript as raw Evidence"
 echo
 echo "To use without the hooks, keep the MCP server approach (see AI_Instructions/)."
