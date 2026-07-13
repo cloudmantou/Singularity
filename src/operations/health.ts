@@ -5,6 +5,7 @@ import {
   readExtractionQueueSnapshot,
   type QueueSnapshot,
 } from "./queue-health";
+import { isVectorSourceMetadataIndexError } from "./vector-health";
 
 export type HealthStatus = "healthy" | "degraded" | "unhealthy";
 
@@ -17,6 +18,7 @@ export interface ProviderHealthSummary {
 
 interface VectorHealthSource {
   describe?: () => Promise<unknown>;
+  probeSourceMetadataFilter?: () => Promise<unknown>;
 }
 
 export interface HealthMatrixInput {
@@ -35,7 +37,12 @@ export interface HealthMatrix {
   checkedAt: number;
   components: {
     database: { status: HealthStatus };
-    vectorIndex: { status: HealthStatus; dimensions?: number; error?: string };
+    vectorIndex: {
+      status: HealthStatus;
+      dimensions?: number;
+      sourceMetadataFilter?: "available" | "missing";
+      error?: string;
+    };
     llmProvider: { status: HealthStatus; configured: boolean };
     embeddingProvider: { status: HealthStatus; configured: boolean };
     graphProjection: { status: HealthStatus; reviewPending: number };
@@ -94,16 +101,31 @@ export async function collectHealthMatrix(input: HealthMatrixInput): Promise<Hea
     databaseStatus = "unhealthy";
   }
 
-  let vectorIndex: HealthMatrix["components"]["vectorIndex"];
-  try {
-    if (typeof input.vectorize.describe !== "function") throw new Error("health probe unsupported");
-    const description = await input.vectorize.describe();
-    vectorIndex = {
-      status: "healthy",
-      dimensions: vectorDimensions(description),
-    };
-  } catch (error) {
-    vectorIndex = { status: "degraded", error: safeError(error) };
+  let vectorIndex: HealthMatrix["components"]["vectorIndex"] = { status: "healthy" };
+  if (typeof input.vectorize.describe === "function") {
+    try {
+      const description = await input.vectorize.describe();
+      vectorIndex = { ...vectorIndex, dimensions: vectorDimensions(description) };
+    } catch (error) {
+      vectorIndex = { status: "degraded", error: safeError(error) };
+    }
+  } else if (typeof input.vectorize.probeSourceMetadataFilter !== "function") {
+    vectorIndex = { status: "degraded", error: "health probe unsupported" };
+  }
+  if (typeof input.vectorize.probeSourceMetadataFilter === "function") {
+    try {
+      await input.vectorize.probeSourceMetadataFilter();
+      vectorIndex = { ...vectorIndex, sourceMetadataFilter: "available" };
+    } catch (error) {
+      vectorIndex = {
+        ...vectorIndex,
+        status: "degraded",
+        sourceMetadataFilter: "missing",
+        error: isVectorSourceMetadataIndexError(error)
+          ? "vector_source_index_missing"
+          : "vector_source_filter_probe_failed",
+      };
+    }
   }
 
   const [

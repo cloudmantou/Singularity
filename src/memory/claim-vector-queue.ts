@@ -65,7 +65,7 @@ export interface ClaimVectorQueueStatus {
 }
 
 const MAX_ATTEMPTS = 6;
-const DEFAULT_LEASE_MS = 60_000;
+export const DEFAULT_CLAIM_VECTOR_LEASE_MS = 5 * 60_000;
 
 function boundedLimit(value: number, maximum = 200): number {
   return Math.min(Math.max(Math.trunc(value) || 1, 1), maximum);
@@ -147,33 +147,39 @@ export async function enqueueMissingClaimVectorJobs(
        rebuild_id = COALESCE(excluded.rebuild_id, sb_claim_vector_jobs.rebuild_id),
        status = CASE
          WHEN sb_claim_vector_jobs.content_hash != excluded.content_hash
-           OR sb_claim_vector_jobs.status IN ('succeeded', 'failed')
+           OR sb_claim_vector_jobs.status = 'succeeded'
          THEN 'pending'
          ELSE sb_claim_vector_jobs.status
        END,
        attempts = CASE
-         WHEN sb_claim_vector_jobs.content_hash != excluded.content_hash THEN 0
+         WHEN sb_claim_vector_jobs.content_hash != excluded.content_hash
+           OR sb_claim_vector_jobs.status = 'succeeded' THEN 0
          ELSE sb_claim_vector_jobs.attempts
        END,
        next_attempt_at = CASE
          WHEN sb_claim_vector_jobs.content_hash != excluded.content_hash
-           OR sb_claim_vector_jobs.status IN ('succeeded', 'failed')
+           OR sb_claim_vector_jobs.status = 'succeeded'
          THEN excluded.next_attempt_at
          ELSE sb_claim_vector_jobs.next_attempt_at
        END,
        lease_owner = CASE
-         WHEN sb_claim_vector_jobs.content_hash != excluded.content_hash THEN NULL
+         WHEN sb_claim_vector_jobs.content_hash != excluded.content_hash
+           OR sb_claim_vector_jobs.status = 'succeeded' THEN NULL
          ELSE sb_claim_vector_jobs.lease_owner
        END,
        lease_expires_at = CASE
-         WHEN sb_claim_vector_jobs.content_hash != excluded.content_hash THEN NULL
+         WHEN sb_claim_vector_jobs.content_hash != excluded.content_hash
+           OR sb_claim_vector_jobs.status = 'succeeded' THEN NULL
          ELSE sb_claim_vector_jobs.lease_expires_at
        END,
        last_error = CASE
-         WHEN sb_claim_vector_jobs.content_hash != excluded.content_hash THEN NULL
+         WHEN sb_claim_vector_jobs.content_hash != excluded.content_hash
+           OR sb_claim_vector_jobs.status = 'succeeded' THEN NULL
          ELSE sb_claim_vector_jobs.last_error
        END,
-       updated_at = excluded.updated_at`
+       updated_at = excluded.updated_at
+     WHERE sb_claim_vector_jobs.status != 'failed'
+       OR sb_claim_vector_jobs.content_hash != excluded.content_hash`
   ).bind(
     crypto.randomUUID(),
     claim.id,
@@ -223,33 +229,39 @@ export async function enqueueClaimVectorJob(
        rebuild_id = COALESCE(excluded.rebuild_id, sb_claim_vector_jobs.rebuild_id),
        status = CASE
          WHEN sb_claim_vector_jobs.content_hash != excluded.content_hash
-           OR sb_claim_vector_jobs.status IN ('succeeded', 'failed')
+           OR sb_claim_vector_jobs.status = 'succeeded'
          THEN 'pending'
          ELSE sb_claim_vector_jobs.status
        END,
        attempts = CASE
-         WHEN sb_claim_vector_jobs.content_hash != excluded.content_hash THEN 0
+         WHEN sb_claim_vector_jobs.content_hash != excluded.content_hash
+           OR sb_claim_vector_jobs.status = 'succeeded' THEN 0
          ELSE sb_claim_vector_jobs.attempts
        END,
        next_attempt_at = CASE
          WHEN sb_claim_vector_jobs.content_hash != excluded.content_hash
-           OR sb_claim_vector_jobs.status IN ('succeeded', 'failed')
+           OR sb_claim_vector_jobs.status = 'succeeded'
          THEN excluded.next_attempt_at
          ELSE sb_claim_vector_jobs.next_attempt_at
        END,
        lease_owner = CASE
-         WHEN sb_claim_vector_jobs.content_hash != excluded.content_hash THEN NULL
+         WHEN sb_claim_vector_jobs.content_hash != excluded.content_hash
+           OR sb_claim_vector_jobs.status = 'succeeded' THEN NULL
          ELSE sb_claim_vector_jobs.lease_owner
        END,
        lease_expires_at = CASE
-         WHEN sb_claim_vector_jobs.content_hash != excluded.content_hash THEN NULL
+         WHEN sb_claim_vector_jobs.content_hash != excluded.content_hash
+           OR sb_claim_vector_jobs.status = 'succeeded' THEN NULL
          ELSE sb_claim_vector_jobs.lease_expires_at
        END,
        last_error = CASE
-         WHEN sb_claim_vector_jobs.content_hash != excluded.content_hash THEN NULL
+         WHEN sb_claim_vector_jobs.content_hash != excluded.content_hash
+           OR sb_claim_vector_jobs.status = 'succeeded' THEN NULL
          ELSE sb_claim_vector_jobs.last_error
        END,
-       updated_at = excluded.updated_at`
+       updated_at = excluded.updated_at
+     WHERE sb_claim_vector_jobs.status != 'failed'
+       OR sb_claim_vector_jobs.content_hash != excluded.content_hash`
   ).bind(
     crypto.randomUUID(),
     claim.id,
@@ -297,6 +309,37 @@ export async function getClaimVectorQueueStatus(
     failed: counts.get("failed") ?? 0,
     missing: Number(missing?.count ?? 0),
   };
+}
+
+export async function retryFailedClaimVectorJobs(
+  db: D1Database,
+  input: {
+    targetFingerprint: string;
+    claimId?: string | null;
+    now?: number;
+    limit?: number;
+  }
+): Promise<number> {
+  const now = input.now ?? Date.now();
+  const claimClause = input.claimId ? "AND claim_id = ?" : "";
+  const bindings: Array<string | number> = [input.targetFingerprint];
+  if (input.claimId) bindings.push(input.claimId);
+  bindings.push(boundedLimit(input.limit ?? 25));
+  const result = await db.prepare(
+    `UPDATE sb_claim_vector_jobs
+     SET status = 'pending', attempts = 0, next_attempt_at = ?,
+         lease_owner = NULL, lease_expires_at = NULL, last_error = NULL,
+         updated_at = ?
+     WHERE id IN (
+       SELECT id FROM sb_claim_vector_jobs
+       WHERE target_fingerprint = ?
+         AND status = 'failed'
+         ${claimClause}
+       ORDER BY updated_at ASC, id ASC
+       LIMIT ?
+     )`
+  ).bind(now, now, ...bindings).run();
+  return Number(result.meta?.changes ?? 0);
 }
 
 export async function listClaimVectorIdsForFingerprint(
@@ -379,7 +422,7 @@ export async function processClaimVectorJobs(
          )`
     ).bind(
       leaseOwner,
-      now + (input.leaseMs ?? DEFAULT_LEASE_MS),
+      now + (input.leaseMs ?? DEFAULT_CLAIM_VECTOR_LEASE_MS),
       now,
       row.id,
       now,
@@ -391,16 +434,18 @@ export async function processClaimVectorJobs(
     }
     attempted += 1;
     const claim = await db.prepare(
-      `SELECT id, entry_id, parent_version_id, content, content_hash, created_at
-       FROM sb_memories
-       WHERE id = ? AND entry_id IS NOT NULL AND content_hash = ?
+      `SELECT m.id, m.entry_id, m.parent_version_id, m.content, m.content_hash, m.created_at
+       FROM sb_memories m
+       WHERE m.id = ?
+         AND m.content_hash = ?
+         AND ${indexableClaimPredicate("m")}
        LIMIT 1`
     ).bind(row.claim_id, row.content_hash).first<IndexableClaimRow>();
     if (!claim) {
       await db.prepare(
         `UPDATE sb_claim_vector_jobs
          SET status = 'failed', lease_owner = NULL, lease_expires_at = NULL,
-             last_error = 'claim_snapshot_changed_or_deleted', updated_at = ?
+             last_error = 'claim_snapshot_ineligible_or_changed', updated_at = ?
          WHERE id = ? AND lease_owner = ?`
       ).bind(now, row.id, leaseOwner).run();
       failed += 1;

@@ -3245,7 +3245,7 @@ export class D1Mock {
           };
         }
         if (
-          s.includes("SELECT m.id, m.entry_id, m.parent_version_id, m.content, m.content_hash") &&
+          s.includes("COALESCE(pv_snapshot.version_id, m.parent_version_id) AS parent_version_id") &&
           s.includes("COALESCE(m.observed_at, m.created_at) AS created_at") &&
           s.includes("LEFT JOIN sb_memory_sources ms")
         ) {
@@ -3317,6 +3317,19 @@ export class D1Mock {
             .slice(0, limit)
             .map((memory: any) => {
               const entry = db.entries.find((item: any) => String(item.id) === String(memory.entry_id));
+              const parentVersionLink = db.parentVersionClaims
+                .filter((item: any) =>
+                  String(item.memory_id) === String(memory.id) &&
+                  String(item.relation ?? "supports") === "supports" &&
+                  parentVersionIsEligibleAt(db, item.parent_version_id, asOf)
+                )
+                .map((item: any) => db.parentVersions.find((version: any) =>
+                  String(version.version_id) === String(item.parent_version_id)
+                ))
+                .filter(Boolean)
+                .sort((left: any, right: any) =>
+                  Number(right.version_number ?? 0) - Number(left.version_number ?? 0)
+                )[0];
               const firstSource = db.memorySources
                 .filter((source: any) => String(source.memory_id) === String(memory.id))
                 .sort((left: any, right: any) =>
@@ -3329,7 +3342,7 @@ export class D1Mock {
               return {
                 id: memory.id,
                 entry_id: memory.entry_id,
-                parent_version_id: memory.parent_version_id ?? null,
+                parent_version_id: parentVersionLink?.version_id ?? memory.parent_version_id ?? null,
                 content: memory.content,
                 content_hash: memory.content_hash,
                 kind: memory.kind ?? "semantic",
@@ -3337,8 +3350,12 @@ export class D1Mock {
                 confidence: memory.confidence ?? 0,
                 claim_status: memory.claim_status ?? "supported",
                 created_at: memory.observed_at ?? memory.created_at ?? 0,
-                tags: entry?.tags ?? "[]",
-                source: entry?.source ?? observation?.source_channel ?? observation?.source ?? "claim",
+                tags: parentVersionLink?.metadata_snapshot_hash
+                  ? parentVersionLink.tags_snapshot_json ?? "[]"
+                  : entry?.tags ?? "[]",
+                source: parentVersionLink?.metadata_snapshot_hash
+                  ? parentVersionLink.source_snapshot ?? observation?.source_channel ?? observation?.source ?? "claim"
+                  : entry?.source ?? observation?.source_channel ?? observation?.source ?? "claim",
               };
             });
           return { results };

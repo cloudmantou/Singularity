@@ -85,7 +85,12 @@ import {
   indexableClaimPredicate,
   listClaimVectorIdsForFingerprint,
   processClaimVectorJobs,
+  retryFailedClaimVectorJobs,
 } from "./memory/claim-vector-queue";
+import {
+  commitAtomicMutationWithProjection,
+  mutationActorForSource,
+} from "./memory/atomic-mutation";
 import {
   linkPendingEntryConflictClaims,
   loadRecallConflictContext,
@@ -216,6 +221,10 @@ import {
   collectHealthMatrix,
   type ProviderHealthSummary,
 } from "./operations/health";
+import {
+  cachedVectorSourceMetadataProbe,
+  isVectorSourceMetadataIndexError,
+} from "./operations/vector-health";
 import {
   CLASSIFICATION_LEASE_MS as CLASSIFICATION_PROCESSING_LEASE_MS,
   CLASSIFICATION_MAX_ATTEMPTS,
@@ -2960,6 +2969,7 @@ async function handleObsidianPush(
   let contentHash = (row.content_hash as string | null) ?? await contentFingerprint(oldContent);
   let vectors = 0;
   let atomicSyncWarning: string | undefined;
+  let atomicWarnings: string[] = [];
   if (contentChanged || tagsChanged) {
     let newVectorIds: string[];
     try {
@@ -2987,14 +2997,16 @@ async function handleObsidianPush(
     finalRevisionId = await latestMemoryRevisionId(env, entryId, false);
     const updateObservedAt = Date.now();
     try {
-      await replaceEntryAtomicMemoryAndEnqueue(env, {
+      const atomicMutation = await replaceEntryAtomicMemoryAndEnqueue(env, {
         entryId,
         content,
         contentHash,
         source: OBSIDIAN_PROVIDER,
+        actor: mutationActorForSource(OBSIDIAN_PROVIDER),
         eventType: "update",
         createdAt: updateObservedAt,
       });
+      atomicWarnings = atomicMutation.warnings;
     } catch (error) {
       console.error("Obsidian atomic memory update sync failed (non-fatal):", error);
       atomicSyncWarning = "atomic_sync_failed";
@@ -3057,6 +3069,7 @@ async function handleObsidianPush(
     revisionId: finalRevisionId,
     vectors,
     warning: atomicSyncWarning,
+    warnings: atomicWarnings,
     link: serializeObsidianLink(link),
   });
 }
@@ -3831,7 +3844,7 @@ async function filterActiveVectorMatches(
 interface ActiveVectorQueryResult {
   matches: VectorizeMatch[];
   degraded: boolean;
-  degradedReason?: "vector_metadata_filter_unavailable";
+  degradedReason?: "vector_metadata_filter_unavailable" | "vector_source_index_missing";
 }
 
 async function queryActiveVectors(
@@ -3858,22 +3871,17 @@ async function queryActiveVectors(
       degraded: false,
     };
   } catch (error) {
-    console.error(
-      "Active fingerprint filtering failed; using active-ID fallback:",
-      error
-    );
-    const fallbackOptions = {
-      topK: Math.max(topK, 50),
-      returnMetadata: "all" as const,
-    };
-    const fallback = env.SELFHOST === "1"
-      ? await (env.VECTORIZE as any).query(vector, { ...fallbackOptions, queryText })
-      : await env.VECTORIZE.query(vector, fallbackOptions);
+    if (isVectorSourceMetadataIndexError(error)) {
+      console.error("Vectorize source metadata index is unavailable; using lexical recall:", error);
+      return {
+        matches: [],
+        degraded: true,
+        degradedReason: "vector_source_index_missing",
+      };
+    }
+    console.error("Active vector metadata filtering failed; using lexical recall:", error);
     return {
-      matches: await filterActiveVectorMatches(
-        fallback.matches as VectorizeMatch[],
-        env
-      ),
+      matches: [],
       degraded: true,
       degradedReason: "vector_metadata_filter_unavailable",
     };
@@ -6760,18 +6768,6 @@ function buildCitableInsightClaims(
   return claims;
 }
 
-function renderSingleVerifiedInsight(
-  context: InsightContextPackage<RecallClaimContext>
-): VerifiedInsightResult {
-  const citableClaims = buildCitableInsightClaims(context);
-  const claim = citableClaims[0];
-  if (!claim) return { answer: "", verifiedClaims: [], unverifiedClaims: [] };
-  return validateStructuredInsightResponse(JSON.stringify({
-    answer: "",
-    claims: [{ text: claim.statement, refs: [claim.ref], kind: "fact" }],
-  }), citableClaims);
-}
-
 export async function resolveVerifiedRecallInsight(
   query: string,
   contextInput: InsightContextPackage<RecallClaimContext>,
@@ -6780,15 +6776,6 @@ export async function resolveVerifiedRecallInsight(
   options: { asOf?: number } = {}
 ): Promise<VerifiedInsightResult> {
   const context = normalizeInsightContext(contextInput);
-  const citableClaims = buildCitableInsightClaims(context, conflicts);
-  const singleClaim = citableClaims.length === 1 ? citableClaims[0] : null;
-  const canUseFastPath =
-    context.directEvidence.length === 1 &&
-    context.relatedContext.length === 0 &&
-    conflicts.length === 0 &&
-    singleClaim?.citationUse !== "conflict_only" &&
-    singleClaim?.conflictIds.length === 0;
-  if (canUseFastPath) return renderSingleVerifiedInsight(context);
   return synthesizeVerifiedInsight(query, context, env, conflicts, options);
 }
 
@@ -7113,6 +7100,7 @@ export async function compressTag(
       content,
       contentHash: await contentFingerprint(content),
       source: "system",
+      actor: mutationActorForSource("system"),
       eventType: "update",
       createdAt: Date.now(),
     });
@@ -8149,14 +8137,21 @@ async function processClaimVectorQueue(
 async function replaceEntryAtomicMemoryAndEnqueue(
   env: Env,
   input: Parameters<typeof replaceEntryAtomicMemory>[1]
-): ReturnType<typeof replaceEntryAtomicMemory> {
-  const result = await replaceEntryAtomicMemory(env.DB, input);
-  const snapshot = await loadActiveEmbeddingSnapshot(env);
-  await enqueueClaimVectorJob(env.DB, {
-    claimId: result.memoryId,
-    targetFingerprint: snapshot.fingerprint,
-  });
-  return result;
+): Promise<Awaited<ReturnType<typeof replaceEntryAtomicMemory>> & {
+  claimVectorQueued: boolean;
+  warnings: string[];
+}> {
+  return commitAtomicMutationWithProjection(
+    () => replaceEntryAtomicMemory(env.DB, input),
+    async (claimId) => {
+      const snapshot = await loadActiveEmbeddingSnapshot(env);
+      return enqueueClaimVectorJob(env.DB, {
+        claimId,
+        targetFingerprint: snapshot.fingerprint,
+      });
+    },
+    (error) => console.error("Claim vector enqueue failed after committed Atomic mutation:", error)
+  );
 }
 
 async function queryHistoricalClaimVectors(
@@ -8164,7 +8159,11 @@ async function queryHistoricalClaimVectors(
   vector: number[],
   fingerprint: string,
   queryText: string
-): Promise<{ scores: Map<string, number>; degraded: boolean }> {
+): Promise<{
+  scores: Map<string, number>;
+  degraded: boolean;
+  degradedReason?: "vector_metadata_filter_unavailable" | "vector_source_index_missing";
+}> {
   let matches: VectorizeMatch[] = [];
   let degraded = false;
   try {
@@ -8179,18 +8178,20 @@ async function queryHistoricalClaimVectors(
     matches = result.matches as VectorizeMatch[];
   } catch (error) {
     degraded = true;
-    console.error("Claim vector source filtering unavailable; using metadata fallback:", error);
-    const options = {
-      topK: 50,
-      returnMetadata: "all" as const,
-      filter: { embedding_fingerprint: fingerprint },
+    if (isVectorSourceMetadataIndexError(error)) {
+      console.error("Claim vector source metadata index is unavailable; using keyword recall:", error);
+      return {
+        scores: new Map<string, number>(),
+        degraded: true,
+        degradedReason: "vector_source_index_missing",
+      };
+    }
+    console.error("Claim vector metadata filtering failed; using keyword recall:", error);
+    return {
+      scores: new Map<string, number>(),
+      degraded: true,
+      degradedReason: "vector_metadata_filter_unavailable",
     };
-    const result = env.SELFHOST === "1"
-      ? await (env.VECTORIZE as any).query(vector, { ...options, queryText })
-      : await env.VECTORIZE.query(vector, options);
-    matches = (result.matches as VectorizeMatch[]).filter(
-      (match) => (match.metadata as Record<string, unknown> | undefined)?.source === CLAIM_VECTOR_SOURCE
-    );
   }
   const claimIds = [...new Set(matches.map((match) =>
     String((match.metadata as Record<string, unknown> | undefined)?.claimId ?? "")
@@ -8212,7 +8213,11 @@ async function queryHistoricalClaimVectors(
     if (!claimId || mappings.get(claimId)?.has(match.id) !== true) continue;
     scores.set(claimId, Math.max(scores.get(claimId) ?? 0, Number(match.score ?? 0)));
   }
-  return { scores, degraded };
+  return {
+    scores,
+    degraded,
+    degradedReason: degraded ? "vector_metadata_filter_unavailable" : undefined,
+  };
 }
 
 async function recallHistoricalClaims(
@@ -8243,6 +8248,7 @@ async function recallHistoricalClaims(
   let snapshot: ActiveEmbeddingSnapshot | null = null;
   let semanticScores = new Map<string, number>();
   let degraded = false;
+  let degradedReason: string | undefined;
   try {
     snapshot = await loadActiveEmbeddingSnapshot(env);
     const queryVector = await embedWithProvider(snapshot.provider, params.query, "query");
@@ -8254,8 +8260,10 @@ async function recallHistoricalClaims(
     );
     semanticScores = queried.scores;
     degraded = queried.degraded;
+    degradedReason = queried.degradedReason;
   } catch (error) {
     degraded = true;
+    degradedReason = "embedding_failed";
     console.error("Historical Claim vector recall failed; using immutable keyword recall:", error);
   }
 
@@ -8275,15 +8283,18 @@ async function recallHistoricalClaims(
     insight: "",
     conflicts: [],
     degraded,
-    degradedReason: degraded ? "embedding_failed" : undefined,
+    degradedReason,
   };
   const bindings: Array<string | number> = [
     ...tokens.map((token) => `%${token}%`),
     ...semanticClaimIds,
     ...graphEntryIds,
   ];
+  const snapshotAsOf = String(Math.max(0, Math.trunc(params.before)));
   let sql = `SELECT
-      m.id, m.entry_id, m.parent_version_id, m.content, m.content_hash,
+      m.id, m.entry_id,
+      COALESCE(pv_snapshot.version_id, m.parent_version_id) AS parent_version_id,
+      m.content, m.content_hash,
       m.kind, m.importance, m.confidence, m.claim_status,
       COALESCE(m.observed_at, m.created_at) AS created_at,
       CASE
@@ -8297,7 +8308,22 @@ async function recallHistoricalClaims(
       END AS source
     FROM sb_memories m
     LEFT JOIN entries e ON e.id = m.entry_id
-    LEFT JOIN sb_parent_versions pv_snapshot ON pv_snapshot.version_id = m.parent_version_id
+    LEFT JOIN sb_parent_versions pv_snapshot ON pv_snapshot.version_id = (
+      SELECT pvc_snapshot.parent_version_id
+      FROM sb_parent_version_claims pvc_snapshot
+      JOIN sb_parent_versions pv_candidate
+        ON pv_candidate.version_id = pvc_snapshot.parent_version_id
+      WHERE pvc_snapshot.memory_id = m.id
+        AND pvc_snapshot.relation = 'supports'
+        AND COALESCE(pv_candidate.activated_at, pv_candidate.created_at) <= ${snapshotAsOf}
+        AND (
+          pv_candidate.superseded_at IS NULL
+          OR pv_candidate.superseded_at > ${snapshotAsOf}
+        )
+        AND pv_candidate.state IN ('active', 'active_degraded', 'superseded')
+      ORDER BY pv_candidate.version_number DESC, pv_candidate.version_id DESC
+      LIMIT 1
+    )
     LEFT JOIN sb_memory_sources ms ON ms.id = (
       SELECT ms_first.id FROM sb_memory_sources ms_first
       WHERE ms_first.memory_id = m.id
@@ -8444,7 +8470,7 @@ async function recallHistoricalClaims(
     retrievalMode: "claim_snapshot",
     snapshotAt: params.before,
     degraded,
-    degradedReason: degraded ? "embedding_failed" : undefined,
+    degradedReason,
   };
 }
 
@@ -11628,15 +11654,18 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
           isError: true,
         };
       }
+      let atomicWarnings: string[] = [];
       try {
-        await replaceEntryAtomicMemoryAndEnqueue(env, {
+        const atomicMutation = await replaceEntryAtomicMemoryAndEnqueue(env, {
           entryId: id,
           content: appendedContent,
           contentHash: await contentFingerprint(appendedContent),
           source: "mcp",
+          actor: mutationActorForSource("mcp"),
           eventType: "append",
           createdAt: Date.now(),
         });
+        atomicWarnings = atomicMutation.warnings;
       } catch (e) {
         console.error("MCP atomic memory append sync failed (non-fatal):", e);
         return {
@@ -11652,7 +11681,7 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
       return {
         content: [{
           type: "text",
-          text: `Appended to entry ${id}. The original content is preserved and your update has been added with today's date.`,
+          text: `Appended to entry ${id}. The original content is preserved and your update has been added with today's date.${atomicWarnings.length ? " Claim vector indexing is queued for maintenance repair." : ""}`,
         }],
       };
     }
@@ -11712,15 +11741,18 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
           isError: true,
         };
       }
+      let atomicWarnings: string[] = [];
       try {
-        await replaceEntryAtomicMemoryAndEnqueue(env, {
+        const atomicMutation = await replaceEntryAtomicMemoryAndEnqueue(env, {
           entryId: id,
           content: newContent,
           contentHash: await contentFingerprint(newContent),
           source: "mcp",
+          actor: mutationActorForSource("mcp"),
           eventType: "update",
           createdAt: Date.now(),
         });
+        atomicWarnings = atomicMutation.warnings;
       } catch (e) {
         console.error("MCP atomic memory update sync failed (non-fatal):", e);
         return {
@@ -11736,7 +11768,7 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
       return {
         content: [{
           type: "text",
-          text: `Updated entry ${id}. Re-embedded as ${newVectorIds.length} vector(s).`,
+          text: `Updated entry ${id}. Re-embedded as ${newVectorIds.length} vector(s).${atomicWarnings.length ? " Claim vector indexing is queued for maintenance repair." : ""}`,
         }],
       };
     }
@@ -12131,7 +12163,26 @@ async function detailedHealth(env: Env) {
     (env.ALLOW_DEV_EMBEDDING === "1" || env.ALLOW_DEV_EMBEDDING === "true");
   return collectHealthMatrix({
     db: env.DB,
-    vectorize: env.VECTORIZE as unknown as { describe?: () => Promise<unknown> },
+    vectorize: {
+      describe: (env.VECTORIZE as unknown as { describe?: () => Promise<unknown> }).describe?.bind(env.VECTORIZE),
+      ...(env.SELFHOST === "1" ? {} : {
+        probeSourceMetadataFilter: async () => {
+          const dimensions = Math.max(1, Math.trunc(effective.embedding.dimensions));
+          const probe = Array.from({ length: dimensions }, (_, index) => index === 0 ? 1 : 0);
+          await cachedVectorSourceMetadataProbe(
+            env.VECTORIZE as unknown as object,
+            String(dimensions),
+            async () => {
+              await env.VECTORIZE.query(probe, {
+                topK: 1,
+                returnMetadata: "none",
+                filter: { source: { $ne: CLAIM_VECTOR_SOURCE } },
+              });
+            }
+          );
+        },
+      }),
+    },
     mode: env.SELFHOST === "1" ? "selfhost" : "cloudflare",
     llmConfigured: Boolean(
       (effective.llm.baseURL && effective.llm.apiKey) ||
@@ -12800,15 +12851,18 @@ const defaultHandler = {
         console.error("Append failed:", e);
         return json({ ok: false, error: "Append failed. Retry later." }, 500);
       }
+      let atomicWarnings: string[] = [];
       try {
-        await replaceEntryAtomicMemoryAndEnqueue(env, {
+        const atomicMutation = await replaceEntryAtomicMemoryAndEnqueue(env, {
           entryId: id,
           content: appendedContent,
           contentHash: await contentFingerprint(appendedContent),
           source: "api",
+          actor: mutationActorForSource("api"),
           eventType: "append",
           createdAt: Date.now(),
         });
+        atomicWarnings = atomicMutation.warnings;
       } catch (e) {
         console.error("Atomic memory append sync failed (non-fatal):", e);
         return json({
@@ -12823,6 +12877,7 @@ const defaultHandler = {
       return json({
         ok: true,
         id,
+        warnings: atomicWarnings,
         message: "Update appended successfully with timestamp",
       });
     }
@@ -12873,15 +12928,18 @@ const defaultHandler = {
           error: "Update could not be indexed. Previous content remains active; retry later.",
         }, 503);
       }
+      let atomicWarnings: string[] = [];
       try {
-        await replaceEntryAtomicMemoryAndEnqueue(env, {
+        const atomicMutation = await replaceEntryAtomicMemoryAndEnqueue(env, {
           entryId: id,
           content: finalContent,
           contentHash: await contentFingerprint(finalContent),
           source: "api",
+          actor: mutationActorForSource("api"),
           eventType: "update",
           createdAt: Date.now(),
         });
+        atomicWarnings = atomicMutation.warnings;
       } catch (e) {
         console.error("Atomic memory update sync failed (non-fatal):", e);
         return json({
@@ -12897,6 +12955,7 @@ const defaultHandler = {
         ok: true,
         id,
         vectors: newVectorIds.length,
+        warnings: atomicWarnings,
       });
     }
 
@@ -14102,6 +14161,39 @@ const defaultHandler = {
         targetFingerprint,
         enqueued,
         processed,
+        queue: await getClaimVectorQueueStatus(env.DB, targetFingerprint),
+      });
+    }
+
+    if (url.pathname === "/maintenance/claim-vectors/retry-failed" && request.method === "POST") {
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
+      let body: { limit?: number; fingerprint?: string; claimId?: string } = {};
+      try {
+        body = await request.json();
+      } catch {
+        /* empty body OK */
+      }
+      const { effective } = await getEffectiveModelSettings(env);
+      const activeFingerprint = effective.embeddingFingerprint ??
+        embeddingFingerprintOf(activeEmbeddingOf(effective));
+      const pendingFingerprint = effective.pendingEmbeddingFingerprint ?? null;
+      const targetFingerprint = body.fingerprint?.trim() || activeFingerprint;
+      if (targetFingerprint !== activeFingerprint && targetFingerprint !== pendingFingerprint) {
+        return json({ ok: false, error: "unknown_embedding_fingerprint" }, 400);
+      }
+      const claimId = body.claimId?.trim() || null;
+      const limit = Math.min(Math.max(Math.trunc(Number(body.limit)) || 25, 1), 200);
+      const retried = await retryFailedClaimVectorJobs(env.DB, {
+        targetFingerprint,
+        claimId,
+        limit,
+      });
+      return json({
+        ok: true,
+        targetFingerprint,
+        claimId,
+        retried,
         queue: await getClaimVectorQueueStatus(env.DB, targetFingerprint),
       });
     }

@@ -5,7 +5,7 @@
   "description": "Singularity — self-hosted AI memory engine",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "tsx scripts/ensure-vectorize-metadata-indexes.ts && wrangler deploy",
     "server": "node --require ./src/selfhost/register-cf-shim.cjs --import tsx src/server.ts",
     "start": "node --require ./src/selfhost/register-cf-shim.cjs --import tsx src/server.ts",
     "selfhost": "node --require ./src/selfhost/register-cf-shim.cjs --import tsx src/server.ts",

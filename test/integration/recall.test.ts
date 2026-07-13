@@ -711,7 +711,7 @@ describe("GET /recall", () => {
     ]);
   });
 
-  it("degrades to active-id fallback when Vectorize metadata filter is unavailable", async () => {
+  it("fails closed to lexical recall when the Vectorize source metadata index is unavailable", async () => {
     db.entries.push({
       id: "entry-1",
       content: "Fallback memory",
@@ -723,11 +723,7 @@ describe("GET /recall", () => {
       importance_score: 0,
     });
     seedActiveClaimsForEntries(db);
-    const queryMock = vi.fn()
-      .mockRejectedValueOnce(new Error("metadata index missing"))
-      .mockResolvedValueOnce({
-        matches: [makeMatch("active-vector", 0.91, { parentId: "entry-1" })],
-      });
+    const queryMock = vi.fn().mockRejectedValueOnce(new Error("metadata index missing for source"));
     env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({ query: queryMock }),
     });
@@ -737,15 +733,14 @@ describe("GET /recall", () => {
 
     expect(res.status).toBe(200);
     expect(data.degraded_mode).toBe(true);
-    expect(data.degraded_reason).toBe("vector_metadata_filter_unavailable");
+    expect(data.degraded_reason).toBe("vector_source_index_missing");
     expect(data.results).toHaveLength(1);
     expect(data.results[0].id).toBe("entry-1");
-    expect(queryMock).toHaveBeenCalledTimes(2);
+    expect(queryMock).toHaveBeenCalledTimes(1);
     expect(queryMock.mock.calls[0][1].filter).toEqual({
       embedding_fingerprint: expect.any(String),
       source: { $ne: "singularity-claim" },
     });
-    expect(queryMock.mock.calls[1][1].filter).toBeUndefined();
   });
 
   it("ignores stale vectors that are no longer referenced by the D1 entry", async () => {
@@ -1105,10 +1100,11 @@ describe("GET /recall", () => {
 
     const res = await worker.fetch(req("GET", "/recall?query=work+meeting"), env, ctx);
     expect(res.status).toBe(200);
-    // "work" is a known tag AND appears as a keyword in the query → LLM not called for inference
-    // (embed call uses BGE model; only LLM calls use other models)
+    // "work" is a known tag and skips tag inference. The single remaining LLM call is
+    // the mandatory query-answerability pass over the retrieved Claim.
     const llmCalls = aiRun.mock.calls.filter((args: any[]) => args[0] !== "@cf/baai/bge-small-en-v1.5");
-    expect(llmCalls).toHaveLength(0);
+    expect(llmCalls).toHaveLength(1);
+    expect(String(llmCalls[0][1]?.messages?.[0]?.content ?? "")).not.toContain("Which tags best match");
   });
 
   it("excludes status:deprecated entries from recall results", async () => {

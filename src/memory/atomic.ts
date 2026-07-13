@@ -27,6 +27,10 @@ import {
   type EvidenceAuthorType,
   type ProvenanceRelation,
 } from "./evidence-contract";
+import {
+  mutationActorForSource,
+  type MutationActor,
+} from "./atomic-mutation";
 
 export const MEMORY_CLASS_VALUES = [
   "fact",
@@ -655,6 +659,7 @@ export async function replaceEntryAtomicMemory(
     content: string;
     contentHash: string;
     source: string;
+    actor?: MutationActor;
     eventType: "append" | "update";
     createdAt: number;
   }
@@ -686,6 +691,7 @@ async function replaceEntryAtomicMemoryOnce(
     content: string;
     contentHash: string;
     source: string;
+    actor?: MutationActor;
     eventType: "append" | "update";
     createdAt: number;
   }
@@ -745,7 +751,7 @@ async function replaceEntryAtomicMemoryOnce(
   const parentVersionId = crypto.randomUUID();
   const parentVersionNumber = Math.max(1, Number(latestVersion?.version_number ?? 0) + 1);
   const evidenceRootId = parentId;
-  const authorType: EvidenceAuthorType = input.source === "system" ? "system" : "user";
+  const actor = input.actor ?? mutationActorForSource(input.source);
   const entrySnapshot = await db.prepare(
     `SELECT tags, source FROM entries WHERE id = ? LIMIT 1`
   ).bind(input.entryId).first<{ tags: string | null; source: string | null }>();
@@ -797,11 +803,13 @@ async function replaceEntryAtomicMemoryOnce(
         parent_version_id: parentVersionId,
         parent_version_number: parentVersionNumber,
         evidence_root_id: evidenceRootId,
+        evidence_type: actor.evidenceType,
+        actor_id: actor.actorId,
       },
       contentHash: input.contentHash,
-      sourceChannel: input.source,
-      sourceIdentity: `${input.source}:${input.entryId}:${parentVersionNumber}`,
-      authorType,
+      sourceChannel: actor.sourceChannel,
+      sourceIdentity: `${actor.sourceChannel}:${input.entryId}:${parentVersionNumber}`,
+      authorType: actor.authorType,
       rootEvidenceId: evidenceRootId,
       previousEvidenceId: previousEvidence?.source_observation_id ?? null,
       revision: parentVersionNumber,

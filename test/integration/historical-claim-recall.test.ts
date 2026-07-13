@@ -73,9 +73,9 @@ describe("historical Claim recall", () => {
            id, content, kind, entry_id, parent_version_id, claim_status, content_hash,
            observed_at, valid_from, invalid_at, created_at
          ) VALUES
-           ('claim-a', '历史使用方案 A', 'semantic', 'entry-1', 'version-1', 'superseded',
+           ('claim-a', '历史使用方案 A', 'semantic', 'entry-1', NULL, 'superseded',
             'hash-a', 100, 100, 200, 100),
-           ('claim-b', '当前使用方案 B', 'semantic', 'entry-1', 'version-2', 'confirmed',
+           ('claim-b', '当前使用方案 B', 'semantic', 'entry-1', NULL, 'confirmed',
             'hash-b', 200, 200, NULL, 200)`
       ).run();
       db.prepare(
@@ -171,6 +171,35 @@ describe("historical Claim recall", () => {
       expect(await status.json()).toMatchObject({
         ok: true,
         queue: { missing: 0, succeeded: 2 },
+      });
+
+      db.prepare(
+        `UPDATE sb_claim_vector_jobs
+         SET status = 'failed', attempts = 6, last_error = 'terminal'
+         WHERE claim_id = 'claim-a' AND target_fingerprint = ?`
+      ).run(fingerprint);
+      db.prepare(
+        `DELETE FROM sb_claim_vectors
+         WHERE claim_id = 'claim-a' AND embedding_fingerprint = ?`
+      ).run(fingerprint);
+      const retryFailed = await worker.fetch(new Request(
+        "http://localhost/maintenance/claim-vectors/retry-failed",
+        {
+          method: "POST",
+          headers: {
+            Authorization: "Bearer test-token",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ fingerprint, claimId: "claim-a", limit: 1 }),
+        }
+      ), env, ctx());
+      expect(retryFailed.status).toBe(200);
+      expect(await retryFailed.json()).toMatchObject({
+        ok: true,
+        targetFingerprint: fingerprint,
+        claimId: "claim-a",
+        retried: 1,
+        queue: { pending: 1, failed: 0, missing: 1 },
       });
 
       env.VECTORIZE = makeVectorizeMock({

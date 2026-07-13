@@ -8,8 +8,14 @@ export default defineConfig({
     coverage: {
       provider: "v8",
       include: ["src/**/*.ts", "public/utils.js"],
+      exclude: ["src/server.ts"],
       reporter: ["text", "html", "json-summary", "json"],
       reportsDirectory: "coverage",
+      thresholds: {
+        statements: 80,
+        lines: 80,
+        functions: 80,
+      },
     },
   },
 });

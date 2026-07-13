@@ -216,16 +216,21 @@ export async function resolveAndInsertEntityRelation(
     )`;
   const { results } = await db.prepare(
     `SELECT id, from_entity_id, to_entity_id, relation_type, fact,
-            COALESCE(
-              (SELECT fs_active.memory_id
-               FROM sb_fact_sources fs_active
-               JOIN sb_memories m_active ON m_active.id = fs_active.memory_id
-               WHERE fs_active.relation_id = sb_entity_relations.id
-                 AND ${eligibleCandidateMemorySql}
-               ORDER BY m_active.created_at DESC, fs_active.created_at DESC
-               LIMIT 1),
-              memory_id
-            ) AS memory_id,
+            CASE
+              WHEN EXISTS (
+                SELECT 1 FROM sb_fact_sources fs_any
+                WHERE fs_any.relation_id = sb_entity_relations.id
+              ) THEN (
+                SELECT fs_active.memory_id
+                FROM sb_fact_sources fs_active
+                JOIN sb_memories m_active ON m_active.id = fs_active.memory_id
+                WHERE fs_active.relation_id = sb_entity_relations.id
+                  AND ${eligibleCandidateMemorySql}
+                ORDER BY m_active.created_at DESC, fs_active.created_at DESC
+                LIMIT 1
+              )
+              ELSE memory_id
+            END AS memory_id,
             scope_id, polarity, modality, valid_from, valid_to, reference_time, created_at,
             CASE
               WHEN EXISTS (
@@ -243,7 +248,7 @@ export async function resolveAndInsertEntityRelation(
      ORDER BY created_at DESC
      LIMIT 20`
   ).bind(input.fromEntityId, input.relationType).all<FactCandidateRow>();
-  const candidates = (results ?? []).map((row) => ({
+  const candidates = (results ?? []).filter((row) => row.memory_id !== null).map((row) => ({
     relationId: row.id,
     fromEntityId: row.from_entity_id,
     toEntityId: row.to_entity_id,

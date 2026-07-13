@@ -83,6 +83,45 @@ describe("Health Matrix", () => {
     expect(JSON.stringify(matrix)).not.toContain("apiKey");
   });
 
+  it("reports a missing Vectorize source metadata index explicitly", async () => {
+    const matrix = await collectHealthMatrix({
+      db,
+      vectorize: {
+        describe: vi.fn().mockResolvedValue({ dimensions: 384 }),
+        probeSourceMetadataFilter: vi.fn().mockRejectedValue(new Error("metadata index missing for source")),
+      },
+      mode: "cloudflare",
+      llmConfigured: true,
+      embeddingConfigured: true,
+      providers: [],
+    });
+
+    expect(matrix.components.vectorIndex).toMatchObject({
+      status: "degraded",
+      sourceMetadataFilter: "missing",
+      error: "vector_source_index_missing",
+    });
+    expect(matrix.status).toBe("degraded");
+  });
+
+  it("probes Cloudflare source filtering even when the binding has no describe method", async () => {
+    const probeSourceMetadataFilter = vi.fn().mockResolvedValue({ matches: [] });
+    const matrix = await collectHealthMatrix({
+      db,
+      vectorize: { probeSourceMetadataFilter },
+      mode: "cloudflare",
+      llmConfigured: true,
+      embeddingConfigured: true,
+      providers: [],
+    });
+
+    expect(probeSourceMetadataFilter).toHaveBeenCalledTimes(1);
+    expect(matrix.components.vectorIndex).toMatchObject({
+      status: "healthy",
+      sourceMetadataFilter: "available",
+    });
+  });
+
   it("does not report a tampered audit record as a healthy chain", async () => {
     raw.prepare(
       `INSERT INTO sb_audit_events (

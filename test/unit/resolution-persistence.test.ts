@@ -25,6 +25,61 @@ describe("resolution persistence", () => {
 
   afterEach(() => raw.close());
 
+  function makeFactClaimsEligible(memoryIds: string[]): void {
+    for (const memoryId of memoryIds) {
+      const existing = raw.prepare(
+        `SELECT content, entry_id FROM sb_memories WHERE id = ?`
+      ).get(memoryId) as { content: string; entry_id: string | null } | undefined;
+      const content = existing?.content ?? memoryId;
+      const entryId = existing?.entry_id ?? `entry-${memoryId}`;
+      const contentHash = `hash-${memoryId}`;
+      raw.prepare(
+        `INSERT OR IGNORE INTO entries (id, content, content_hash) VALUES (?, ?, ?)`
+      ).run(entryId, content, contentHash);
+      raw.prepare(`UPDATE entries SET content_hash = ? WHERE id = ?`).run(contentHash, entryId);
+      if (existing) {
+        raw.prepare(
+          `UPDATE sb_memories SET entry_id = ?, content_hash = ?, claim_status = 'supported'
+           WHERE id = ?`
+        ).run(entryId, contentHash, memoryId);
+      } else {
+        raw.prepare(
+          `INSERT INTO sb_memories (
+             id, content, entry_id, content_hash, claim_status, entities_json, created_at
+           ) VALUES (?, ?, ?, ?, 'supported', '[]', 1)`
+        ).run(memoryId, content, entryId, contentHash);
+      }
+      const observationId = `obs-${memoryId}`;
+      const parentId = `parent-${memoryId}`;
+      const parentVersionId = `${parentId}-v1`;
+      raw.prepare(
+        `INSERT OR IGNORE INTO sb_observations (
+           id, content, source, content_hash, root_evidence_id, author_type, created_at
+         ) VALUES (?, ?, 'api', ?, ?, 'user', 1)`
+      ).run(observationId, content, `obs-${contentHash}`, parentId);
+      raw.prepare(
+        `INSERT OR IGNORE INTO sb_parent_units (
+           parent_id, active_version_id, created_at, updated_at
+         ) VALUES (?, ?, 1, 1)`
+      ).run(parentId, parentVersionId);
+      raw.prepare(
+        `INSERT OR IGNORE INTO sb_parent_versions (
+           version_id, parent_id, version_number, state, activated_at, created_at, updated_at
+         ) VALUES (?, ?, 1, 'active', 1, 1, 1)`
+      ).run(parentVersionId, parentId);
+      raw.prepare(
+        `INSERT OR IGNORE INTO sb_parent_version_claims (
+           parent_version_id, memory_id, relation, created_at
+         ) VALUES (?, ?, 'supports', 1)`
+      ).run(parentVersionId, memoryId);
+      raw.prepare(
+        `INSERT OR IGNORE INTO sb_memory_sources (
+           id, memory_id, observation_id, role, relation, evidence_root_id, created_at
+         ) VALUES (?, ?, ?, 'supports', 'supports', ?, 1)`
+      ).run(`source-${memoryId}`, memoryId, observationId, parentId);
+    }
+  }
+
   it("persists aliases, stable ids, embeddings, and review-only merge candidates", async () => {
     const resolver = new D1EntityResolver(db);
     const first = await resolver.resolve(
@@ -112,6 +167,7 @@ describe("resolution persistence", () => {
                 ('memory-test', 'test installer', 'supported', NULL, NULL, '[]', 2),
                 ('memory-new', 'new installer', 'supported', NULL, NULL, '[]', 3)`
     ).run();
+    makeFactClaimsEligible(["memory-old", "memory-test", "memory-new"]);
     const resolver = new D1EntityResolver(db);
     const mtzs = await resolver.resolve({ name: "mtzs", entityType: "project" }, { now: 1 });
     const oldInstaller = await resolver.resolve({ name: "installation_proxy", entityType: "product" }, { now: 2 });
@@ -195,6 +251,7 @@ describe("resolution persistence", () => {
       `INSERT INTO sb_memories (id, content, entry_id, entities_json, created_at)
        VALUES (?, ?, ?, '[]', ?)`
     ).run("memory-2", "shared", "entry-2", 2);
+    makeFactClaimsEligible(["memory-1", "memory-2"]);
     const resolver = new D1EntityResolver(db);
     const source = await resolver.resolve({ name: "mtzs", entityType: "project" }, { now: 1 });
     const target = await resolver.resolve({ name: "SQLite", entityType: "product" }, { now: 2 });
@@ -227,7 +284,75 @@ describe("resolution persistence", () => {
       .toEqual({ invalid_at: 20 });
   });
 
+  it("does not fall back to a legacy Relation memory when Fact Sources exist but are ineligible", async () => {
+    raw.prepare(
+      `INSERT INTO entries (id, content, content_hash)
+       VALUES ('entry-old', 'old database', 'hash-old')`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_observations (
+         id, content, source, content_hash, root_evidence_id, author_type, created_at
+       ) VALUES ('obs-old', 'old database', 'api', 'obs-hash-old', 'root-old', 'user', 1)`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_parent_units (parent_id, active_version_id, created_at, updated_at)
+       VALUES ('parent-old', 'parent-old-v1', 1, 1)`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_parent_versions (
+         version_id, parent_id, version_number, state, activated_at, created_at, updated_at
+       ) VALUES ('parent-old-v1', 'parent-old', 1, 'active', 1, 1, 1)`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_memories (
+         id, content, entry_id, content_hash, claim_status, entities_json, created_at
+       ) VALUES ('claim-old', 'project uses old_db', 'entry-old', 'hash-old', 'supported', '[]', 1)`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_parent_version_claims (parent_version_id, memory_id, relation, created_at)
+       VALUES ('parent-old-v1', 'claim-old', 'supports', 1)`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_memory_sources (
+         id, memory_id, observation_id, role, relation, evidence_root_id, created_at
+       ) VALUES ('source-old', 'claim-old', 'obs-old', 'supports', 'supports', 'root-old', 1)`
+    ).run();
+
+    const resolver = new D1EntityResolver(db);
+    const project = await resolver.resolve({ name: "project", entityType: "project" }, { now: 1 });
+    const oldDb = await resolver.resolve({ name: "old_db", entityType: "product" }, { now: 2 });
+    const newDb = await resolver.resolve({ name: "new_db", entityType: "product" }, { now: 3 });
+    await resolveAndInsertEntityRelation(db, {
+      fromEntityId: project.entityId,
+      toEntityId: oldDb.entityId,
+      relationType: "uses",
+      fact: "project uses old_db",
+      memoryId: "claim-old",
+      observationId: "obs-old",
+      scopeId: "project/production",
+      createdAt: 10,
+    });
+    raw.prepare(`UPDATE sb_memories SET claim_status = 'unsupported' WHERE id = 'claim-old'`).run();
+
+    const replacement = await resolveAndInsertEntityRelation(db, {
+      fromEntityId: project.entityId,
+      toEntityId: newDb.entityId,
+      relationType: "uses",
+      fact: "project uses new_db",
+      memoryId: "claim-new",
+      scopeId: "project/production",
+      createdAt: 20,
+    });
+
+    expect(replacement.resolution).toMatchObject({
+      type: "coexists",
+      targetMemoryId: null,
+      reasonCodes: ["no_prior_fact"],
+    });
+  });
+
   it("attaches supporting and elaborating Claims to one canonical Fact edge", async () => {
+    makeFactClaimsEligible(["claim-support-1", "claim-support-2"]);
     const resolver = new D1EntityResolver(db);
     const project = await resolver.resolve({ name: "mtzs", entityType: "project" }, { now: 1 });
     const database = await resolver.resolve({ name: "SQLite", entityType: "product" }, { now: 2 });
@@ -368,6 +493,7 @@ describe("resolution persistence", () => {
        VALUES ('claim-old', 'mtzs uses old_db', 'entry-old', 'supported', '[]', 1),
               ('claim-new', 'mtzs uses new_db', 'entry-new', 'supported', '[]', 2)`
     ).run();
+    makeFactClaimsEligible(["claim-old", "claim-new"]);
     const resolver = new D1EntityResolver(db);
     const project = await resolver.resolve({ name: "mtzs", entityType: "project" }, { now: 1 });
     const oldDb = await resolver.resolve({ name: "old_db", entityType: "product" }, { now: 2 });
@@ -421,6 +547,7 @@ describe("resolution persistence", () => {
        ) VALUES ('claim-note-old', 'old', 'supported', '{"humanConfirmation":0}', NULL, NULL, '[]', 1),
                 ('claim-note-new', 'new', 'supported', '{"humanConfirmation":0}', NULL, NULL, '[]', 2)`
     ).run();
+    makeFactClaimsEligible(["claim-note-old", "claim-note-new"]);
     const resolver = new D1EntityResolver(db);
     const project = await resolver.resolve({ name: "mtzs", entityType: "project" }, { now: 1 });
     const oldDb = await resolver.resolve({ name: "old_db", entityType: "product" }, { now: 2 });

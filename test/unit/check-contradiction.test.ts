@@ -60,22 +60,19 @@ describe("checkDuplicateAndContradiction()", () => {
     });
   });
 
-  it("falls back to active-ID filtering when metadata filter query fails", async () => {
-    const queryFn = vi.fn()
-      .mockRejectedValueOnce(new Error("metadata index missing"))
-      .mockResolvedValueOnce({ matches: [match("a", 0.96)] });
+  it("does not use an unfiltered Top-K fallback when the source metadata index is missing", async () => {
+    const queryFn = vi.fn().mockRejectedValueOnce(new Error("metadata index missing for source"));
     const env = makeEnv("", [], [entry("a", "I enjoy hiking")]);
     (env.VECTORIZE as any).query = queryFn;
 
     const { duplicate } = await checkDuplicateAndContradiction("I enjoy hiking", env);
 
-    expect(duplicate.status).toBe("flagged");
-    expect(queryFn).toHaveBeenCalledTimes(2);
+    expect(duplicate.status).toBe("unique");
+    expect(queryFn).toHaveBeenCalledTimes(1);
     expect(queryFn.mock.calls[0][1].filter).toEqual({
       embedding_fingerprint: expect.any(String),
       source: { $ne: "singularity-claim" },
     });
-    expect(queryFn.mock.calls[1][1].filter).toBeUndefined();
   });
 
   it("returns no contradiction when LLM says no contradiction", async () => {
