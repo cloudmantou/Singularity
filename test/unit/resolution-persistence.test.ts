@@ -16,6 +16,11 @@ describe("resolution persistence", () => {
     db = new SqliteD1Database(raw) as unknown as D1Database;
     await ensureMemoryDataModel(db);
     for (const statement of MEMORY_QUALITY_SCHEMA_STATEMENTS) await db.exec(statement);
+    raw.exec(`CREATE TABLE entries (
+      id TEXT PRIMARY KEY,
+      content TEXT NOT NULL,
+      content_hash TEXT
+    )`);
   });
 
   afterEach(() => raw.close());
@@ -181,7 +186,6 @@ describe("resolution persistence", () => {
   });
 
   it("keeps a shared fact active until its final supporting memory is deprecated", async () => {
-    raw.exec(`CREATE TABLE entries (id TEXT PRIMARY KEY, content TEXT NOT NULL)`);
     raw.prepare(`INSERT INTO entries (id, content) VALUES ('entry-1', 'one'), ('entry-2', 'two')`).run();
     raw.prepare(
       `INSERT INTO sb_memories (id, content, entry_id, entities_json, created_at)
@@ -262,20 +266,52 @@ describe("resolution persistence", () => {
 
   it("counts revisions and AI derivations of one Evidence root as one independent Fact source", async () => {
     raw.prepare(
+      `INSERT INTO entries (id, content, content_hash) VALUES
+         ('entry-a1', 'mtzs uses SQLite', 'claim-hash-a1'),
+         ('entry-a2', 'mtzs uses SQLite', 'claim-hash-a2'),
+         ('entry-ai', 'mtzs uses SQLite', 'claim-hash-ai'),
+         ('entry-b1', 'mtzs uses SQLite', 'claim-hash-b1'),
+         ('entry-c1', 'mtzs uses SQLite', 'claim-hash-c1')`
+    ).run();
+    raw.prepare(
       `INSERT INTO sb_observations (
          id, content, source, content_hash, root_evidence_id, revision, author_type, created_at
        ) VALUES
          ('obs-root-a-v1', 'first revision', 'obsidian', 'hash-a1', 'root-a', 1, 'user', 1),
          ('obs-root-a-v2', 'second revision', 'obsidian', 'hash-a2', 'root-a', 2, 'user', 2),
          ('obs-root-a-ai', 'derived summary', 'system', 'hash-a3', 'root-a', 3, 'assistant', 3),
-         ('obs-root-b-v1', 'independent source', 'mcp', 'hash-b1', 'root-b', 1, 'user', 4)`
+         ('obs-root-b-v1', 'independent source', 'mcp', 'hash-b1', 'root-b', 1, 'user', 4),
+         ('obs-root-c-v1', 'unsupported source', 'mcp', 'hash-c1', 'root-c', 1, 'user', 5)`
     ).run();
     raw.prepare(
-      `INSERT INTO sb_memories (id, content, claim_status, entities_json, created_at)
-       VALUES ('claim-a1', 'mtzs uses SQLite', 'supported', '[]', 1),
-              ('claim-a2', 'mtzs uses SQLite', 'supported', '[]', 2),
-              ('claim-ai', 'mtzs uses SQLite', 'supported', '[]', 3),
-              ('claim-b1', 'mtzs uses SQLite', 'supported', '[]', 4)`
+      `INSERT INTO sb_memories (
+         id, content, entry_id, content_hash, parent_version_id,
+         claim_status, entities_json, created_at
+       ) VALUES
+         ('claim-a1', 'mtzs uses SQLite', 'entry-a1', 'claim-hash-a1', 'parent-v1', 'supported', '[]', 1),
+         ('claim-a2', 'mtzs uses SQLite', 'entry-a2', 'claim-hash-a2', 'parent-v1', 'supported', '[]', 2),
+         ('claim-ai', 'mtzs uses SQLite', 'entry-ai', 'claim-hash-ai', 'parent-v1', 'supported', '[]', 3),
+         ('claim-b1', 'mtzs uses SQLite', 'entry-b1', 'claim-hash-b1', 'parent-v1', 'supported', '[]', 4),
+         ('claim-c1', 'mtzs uses SQLite', 'entry-c1', 'claim-hash-c1', 'parent-v1', 'unsupported', '[]', 5)`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_parent_units (
+         parent_id, active_version_id, created_at, updated_at
+       ) VALUES ('parent-1', 'parent-v1', 1, 1)`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_parent_versions (
+         version_id, parent_id, version_number, state, activated_at, created_at, updated_at
+       ) VALUES ('parent-v1', 'parent-1', 1, 'active', 1, 1, 1)`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_parent_version_claims (parent_version_id, memory_id, relation, created_at)
+       VALUES
+         ('parent-v1', 'claim-a1', 'supports', 1),
+         ('parent-v1', 'claim-a2', 'supports', 2),
+         ('parent-v1', 'claim-ai', 'supports', 3),
+         ('parent-v1', 'claim-b1', 'supports', 4),
+         ('parent-v1', 'claim-c1', 'supports', 5)`
     ).run();
     raw.prepare(
       `INSERT INTO sb_memory_sources (
@@ -284,7 +320,8 @@ describe("resolution persistence", () => {
          ('ms-a1', 'claim-a1', 'obs-root-a-v1', 'supports', 'supports', 'root-a', 1),
          ('ms-a2', 'claim-a2', 'obs-root-a-v2', 'supports', 'supports', 'root-a', 2),
          ('ms-ai', 'claim-ai', 'obs-root-a-ai', 'derived', 'derived_from', 'root-a', 3),
-         ('ms-b1', 'claim-b1', 'obs-root-b-v1', 'supports', 'supports', 'root-b', 4)`
+         ('ms-b1', 'claim-b1', 'obs-root-b-v1', 'supports', 'supports', 'root-b', 4),
+         ('ms-c1', 'claim-c1', 'obs-root-c-v1', 'supports', 'supports', 'root-c', 5)`
     ).run();
     const resolver = new D1EntityResolver(db);
     const project = await resolver.resolve({ name: "mtzs", entityType: "project" }, { now: 1 });
@@ -309,12 +346,22 @@ describe("resolution persistence", () => {
       relationId = result.relationId;
     }
 
+    const unsupported = await resolveAndInsertEntityRelation(db, {
+      fromEntityId: project.entityId,
+      toEntityId: database.entityId,
+      relationType: "uses",
+      fact: "mtzs uses SQLite",
+      memoryId: "claim-c1",
+      observationId: "obs-root-c-v1",
+      createdAt: 5,
+    });
+    relationId = unsupported.relationId;
+
     expect(raw.prepare(`SELECT evidence_count FROM sb_entity_relations WHERE id = ?`).get(relationId))
       .toEqual({ evidence_count: 2 });
   });
 
   it("stores Fact conflicts with Entry compatibility IDs and authoritative Claim IDs", async () => {
-    raw.exec(`CREATE TABLE entries (id TEXT PRIMARY KEY, content TEXT NOT NULL)`);
     raw.prepare(`INSERT INTO entries (id, content) VALUES ('entry-old', 'old'), ('entry-new', 'new')`).run();
     raw.prepare(
       `INSERT INTO sb_memories (id, content, entry_id, claim_status, entities_json, created_at)

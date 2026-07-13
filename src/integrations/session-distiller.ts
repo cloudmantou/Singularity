@@ -60,7 +60,7 @@ export function classifyDevelopmentSessionMessageIntent(
   const lower = semanticValue.toLowerCase();
   if (
     /\b(?:maybe|perhaps|possibly|might|could be|hypothesis|assume|suppose|guess)\b/i.test(lower) ||
-    /(?:也许|可能|或许|假设|猜测|推测)/.test(semanticValue)
+    /(?:也许|可能|或许|假设|猜测|推测|不确定|不知道|听说|据说|似乎|是否)/.test(semanticValue)
   ) return "hypothesis";
   if (
     /\b(?:we|i)\s+(?:have\s+)?decided\b|\bdecision\s+is\b|\bchose\b|\bselected\b|\badopted\b/i.test(semanticValue) ||

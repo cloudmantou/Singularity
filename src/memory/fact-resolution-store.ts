@@ -6,6 +6,7 @@ import {
 import { ensureConflictClaimSchema } from "./quality";
 import { D1ResolutionCoordinator } from "./resolution-coordinator";
 import { distinctFactEvidenceCountSql } from "./fact-evidence";
+import { activeMemoryClaimPredicate } from "./claim-eligibility";
 
 export interface ResolveEntityRelationInput {
   fromEntityId: string;
@@ -190,7 +191,29 @@ export async function resolveAndInsertEntityRelation(
   const candidateEvidenceCountSql = distinctFactEvidenceCountSql({
     relationIdSql: "sb_entity_relations.id",
     activeMemoriesOnly: true,
+    asOf: input.createdAt,
   });
+  const eligibleCandidateMemorySql = `${activeMemoryClaimPredicate(
+    "m_active",
+    String(input.createdAt),
+    { requireActiveParentLink: true }
+  )}
+    AND m_active.content_hash IS NOT NULL
+    AND EXISTS (
+      SELECT 1
+      FROM entries e_active
+      WHERE e_active.id = m_active.entry_id
+        AND e_active.content_hash = m_active.content_hash
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM sb_conflict_cases c_active
+      WHERE c_active.state = 'pending'
+        AND (
+          c_active.old_claim_id = m_active.id
+          OR c_active.new_claim_id = m_active.id
+        )
+    )`;
   const { results } = await db.prepare(
     `SELECT id, from_entity_id, to_entity_id, relation_type, fact,
             COALESCE(
@@ -198,8 +221,7 @@ export async function resolveAndInsertEntityRelation(
                FROM sb_fact_sources fs_active
                JOIN sb_memories m_active ON m_active.id = fs_active.memory_id
                WHERE fs_active.relation_id = sb_entity_relations.id
-                 AND m_active.invalid_at IS NULL
-                 AND m_active.expired_at IS NULL
+                 AND ${eligibleCandidateMemorySql}
                ORDER BY m_active.created_at DESC, fs_active.created_at DESC
                LIMIT 1),
               memory_id
@@ -262,6 +284,8 @@ export async function resolveAndInsertEntityRelation(
   const targetRelationId = reuseCanonical ? null : resolution.targetRelationId;
   const writtenEvidenceCountSql = distinctFactEvidenceCountSql({
     relationIdSql: "?",
+    activeMemoriesOnly: true,
+    asOf: input.createdAt,
     floorAtOne: true,
   });
   const statements: D1PreparedStatement[] = [];

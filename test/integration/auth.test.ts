@@ -13,7 +13,6 @@ const PROTECTED_ROUTES: Array<[string, string, unknown?]> = [
   ["GET", "/tags", undefined],
   ["GET", "/recall?query=test", undefined],
   ["POST", "/forget", { id: "abc" }],
-  ["POST", "/chat", { query: "what?" }],
   ["POST", "/mcp", undefined],
 ];
 

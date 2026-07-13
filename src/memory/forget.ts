@@ -463,6 +463,7 @@ function prepareDatabaseErase(
             OR target_parent_id NOT IN (SELECT parent_id FROM sb_parent_units)`
       ),
       db.prepare(`DELETE FROM sb_claim_vectors WHERE claim_id IN (${inList})`).bind(...batch),
+      db.prepare(`DELETE FROM sb_claim_vector_jobs WHERE claim_id IN (${inList})`).bind(...batch),
       db.prepare(`DELETE FROM sb_memories WHERE id IN (${inList})`).bind(...batch),
     ];
   });

@@ -26,6 +26,7 @@ export interface CitableInsightClaim {
   statement: string;
   status: string;
   conflictIds: string[];
+  citationUse?: "fact" | "conflict_only";
 }
 
 export interface VerifiedInsightClaim {
@@ -42,6 +43,7 @@ export interface UnverifiedInsightClaim {
     | "missing_claim_ref"
     | "unknown_claim_ref"
     | "too_many_claim_refs"
+    | "conflict_only_ref"
     | "claim_text_not_supported"
     | "unresolved_conflict"
     | "invalid_conflict_refs";
@@ -177,6 +179,11 @@ export function validateStructuredInsightResponse(
         refs,
         kind,
       });
+      continue;
+    }
+
+    if (claims.some((claim) => claim.citationUse === "conflict_only")) {
+      unverifiedClaims.push({ text, refs, reason: "conflict_only_ref" });
       continue;
     }
 

@@ -396,6 +396,10 @@ CREATE TABLE IF NOT EXISTS sb_parent_versions (
   version_number INTEGER NOT NULL,
   source_observation_id TEXT,
   source_snapshot_hash TEXT,
+  tags_snapshot_json TEXT NOT NULL DEFAULT '[]',
+  source_snapshot TEXT,
+  vault_snapshot TEXT,
+  metadata_snapshot_hash TEXT,
   summary TEXT,
   state TEXT NOT NULL DEFAULT 'building',
   summary_vector_ids TEXT NOT NULL DEFAULT '[]',
@@ -518,6 +522,29 @@ CREATE TABLE IF NOT EXISTS sb_claim_vectors (
 );
 CREATE INDEX IF NOT EXISTS idx_sb_claim_vectors_parent
   ON sb_claim_vectors(parent_version_id, indexed_at DESC);
+
+CREATE TABLE IF NOT EXISTS sb_claim_vector_jobs (
+  id TEXT PRIMARY KEY,
+  claim_id TEXT NOT NULL,
+  target_fingerprint TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  parent_version_id TEXT,
+  rebuild_id TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER,
+  lease_owner TEXT,
+  lease_expires_at INTEGER,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(claim_id, target_fingerprint),
+  CHECK (status IN ('pending', 'processing', 'retryable_error', 'succeeded', 'failed'))
+);
+CREATE INDEX IF NOT EXISTS idx_claim_vector_jobs_due
+  ON sb_claim_vector_jobs(target_fingerprint, status, next_attempt_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_claim_vector_jobs_rebuild
+  ON sb_claim_vector_jobs(rebuild_id, status, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS sb_memory_sources (
   id TEXT PRIMARY KEY,

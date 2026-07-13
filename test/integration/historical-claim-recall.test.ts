@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { initializeDatabase, recallEntries } from "../../src/index";
+import worker, { initializeDatabase, recallEntries } from "../../src/index";
 import { createSelfhostEnv } from "../../src/selfhost/env";
 import { getEffectiveModelSettings, resetSettingsCache } from "../../src/settings/store";
 import { activeEmbeddingOf, embeddingFingerprintOf } from "../../src/settings/model-settings";
@@ -51,10 +51,22 @@ describe("historical Claim recall", () => {
       db.prepare(
         `INSERT INTO sb_parent_versions (
            version_id, parent_id, version_number, state, summary_vector_ids,
-           activated_at, superseded_at, created_at, updated_at
+           activated_at, superseded_at, tags_snapshot_json, source_snapshot,
+           vault_snapshot, metadata_snapshot_hash, created_at, updated_at
          ) VALUES
-           ('version-1', 'parent-1', 1, 'superseded', '[]', 100, 200, 100, 200),
-           ('version-2', 'parent-1', 2, 'active', '[]', 200, NULL, 200, 200)`
+           ('version-1', 'parent-1', 1, 'superseded', '[]', 100, 200,
+            '["history","version:1"]', 'obsidian-old', 'vault-a', 'metadata-v1', 100, 200),
+           ('version-2', 'parent-1', 2, 'active', '[]', 200, NULL,
+            '["current"]', 'api-current', 'vault-b', 'metadata-v2', 200, 200)`
+      ).run();
+      db.prepare(
+        `INSERT INTO sb_external_links (
+           id, provider, vault_id, external_path, object_type, object_id,
+           entry_id, sync_status, created_at, updated_at
+         ) VALUES (
+           'link-current', 'obsidian', 'vault-b', 'current.md', 'memory', 'entry-1',
+           'entry-1', 'synced', 200, 200
+         )`
       ).run();
       db.prepare(
         `INSERT INTO sb_memories (
@@ -123,11 +135,43 @@ describe("historical Claim recall", () => {
           id: "entry-1",
           claimId: "claim-a",
           content: "历史使用方案 A",
+          tags: ["history", "version:1", "kind:semantic"],
+          source: "obsidian-old",
         }),
       ]);
       expect(result.matches.some((match) => match.content.includes("方案 B"))).toBe(false);
       expect(result.degraded).toBe(true);
-      expect(insertedClaimVectorIds).not.toHaveLength(0);
+      expect(insertedClaimVectorIds).toHaveLength(0);
+      expect(db.prepare(`SELECT COUNT(*) AS count FROM sb_claim_vectors`).get())
+        .toEqual({ count: 0 });
+
+      const maintenance = await worker.fetch(new Request(
+        "http://localhost/maintenance/claim-vectors/backfill",
+        {
+          method: "POST",
+          headers: {
+            Authorization: "Bearer test-token",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ limit: 10 }),
+        }
+      ), env, ctx());
+      expect(maintenance.status).toBe(200);
+      expect(await maintenance.json()).toMatchObject({
+        ok: true,
+        queue: { missing: 0 },
+      });
+      expect(insertedClaimVectorIds.length).toBeGreaterThan(0);
+
+      const status = await worker.fetch(new Request(
+        "http://localhost/maintenance/claim-vectors/status",
+        { headers: { Authorization: "Bearer test-token" } }
+      ), env, ctx());
+      expect(status.status).toBe(200);
+      expect(await status.json()).toMatchObject({
+        ok: true,
+        queue: { missing: 0, succeeded: 2 },
+      });
 
       env.VECTORIZE = makeVectorizeMock({
         query: vi.fn().mockRejectedValue(new Error("vector backend unavailable")),
@@ -160,8 +204,26 @@ describe("historical Claim recall", () => {
       expect(malformedTagEvidence).toHaveLength(1);
       expect(malformedTagEvidence[0]).toMatchObject({
         claimId: "claim-a",
-        tags: ["kind:semantic"],
+        tags: ["history", "version:1", "kind:semantic"],
+        source: "obsidian-old",
       });
+
+      const historicalVault = await recallEntries({
+        query: "方案 A",
+        topK: 5,
+        before: 150,
+        tag: "history",
+      }, env, ctx(), "vault-a", { allowClaimVectorBackfill: false });
+      expect(historicalVault.directEvidence).toEqual([
+        expect.objectContaining({ claimId: "claim-a", source: "obsidian-old" }),
+      ]);
+
+      const currentVaultMustNotLeak = await recallEntries({
+        query: "方案 A",
+        topK: 5,
+        before: 150,
+      }, env, ctx(), "vault-b", { allowClaimVectorBackfill: false });
+      expect(currentVaultMustNotLeak.matches).toEqual([]);
 
       const wrongVault = await recallEntries({
         query: "方案 A",

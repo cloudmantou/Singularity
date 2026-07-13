@@ -1,5 +1,9 @@
 import { describe, it, expect, vi } from "vitest";
-import { synthesizeInsight, synthesizeVerifiedInsight } from "../../src/index";
+import {
+  resolveVerifiedRecallInsight,
+  synthesizeInsight,
+  synthesizeVerifiedInsight,
+} from "../../src/index";
 import { makeTestEnv } from "../helpers/make-env";
 
 function makeSseStream(response: string) {
@@ -20,7 +24,119 @@ function structuredClaim(text: string, refs = ["C1"], kind: "fact" | "conflict" 
   return JSON.stringify({ answer: "", claims: [{ text, refs, kind }] });
 }
 
+function verifiedEvidence(id: string, content: string) {
+  return {
+    id,
+    content,
+    claims: [{
+      id: `claim-${id}`,
+      entryId: id,
+      statement: content,
+      status: "confirmed",
+      verificationStatus: "confirmed" as const,
+      conflictIds: [],
+      opposingClaimIds: [],
+    }],
+  };
+}
+
 describe("synthesizeInsight()", () => {
+  it("uses query-aware synthesis when one Entry contains multiple Claims", async () => {
+    const env = makeTestEnv(undefined, {
+      AI: aiMock(structuredClaim("The project port is 8787", ["C2"])),
+    });
+    const result = await resolveVerifiedRecallInsight("What is the project port?", {
+      directEvidence: [{
+        id: "entry-project",
+        content: "Project details",
+        claims: [{
+          id: "claim-db",
+          entryId: "entry-project",
+          statement: "The project uses SQLite",
+          status: "confirmed",
+          verificationStatus: "confirmed",
+          conflictIds: [],
+          opposingClaimIds: [],
+        }, {
+          id: "claim-port",
+          entryId: "entry-project",
+          statement: "The project port is 8787",
+          status: "confirmed",
+          verificationStatus: "confirmed",
+          conflictIds: [],
+          opposingClaimIds: [],
+        }],
+      }],
+      relatedContext: [],
+    }, env);
+
+    expect(result.answer).toBe("The project port is 8787 [C2]");
+    expect(env.AI.run).toHaveBeenCalled();
+  });
+
+  it("fails closed when direct Evidence has no Atomic Claim", async () => {
+    const env = makeTestEnv(undefined, {
+      AI: aiMock(structuredClaim("Legacy entry text")),
+    });
+    const result = await synthesizeVerifiedInsight("query", {
+      directEvidence: [{ id: "legacy-entry", content: "Legacy entry text" }],
+      relatedContext: [],
+    }, env);
+
+    expect(result.answer).toBe("Retrieved direct evidence is insufficient for a verified answer.");
+    expect(result.verifiedClaims).toEqual([]);
+    expect(env.AI.run).not.toHaveBeenCalled();
+  });
+
+  it("can cite the opposing side only for a conflict when one side was directly recalled", async () => {
+    const conflict = {
+      id: "conflict-1",
+      state: "pending" as const,
+      reason: "different_object",
+      claimIds: ["claim-old", "claim-new"],
+      claims: [
+        { id: "claim-old", entryId: "entry-old", statement: "The project uses SQLite", status: "contested" },
+        { id: "claim-new", entryId: "entry-new", statement: "The project uses Postgres", status: "contested" },
+      ],
+    };
+    const directEvidence = [{
+      id: "entry-old",
+      content: "The project uses SQLite",
+      claims: [{
+        id: "claim-old",
+        entryId: "entry-old",
+        statement: "The project uses SQLite",
+        status: "contested",
+        verificationStatus: "contested" as const,
+        conflictIds: ["conflict-1"],
+        opposingClaimIds: ["claim-new"],
+      }],
+    }];
+    const conflictEnv = makeTestEnv(undefined, {
+      AI: aiMock(structuredClaim("Conflict", ["C1", "C2"], "conflict")),
+    });
+    const disclosed = await synthesizeVerifiedInsight(
+      "Which database is used?",
+      { directEvidence, relatedContext: [] },
+      conflictEnv,
+      [conflict]
+    );
+    expect(disclosed.answer).toContain("The project uses SQLite");
+    expect(disclosed.answer).toContain("The project uses Postgres");
+
+    const factEnv = makeTestEnv(undefined, {
+      AI: aiMock(structuredClaim("The project uses Postgres", ["C2"])),
+    });
+    const laundered = await synthesizeVerifiedInsight(
+      "Which database is used?",
+      { directEvidence, relatedContext: [] },
+      factEnv,
+      [conflict]
+    );
+    expect(laundered.answer).toBe("Retrieved direct evidence is insufficient for a verified answer.");
+    expect(laundered.unverifiedClaims[0]?.reason).toBe("conflict_only_ref");
+  });
+
   it("refuses to synthesize facts from Association-only navigation context", async () => {
     const env = makeTestEnv();
     const result = await synthesizeVerifiedInsight("query", {
@@ -53,7 +169,7 @@ describe("synthesizeInsight()", () => {
     });
     const result = await synthesizeInsight(
       "auth strategy",
-      [{ id: "1", content: "We chose JWT with 1hr expiry" }],
+      [verifiedEvidence("1", "We chose JWT with 1hr expiry")],
       env
     );
     expect(result).toBe("We chose JWT with 1hr expiry [C1]");
@@ -63,25 +179,25 @@ describe("synthesizeInsight()", () => {
     const env = makeTestEnv(undefined, {
       AI: { run: vi.fn().mockRejectedValue(new Error("AI unavailable")) } as unknown as Ai,
     });
-    const result = await synthesizeInsight("query", [{ id: "1", content: "content" }], env);
+    const result = await synthesizeInsight("query", [verifiedEvidence("1", "content")], env);
     expect(result).toBe("");
   });
 
   it("returns empty string when LLM response text is empty", async () => {
     const env = makeTestEnv(undefined, { AI: aiMock("") });
-    const result = await synthesizeInsight("query", [{ id: "1", content: "content" }], env);
+    const result = await synthesizeInsight("query", [verifiedEvidence("1", "content")], env);
     expect(result).toBe("");
   });
 
   it("trims whitespace from LLM response", async () => {
     const env = makeTestEnv(undefined, { AI: aiMock(`  ${structuredClaim("content")}  `) });
-    const result = await synthesizeInsight("query", [{ id: "1", content: "content" }], env);
+    const result = await synthesizeInsight("query", [verifiedEvidence("1", "content")], env);
     expect(result).toBe("content [C1]");
   });
 
   it("includes the query in the prompt sent to LLM", async () => {
     const env = makeTestEnv(undefined, { AI: aiMock("ok") });
-    await synthesizeInsight("fintech auth strategy", [{ id: "1", content: "note" }], env);
+    await synthesizeInsight("fintech auth strategy", [verifiedEvidence("1", "note")], env);
     const [, { messages }] = (env.AI.run as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(messages[0].content).toContain("fintech auth strategy");
   });
@@ -89,8 +205,8 @@ describe("synthesizeInsight()", () => {
   it("includes all row content in the prompt", async () => {
     const env = makeTestEnv(undefined, { AI: aiMock("ok") });
     await synthesizeInsight("query", [
-      { id: "1", content: "JWT decision" },
-      { id: "2", content: "switched to Postgres" },
+      verifiedEvidence("1", "JWT decision"),
+      verifiedEvidence("2", "switched to Postgres"),
     ], env);
     const [, { messages }] = (env.AI.run as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(messages[0].content).toContain("JWT decision");
@@ -99,7 +215,7 @@ describe("synthesizeInsight()", () => {
 
   it("grounds the prompt: local evidence refs, insufficient-evidence path, no speculation", async () => {
     const env = makeTestEnv(undefined, { AI: aiMock("ok") });
-    await synthesizeInsight("release v1.9", [{ id: "1", content: "note" }], env);
+    await synthesizeInsight("release v1.9", [verifiedEvidence("1", "note")], env);
     const [, { messages }] = (env.AI.run as ReturnType<typeof vi.fn>).mock.calls[0];
     const prompt = (messages[0].content as string).toLowerCase();
     expect(prompt).toContain("only");
@@ -168,7 +284,7 @@ describe("synthesizeInsight()", () => {
     const result = await synthesizeInsight(
       "project database",
       {
-        directEvidence: [{ id: "entry-direct", content: "The project uses SQLite" }],
+        directEvidence: [verifiedEvidence("entry-direct", "The project uses SQLite")],
         relatedContext: [{
           id: "entry-related",
           content: "A related project uses Postgres",
@@ -183,7 +299,7 @@ describe("synthesizeInsight()", () => {
     const [, { messages }] = (env.AI.run as ReturnType<typeof vi.fn>).mock.calls[0];
     const prompt = messages[0].content as string;
     expect(prompt).toContain("[E1] evidence_id=entry-direct");
-    expect(prompt).toContain("[C1] claim=legacy-entry");
+    expect(prompt).toContain("[C1] claim=claim-entry-direct");
     expect(prompt).toContain("statement=The project uses SQLite");
     expect(prompt).toContain("[R1] association=references; hop=1");
     expect(prompt).not.toContain("A related project uses Postgres");
@@ -195,7 +311,7 @@ describe("synthesizeInsight()", () => {
     const result = await synthesizeInsight(
       "project database",
       {
-        directEvidence: [{ id: "entry-direct", content: "The project uses SQLite" }],
+        directEvidence: [verifiedEvidence("entry-direct", "The project uses SQLite")],
         relatedContext: [{
           id: "entry-related",
           content: "A related project uses Postgres",
@@ -217,7 +333,7 @@ describe("synthesizeInsight()", () => {
     const result = await synthesizeInsight(
       "project database",
       {
-        directEvidence: [{ id: "entry-direct", content: "The project uses SQLite" }],
+        directEvidence: [verifiedEvidence("entry-direct", "The project uses SQLite")],
         relatedContext: [{
           id: "entry-related",
           content: "A related project uses Postgres",
@@ -242,12 +358,12 @@ describe("synthesizeInsight()", () => {
 
     await expect(synthesizeInsight(
       "project database",
-      [{ id: "entry-direct", content: "The project uses SQLite" }],
+      [verifiedEvidence("entry-direct", "The project uses SQLite")],
       missingRefEnv
     )).resolves.toBe("Retrieved direct evidence is insufficient for a verified answer.");
     await expect(synthesizeInsight(
       "project database",
-      [{ id: "entry-direct", content: "The project uses SQLite" }],
+      [verifiedEvidence("entry-direct", "The project uses SQLite")],
       unknownRefEnv
     )).resolves.toBe("Retrieved direct evidence is insufficient for a verified answer.");
   });

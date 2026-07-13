@@ -10,6 +10,7 @@ import {
   type EntityRelationDraft,
 } from "./entities";
 import {
+  buildParentVersionMetadataSnapshot,
   defaultClaimScores,
   normalizeClaimModality,
   normalizeClaimPolarity,
@@ -745,6 +746,29 @@ async function replaceEntryAtomicMemoryOnce(
   const parentVersionNumber = Math.max(1, Number(latestVersion?.version_number ?? 0) + 1);
   const evidenceRootId = parentId;
   const authorType: EvidenceAuthorType = input.source === "system" ? "system" : "user";
+  const entrySnapshot = await db.prepare(
+    `SELECT tags, source FROM entries WHERE id = ? LIMIT 1`
+  ).bind(input.entryId).first<{ tags: string | null; source: string | null }>();
+  let vaultSnapshot: string | null = null;
+  try {
+    const vault = await db.prepare(
+      `SELECT vault_id
+       FROM sb_external_links
+       WHERE entry_id = ?
+         AND provider = 'obsidian'
+         AND object_type = 'memory'
+       ORDER BY updated_at DESC
+       LIMIT 1`
+    ).bind(input.entryId).first<{ vault_id: string | null }>();
+    vaultSnapshot = vault?.vault_id ?? null;
+  } catch {
+    vaultSnapshot = null;
+  }
+  const metadataSnapshot = buildParentVersionMetadataSnapshot({
+    tags: entrySnapshot?.tags,
+    source: input.source || entrySnapshot?.source,
+    vault: vaultSnapshot,
+  });
 
   const statements = [
     prepareParentUnitInsert(db, {
@@ -757,6 +781,7 @@ async function replaceEntryAtomicMemoryOnce(
       versionNumber: parentVersionNumber,
       sourceObservationId: observationId,
       sourceSnapshotHash: input.contentHash,
+      metadataSnapshot,
       state: "building",
       createdAt: input.createdAt,
     }),

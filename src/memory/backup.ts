@@ -3,9 +3,9 @@ import { ensureEntityResolutionDataModel } from "./entities";
 import { ensureConflictClaimSchema } from "./quality";
 import { ensureAssociationDataModel } from "./associations";
 
-export const MEMORY_BACKUP_SCHEMA_VERSION = 12;
+export const MEMORY_BACKUP_SCHEMA_VERSION = 13;
 const MEMORY_BACKUP_FORMAT = "singularity-memory-backup";
-const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7, 8, 9, 10, 11, 12]);
+const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
 const MEMORY_BACKUP_FEATURES = [
   "atomic-memory",
   "temporal-facts",
@@ -18,6 +18,7 @@ const MEMORY_BACKUP_FEATURES = [
   "parent-version-claims",
   "parent-version-time-windows",
   "parent-version-time-provenance",
+  "parent-version-metadata-snapshots",
   "entity-resolution",
   "entity-merge-execution",
   "fact-resolution",
@@ -72,7 +73,7 @@ export interface BackupIntegrityReport {
 
 export interface MemoryBackup {
   backupFormat: typeof MEMORY_BACKUP_FORMAT;
-  schemaVersion: 12;
+  schemaVersion: 13;
   features: Array<(typeof MEMORY_BACKUP_FEATURES)[number]>;
   exportedAt: string;
   source: string;
@@ -108,7 +109,7 @@ export interface MemoryBackup {
 }
 
 export interface MemoryBackupImportResult extends ImportResult {
-  schemaVersion: 12;
+  schemaVersion: 13;
   graph: Record<GraphArrayKey, TableImportStats>;
   integrity: BackupIntegrityReport;
 }
@@ -353,7 +354,9 @@ export async function exportMemoryBackup(
                 FROM sb_parent_units
                 ORDER BY updated_at DESC, parent_id DESC`),
     allRows(db, `SELECT version_id, parent_id, version_number, source_observation_id,
-                       source_snapshot_hash, summary, state, summary_vector_ids,
+                       source_snapshot_hash, tags_snapshot_json, source_snapshot,
+                       vault_snapshot, metadata_snapshot_hash,
+                       summary, state, summary_vector_ids,
                        activated_at, superseded_at, activation_time_source,
                        superseded_time_source, created_at, updated_at
                 FROM sb_parent_versions
@@ -706,16 +709,21 @@ export async function importMemoryBackup(
     return db.prepare(
       `${insertVerb(mode)} INTO sb_parent_versions (
          version_id, parent_id, version_number, source_observation_id,
-         source_snapshot_hash, summary, state, summary_vector_ids,
+         source_snapshot_hash, tags_snapshot_json, source_snapshot,
+         vault_snapshot, metadata_snapshot_hash, summary, state, summary_vector_ids,
          activated_at, superseded_at, activation_time_source,
          superseded_time_source, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       requiredText(row, "version_id"),
       requiredText(row, "parent_id"),
       intOrDefault(row, "version_number", 1),
       textOrNull(row, "source_observation_id"),
       textOrNull(row, "source_snapshot_hash"),
+      jsonText(row, "tags_snapshot_json", "[]"),
+      textOrNull(row, "source_snapshot"),
+      textOrNull(row, "vault_snapshot"),
+      textOrNull(row, "metadata_snapshot_hash"),
       textOrNull(row, "summary"),
       state,
       jsonText(row, "summary_vector_ids", "[]"),

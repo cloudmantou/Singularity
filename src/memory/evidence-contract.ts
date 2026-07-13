@@ -54,6 +54,10 @@ export const EVIDENCE_CONTRACT_SCHEMA_STATEMENTS = [
     version_number INTEGER NOT NULL,
     source_observation_id TEXT,
     source_snapshot_hash TEXT,
+    tags_snapshot_json TEXT NOT NULL DEFAULT '[]',
+    source_snapshot TEXT,
+    vault_snapshot TEXT,
+    metadata_snapshot_hash TEXT,
     summary TEXT,
     state TEXT NOT NULL DEFAULT 'building',
     summary_vector_ids TEXT NOT NULL DEFAULT '[]',
@@ -90,6 +94,13 @@ export const PARENT_VERSION_TEMPORAL_MIGRATIONS = [
   { column: "superseded_at", statement: `ALTER TABLE sb_parent_versions ADD COLUMN superseded_at INTEGER` },
   { column: "activation_time_source", statement: `ALTER TABLE sb_parent_versions ADD COLUMN activation_time_source TEXT` },
   { column: "superseded_time_source", statement: `ALTER TABLE sb_parent_versions ADD COLUMN superseded_time_source TEXT` },
+] as const;
+
+export const PARENT_VERSION_METADATA_MIGRATIONS = [
+  { column: "tags_snapshot_json", statement: `ALTER TABLE sb_parent_versions ADD COLUMN tags_snapshot_json TEXT NOT NULL DEFAULT '[]'` },
+  { column: "source_snapshot", statement: `ALTER TABLE sb_parent_versions ADD COLUMN source_snapshot TEXT` },
+  { column: "vault_snapshot", statement: `ALTER TABLE sb_parent_versions ADD COLUMN vault_snapshot TEXT` },
+  { column: "metadata_snapshot_hash", statement: `ALTER TABLE sb_parent_versions ADD COLUMN metadata_snapshot_hash TEXT` },
 ] as const;
 
 export const PARENT_VERSION_TEMPORAL_BACKFILL_STATEMENTS = [
@@ -208,6 +219,81 @@ export function normalizeProvenanceRelation(value: unknown): ProvenanceRelation 
     : "derived_from";
 }
 
+export interface ParentVersionMetadataSnapshot {
+  tagsJson: string;
+  source: string | null;
+  vault: string | null;
+  hash: string;
+}
+
+function normalizedSnapshotText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized || null;
+}
+
+function snapshotRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return value as Record<string, unknown>;
+}
+
+function snapshotTags(value: unknown): string[] {
+  let candidate = value;
+  if (typeof candidate === "string") {
+    try {
+      candidate = JSON.parse(candidate);
+    } catch {
+      candidate = [candidate];
+    }
+  }
+  if (!Array.isArray(candidate)) return [];
+  return [...new Set(candidate
+    .filter((tag): tag is string => typeof tag === "string")
+    .map((tag) => tag.trim())
+    .filter(Boolean))].sort();
+}
+
+function snapshotHash(value: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+export function buildParentVersionMetadataSnapshot(input: {
+  metadata?: unknown;
+  tags?: unknown;
+  source?: unknown;
+  vault?: unknown;
+}): ParentVersionMetadataSnapshot {
+  let metadataValue = input.metadata;
+  if (typeof metadataValue === "string") {
+    try {
+      metadataValue = JSON.parse(metadataValue);
+    } catch {
+      metadataValue = {};
+    }
+  }
+  const metadata = snapshotRecord(metadataValue);
+  const properties = snapshotRecord(metadata.properties);
+  const tags = snapshotTags(input.tags ?? metadata.tags ?? properties.tags);
+  const source = normalizedSnapshotText(
+    input.source ?? metadata.source_channel ?? metadata.provider ?? metadata.source
+  );
+  const vault = normalizedSnapshotText(
+    input.vault ?? metadata.vault_id ?? metadata.vaultId ?? properties.vault_id
+  );
+  const canonical = JSON.stringify({ tags, source, vault });
+  return {
+    tagsJson: JSON.stringify(tags),
+    source,
+    vault,
+    hash: snapshotHash(canonical),
+  };
+}
+
 export function defaultClaimScores(input: {
   confidence?: number | null;
   evidenceScore?: number | null;
@@ -260,6 +346,7 @@ export function prepareParentVersionInsert(
     versionNumber: number;
     sourceObservationId: string;
     sourceSnapshotHash: string | null;
+    metadataSnapshot?: ParentVersionMetadataSnapshot;
     state?: ParentVersionState;
     createdAt: number;
   }
@@ -267,14 +354,19 @@ export function prepareParentVersionInsert(
   return db.prepare(
     `INSERT INTO sb_parent_versions (
        version_id, parent_id, version_number, source_observation_id,
-       source_snapshot_hash, summary, state, summary_vector_ids, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, NULL, ?, '[]', ?, ?)`
+       source_snapshot_hash, tags_snapshot_json, source_snapshot, vault_snapshot,
+       metadata_snapshot_hash, summary, state, summary_vector_ids, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, '[]', ?, ?)`
   ).bind(
     input.versionId,
     input.parentId,
     input.versionNumber,
     input.sourceObservationId,
     input.sourceSnapshotHash,
+    input.metadataSnapshot?.tagsJson ?? "[]",
+    input.metadataSnapshot?.source ?? null,
+    input.metadataSnapshot?.vault ?? null,
+    input.metadataSnapshot?.hash ?? null,
     input.state ?? "building",
     input.createdAt,
     input.createdAt

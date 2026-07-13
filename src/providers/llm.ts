@@ -32,7 +32,7 @@ export interface LLMProvider {
 
   /**
    * Stream a chat as Cloudflare Workers AI–compatible SSE
-   * (`data: {"response":"..."}`), for the web UI `/chat` endpoint.
+   * (`data: {"response":"..."}`) for provider-level streaming consumers.
    */
   chatAsCfSse(messages: ChatMessage[], options?: ChatOptions): Promise<ReadableStream>;
 }

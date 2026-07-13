@@ -1,9 +1,12 @@
+import { activeMemoryClaimPredicate } from "./claim-eligibility";
+
 type FactRelationIdSql = "?" | "sb_entity_relations.id";
 
 interface DistinctFactEvidenceCountSqlOptions {
   relationIdSql: FactRelationIdSql;
   excludeMemoryIdCount?: number;
   activeMemoriesOnly?: boolean;
+  asOf?: number;
   floorAtOne?: boolean;
 }
 
@@ -18,17 +21,35 @@ export function distinctFactEvidenceCountSql(
   if (!Number.isSafeInteger(excludeMemoryIdCount) || excludeMemoryIdCount < 0) {
     throw new Error("excludeMemoryIdCount must be a non-negative safe integer");
   }
+  const asOf = options.asOf ?? Date.now();
+  if (!Number.isSafeInteger(asOf) || asOf < 0) {
+    throw new Error("asOf must be a non-negative safe integer");
+  }
+  const asOfSql = String(asOf);
 
   const activeMemoryJoin = options.activeMemoriesOnly
-    ? "LEFT JOIN sb_memories m_count ON m_count.id = fs_count.memory_id"
+    ? `LEFT JOIN sb_memories m_count ON m_count.id = fs_count.memory_id
+       LEFT JOIN entries e_count
+         ON e_count.id = m_count.entry_id
+        AND e_count.content_hash = m_count.content_hash`
     : "";
   const activeMemoryFilter = options.activeMemoriesOnly
     ? `AND (
          fs_count.memory_id IS NULL
          OR (
            m_count.id IS NOT NULL
-           AND m_count.invalid_at IS NULL
-           AND m_count.expired_at IS NULL
+           AND m_count.content_hash IS NOT NULL
+           AND e_count.id IS NOT NULL
+           AND ${activeMemoryClaimPredicate("m_count", asOfSql, { requireActiveParentLink: true })}
+           AND NOT EXISTS (
+             SELECT 1
+             FROM sb_conflict_cases c_count
+             WHERE c_count.state = 'pending'
+               AND (
+                 c_count.old_claim_id = m_count.id
+                 OR c_count.new_claim_id = m_count.id
+               )
+           )
          )
        )`
     : "";

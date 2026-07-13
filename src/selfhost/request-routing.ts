@@ -11,18 +11,18 @@ const GET_ROUTES = new Set([
   "/entities", "/export", "/extract-pending", "/graph/facts", "/health", "/health/details",
   "/integrations/obsidian/aggregates", "/integrations/obsidian/pull",
   "/integrations/obsidian/rules", "/integrations/obsidian/status", "/integrations/providers",
-  "/list", "/maintenance/vector-index/status", "/quality/conflict-cases",
+  "/list", "/maintenance/claim-vectors/status", "/maintenance/vector-index/status", "/quality/conflict-cases",
   "/quality/entity-merge-candidates", "/quality/merge-candidates", "/recall", "/relations",
   "/settings/models", "/settings/oauth/clients", "/settings/telemetry", "/stats", "/tags",
 ]);
 
 const POST_ROUTES = new Set([
   "/analytics/purge", "/append", "/associations/link", "/associations/unlink", "/capture",
-  "/chat", "/classify-pending", "/digest", "/extract-pending", "/forget", "/import",
+  "/classify-pending", "/digest", "/extract-pending", "/forget", "/import",
   "/integrations/development-session/capture", "/integrations/obsidian/ack",
   "/integrations/obsidian/aggregates/generate", "/integrations/obsidian/push",
   "/integrations/obsidian/resolve-conflict", "/integrations/obsidian/rules",
-  "/integrations/obsidian/tokens", "/link", "/maintenance/vector-index/backfill",
+  "/integrations/obsidian/tokens", "/link", "/maintenance/claim-vectors/backfill", "/maintenance/vector-index/backfill",
   "/quality/conflict-cases/resolve", "/quality/entity-merge-candidates/resolve",
   "/quality/merge-candidates/resolve", "/settings/models/reindex",
   "/settings/models/reindex/cancel", "/settings/models/test", "/status", "/unlink", "/update",

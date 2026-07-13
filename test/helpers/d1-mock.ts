@@ -546,6 +546,10 @@ export class D1Mock {
           let version_number: any;
           let source_observation_id: any;
           let source_snapshot_hash: any;
+          let tags_snapshot_json: any = "[]";
+          let source_snapshot: any = null;
+          let vault_snapshot: any = null;
+          let metadata_snapshot_hash: any = null;
           let summary: any = null;
           let state: any;
           let summary_vector_ids: any = "[]";
@@ -553,7 +557,21 @@ export class D1Mock {
           let updated_at: any;
           let activated_at: any = null;
           let superseded_at: any = null;
-          if (args.length >= 12) {
+          if (s.includes("tags_snapshot_json") && args.length >= 18) {
+            [
+              version_id, parent_id, version_number, source_observation_id,
+              source_snapshot_hash, tags_snapshot_json, source_snapshot,
+              vault_snapshot, metadata_snapshot_hash, summary, state,
+              summary_vector_ids, activated_at, superseded_at,
+              , , created_at, updated_at,
+            ] = args;
+          } else if (s.includes("tags_snapshot_json") && args.length >= 12) {
+            [
+              version_id, parent_id, version_number, source_observation_id,
+              source_snapshot_hash, tags_snapshot_json, source_snapshot,
+              vault_snapshot, metadata_snapshot_hash, state, created_at, updated_at,
+            ] = args;
+          } else if (args.length >= 12) {
             [
               version_id, parent_id, version_number, source_observation_id,
               source_snapshot_hash, summary, state, summary_vector_ids,
@@ -578,7 +596,8 @@ export class D1Mock {
             if (s.startsWith("INSERT OR REPLACE")) {
               Object.assign(existing, {
                 version_id, parent_id, version_number, source_observation_id,
-                source_snapshot_hash, summary, state, summary_vector_ids,
+                source_snapshot_hash, tags_snapshot_json, source_snapshot,
+                vault_snapshot, metadata_snapshot_hash, summary, state, summary_vector_ids,
                 activated_at, superseded_at, created_at, updated_at,
               });
               return { meta: { changes: 1 } };
@@ -588,7 +607,8 @@ export class D1Mock {
           }
           db.parentVersions.push({
             version_id, parent_id, version_number, source_observation_id,
-            source_snapshot_hash, summary, state, summary_vector_ids,
+            source_snapshot_hash, tags_snapshot_json, source_snapshot,
+            vault_snapshot, metadata_snapshot_hash, summary, state, summary_vector_ids,
             activated_at, superseded_at, created_at, updated_at,
           });
           return { meta: { changes: 1 } };

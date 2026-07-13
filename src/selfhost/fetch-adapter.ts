@@ -2,7 +2,7 @@
  * Convert a Fastify request into a Fetch API Request and write the Response back.
  *
  * JSON/HTML are fully buffered (avoids empty bodies under Fastify/Nginx).
- * SSE (text/event-stream) is streamed for /chat without using stream.pipeline
+ * SSE (text/event-stream) is forwarded without using stream.pipeline
  * (pipeline + client disconnect → ERR_STREAM_PREMATURE_CLOSE can kill Node).
  */
 

@@ -38,7 +38,7 @@ export function previewText(
 }
 
 /**
- * Credential exchange, model settings, and memory write/chat bodies may contain
+ * Credential exchange, model settings, memory writes, and retired client paths may contain
  * owner tokens, provider keys, or private memories. Never preview or hash them.
  */
 export function shouldSuppressRequestBodyTelemetry(pathname: string): boolean {
