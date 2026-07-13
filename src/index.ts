@@ -76,6 +76,7 @@ import {
 import { readPublicUrl, siteConfigJson } from "./config/site";
 import { planRecallRequest, type RecallRequestPlan } from "./query-intent";
 import { ensureMemoryDataModel } from "./memory/schema";
+import { activeMemoryClaimPredicate } from "./memory/claim-eligibility";
 import {
   forgetMemoryGraph,
   type ForgetMemoryResult,
@@ -135,6 +136,7 @@ import {
   CONFLICT_CASE_STATES,
   CONFLICT_RESOLUTIONS,
   MERGE_CANDIDATE_STATES,
+  ensureConflictClaimSchema,
   prepareComplianceAuditEvent,
   prepareConflictCase,
   prepareMemoryMergeCandidate,
@@ -145,6 +147,10 @@ import {
   type MergeCandidateState,
   type MergeSuggestedAction,
 } from "./memory/quality";
+import {
+  ConflictClaimsUnavailableError,
+  D1ResolutionCoordinator,
+} from "./memory/resolution-coordinator";
 
 export interface Env {
   DB: D1Database;
@@ -1295,10 +1301,25 @@ function shouldStripObsidianFrontmatter(properties: Record<string, unknown>): bo
   );
 }
 
-function sanitizeObsidianContent(content: string, properties: Record<string, unknown>): string {
-  return shouldStripObsidianFrontmatter(properties)
+export const OBSIDIAN_KNOWLEDGE_BEGIN = "<!-- SINGULARITY:KNOWLEDGE:BEGIN -->";
+export const OBSIDIAN_KNOWLEDGE_END = "<!-- SINGULARITY:KNOWLEDGE:END -->";
+
+function stripObsidianKnowledgeProjection(content: string): string {
+  const completeBlock = new RegExp(
+    `${OBSIDIAN_KNOWLEDGE_BEGIN.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[\\s\\S]*?${OBSIDIAN_KNOWLEDGE_END.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+    "g"
+  );
+  let stripped = content.replace(completeBlock, "");
+  const unmatchedBegin = stripped.indexOf(OBSIDIAN_KNOWLEDGE_BEGIN);
+  if (unmatchedBegin >= 0) stripped = stripped.slice(0, unmatchedBegin);
+  return stripped.replaceAll(OBSIDIAN_KNOWLEDGE_END, "").trim();
+}
+
+export function sanitizeObsidianContent(content: string, properties: Record<string, unknown>): string {
+  const withoutFrontmatter = shouldStripObsidianFrontmatter(properties)
     ? stripLeadingYamlFrontmatter(content)
     : content.trim();
+  return stripObsidianKnowledgeProjection(withoutFrontmatter);
 }
 
 function parseScopesJson(scopesJson: string | null | undefined): string[] {
@@ -1600,7 +1621,7 @@ function markdownForObsidian(row: ObsidianLinkedEntryRow, syncEtag?: string | nu
     );
   }
   return sections.length > 0
-    ? `${frontmatter}${row.content}\n\n${sections.join("\n")}`
+    ? `${frontmatter}${row.content}\n\n${OBSIDIAN_KNOWLEDGE_BEGIN}\n${sections.join("\n")}\n${OBSIDIAN_KNOWLEDGE_END}`
     : `${frontmatter}${row.content}`;
 }
 
@@ -2818,27 +2839,9 @@ async function loadObsidianKnowledgeProjections(
   await ensureEntityResolutionDataModel(env.DB);
   const placeholders = ids.map(() => "?").join(",");
   const activeClaimPredicate = `
-    m.invalid_at IS NULL
-    AND m.expired_at IS NULL
-    AND m.claim_status IN ('supported', 'confirmed', 'contested')
-    AND (m.content_hash IS NULL OR en.content_hash IS NULL OR m.content_hash = en.content_hash)
-    AND EXISTS (
-      SELECT 1
-      FROM sb_parent_version_claims pvc
-      JOIN sb_parent_versions pv ON pv.version_id = pvc.parent_version_id
-      JOIN sb_parent_units pu
-        ON pu.parent_id = pv.parent_id
-       AND pu.active_version_id = pv.version_id
-      WHERE pvc.memory_id = m.id
-        AND pvc.relation = 'supports'
-        AND pv.state IN ('active', 'active_degraded')
-    )
-    AND EXISTS (
-      SELECT 1
-      FROM sb_memory_sources ms
-      WHERE ms.memory_id = m.id
-        AND ms.relation IN ('supports', 'derived_from')
-    )`;
+    m.content_hash IS NOT NULL
+    AND en.content_hash = m.content_hash
+    AND ${activeMemoryClaimPredicate("m", String(Date.now()), { requireActiveParentLink: true })}`;
   const entityRows = await env.DB.prepare(
     `SELECT DISTINCT en.id AS entry_id, e.id, e.name, e.entity_type
      FROM entries en
@@ -6788,60 +6791,6 @@ export interface RecallSearchResult {
 
 interface KeywordRow { id: string; content: string; tags: string; source: string; created_at: number; }
 
-function activeMemoryClaimPredicate(memoryRef: string, asOfExpression: string): string {
-  return `(
-    ${memoryRef}.claim_status IN ('supported', 'confirmed', 'contested')
-    AND (${memoryRef}.valid_from IS NULL OR ${memoryRef}.valid_from <= ${asOfExpression})
-    AND (${memoryRef}.valid_to IS NULL OR ${memoryRef}.valid_to > ${asOfExpression})
-    AND (${memoryRef}.invalid_at IS NULL OR ${memoryRef}.invalid_at > ${asOfExpression})
-    AND (${memoryRef}.expired_at IS NULL OR ${memoryRef}.expired_at > ${asOfExpression})
-    AND EXISTS (
-      SELECT 1
-      FROM sb_memory_sources ms_active
-      JOIN sb_observations o_active
-        ON o_active.id = ms_active.observation_id
-      WHERE ms_active.memory_id = ${memoryRef}.id
-        AND (
-          ms_active.relation IN ('supports', 'derived_from')
-          OR ms_active.role IN ('supports', 'derived_from')
-        )
-        AND o_active.content_hash IS NOT NULL
-    )
-    AND (
-      EXISTS (
-        SELECT 1
-        FROM sb_parent_version_claims pvc_active
-        JOIN sb_parent_versions pv_active
-          ON pv_active.version_id = pvc_active.parent_version_id
-        JOIN sb_parent_units pu_active
-          ON pu_active.active_version_id = pv_active.version_id
-         AND pu_active.parent_id = pv_active.parent_id
-        WHERE pvc_active.memory_id = ${memoryRef}.id
-          AND pv_active.state IN ('active', 'active_degraded')
-      )
-      OR (
-        NOT EXISTS (
-          SELECT 1
-          FROM sb_parent_version_claims pvc_any
-          WHERE pvc_any.memory_id = ${memoryRef}.id
-        )
-        AND (
-          ${memoryRef}.parent_version_id IS NULL
-          OR EXISTS (
-            SELECT 1
-            FROM sb_parent_versions pv_legacy
-            JOIN sb_parent_units pu_legacy
-              ON pu_legacy.active_version_id = pv_legacy.version_id
-             AND pu_legacy.parent_id = pv_legacy.parent_id
-            WHERE pv_legacy.version_id = ${memoryRef}.parent_version_id
-              AND pv_legacy.state IN ('active', 'active_degraded')
-          )
-        )
-      )
-    )
-  )`;
-}
-
 function activeParentEntryPredicate(entryRef: string): string {
   return activeParentEntryPredicateAt(entryRef, String(Date.now()));
 }
@@ -7285,14 +7234,18 @@ async function buildGraphRecallSignals(
             me.entity_id, me.score AS entity_score, e.name AS entity_name
      FROM sb_memory_entities me
      JOIN sb_memories m ON m.id = me.memory_id
+     JOIN entries en_graph
+       ON en_graph.id = m.entry_id
+      AND en_graph.content_hash = m.content_hash
      JOIN sb_entities e ON e.id = me.entity_id
      WHERE me.entity_id IN (${placeholders})
        AND m.entry_id IS NOT NULL
+       AND m.content_hash IS NOT NULL
        AND (m.invalid_at IS NULL OR m.invalid_at > ?)
        AND (m.expired_at IS NULL OR m.expired_at > ?)
        AND (m.valid_from IS NULL OR m.valid_from <= ?)
        AND (m.valid_to IS NULL OR m.valid_to > ?)
-       AND ${activeMemoryClaimPredicate("m", String(asOf))}
+       AND ${activeMemoryClaimPredicate("m", String(asOf), { requireActiveParentLink: true })}
      ORDER BY COALESCE(me.score, 0) DESC, m.created_at DESC
      LIMIT ?`
   ).bind(...entityIds, asOf, asOf, asOf, asOf, GRAPH_DIRECT_MEMORY_LIMIT).all() as {
@@ -7328,6 +7281,9 @@ async function buildGraphRecallSignals(
      FROM sb_entity_relations r
      LEFT JOIN sb_fact_sources rfs ON rfs.relation_id = r.id
      JOIN sb_memories m ON m.id = COALESCE(rfs.memory_id, r.memory_id)
+     JOIN entries en_graph
+       ON en_graph.id = m.entry_id
+      AND en_graph.content_hash = m.content_hash
      JOIN sb_entities fe ON fe.id = r.from_entity_id
      JOIN sb_entities te ON te.id = r.to_entity_id
      WHERE (r.from_entity_id IN (${relationWhere}) OR r.to_entity_id IN (${relationWhere}))
@@ -7337,9 +7293,10 @@ async function buildGraphRecallSignals(
        AND (r.valid_to IS NULL OR r.valid_to > ?)
        AND COALESCE(r.resolution_state, 'active') = 'active'
        AND m.entry_id IS NOT NULL
+       AND m.content_hash IS NOT NULL
        AND (m.invalid_at IS NULL OR m.invalid_at > ?)
        AND (m.expired_at IS NULL OR m.expired_at > ?)
-       AND ${activeMemoryClaimPredicate("m", String(asOf))}
+       AND ${activeMemoryClaimPredicate("m", String(asOf), { requireActiveParentLink: true })}
      ORDER BY COALESCE(r.score, 0) DESC, r.created_at DESC
      LIMIT ?`
   ).bind(
@@ -8609,6 +8566,7 @@ async function listConflictCases(
   env: Env,
   input: { state: ConflictCaseState | null; limit: number }
 ): Promise<Record<string, unknown>[]> {
+  await ensureConflictClaimSchema(env.DB);
   const stateClause = input.state ? "WHERE c.state = ?" : "";
   const bindings: unknown[] = [];
   if (input.state) bindings.push(input.state);
@@ -8616,13 +8574,17 @@ async function listConflictCases(
   const { results } = await env.DB.prepare(
     `SELECT
        c.*,
+       old_claim.content AS old_claim_content,
+       new_claim.content AS new_claim_content,
        old_entry.content AS old_content,
        old_entry.tags AS old_tags,
        new_entry.content AS new_content,
        new_entry.tags AS new_tags
      FROM sb_conflict_cases c
-     LEFT JOIN entries old_entry ON old_entry.id = c.old_memory_id
-     LEFT JOIN entries new_entry ON new_entry.id = c.new_memory_id
+     LEFT JOIN sb_memories old_claim ON old_claim.id = c.old_claim_id
+     LEFT JOIN sb_memories new_claim ON new_claim.id = c.new_claim_id
+     LEFT JOIN entries old_entry ON old_entry.id = COALESCE(old_claim.entry_id, c.old_memory_id)
+     LEFT JOIN entries new_entry ON new_entry.id = COALESCE(new_claim.entry_id, c.new_memory_id)
      ${stateClause}
      ORDER BY c.created_at DESC, c.id DESC
      LIMIT ?`
@@ -8632,6 +8594,8 @@ async function listConflictCases(
     id: row.id,
     oldMemoryId: row.old_memory_id,
     newMemoryId: row.new_memory_id,
+    oldClaimId: row.old_claim_id ?? null,
+    newClaimId: row.new_claim_id ?? null,
     conflictType: row.conflict_type,
     reason: row.reason,
     confidence: row.confidence == null ? null : Number(row.confidence),
@@ -8645,11 +8609,19 @@ async function listConflictCases(
       content: row.old_content ?? null,
       tags: parseStoredTags(row.old_tags),
     },
+    oldClaim: row.old_claim_id ? {
+      id: row.old_claim_id,
+      content: row.old_claim_content ?? null,
+    } : null,
     newMemory: {
       id: row.new_memory_id,
       content: row.new_content ?? null,
       tags: parseStoredTags(row.new_tags),
     },
+    newClaim: row.new_claim_id ? {
+      id: row.new_claim_id,
+      content: row.new_claim_content ?? null,
+    } : null,
   }));
 }
 
@@ -8664,67 +8636,16 @@ async function resolveConflictCase(
   }
 ): Promise<boolean> {
   const now = Date.now();
-  const conflict = await env.DB.prepare(
-    `SELECT old_memory_id, new_memory_id
-     FROM sb_conflict_cases
-     WHERE id = ?`
-  ).bind(input.id).first<{ old_memory_id: string; new_memory_id: string }>();
-  const auditEvent = await prepareComplianceAuditEvent(env.DB, {
-    ...auditActorFromPrincipal(input.principal),
-    action: "quality.conflict_case.resolve",
-    objectType: "conflict_case",
-    objectId: input.id,
-    metadata: {
-      state: input.state,
-      resolution: input.resolution,
-      resolved_by: input.resolvedBy,
-    },
+  const actor = auditActorFromPrincipal(input.principal);
+  return await new D1ResolutionCoordinator(env.DB).applyConflictResolution({
+    conflictId: input.id,
+    state: input.state,
+    resolution: input.resolution,
+    resolvedBy: input.resolvedBy,
+    effectiveAt: now,
+    actorType: actor.actorType,
+    actorId: actor.actorId,
   });
-  const statements: D1PreparedStatement[] = [
-    env.DB.prepare(
-      `UPDATE sb_conflict_cases
-       SET state = ?, resolution = ?, resolved_by = ?, resolved_at = ?
-       WHERE id = ?`
-    ).bind(input.state, input.resolution, input.resolvedBy, now, input.id),
-  ];
-  if (conflict && input.state === "resolved" && input.resolution === "use_new") {
-    statements.push(
-      env.DB.prepare(
-        `UPDATE sb_memories
-         SET claim_status = 'superseded',
-             invalid_at = COALESCE(invalid_at, ?),
-             valid_to = COALESCE(valid_to, ?)
-         WHERE entry_id = ?
-           AND claim_status NOT IN ('superseded', 'deprecated')`
-      ).bind(now, now, conflict.old_memory_id),
-      env.DB.prepare(
-        `UPDATE sb_memories
-         SET claim_status = 'confirmed'
-         WHERE entry_id = ?
-           AND claim_status IN ('supported', 'contested', 'unsupported')`
-      ).bind(conflict.new_memory_id)
-    );
-  } else if (conflict && input.state === "resolved" && input.resolution === "use_old") {
-    statements.push(
-      env.DB.prepare(
-        `UPDATE sb_memories
-         SET claim_status = 'deprecated',
-             invalid_at = COALESCE(invalid_at, ?),
-             valid_to = COALESCE(valid_to, ?)
-         WHERE entry_id = ?
-           AND claim_status NOT IN ('superseded', 'deprecated')`
-      ).bind(now, now, conflict.new_memory_id),
-      env.DB.prepare(
-        `UPDATE sb_memories
-         SET claim_status = 'confirmed'
-         WHERE entry_id = ?
-           AND claim_status IN ('supported', 'contested', 'unsupported')`
-      ).bind(conflict.old_memory_id)
-    );
-  }
-  statements.push(auditEvent.statement);
-  const results = await env.DB.batch(statements);
-  return Number(results[0]?.meta?.changes ?? 0) > 0;
 }
 
 async function listAuditEvents(
@@ -11964,14 +11885,28 @@ const defaultHandler = {
       if (!resolution) {
         return json({ ok: false, error: `resolution must be one of: ${CONFLICT_RESOLUTIONS.join(", ")}` }, 400);
       }
+      if (
+        (state === "dismissed" && resolution !== "dismissed") ||
+        (state === "resolved" && resolution === "dismissed")
+      ) {
+        return json({ ok: false, error: "dismissed state requires dismissed resolution, and resolved state cannot use it" }, 400);
+      }
       const resolvedBy = parseReviewId(body.resolvedBy) ?? "owner";
-      const ok = await resolveConflictCase(env, {
-        id,
-        state,
-        resolution,
-        resolvedBy,
-        principal: auth.principal,
-      });
+      let ok: boolean;
+      try {
+        ok = await resolveConflictCase(env, {
+          id,
+          state,
+          resolution,
+          resolvedBy,
+          principal: auth.principal,
+        });
+      } catch (error) {
+        if (error instanceof ConflictClaimsUnavailableError) {
+          return json({ ok: false, error: "conflict_claims_unavailable", message: error.message }, 409);
+        }
+        throw error;
+      }
       if (!ok) return json({ ok: false, error: `No conflict case found with ID: ${id}` }, 404);
       return json({ ok: true, id, state, resolution, resolvedBy });
     }

@@ -3,6 +3,8 @@ import {
   resolveFact,
   type FactResolutionResult,
 } from "./fact-resolution";
+import { ensureConflictClaimSchema } from "./quality";
+import { D1ResolutionCoordinator } from "./resolution-coordinator";
 
 export interface ResolveEntityRelationInput {
   fromEntityId: string;
@@ -39,6 +41,7 @@ interface FactCandidateRow {
   valid_to: number | null;
   reference_time: number | null;
   evidence_count: number | null;
+  created_at: number;
 }
 
 async function evidenceCanInvalidate(
@@ -48,12 +51,19 @@ async function evidenceCanInvalidate(
   if (input.trustedEvidence != null) return input.trustedEvidence;
   if (!input.observationId || Number(input.score ?? 0) < 0.8) return false;
   const row = await db.prepare(
-    `SELECT author_type, source_channel
-     FROM sb_observations
-     WHERE id = ?
+    `SELECT o.author_type, m.scores_json
+     FROM sb_observations o
+     LEFT JOIN sb_memories m ON m.id = ?
+     WHERE o.id = ?
      LIMIT 1`
-  ).bind(input.observationId).first<{ author_type: string | null; source_channel: string | null }>();
-  return row?.author_type === "user" || row?.author_type === "import";
+  ).bind(input.memoryId ?? null, input.observationId).first<{
+    author_type: string | null;
+    scores_json: string | null;
+  }>();
+  if (row?.author_type !== "user" && row?.author_type !== "import") return false;
+  let scores: Record<string, any> = {};
+  try { scores = JSON.parse(row.scores_json ?? "{}"); } catch { scores = {}; }
+  return Number(scores.humanConfirmation ?? 0) === 1;
 }
 
 export function normalizeEntityFactKey(fact: string | null | undefined): string {
@@ -189,18 +199,28 @@ export async function resolveAndInsertEntityRelation(
                LIMIT 1),
               memory_id
             ) AS memory_id,
-            scope_id, polarity, modality, valid_from, valid_to, reference_time,
+            scope_id, polarity, modality, valid_from, valid_to, reference_time, created_at,
             CASE
               WHEN EXISTS (
-                SELECT 1 FROM sb_fact_sources fs_any
-                WHERE fs_any.relation_id = sb_entity_relations.id
+                SELECT 1
+                FROM sb_fact_sources fs_evidence
+                JOIN sb_memory_sources ms_evidence
+                  ON ms_evidence.memory_id = fs_evidence.memory_id
+                WHERE fs_evidence.relation_id = sb_entity_relations.id
               ) THEN (
-                SELECT COUNT(*)
+                SELECT COUNT(DISTINCT COALESCE(
+                  ms_count.evidence_root_id,
+                  o_count.root_evidence_id,
+                  ms_count.observation_id
+                ))
                 FROM sb_fact_sources fs_count
                 JOIN sb_memories m_count ON m_count.id = fs_count.memory_id
+                JOIN sb_memory_sources ms_count ON ms_count.memory_id = m_count.id
+                LEFT JOIN sb_observations o_count ON o_count.id = ms_count.observation_id
                 WHERE fs_count.relation_id = sb_entity_relations.id
                   AND m_count.invalid_at IS NULL
                   AND m_count.expired_at IS NULL
+                  AND ms_count.relation IN ('supports', 'derived_from')
               )
               ELSE evidence_count
             END AS evidence_count
@@ -226,6 +246,7 @@ export async function resolveAndInsertEntityRelation(
     referenceTime: row.reference_time,
     memoryId: row.memory_id,
     evidenceCount: Number(row.evidence_count ?? 1),
+    createdAt: row.created_at,
   }));
   const allowInvalidation = await evidenceCanInvalidate(db, input);
   const resolution = resolveFact({
@@ -243,16 +264,34 @@ export async function resolveAndInsertEntityRelation(
     allowInvalidation,
   }, candidates);
 
-  const reuseDuplicate = resolution.type === "duplicate" && resolution.targetRelationId != null;
-  const relationId = reuseDuplicate ? resolution.targetRelationId as string : crypto.randomUUID();
+  const reuseCanonical = (
+    resolution.type === "duplicate" ||
+    resolution.type === "supports" ||
+    resolution.type === "elaborates"
+  ) && resolution.targetRelationId != null;
+  const relationId = reuseCanonical ? resolution.targetRelationId as string : crypto.randomUUID();
   const statements: D1PreparedStatement[] = [];
-  if (!reuseDuplicate) statements.push(prepareNewRelation(db, relationId, input, resolution));
+  if (!reuseCanonical) statements.push(prepareNewRelation(db, relationId, input, resolution));
   statements.push(prepareFactSource(db, relationId, input));
   statements.push(
     db.prepare(
       `UPDATE sb_entity_relations
        SET evidence_count = MAX(1, (
-             SELECT COUNT(*) FROM sb_fact_sources WHERE relation_id = ?
+             SELECT COUNT(DISTINCT COALESCE(
+               ms_count.evidence_root_id,
+               o_count.root_evidence_id,
+               ms_count.observation_id,
+               fs_count.observation_id,
+               CASE WHEN fs_count.memory_id IS NOT NULL THEN 'memory:' || fs_count.memory_id END,
+               'fact-source:' || fs_count.id
+             ))
+             FROM sb_fact_sources fs_count
+             LEFT JOIN sb_memory_sources ms_count
+               ON ms_count.memory_id = fs_count.memory_id
+              AND ms_count.relation IN ('supports', 'derived_from')
+             LEFT JOIN sb_observations o_count
+               ON o_count.id = COALESCE(ms_count.observation_id, fs_count.observation_id)
+             WHERE fs_count.relation_id = ?
            )),
            score = CASE
              WHEN ? IS NULL THEN score
@@ -286,21 +325,6 @@ export async function resolveAndInsertEntityRelation(
       relationId
     )
   );
-  if (resolution.applyInvalidation && resolution.targetRelationId) {
-    statements.push(
-      db.prepare(
-        `UPDATE sb_entity_relations
-         SET invalid_at = ?, expired_at = ?, valid_to = COALESCE(valid_to, ?),
-             resolution_state = 'superseded'
-         WHERE id = ? AND invalid_at IS NULL AND expired_at IS NULL`
-      ).bind(
-        input.createdAt,
-        input.createdAt,
-        input.validFrom ?? input.createdAt,
-        resolution.targetRelationId
-      )
-    );
-  }
   statements.push(
     db.prepare(
       `INSERT INTO sb_fact_resolutions (
@@ -316,21 +340,51 @@ export async function resolveAndInsertEntityRelation(
     )
   );
   if (
+    resolution.applyInvalidation &&
+    resolution.targetRelationId &&
+    resolution.targetMemoryId &&
+    input.memoryId
+  ) {
+    const coordinator = new D1ResolutionCoordinator(db);
+    statements.push(...await coordinator.prepareSupersession({
+      sourceClaimId: input.memoryId,
+      targetClaimId: resolution.targetMemoryId,
+      sourceRelationId: relationId,
+      targetRelationId: resolution.targetRelationId,
+      effectiveAt: input.createdAt,
+      actorType: "system",
+      actorId: "fact-resolver",
+    }));
+  }
+  if (
     resolution.type === "contradicts" &&
     resolution.targetMemoryId && input.memoryId &&
     resolution.targetMemoryId !== input.memoryId
   ) {
-    statements.push(
-      db.prepare(
-        `INSERT OR IGNORE INTO sb_conflict_cases (
-           id, old_memory_id, new_memory_id, conflict_type, reason,
-           confidence, state, resolution, resolved_by, resolved_at, created_at
-         ) VALUES (?, ?, ?, 'fact_resolution', ?, ?, 'pending', NULL, NULL, NULL, ?)`
-      ).bind(
-        crypto.randomUUID(), resolution.targetMemoryId, input.memoryId,
-        resolution.reasonCodes.join(","), resolution.confidence, input.createdAt
-      )
-    );
+    await ensureConflictClaimSchema(db);
+    const claimRows = await db.prepare(
+      `SELECT id, entry_id
+       FROM sb_memories
+       WHERE id IN (?, ?)`
+    ).bind(resolution.targetMemoryId, input.memoryId).all<{ id: string; entry_id: string | null }>();
+    const entryByClaim = new Map((claimRows.results ?? []).map((row) => [row.id, row.entry_id]));
+    const oldEntryId = entryByClaim.get(resolution.targetMemoryId);
+    const newEntryId = entryByClaim.get(input.memoryId);
+    if (oldEntryId && newEntryId) {
+      statements.push(
+        db.prepare(
+          `INSERT OR IGNORE INTO sb_conflict_cases (
+             id, old_memory_id, new_memory_id, old_claim_id, new_claim_id,
+             conflict_type, reason, confidence, state, resolution,
+             resolved_by, resolved_at, created_at
+           ) VALUES (?, ?, ?, ?, ?, 'fact_resolution', ?, ?, 'pending', NULL, NULL, NULL, ?)`
+        ).bind(
+          crypto.randomUUID(), oldEntryId, newEntryId,
+          resolution.targetMemoryId, input.memoryId,
+          resolution.reasonCodes.join(","), resolution.confidence, input.createdAt
+        )
+      );
+    }
   }
   await db.batch(statements);
   return { relationId, resolution };

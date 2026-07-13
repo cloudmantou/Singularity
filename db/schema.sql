@@ -268,6 +268,8 @@ CREATE TABLE IF NOT EXISTS sb_conflict_cases (
   id TEXT PRIMARY KEY,
   old_memory_id TEXT NOT NULL,
   new_memory_id TEXT NOT NULL,
+  old_claim_id TEXT,
+  new_claim_id TEXT,
   conflict_type TEXT NOT NULL,
   reason TEXT,
   confidence REAL,
@@ -280,13 +282,21 @@ CREATE TABLE IF NOT EXISTS sb_conflict_cases (
   CHECK (resolution IS NULL OR resolution IN ('use_old', 'use_new', 'keep_both', 'manual', 'dismissed'))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_conflict_cases_identity
-  ON sb_conflict_cases(old_memory_id, new_memory_id, conflict_type);
+  ON sb_conflict_cases(
+    COALESCE(old_claim_id, old_memory_id),
+    COALESCE(new_claim_id, new_memory_id),
+    conflict_type
+  );
 CREATE INDEX IF NOT EXISTS idx_conflict_cases_state
   ON sb_conflict_cases(state, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_conflict_cases_old
   ON sb_conflict_cases(old_memory_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_conflict_cases_new
   ON sb_conflict_cases(new_memory_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_conflict_cases_old_claim
+  ON sb_conflict_cases(old_claim_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_conflict_cases_new_claim
+  ON sb_conflict_cases(new_claim_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS sb_audit_events (
   id TEXT PRIMARY KEY,

@@ -61,6 +61,8 @@ export const MEMORY_QUALITY_SCHEMA_STATEMENTS = [
     id TEXT PRIMARY KEY,
     old_memory_id TEXT NOT NULL,
     new_memory_id TEXT NOT NULL,
+    old_claim_id TEXT,
+    new_claim_id TEXT,
     conflict_type TEXT NOT NULL,
     reason TEXT,
     confidence REAL,
@@ -124,10 +126,48 @@ export interface MemoryMergeCandidateInput {
 export interface ConflictCaseInput {
   oldMemoryId: string;
   newMemoryId: string;
+  oldClaimId?: string | null;
+  newClaimId?: string | null;
   conflictType: string;
   reason?: string | null;
   confidence?: number | null;
   createdAt?: number;
+}
+
+export async function ensureConflictClaimSchema(db: D1Database): Promise<void> {
+  const columns = await db.prepare(`PRAGMA table_info(sb_conflict_cases)`).all<{ name: string }>();
+  const names = new Set((columns.results ?? []).map((column) => column.name));
+  if (!names.has("old_claim_id")) {
+    await db.exec(`ALTER TABLE sb_conflict_cases ADD COLUMN old_claim_id TEXT`);
+  }
+  if (!names.has("new_claim_id")) {
+    await db.exec(`ALTER TABLE sb_conflict_cases ADD COLUMN new_claim_id TEXT`);
+  }
+  const identityIndex = await db.prepare(
+    `SELECT sql FROM sqlite_master
+     WHERE type = 'index' AND name = 'idx_conflict_cases_identity'
+     LIMIT 1`
+  ).first<{ sql: string | null }>();
+  const identityUsesClaims = identityIndex?.sql?.includes("old_claim_id") === true;
+  if (!names.has("old_claim_id") || !names.has("new_claim_id") || !identityUsesClaims) {
+    await db.exec(`DROP INDEX IF EXISTS idx_conflict_cases_identity`);
+    await db.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_conflict_cases_identity
+       ON sb_conflict_cases(
+         COALESCE(old_claim_id, old_memory_id),
+         COALESCE(new_claim_id, new_memory_id),
+         conflict_type
+       )`
+    );
+    await db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_conflict_cases_old_claim
+       ON sb_conflict_cases(old_claim_id, created_at DESC)`
+    );
+    await db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_conflict_cases_new_claim
+       ON sb_conflict_cases(new_claim_id, created_at DESC)`
+    );
+  }
 }
 
 export interface ComplianceAuditEventInput {
@@ -259,13 +299,15 @@ export function prepareConflictCase(
   return {
     statement: db.prepare(
       `INSERT OR IGNORE INTO sb_conflict_cases (
-         id, old_memory_id, new_memory_id, conflict_type, reason,
+         id, old_memory_id, new_memory_id, old_claim_id, new_claim_id, conflict_type, reason,
          confidence, state, resolution, resolved_by, resolved_at, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?)`
     ).bind(
       crypto.randomUUID(),
       oldMemoryId,
       newMemoryId,
+      boundedText(input.oldClaimId, 512),
+      boundedText(input.newClaimId, 512),
       boundedRequiredText(input.conflictType, "conflictType", 128),
       boundedText(input.reason, 1000),
       normalizeSimilarity(input.confidence),

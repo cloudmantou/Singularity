@@ -1,9 +1,10 @@
 import { importEntries, type ImportMode, type ImportOptions, type ImportResult } from "../import-entries";
 import { ensureEntityResolutionDataModel } from "./entities";
+import { ensureConflictClaimSchema } from "./quality";
 
-export const MEMORY_BACKUP_SCHEMA_VERSION = 8;
+export const MEMORY_BACKUP_SCHEMA_VERSION = 9;
 const MEMORY_BACKUP_FORMAT = "singularity-memory-backup";
-const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7, 8]);
+const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7, 8, 9]);
 const MEMORY_BACKUP_FEATURES = [
   "atomic-memory",
   "temporal-facts",
@@ -16,6 +17,7 @@ const MEMORY_BACKUP_FEATURES = [
   "parent-version-claims",
   "entity-resolution",
   "fact-resolution",
+  "claim-level-conflicts",
 ] as const;
 
 const GRAPH_ARRAY_KEYS = [
@@ -62,7 +64,7 @@ export interface BackupIntegrityReport {
 
 export interface MemoryBackup {
   backupFormat: typeof MEMORY_BACKUP_FORMAT;
-  schemaVersion: 8;
+  schemaVersion: 9;
   features: Array<(typeof MEMORY_BACKUP_FEATURES)[number]>;
   exportedAt: string;
   source: string;
@@ -96,7 +98,7 @@ export interface MemoryBackup {
 }
 
 export interface MemoryBackupImportResult extends ImportResult {
-  schemaVersion: 8;
+  schemaVersion: 9;
   graph: Record<GraphArrayKey, TableImportStats>;
   integrity: BackupIntegrityReport;
 }
@@ -262,7 +264,13 @@ export async function inspectMemoryBackupIntegrity(db: D1Database): Promise<Back
         WHERE e.id IS NULL) as conflict_cases_missing_old,
        (SELECT COUNT(*) FROM sb_conflict_cases c
         LEFT JOIN entries e ON e.id = c.new_memory_id
-        WHERE e.id IS NULL) as conflict_cases_missing_new`
+        WHERE e.id IS NULL) as conflict_cases_missing_new,
+       (SELECT COUNT(*) FROM sb_conflict_cases c
+        LEFT JOIN sb_memories m ON m.id = c.old_claim_id
+        WHERE c.old_claim_id IS NOT NULL AND m.id IS NULL) as conflict_cases_missing_old_claim,
+       (SELECT COUNT(*) FROM sb_conflict_cases c
+        LEFT JOIN sb_memories m ON m.id = c.new_claim_id
+        WHERE c.new_claim_id IS NOT NULL AND m.id IS NULL) as conflict_cases_missing_new_claim`
   );
   const issues: Record<string, number> = {};
   for (const [key, value] of Object.entries(row ?? {})) {
@@ -279,6 +287,7 @@ export async function exportMemoryBackup(
   input: { source: string }
 ): Promise<MemoryBackup> {
   await ensureEntityResolutionDataModel(db);
+  await ensureConflictClaimSchema(db);
   const [
     scopes,
     parentUnits,
@@ -413,7 +422,7 @@ export async function exportMemoryBackup(
                        suggested_action, reason, state, reviewed_by, reviewed_at, created_at
                 FROM sb_memory_merge_candidates
                 ORDER BY created_at DESC, id DESC`),
-    allRows(db, `SELECT id, old_memory_id, new_memory_id, conflict_type,
+    allRows(db, `SELECT id, old_memory_id, new_memory_id, old_claim_id, new_claim_id, conflict_type,
                        reason, confidence, state, resolution, resolved_by,
                        resolved_at, created_at
                 FROM sb_conflict_cases
@@ -577,6 +586,7 @@ export async function importMemoryBackup(
   options: ImportOptions = {}
 ): Promise<MemoryBackupImportResult> {
   await ensureEntityResolutionDataModel(db);
+  await ensureConflictClaimSchema(db);
   const rawSchemaVersion = body.schemaVersion == null ? 4 : Number(body.schemaVersion);
   if (!Number.isFinite(rawSchemaVersion) || rawSchemaVersion < 4) {
     throw new Error("Unsupported memory backup schemaVersion");
@@ -1042,13 +1052,15 @@ export async function importMemoryBackup(
   graph.conflictCases = await importTable(db, rowsFor(body, "conflictCases"), (row) =>
     db.prepare(
       `${insertVerb(mode)} INTO sb_conflict_cases (
-         id, old_memory_id, new_memory_id, conflict_type, reason,
+         id, old_memory_id, new_memory_id, old_claim_id, new_claim_id, conflict_type, reason,
          confidence, state, resolution, resolved_by, resolved_at, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       requiredText(row, "id"),
       requiredText(row, "old_memory_id"),
       requiredText(row, "new_memory_id"),
+      textOrNull(row, "old_claim_id"),
+      textOrNull(row, "new_claim_id"),
       textOrDefault(row, "conflict_type", "contradiction"),
       textOrNull(row, "reason"),
       numberOrNull(row, "confidence"),

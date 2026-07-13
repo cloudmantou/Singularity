@@ -152,13 +152,15 @@ describe("memory quality review queues", () => {
       );
       db.prepare(
         `INSERT INTO sb_conflict_cases (
-           id, old_memory_id, new_memory_id, conflict_type,
+           id, old_memory_id, new_memory_id, old_claim_id, new_claim_id, conflict_type,
            reason, confidence, state, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         "conflict-1",
         "old-memory",
         "new-memory",
+        "old-claim",
+        "new-claim",
         "contradiction",
         "different city",
         0.72,
@@ -251,6 +253,8 @@ describe("memory quality review queues", () => {
             id: "conflict-1",
             oldMemoryId: "old-memory",
             newMemoryId: "new-memory",
+            oldClaimId: "old-claim",
+            newClaimId: "new-claim",
             conflictType: "contradiction",
             state: "pending",
           },
@@ -304,6 +308,20 @@ describe("memory quality review queues", () => {
       });
       expect(audit.events[0].eventHash).toEqual(expect.any(String));
       expect(audit.events[0].previousEventHash).toEqual(expect.any(String));
+
+      const invalidPair = await worker.fetch(
+        auth("/quality/conflict-cases/resolve", {
+          method: "POST",
+          body: JSON.stringify({
+            id: "conflict-1",
+            state: "dismissed",
+            resolution: "use_new",
+          }),
+        }),
+        env,
+        testCtx()
+      );
+      expect(invalidPair.status).toBe(400);
     } finally {
       db.close();
     }

@@ -48,6 +48,7 @@ export interface FactResolutionInput {
 export interface FactResolutionCandidate extends FactResolutionInput {
   relationId: string;
   evidenceCount?: number;
+  createdAt?: number;
 }
 
 export interface FactResolutionResult {
@@ -161,39 +162,47 @@ export function resolveFact(
     }
   }
 
-  const ranked = samePredicate
-    .map((candidate) => {
-      let score = 0;
-      if (candidate.toEntityId === input.toEntityId) score += 4;
-      if (scopesCompatible(input.scopeId, candidate.scopeId)) score += 2;
-      if (overlaps(input, candidate)) score += 2;
-      if (normalize(candidate.polarity) === normalize(input.polarity)) score += 1;
-      return { candidate, score };
-    })
-    .sort((left, right) => right.score - left.score || left.candidate.relationId.localeCompare(right.candidate.relationId));
-  const target = ranked[0]?.candidate ?? null;
-  if (!target) return result("uncertain", null, 0, ["no_candidate"], { requiresReview: true });
-
-  if (!scopesCompatible(input.scopeId, target.scopeId)) {
-    return result("coexists", target, 0.98, ["different_scope"]);
-  }
-  if (!overlaps(input, target)) {
-    return result("coexists", target, 0.98, ["non_overlapping_time"]);
+  const compatible = samePredicate.filter((candidate) =>
+    scopesCompatible(input.scopeId, candidate.scopeId) && overlaps(input, candidate)
+  );
+  if (compatible.length === 0) {
+    const sameScope = samePredicate.find((candidate) => scopesCompatible(input.scopeId, candidate.scopeId));
+    return result(
+      "coexists",
+      sameScope ?? samePredicate[0] ?? null,
+      0.98,
+      [sameScope ? "non_overlapping_time" : "different_scope"]
+    );
   }
 
-  if (input.toEntityId === target.toEntityId) {
-    if (normalize(input.polarity) !== normalize(target.polarity)) {
-      return result("contradicts", target, 0.96, ["opposite_polarity"], { requiresReview: true });
-    }
-    const nextFact = normalize(input.fact);
-    const priorFact = normalize(target.fact);
-    if (nextFact && priorFact && (nextFact.includes(priorFact) || priorFact.includes(nextFact))) {
-      return result("elaborates", target, 0.92, ["same_structure", "qualified_detail"]);
-    }
-    return result("supports", target, 0.9, ["same_structure", "compatible_assertion"]);
+  const candidateOrder = (left: FactResolutionCandidate, right: FactResolutionCandidate) => {
+    const leftExactScope = normalize(left.scopeId) === normalize(input.scopeId) ? 1 : 0;
+    const rightExactScope = normalize(right.scopeId) === normalize(input.scopeId) ? 1 : 0;
+    const supportOrder = Number(right.evidenceCount ?? 1) - Number(left.evidenceCount ?? 1);
+    const recencyOrder = Number(right.createdAt ?? 0) - Number(left.createdAt ?? 0);
+    return rightExactScope - leftExactScope ||
+      supportOrder ||
+      recencyOrder ||
+      left.relationId.localeCompare(right.relationId);
+  };
+  const sameObject = compatible
+    .filter((candidate) => candidate.toEntityId === input.toEntityId)
+    .sort(candidateOrder);
+  const differentObject = compatible
+    .filter((candidate) => candidate.toEntityId !== input.toEntityId)
+    .sort(candidateOrder);
+
+  const oppositePolarity = sameObject.find(
+    (candidate) => normalize(input.polarity) !== normalize(candidate.polarity)
+  );
+  if (oppositePolarity) {
+    return result("contradicts", oppositePolarity, 0.96, ["opposite_polarity"], {
+      requiresReview: true,
+    });
   }
 
-  if (explicitlySupersedes(input.fact)) {
+  if (explicitlySupersedes(input.fact) && differentObject.length > 0) {
+    const target = differentObject[0];
     const explicitSameScope = Boolean(
       input.scopeId && target.scopeId && normalize(input.scopeId) === normalize(target.scopeId)
     );
@@ -215,7 +224,27 @@ export function resolveFact(
     });
   }
 
-  return result("contradicts", target, 0.9, ["same_subject_predicate_scope", "different_object"], {
-    requiresReview: true,
-  });
+  if (differentObject.length > 0) {
+    return result(
+      "contradicts",
+      differentObject[0],
+      0.9,
+      ["same_subject_predicate_scope", "different_object"],
+      { requiresReview: true }
+    );
+  }
+
+  const target = sameObject[0] ?? null;
+  if (target) {
+    if (normalize(input.polarity) !== normalize(target.polarity)) {
+      return result("contradicts", target, 0.96, ["opposite_polarity"], { requiresReview: true });
+    }
+    const nextFact = normalize(input.fact);
+    const priorFact = normalize(target.fact);
+    if (nextFact && priorFact && (nextFact.includes(priorFact) || priorFact.includes(nextFact))) {
+      return result("elaborates", target, 0.92, ["same_structure", "qualified_detail"]);
+    }
+    return result("supports", target, 0.9, ["same_structure", "compatible_assertion"]);
+  }
+  return result("uncertain", null, 0, ["no_candidate"], { requiresReview: true });
 }

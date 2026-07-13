@@ -131,4 +131,65 @@ describe("resolveFact", () => {
     expect(result.type).toBe("contradicts");
     expect(result.applyInvalidation).toBe(false);
   });
+
+  it("filters incompatible scopes before selecting a conflicting candidate", () => {
+    const result = resolveFact(
+      {
+        ...base,
+        toEntityId: "new-installer",
+        fact: "mtzs production uses new_installer",
+      },
+      [
+        existing({
+          relationId: "relation-test-same-object",
+          scopeId: "mtzs/ios/test",
+          toEntityId: "new-installer",
+          fact: "mtzs test uses new_installer",
+        }),
+        existing({
+          relationId: "relation-production-conflict",
+          scopeId: "mtzs/ios/production",
+          toEntityId: "installation-proxy",
+          fact: "mtzs production uses installation_proxy",
+        }),
+      ]
+    );
+
+    expect(result).toMatchObject({
+      type: "contradicts",
+      targetRelationId: "relation-production-conflict",
+      requiresReview: true,
+    });
+  });
+
+  it("ranks compatible candidates by independent support and recency instead of relation id", () => {
+    const result = resolveFact(
+      {
+        ...base,
+        toEntityId: "new-installer",
+        fact: "mtzs production now replaces the prior installer with new-installer",
+      },
+      [
+        existing({
+          relationId: "a-random-id",
+          toEntityId: "weak-installer",
+          evidenceCount: 1,
+          createdAt: 3_000,
+        }),
+        existing({
+          relationId: "z-strong-id",
+          toEntityId: "supported-installer",
+          evidenceCount: 3,
+          createdAt: 2_000,
+        }),
+      ]
+    );
+
+    expect(result).toMatchObject({
+      type: "supersedes",
+      targetRelationId: "z-strong-id",
+      applyInvalidation: false,
+      requiresReview: true,
+    });
+  });
 });

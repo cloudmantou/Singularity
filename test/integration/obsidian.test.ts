@@ -245,6 +245,8 @@ describe("Obsidian integration", () => {
       expect(pulled.results[0].markdown).toContain("project/mtzs");
       expect(pulled.results[0].markdown).toContain("installation_proxy");
       expect(pulled.results[0].markdown).toContain("## 关联实体");
+      expect(pulled.results[0].markdown).toContain("<!-- SINGULARITY:KNOWLEDGE:BEGIN -->");
+      expect(pulled.results[0].markdown).toContain("<!-- SINGULARITY:KNOWLEDGE:END -->");
       expect(pulled.results[0].markdown).toContain("[[mtzs]]");
       expect(pulled.results[0].markdown).toContain("## 事实解析");
       expect(pulled.results[0].properties.singularity_entities).toEqual([

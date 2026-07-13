@@ -262,13 +262,19 @@ describe("full memory backup import/export", () => {
         old_metadata_json, new_metadata_json, reason, actor, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run("revision-1", "entry-1", "ADD", null, "Singularity uses SQLite", null, "{}", null, "api", now - 2000);
+    db.prepare(
+      `INSERT INTO sb_conflict_cases (
+         id, old_memory_id, new_memory_id, old_claim_id, new_claim_id,
+         conflict_type, state, created_at
+       ) VALUES (?, ?, ?, ?, NULL, 'fact_resolution', 'pending', ?)`
+    ).run("conflict-1", "entry-1", "entry-2", "mem-1", now - 500);
 
     const exportResponse = await worker.fetch(auth("/export?full=true"), env, createExecutionContext());
     expect(exportResponse.status).toBe(200);
     const backup = await exportResponse.json() as any;
 
     expect(backup.backupFormat).toBe("singularity-memory-backup");
-    expect(backup.schemaVersion).toBe(8);
+    expect(backup.schemaVersion).toBe(9);
     expect(backup.features).toEqual(
       expect.arrayContaining([
         "atomic-memory",
@@ -280,6 +286,7 @@ describe("full memory backup import/export", () => {
         "parent-version-claims",
         "entity-resolution",
         "fact-resolution",
+        "claim-level-conflicts",
       ])
     );
     expect(backup.features).not.toContain("vector-rebuild-state");
@@ -308,6 +315,7 @@ describe("full memory backup import/export", () => {
       factSources: 1,
       memoryRelations: 1,
       revisions: 1,
+      conflictCases: 1,
     });
     expect(backup.scopes[0]).toMatchObject({ scope_id: "scope-1" });
     expect(backup.parentUnits[0]).toMatchObject({
@@ -340,6 +348,12 @@ describe("full memory backup import/export", () => {
       evidence_root_id: "evidence-root-1",
       extractor_model: "test-extractor",
     });
+    expect(backup.conflictCases[0]).toMatchObject({
+      old_memory_id: "entry-1",
+      new_memory_id: "entry-2",
+      old_claim_id: "mem-1",
+      new_claim_id: null,
+    });
 
     const restored = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
     await initializeDatabase(restored.env);
@@ -353,7 +367,7 @@ describe("full memory backup import/export", () => {
     );
     expect(importResponse.status).toBe(200);
     const imported = await importResponse.json() as any;
-    expect(imported.schemaVersion).toBe(8);
+    expect(imported.schemaVersion).toBe(9);
     expect(imported.inserted).toBe(2);
     expect(imported.graph.scopes.imported).toBe(1);
     expect(imported.graph.parentUnits.imported).toBe(1);
@@ -370,6 +384,7 @@ describe("full memory backup import/export", () => {
     expect(imported.graph.entityMergeHistory.imported).toBe(1);
     expect(imported.graph.factResolutions.imported).toBe(1);
     expect(imported.graph.factSources.imported).toBe(1);
+    expect(imported.graph.conflictCases.imported).toBe(1);
     expect(imported.integrity.ok).toBe(true);
 
     const restoredExport = await worker.fetch(
@@ -407,7 +422,7 @@ describe("full memory backup import/export", () => {
     );
     expect(legacyImportResponse.status).toBe(200);
     const legacyImported = await legacyImportResponse.json() as any;
-    expect(legacyImported.schemaVersion).toBe(8);
+    expect(legacyImported.schemaVersion).toBe(9);
     expect(legacyImported.graph.factSources.total).toBe(0);
     expect(legacyImported.graph.parentVersionClaims.total).toBe(1);
 
@@ -426,14 +441,14 @@ describe("full memory backup import/export", () => {
     const futureImportResponse = await worker.fetch(
       auth("/import", {
         method: "POST",
-        body: JSON.stringify({ ...backup, schemaVersion: 9 }),
+        body: JSON.stringify({ ...backup, schemaVersion: 10 }),
       }),
       legacyRestored.env,
       createExecutionContext()
     );
     expect(futureImportResponse.status).toBe(400);
     const futureImported = await futureImportResponse.json() as any;
-    expect(futureImported.error).toMatch(/schemaVersion 9/);
+    expect(futureImported.error).toMatch(/schemaVersion 10/);
 
     db.close();
     restored.db.close();

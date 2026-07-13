@@ -1311,15 +1311,15 @@ export class D1Mock {
           return { meta: { changes: row ? 1 : 0 } };
         }
         if (s.startsWith("INSERT OR IGNORE INTO sb_conflict_cases")) {
-          const [
-            id,
-            old_memory_id,
-            new_memory_id,
-            conflict_type,
-            reason,
-            confidence,
-            created_at,
-          ] = args;
+          const hasClaimIds = s.includes("old_claim_id, new_claim_id");
+          const [id, old_memory_id, new_memory_id] = args;
+          const old_claim_id = hasClaimIds ? args[3] : null;
+          const new_claim_id = hasClaimIds ? args[4] : null;
+          const offset = hasClaimIds ? 5 : 3;
+          const conflict_type = args[offset];
+          const reason = args[offset + 1];
+          const confidence = args[offset + 2];
+          const created_at = args[offset + 3];
           const exists = db.conflictCases.some((conflict: any) =>
             conflict.old_memory_id === old_memory_id &&
             conflict.new_memory_id === new_memory_id &&
@@ -1330,6 +1330,8 @@ export class D1Mock {
               id,
               old_memory_id,
               new_memory_id,
+              old_claim_id,
+              new_claim_id,
               conflict_type,
               reason,
               confidence,
@@ -1472,15 +1474,45 @@ export class D1Mock {
           return { meta: { changes: before - db.factSources.length } };
         }
         if (s.startsWith("UPDATE sb_entity_relations SET evidence_count")) {
-          if (s.includes("SELECT COUNT(*) FROM sb_fact_sources WHERE relation_id = ?")) {
+          if (
+            s.includes("SELECT COUNT(*) FROM sb_fact_sources WHERE relation_id = ?") ||
+            s.includes("FROM sb_fact_sources fs_count")
+          ) {
             const [relationId, scoreA, scoreB, scoreC,
               validFromA, validFromB, validFromC,
               validToA, validToB, validToC, referenceTime, id] = args;
             const relation = db.entityRelations.find((row: any) => row.id === id);
             if (relation) {
+              const independentSources = new Set<string>();
+              for (const source of db.factSources.filter(
+                (item: any) => item.relation_id === relationId
+              )) {
+                const provenance = db.memorySources.filter(
+                  (item: any) =>
+                    item.memory_id === source.memory_id &&
+                    ["supports", "derived_from"].includes(String(item.relation ?? item.role ?? ""))
+                );
+                if (provenance.length > 0) {
+                  for (const item of provenance) {
+                    const observation = db.observations.find(
+                      (candidate: any) => candidate.id === item.observation_id
+                    );
+                    independentSources.add(String(
+                      item.evidence_root_id ??
+                      observation?.root_evidence_id ??
+                      item.observation_id
+                    ));
+                  }
+                } else {
+                  independentSources.add(String(
+                    source.observation_id ??
+                    (source.memory_id != null ? `memory:${source.memory_id}` : `fact-source:${source.id}`)
+                  ));
+                }
+              }
               relation.evidence_count = Math.max(
                 1,
-                db.factSources.filter((source: any) => source.relation_id === relationId).length
+                independentSources.size
               );
               if (scoreA != null && (relation.score == null || Number(relation.score) < Number(scoreB))) {
                 relation.score = scoreC;

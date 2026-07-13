@@ -14,6 +14,10 @@ import {
   FACT_RESOLUTION_SCHEMA_STATEMENTS,
 } from "./fact-resolution";
 import { insertEntityRelation as insertResolvedEntityRelation } from "./fact-resolution-store";
+import {
+  activeMemoryClaimPredicate,
+  eligibleRelationClaimPredicate,
+} from "./claim-eligibility";
 export {
   normalizeEntityFactKey,
   temporalWindowsOverlap,
@@ -534,6 +538,7 @@ export async function getEntityGraph(
   relations: Array<Record<string, unknown>>;
   memories: Array<Record<string, unknown>>;
 }> {
+  const asOf = Date.now();
   const entity = await db
     .prepare(
       `SELECT id, name, name_normalized, entity_type, aliases_json, metadata_json,
@@ -556,11 +561,15 @@ export async function getEntityGraph(
        FROM sb_entity_relations r
        JOIN sb_entities fe ON fe.id = r.from_entity_id
        JOIN sb_entities te ON te.id = r.to_entity_id
-       WHERE r.from_entity_id = ? OR r.to_entity_id = ?
+       WHERE (r.from_entity_id = ? OR r.to_entity_id = ?)
+         AND r.resolution_state = 'active'
+         AND (r.invalid_at IS NULL OR r.invalid_at > ?)
+         AND (r.expired_at IS NULL OR r.expired_at > ?)
+         AND ${eligibleRelationClaimPredicate("r", String(asOf))}
        ORDER BY r.created_at DESC
        LIMIT ?`
     )
-    .bind(entityId, entityId, limit)
+    .bind(entityId, entityId, asOf, asOf, limit)
     .all();
 
   const { results: memories } = await db
@@ -570,7 +579,10 @@ export async function getEntityGraph(
               m.invalid_at, m.expired_at, m.created_at, me.role
        FROM sb_memory_entities me
        JOIN sb_memories m ON m.id = me.memory_id
+       JOIN entries e ON e.id = m.entry_id AND e.content_hash = m.content_hash
        WHERE me.entity_id = ?
+         AND m.content_hash IS NOT NULL
+         AND ${activeMemoryClaimPredicate("m", String(asOf), { requireActiveParentLink: true })}
        ORDER BY m.created_at DESC
        LIMIT ?`
     )
@@ -599,23 +611,19 @@ export async function listActiveEntityRelations(
          JOIN sb_entities fe ON fe.id = r.from_entity_id
          JOIN sb_entities te ON te.id = r.to_entity_id
          WHERE (r.from_entity_id = ? OR r.to_entity_id = ?)
-           AND r.invalid_at IS NULL
-           AND r.expired_at IS NULL
-           AND r.resolution_state = 'active'
-           AND EXISTS (
-             SELECT 1
-             FROM sb_fact_sources fs
-             JOIN sb_memories m ON m.id = fs.memory_id
-             WHERE fs.relation_id = r.id
-               AND m.invalid_at IS NULL
-               AND m.expired_at IS NULL
+           AND (r.invalid_at IS NULL OR r.invalid_at > ?)
+           AND (r.expired_at IS NULL OR r.expired_at > ?)
+           AND (
+             r.resolution_state = 'active'
+             OR (r.resolution_state = 'superseded' AND r.invalid_at > ${String(asOf)})
            )
+           AND ${eligibleRelationClaimPredicate("r", String(asOf))}
            AND (r.valid_from IS NULL OR r.valid_from <= ?)
            AND (r.valid_to IS NULL OR r.valid_to > ?)
          ORDER BY r.created_at DESC
          LIMIT ?`
       )
-      .bind(opts.entityId, opts.entityId, asOf, asOf, limit)
+      .bind(opts.entityId, opts.entityId, asOf, asOf, asOf, asOf, limit)
       .all();
     return (results ?? []) as Array<Record<string, unknown>>;
   }
@@ -625,23 +633,19 @@ export async function listActiveEntityRelations(
        FROM sb_entity_relations r
        JOIN sb_entities fe ON fe.id = r.from_entity_id
        JOIN sb_entities te ON te.id = r.to_entity_id
-       WHERE r.invalid_at IS NULL
-         AND r.expired_at IS NULL
-         AND r.resolution_state = 'active'
-         AND EXISTS (
-           SELECT 1
-           FROM sb_fact_sources fs
-           JOIN sb_memories m ON m.id = fs.memory_id
-           WHERE fs.relation_id = r.id
-             AND m.invalid_at IS NULL
-             AND m.expired_at IS NULL
+       WHERE (r.invalid_at IS NULL OR r.invalid_at > ?)
+         AND (r.expired_at IS NULL OR r.expired_at > ?)
+         AND (
+           r.resolution_state = 'active'
+           OR (r.resolution_state = 'superseded' AND r.invalid_at > ${String(asOf)})
          )
+         AND ${eligibleRelationClaimPredicate("r", String(asOf))}
          AND (r.valid_from IS NULL OR r.valid_from <= ?)
          AND (r.valid_to IS NULL OR r.valid_to > ?)
        ORDER BY r.created_at DESC
        LIMIT ?`
     )
-    .bind(asOf, asOf, limit)
+    .bind(asOf, asOf, asOf, asOf, limit)
     .all();
   return (results ?? []) as Array<Record<string, unknown>>;
 }
