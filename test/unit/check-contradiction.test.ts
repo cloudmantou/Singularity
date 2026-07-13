@@ -54,7 +54,10 @@ describe("checkDuplicateAndContradiction()", () => {
     await checkDuplicateAndContradiction("I live in Paris", env);
 
     const [, options] = queryFn.mock.calls[0];
-    expect(options.filter).toEqual({ embedding_fingerprint: expect.any(String) });
+    expect(options.filter).toEqual({
+      embedding_fingerprint: expect.any(String),
+      source: { $ne: "singularity-claim" },
+    });
   });
 
   it("falls back to active-ID filtering when metadata filter query fails", async () => {
@@ -68,7 +71,10 @@ describe("checkDuplicateAndContradiction()", () => {
 
     expect(duplicate.status).toBe("flagged");
     expect(queryFn).toHaveBeenCalledTimes(2);
-    expect(queryFn.mock.calls[0][1].filter).toEqual({ embedding_fingerprint: expect.any(String) });
+    expect(queryFn.mock.calls[0][1].filter).toEqual({
+      embedding_fingerprint: expect.any(String),
+      source: { $ne: "singularity-claim" },
+    });
     expect(queryFn.mock.calls[1][1].filter).toBeUndefined();
   });
 

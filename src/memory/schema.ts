@@ -46,6 +46,17 @@ const MEMORY_SCHEMA_STATEMENTS = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_sb_memory_revisions_memory
     ON sb_memory_revisions(memory_id, created_at ASC)`,
+  `CREATE TABLE IF NOT EXISTS sb_claim_vectors (
+    claim_id TEXT NOT NULL,
+    embedding_fingerprint TEXT NOT NULL,
+    parent_version_id TEXT,
+    content_hash TEXT NOT NULL,
+    vector_ids_json TEXT NOT NULL DEFAULT '[]',
+    indexed_at INTEGER NOT NULL,
+    PRIMARY KEY (claim_id, embedding_fingerprint)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_sb_claim_vectors_parent
+    ON sb_claim_vectors(parent_version_id, indexed_at DESC)`,
 ] as const;
 
 async function tableColumns(db: D1Database, table: string): Promise<Set<string> | null> {

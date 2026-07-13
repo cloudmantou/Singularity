@@ -271,9 +271,6 @@ async function activeParentIdsForEndpoint(
        ON pvc_endpoint.parent_version_id = pv_endpoint.version_id
       AND pvc_endpoint.relation = 'supports'
      JOIN sb_memories m_endpoint ON m_endpoint.id = pvc_endpoint.memory_id
-     JOIN entries e_endpoint
-       ON e_endpoint.id = m_endpoint.entry_id
-      AND e_endpoint.content_hash = m_endpoint.content_hash
      WHERE (pu_endpoint.parent_id = ? OR m_endpoint.entry_id = ?)
        AND ${predicate}
      ORDER BY pu_endpoint.parent_id`
@@ -309,6 +306,56 @@ function normalizeEndpoints(
   return [sourceParentId, targetParentId];
 }
 
+function toAssociationEdgeRecord(row: AssociationEdgeRow): AssociationEdgeRecord {
+  return {
+    id: row.id,
+    sourceParentId: row.source_parent_id,
+    targetParentId: row.target_parent_id,
+    edgeType: row.edge_type,
+    weight: Number(row.weight),
+    provenance: row.provenance,
+    metadata: parseObject(row.metadata_json),
+    directed: Boolean(row.directed),
+    validFrom: Number(row.valid_from ?? row.created_at),
+    validTo: row.valid_to == null ? null : Number(row.valid_to),
+    deletedAt: row.deleted_at == null ? null : Number(row.deleted_at),
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+  };
+}
+
+function mergeAssociationEdgeRows(current: AssociationEdgeRow, incoming: AssociationEdgeRow): AssociationEdgeRow {
+  const preferIncoming = Number(incoming.weight) >= Number(current.weight);
+  return {
+    ...current,
+    id: incoming.id,
+    weight: Math.max(Number(current.weight), Number(incoming.weight)),
+    provenance: incoming.provenance === "manual"
+      ? incoming.provenance
+      : current.provenance === "manual"
+        ? current.provenance
+        : preferIncoming ? incoming.provenance : current.provenance,
+    metadata_json: preferIncoming ? incoming.metadata_json : current.metadata_json,
+    directed: incoming.directed,
+    valid_from: Math.min(
+      Number(current.valid_from ?? current.created_at), Number(incoming.valid_from ?? incoming.created_at)
+    ),
+    valid_to: incoming.valid_to,
+    deleted_at: null,
+    created_at: incoming.created_at,
+    updated_at: incoming.updated_at,
+  };
+}
+function hasMaterialAssociationChange(current: AssociationEdgeRow, next: AssociationEdgeRow): boolean {
+  return Number(current.weight) !== Number(next.weight)
+    || current.provenance !== next.provenance
+    || current.metadata_json !== next.metadata_json
+    || Number(current.directed) !== Number(next.directed)
+    || Number(current.valid_from ?? current.created_at) !== Number(next.valid_from ?? next.created_at)
+    || (current.valid_to == null ? null : Number(current.valid_to))
+      !== (next.valid_to == null ? null : Number(next.valid_to));
+}
+
 export async function createAssociationEdge(
   db: D1Database,
   input: AssociationEdgeInput
@@ -333,20 +380,32 @@ export async function createAssociationEdge(
     throw new Error("Association validTo must be later than validFrom");
   }
   const weight = normalizeWeight(input.weight);
-  const id = crypto.randomUUID();
   const metadata = { ...(input.metadata ?? {}) };
   const directed = SYMMETRIC_EDGE_TYPES.has(input.edgeType) ? 0 : 1;
+  const incoming: AssociationEdgeRow = {
+    id: crypto.randomUUID(),
+    source_parent_id: sourceParentId,
+    target_parent_id: targetParentId,
+    edge_type: input.edgeType,
+    weight,
+    provenance: input.provenance,
+    metadata_json: JSON.stringify(metadata),
+    directed,
+    valid_from: validFrom,
+    valid_to: validTo,
+    deleted_at: null,
+    created_at: createdAt,
+    updated_at: createdAt,
+  };
 
-  const closedEdge = await db.prepare(
-    `SELECT id, deleted_at
+  const current = await db.prepare(
+    `SELECT id, source_parent_id, target_parent_id, edge_type, weight,
+            provenance, metadata_json, directed, valid_from, valid_to, deleted_at,
+            created_at, updated_at
      FROM sb_association_edges
-     WHERE source_parent_id = ? AND target_parent_id = ? AND edge_type = ?
-       AND deleted_at IS NOT NULL`
-  ).bind(sourceParentId, targetParentId, input.edgeType).first<{
-    id: string;
-    deleted_at: number;
-  }>();
-  if (closedEdge) {
+     WHERE source_parent_id = ? AND target_parent_id = ? AND edge_type = ?`
+  ).bind(sourceParentId, targetParentId, input.edgeType).first<AssociationEdgeRow>();
+  if (current?.deleted_at != null) {
     await db.batch([
       db.prepare(
         `INSERT OR IGNORE INTO sb_association_edge_history (
@@ -359,54 +418,77 @@ export async function createAssociationEdge(
                 created_at, updated_at
          FROM sb_association_edges
          WHERE id = ? AND deleted_at = ?`
-      ).bind(closedEdge.id, closedEdge.deleted_at),
+      ).bind(current.id, current.deleted_at),
       db.prepare(
         `DELETE FROM sb_association_edges
          WHERE id = ? AND deleted_at = ?`
-      ).bind(closedEdge.id, closedEdge.deleted_at),
+      ).bind(current.id, current.deleted_at),
     ]);
   }
 
-  await db.prepare(
-    `INSERT INTO sb_association_edges (
+  if (current && current.deleted_at == null) {
+    const next = mergeAssociationEdgeRows(current, incoming);
+    if (!hasMaterialAssociationChange(current, next)) {
+      return toAssociationEdgeRecord(current);
+    }
+    const [archived, updated] = await db.batch([
+      db.prepare(
+        `INSERT INTO sb_association_edge_history (
+           id, source_parent_id, target_parent_id, edge_type, weight,
+           provenance, metadata_json, directed, valid_from, valid_to, deleted_at,
+           created_at, updated_at
+         )
+         SELECT id, source_parent_id, target_parent_id, edge_type, weight,
+                provenance, metadata_json, directed, valid_from, valid_to, ?,
+                created_at, updated_at
+         FROM sb_association_edges
+         WHERE id = ? AND updated_at = ? AND deleted_at IS NULL`
+      ).bind(createdAt, current.id, current.updated_at),
+      db.prepare(
+        `UPDATE sb_association_edges
+         SET id = ?, weight = ?, provenance = ?, metadata_json = ?, directed = ?,
+             valid_from = ?, valid_to = ?, deleted_at = NULL,
+             created_at = ?, updated_at = ?
+         WHERE id = ? AND updated_at = ? AND deleted_at IS NULL`
+      ).bind(
+        next.id,
+        next.weight,
+        next.provenance,
+        next.metadata_json,
+        next.directed,
+        next.valid_from,
+        next.valid_to,
+        next.created_at,
+        next.updated_at,
+        current.id,
+        current.updated_at
+      ),
+    ]);
+    if (Number(archived.meta.changes ?? 0) !== 1 || Number(updated.meta.changes ?? 0) !== 1) {
+      throw new Error("Association edge changed during material update");
+    }
+  } else {
+    await db.prepare(
+      `INSERT INTO sb_association_edges (
        id, source_parent_id, target_parent_id, edge_type, weight,
        provenance, metadata_json, directed, valid_from, valid_to, deleted_at,
        created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
-     ON CONFLICT(source_parent_id, target_parent_id, edge_type) DO UPDATE SET
-       weight = MAX(sb_association_edges.weight, excluded.weight),
-       provenance = CASE
-         WHEN excluded.provenance = 'manual' THEN excluded.provenance
-         WHEN sb_association_edges.provenance = 'manual' THEN sb_association_edges.provenance
-         WHEN excluded.weight >= sb_association_edges.weight THEN excluded.provenance
-         ELSE sb_association_edges.provenance
-       END,
-       metadata_json = CASE
-         WHEN excluded.weight >= sb_association_edges.weight THEN excluded.metadata_json
-         ELSE sb_association_edges.metadata_json
-       END,
-       directed = excluded.directed,
-       valid_from = CASE
-         WHEN sb_association_edges.deleted_at IS NOT NULL THEN excluded.valid_from
-         ELSE MIN(COALESCE(sb_association_edges.valid_from, excluded.valid_from), excluded.valid_from)
-       END,
-       valid_to = excluded.valid_to,
-       deleted_at = NULL,
-       updated_at = excluded.updated_at`
-  ).bind(
-    id,
-    sourceParentId,
-    targetParentId,
-    input.edgeType,
-    weight,
-    input.provenance,
-    JSON.stringify(metadata),
-    directed,
-    validFrom,
-    validTo,
-    createdAt,
-    createdAt
-  ).run();
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
+    ).bind(
+      incoming.id,
+      incoming.source_parent_id,
+      incoming.target_parent_id,
+      incoming.edge_type,
+      incoming.weight,
+      incoming.provenance,
+      incoming.metadata_json,
+      incoming.directed,
+      incoming.valid_from,
+      incoming.valid_to,
+      incoming.created_at,
+      incoming.updated_at
+    ).run();
+  }
 
   const row = await db.prepare(
     `SELECT id, source_parent_id, target_parent_id, edge_type, weight,
@@ -416,21 +498,7 @@ export async function createAssociationEdge(
      WHERE source_parent_id = ? AND target_parent_id = ? AND edge_type = ?`
   ).bind(sourceParentId, targetParentId, input.edgeType).first<AssociationEdgeRow>();
   if (!row) throw new Error("Association edge upsert failed");
-  return {
-    id: row.id,
-    sourceParentId: row.source_parent_id,
-    targetParentId: row.target_parent_id,
-    edgeType: row.edge_type,
-    weight: Number(row.weight),
-    provenance: row.provenance,
-    metadata: parseObject(row.metadata_json),
-    directed: Boolean(row.directed),
-    validFrom: Number(row.valid_from ?? row.created_at),
-    validTo: row.valid_to == null ? null : Number(row.valid_to),
-    deletedAt: row.deleted_at == null ? null : Number(row.deleted_at),
-    createdAt: Number(row.created_at),
-    updatedAt: Number(row.updated_at),
-  };
+  return toAssociationEdgeRecord(row);
 }
 
 export async function hydrateAssociationParents(
@@ -449,8 +517,10 @@ export async function hydrateAssociationParents(
     const placeholders = batch.map(() => "?").join(", ");
     const { results } = await db.prepare(
       `SELECT pu_association.parent_id, m_association.entry_id,
-              e_association.content, e_association.tags, e_association.source,
-              e_association.created_at
+              m_association.content,
+              COALESCE(e_association.tags, '[]') AS tags,
+              COALESCE(e_association.source, 'claim') AS source,
+              COALESCE(m_association.observed_at, m_association.created_at) AS created_at
        FROM sb_parent_units pu_association
        JOIN sb_parent_versions pv_association
          ON pv_association.parent_id = pu_association.parent_id
@@ -458,9 +528,8 @@ export async function hydrateAssociationParents(
          ON pvc_association.parent_version_id = pv_association.version_id
         AND pvc_association.relation = 'supports'
        JOIN sb_memories m_association ON m_association.id = pvc_association.memory_id
-       JOIN entries e_association
+       LEFT JOIN entries e_association
          ON e_association.id = m_association.entry_id
-        AND e_association.content_hash = m_association.content_hash
        WHERE pu_association.parent_id IN (${placeholders})
          AND ${predicate}
        ORDER BY COALESCE(m_association.importance, 0) DESC,

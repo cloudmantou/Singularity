@@ -14,6 +14,7 @@
     "db:migrate:remote": "wrangler d1 execute singularity-db --remote --file=db/schema.sql",
     "vectors:create": "wrangler vectorize create singularity-vectors --dimensions=384 --metric=cosine",
     "vectors:metadata-index": "wrangler vectorize create-metadata-index singularity-vectors --propertyName=embedding_fingerprint --type=string",
+    "vectors:metadata-index-source": "wrangler vectorize create-metadata-index singularity-vectors --propertyName=source --type=string",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",

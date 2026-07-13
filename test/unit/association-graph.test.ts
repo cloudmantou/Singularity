@@ -161,6 +161,67 @@ describe("Association Graph", () => {
     })).toBe(0);
   });
 
+  it("archives material updates while leaving no-op upserts out of history", async () => {
+    await createAssociationEdge(db, {
+      source: "entry-a",
+      target: "entry-b",
+      edgeType: "related_to",
+      weight: 0.4,
+      provenance: "inferred",
+      metadata: { reason: "initial" },
+      createdAt: 200,
+    });
+    const initial = raw.prepare(
+      `SELECT * FROM sb_association_edges WHERE edge_type = 'related_to'`
+    ).get() as Record<string, unknown>;
+
+    const updated = await createAssociationEdge(db, {
+      source: "entry-b",
+      target: "entry-a",
+      edgeType: "related_to",
+      weight: 0.8,
+      provenance: "manual",
+      metadata: { reason: "stronger" },
+      createdAt: 300,
+    });
+
+    expect(raw.prepare(`SELECT * FROM sb_association_edge_history`).get()).toEqual({
+      ...initial,
+      deleted_at: 300,
+    });
+    await expect(listAssociationConnections(db, "entry-a", { asOf: 250 }))
+      .resolves.toMatchObject([{ weight: 0.4, metadata: { reason: "initial" } }]);
+    await expect(listAssociationConnections(db, "entry-a", { asOf: 300 }))
+      .resolves.toMatchObject([{ weight: 0.8, metadata: { reason: "stronger" } }]);
+
+    const noOp = await createAssociationEdge(db, {
+      source: "entry-a",
+      target: "entry-b",
+      edgeType: "related_to",
+      weight: 0.2,
+      provenance: "inferred",
+      metadata: { reason: "weaker evidence" },
+      createdAt: 400,
+    });
+    expect(noOp).toEqual(updated);
+    expect(raw.prepare(
+      `SELECT COUNT(*) AS count FROM sb_association_edge_history`
+    ).get()).toEqual({ count: 1 });
+
+    await createAssociationEdge(db, {
+      source: "entry-a",
+      target: "entry-b",
+      edgeType: "related_to",
+      weight: 0.9,
+      provenance: "manual",
+      metadata: { reason: "strongest" },
+      createdAt: 500,
+    });
+    expect(raw.prepare(
+      `SELECT COUNT(*) AS count FROM sb_association_edge_history`
+    ).get()).toEqual({ count: 2 });
+  });
+
   it("preserves closed validity intervals when an association is linked again", async () => {
     await createAssociationEdge(db, {
       source: "entry-a",
@@ -182,6 +243,15 @@ describe("Association Graph", () => {
       provenance: "manual",
       createdAt: 700,
     });
+    expect(raw.prepare(
+      `SELECT source_parent_id, target_parent_id, edge_type, deleted_at
+       FROM sb_association_edge_history`
+    ).all()).toEqual([{
+      source_parent_id: "parent-a",
+      target_parent_id: "parent-b",
+      edge_type: "references",
+      deleted_at: 500,
+    }]);
 
     expect(await listAssociationConnections(db, "entry-b", {
       direction: "incoming",
@@ -275,6 +345,31 @@ describe("Association Graph", () => {
       .rejects.toBeInstanceOf(AssociationEndpointUnavailableError);
     await expect(listAssociationConnections(db, "parent-a", { asOf: 250 }))
       .resolves.toMatchObject([{ parentId: "parent-b", entryId: "entry-b" }]);
+  });
+
+  it("hydrates historical associations from immutable Claims after the Entry projection changes", async () => {
+    await createAssociationEdge(db, {
+      source: "entry-a",
+      target: "entry-b",
+      edgeType: "related_to",
+      provenance: "manual",
+      createdAt: 140,
+    });
+    raw.prepare(
+      `UPDATE entries SET content = 'A current projection', content_hash = 'parent-a:new-hash'
+       WHERE id = 'entry-a'`
+    ).run();
+    raw.prepare(
+      `UPDATE entries SET content = 'B current projection', content_hash = 'parent-b:new-hash'
+       WHERE id = 'entry-b'`
+    ).run();
+
+    await expect(listAssociationConnections(db, "entry-a", { asOf: 150 }))
+      .resolves.toMatchObject([{
+        parentId: "parent-b",
+        entryId: "entry-b",
+        content: "B",
+      }]);
   });
 
   it("respects directed traversal and edge validity windows", async () => {

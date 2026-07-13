@@ -7,7 +7,7 @@ import {
 const GET_ROUTES = new Set([
   "/analytics/logs", "/analytics/memory-overview", "/analytics/overview",
   "/analytics/timeseries", "/analytics/vector-runtime", "/associations/connections",
-  "/audit/events", "/config", "/config.json", "/connections", "/count", "/digest",
+  "/audit/events", "/config", "/config.json", "/connections", "/count", "/digest/preview",
   "/entities", "/export", "/extract-pending", "/graph/facts", "/health", "/health/details",
   "/integrations/obsidian/aggregates", "/integrations/obsidian/pull",
   "/integrations/obsidian/rules", "/integrations/obsidian/status", "/integrations/providers",
@@ -18,7 +18,7 @@ const GET_ROUTES = new Set([
 
 const POST_ROUTES = new Set([
   "/analytics/purge", "/append", "/associations/link", "/associations/unlink", "/capture",
-  "/chat", "/classify-pending", "/extract-pending", "/forget", "/import",
+  "/chat", "/classify-pending", "/digest", "/extract-pending", "/forget", "/import",
   "/integrations/development-session/capture", "/integrations/obsidian/ack",
   "/integrations/obsidian/aggregates/generate", "/integrations/obsidian/push",
   "/integrations/obsidian/resolve-conflict", "/integrations/obsidian/rules",

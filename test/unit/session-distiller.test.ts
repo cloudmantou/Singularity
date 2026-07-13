@@ -1,17 +1,69 @@
 import { describe, expect, it } from "vitest";
 import {
+  classifyDevelopmentSessionMessageIntent,
   developmentSessionMessagesMatchTranscript,
   parseDevelopmentSessionMessages,
   planDevelopmentSessionEvidence,
 } from "../../src/integrations/session-distiller";
 
 describe("Development Session Distiller", () => {
+  it("classifies non-factual and factual message intents conservatively", () => {
+    const cases = [
+      ["", "noise"],
+      ["> quoted source", "quoted_material"],
+      ["What database should we use?", "question"],
+      ["Maybe this is caused by WAL.", "hypothesis"],
+      ["Please update the migration.", "instruction"],
+      ["Please remember we decided to keep SQLite.", "decision"],
+      ["Can you note that we decided to keep SQLite?", "decision"],
+      ["Do not remember that we decided to keep SQLite.", "instruction"],
+      ["Please forget that we decided to keep SQLite.", "instruction"],
+      ["请不要记住我们决定继续使用 SQLite。", "instruction"],
+      ["We decided to keep SQLite.", "decision"],
+      ["I prefer local storage.", "preference"],
+      ["The migration is completed.", "project_state"],
+      ["The project uses SQLite.", "confirmed_fact"],
+      ["A casual aside.", "noise"],
+    ] as const;
+    for (const [content, expected] of cases) {
+      expect(classifyDevelopmentSessionMessageIntent(content)).toBe(expected);
+    }
+  });
+
+  it("archives explicit do-not-remember instructions without extracting Claims", () => {
+    const plan = planDevelopmentSessionEvidence([
+      { role: "user", content: "Please forget that we decided to keep SQLite." },
+      { role: "user", content: "请不要记住我们决定继续使用 SQLite。" },
+    ], {
+      sourceIdentity: "codex:Singularity:main:session-exclusion",
+      revision: 1,
+      capturedAt: 100,
+    });
+
+    expect(plan.map((item) => ({
+      messageIntent: item.messageIntent,
+      extractionStatus: item.extractionStatus,
+      extractionSkippedReason: item.extractionSkippedReason,
+    }))).toEqual([
+      {
+        messageIntent: "instruction",
+        extractionStatus: "succeeded",
+        extractionSkippedReason: "user_message_intent_not_factual:instruction",
+      },
+      {
+        messageIntent: "instruction",
+        extractionStatus: "succeeded",
+        extractionSkippedReason: "user_message_intent_not_factual:instruction",
+      },
+    ]);
+  });
+
   it("preserves message roles and makes only user messages extractable Evidence", () => {
     const messages = parseDevelopmentSessionMessages(
-      "User: Keep Fact edges separate.\n\nAssistant: I will update the architecture."
+      "User: Fact edges are separate from Association edges.\n\nAssistant: I will update the architecture."
     );
     expect(messages).toEqual([
-      { role: "user", content: "Keep Fact edges separate." },
+      { role: "user", content: "Fact edges are separate from Association edges." },
       { role: "assistant", content: "I will update the architecture." },
     ]);
 

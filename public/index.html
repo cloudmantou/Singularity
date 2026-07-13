@@ -4713,74 +4713,13 @@
             answerBubble.appendChild(answerEl)
             msgs.appendChild(answerBubble)
 
-            // Serialize results for the /chat LLM context, mirroring the MCP tool's
-            // format — dates/tags/source are needed for temporal questions
-            const memories =
-              (data.insight ? `Insight: ${data.insight}\n\n` : '') +
-              data.results.map((m, i) => {
-                const date = new Date(m.created_at).toLocaleDateString()
-                const tagList = m.tags && m.tags.length ? ` [${m.tags.join(', ')}]` : ''
-                const src = m.source ? ` · ${m.source}` : ''
-                const relevance = recentActivity
-                  ? ''
-                  : ` (${m.relevance || (m.score >= 85 ? 'highly relevant' : m.score >= 55 ? 'relevant' : 'possibly relevant')})`
-                const matchedEntities = Array.isArray(m.matched_entities)
-                  ? m.matched_entities.map(String).filter(Boolean).slice(0, 8)
-                  : []
-                const graphFacts = Array.isArray(m.graph_facts)
-                  ? m.graph_facts.map(String).filter(Boolean).slice(0, 5)
-                  : []
-                const graphContext = [
-                  matchedEntities.length ? `Matched entities:\n${matchedEntities.map((entity) => `- ${entity}`).join('\n')}` : '',
-                  graphFacts.length ? `Current graph facts:\n${graphFacts.map((fact) => `- ${fact}`).join('\n')}` : '',
-                  m.time_basis ? `Time basis: ${formatTimeBasis(m.time_basis)}` : '',
-                ].filter(Boolean).join('\n')
-                return `${i + 1}. [${date}${src}${tagList}]${relevance}${m.updated ? ' [updated]' : ''}\n${m.content}${graphContext ? `\n${graphContext}` : ''}`
-              }).join('\n\n')
-            const res = await fetch(`${WORKER_URL}/chat`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${AUTH_TOKEN}` },
-              body: JSON.stringify({ query, memories, mode: data.mode || 'semantic' }),
-            })
-
-            if (!res.ok) throw new Error(`chat failed (${res.status})`)
-            if (!res.body) throw new Error('chat response body is empty')
-            const contentType = res.headers.get('content-type') || ''
-            if (!contentType.includes('text/event-stream')) {
-              throw new Error(`unexpected chat response: ${contentType || 'unknown content type'}`)
-            }
-
-            const reader = res.body.getReader()
-            const decoder = new TextDecoder()
-            let fullText = ''
-            let parseError = null
-            const parser = createCfSseParser({
-              onResponse(text) {
-                fullText += text
-                answerEl.textContent = fullText
-              },
-              onError(error) {
-                parseError = error
-              },
-            })
-            try {
-              while (true) {
-                const { done, value } = await reader.read()
-                if (done) break
-                parser.push(decoder.decode(value, { stream: true }))
-                msgs.scrollTop = msgs.scrollHeight
-              }
-              parser.push(decoder.decode())
-              parser.finish()
-            } finally {
-              reader.releaseLock()
-            }
-
-            if (parseError) throw parseError
-            if (!fullText.trim()) throw new Error('chat returned an empty answer')
-
-            // Render markdown once the stream is complete (kept plain while streaming for speed)
-            answerEl.innerHTML = renderAnswerMarkdown(fullText)
+            const verifiedAnswer = recentActivity
+              ? entries.map((entry) => {
+                  const date = new Date(entry.createdAt).toLocaleDateString()
+                  return `- ${date}: ${entry.content}`
+                }).join('\n')
+              : String(data.insight || 'Retrieved direct evidence is insufficient for a verified answer.')
+            answerEl.innerHTML = renderAnswerMarkdown(verifiedAnswer)
 
             // 2. Sources toggle
             const sourcesToggle = document.createElement('div')
@@ -5927,8 +5866,13 @@ ${metaLine}
         btn.innerHTML = '<i class="ti ti-loader-2"></i> ' + t('digest.working')
         const row = document.getElementById('digest-row-' + tag)
         try {
-          const res = await fetch(`${WORKER_URL}/digest?tag=${encodeURIComponent(tag)}`, {
-            headers: { Authorization: `Bearer ${AUTH_TOKEN}` }
+          const res = await fetch(`${WORKER_URL}/digest`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${AUTH_TOKEN}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ tag }),
           })
           const data = await res.json()
           if (data.synthesis) {

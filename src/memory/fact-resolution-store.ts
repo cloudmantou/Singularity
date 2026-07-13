@@ -5,6 +5,7 @@ import {
 } from "./fact-resolution";
 import { ensureConflictClaimSchema } from "./quality";
 import { D1ResolutionCoordinator } from "./resolution-coordinator";
+import { distinctFactEvidenceCountSql } from "./fact-evidence";
 
 export interface ResolveEntityRelationInput {
   fromEntityId: string;
@@ -186,6 +187,10 @@ export async function resolveAndInsertEntityRelation(
   if (!resolutionTable) {
     await db.exec(FACT_RESOLUTION_SCHEMA_STATEMENTS.join(";\n"));
   }
+  const candidateEvidenceCountSql = distinctFactEvidenceCountSql({
+    relationIdSql: "sb_entity_relations.id",
+    activeMemoriesOnly: true,
+  });
   const { results } = await db.prepare(
     `SELECT id, from_entity_id, to_entity_id, relation_type, fact,
             COALESCE(
@@ -204,24 +209,8 @@ export async function resolveAndInsertEntityRelation(
               WHEN EXISTS (
                 SELECT 1
                 FROM sb_fact_sources fs_evidence
-                JOIN sb_memory_sources ms_evidence
-                  ON ms_evidence.memory_id = fs_evidence.memory_id
                 WHERE fs_evidence.relation_id = sb_entity_relations.id
-              ) THEN (
-                SELECT COUNT(DISTINCT COALESCE(
-                  ms_count.evidence_root_id,
-                  o_count.root_evidence_id,
-                  ms_count.observation_id
-                ))
-                FROM sb_fact_sources fs_count
-                JOIN sb_memories m_count ON m_count.id = fs_count.memory_id
-                JOIN sb_memory_sources ms_count ON ms_count.memory_id = m_count.id
-                LEFT JOIN sb_observations o_count ON o_count.id = ms_count.observation_id
-                WHERE fs_count.relation_id = sb_entity_relations.id
-                  AND m_count.invalid_at IS NULL
-                  AND m_count.expired_at IS NULL
-                  AND ms_count.relation IN ('supports', 'derived_from')
-              )
+              ) THEN ${candidateEvidenceCountSql}
               ELSE evidence_count
             END AS evidence_count
      FROM sb_entity_relations
@@ -271,29 +260,17 @@ export async function resolveAndInsertEntityRelation(
   ) && resolution.targetRelationId != null;
   const relationId = reuseCanonical ? resolution.targetRelationId as string : crypto.randomUUID();
   const targetRelationId = reuseCanonical ? null : resolution.targetRelationId;
+  const writtenEvidenceCountSql = distinctFactEvidenceCountSql({
+    relationIdSql: "?",
+    floorAtOne: true,
+  });
   const statements: D1PreparedStatement[] = [];
   if (!reuseCanonical) statements.push(prepareNewRelation(db, relationId, input, resolution));
   statements.push(prepareFactSource(db, relationId, input));
   statements.push(
     db.prepare(
       `UPDATE sb_entity_relations
-       SET evidence_count = MAX(1, (
-             SELECT COUNT(DISTINCT COALESCE(
-               ms_count.evidence_root_id,
-               o_count.root_evidence_id,
-               ms_count.observation_id,
-               fs_count.observation_id,
-               CASE WHEN fs_count.memory_id IS NOT NULL THEN 'memory:' || fs_count.memory_id END,
-               'fact-source:' || fs_count.id
-             ))
-             FROM sb_fact_sources fs_count
-             LEFT JOIN sb_memory_sources ms_count
-               ON ms_count.memory_id = fs_count.memory_id
-              AND ms_count.relation IN ('supports', 'derived_from')
-             LEFT JOIN sb_observations o_count
-               ON o_count.id = COALESCE(ms_count.observation_id, fs_count.observation_id)
-             WHERE fs_count.relation_id = ?
-           )),
+       SET evidence_count = ${writtenEvidenceCountSql},
            score = CASE
              WHEN ? IS NULL THEN score
              WHEN score IS NULL OR score < ? THEN ?

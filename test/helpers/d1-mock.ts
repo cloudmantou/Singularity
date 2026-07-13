@@ -141,6 +141,7 @@ export class D1Mock {
   parentUnits: any[] = [];
   parentVersions: any[] = [];
   parentVersionClaims: any[] = [];
+  claimVectors: any[] = [];
   observations: any[] = [];
   memories: any[] = [];
   memorySources: any[] = [];
@@ -926,6 +927,45 @@ export class D1Mock {
             reference_time, invalid_at, expired_at, entities_json, created_at,
           });
           return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("INSERT INTO sb_claim_vectors")) {
+          const [
+            claim_id,
+            embedding_fingerprint,
+            parent_version_id,
+            content_hash,
+            vector_ids_json,
+            indexed_at,
+            guardedClaimId,
+            guardedContentHash,
+          ] = args;
+          if (s.includes("WHERE EXISTS") && !db.memories.some((memory: any) =>
+            String(memory.id) === String(guardedClaimId) &&
+            String(memory.content_hash) === String(guardedContentHash)
+          )) {
+            return { meta: { changes: 0 } };
+          }
+          const existing = db.claimVectors.find((row: any) =>
+            String(row.claim_id) === String(claim_id) &&
+            String(row.embedding_fingerprint) === String(embedding_fingerprint)
+          );
+          const next = {
+            claim_id,
+            embedding_fingerprint,
+            parent_version_id,
+            content_hash,
+            vector_ids_json,
+            indexed_at,
+          };
+          if (existing) Object.assign(existing, next);
+          else db.claimVectors.push(next);
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("DELETE FROM sb_claim_vectors WHERE claim_id IN")) {
+          const wanted = new Set(args.map(String));
+          const before = db.claimVectors.length;
+          db.claimVectors = db.claimVectors.filter((row: any) => !wanted.has(String(row.claim_id)));
+          return { meta: { changes: before - db.claimVectors.length } };
         }
         if (s.startsWith("INSERT INTO sb_memory_sources")) {
           let id: any;
@@ -2498,6 +2538,14 @@ export class D1Mock {
       },
       async first() {
         db.statementCount += 1;
+        if (s.includes("SELECT content_hash") && s.includes("FROM sb_claim_vectors")) {
+          const [claimId, fingerprint] = args.map(String);
+          const row = db.claimVectors.find((item: any) =>
+            String(item.claim_id) === claimId &&
+            String(item.embedding_fingerprint) === fingerprint
+          );
+          return row ? { content_hash: row.content_hash } : null;
+        }
         if (
           s.includes("SELECT pv.parent_id AS parent_id") &&
           s.includes("JOIN sb_parent_version_claims pvc")
@@ -3175,6 +3223,105 @@ export class D1Mock {
               .sort((a: any, b: any) => Number(b.created_at ?? 0) - Number(a.created_at ?? 0))
               .slice(0, 20),
           };
+        }
+        if (
+          s.includes("SELECT m.id, m.entry_id, m.parent_version_id, m.content, m.content_hash") &&
+          s.includes("COALESCE(m.observed_at, m.created_at) AS created_at") &&
+          s.includes("LEFT JOIN sb_memory_sources ms")
+        ) {
+          const lexicalCount = (s.match(/m\.content LIKE \?/g) ?? []).length;
+          const semanticMatch = s.match(/m\.id IN \(([^)]*)\)/);
+          const semanticCount = semanticMatch
+            ? semanticMatch[1].split(",").filter(Boolean).length
+            : 0;
+          const graphMatches = [...s.matchAll(/m\.entry_id IN \(([^)]*)\)/g)];
+          const graphCount = graphMatches.length
+            ? graphMatches[0][1].split(",").filter(Boolean).length
+            : 0;
+          let offset = 0;
+          const lexicalPatterns = args.slice(offset, offset + lexicalCount).map(String);
+          offset += lexicalCount;
+          const semanticIds = new Set(args.slice(offset, offset + semanticCount).map(String));
+          offset += semanticCount;
+          const graphEntryIds = new Set(args.slice(offset, offset + graphCount).map(String));
+          offset += graphCount;
+          const hasAfter = s.includes("COALESCE(m.observed_at, m.created_at) >= ?");
+          const after = hasAfter ? Number(args[offset++]) : null;
+          if (hasAfter && graphMatches.length > 1) offset += graphCount;
+          const before = Number(args[offset++]);
+          const kind = s.includes("AND m.kind = ?") ? String(args[offset++]) : null;
+          const tagPattern = s.includes("COALESCE(e.tags, '[]') LIKE ?")
+            ? String(args[offset++])
+            : null;
+          const vaultId = s.includes("l.vault_id = ?") ? String(args[offset++]) : null;
+          const limit = Number(args.at(-1) ?? 50);
+          const asOf = activePredicateAsOfFromSql(s);
+
+          const results = db.memories
+            .filter((memory: any) => {
+              const observedAt = Number(memory.observed_at ?? memory.created_at ?? 0);
+              const lexicalMatch = lexicalPatterns.some((pattern: string) =>
+                String(memory.content ?? "").toLowerCase().includes(
+                  pattern.replace(/^%/, "").replace(/%$/, "").toLowerCase()
+                )
+              );
+              const candidateMatch = lexicalMatch ||
+                semanticIds.has(String(memory.id)) ||
+                graphEntryIds.has(String(memory.entry_id));
+              if (!candidateMatch || observedAt > before) return false;
+              if (after != null && observedAt < after && !graphEntryIds.has(String(memory.entry_id))) {
+                return false;
+              }
+              if (kind && String(memory.kind) !== kind) return false;
+              if (!memoryPassesActiveParentFilter(db, memory, asOf, true)) return false;
+              const entry = db.entries.find((item: any) => String(item.id) === String(memory.entry_id));
+              if (tagPattern) {
+                const tag = tagPattern.replace(/^%"/, "").replace(/"%$/, "");
+                if (!parseJsonArray(entry?.tags).includes(tag)) return false;
+              }
+              if (vaultId) {
+                const links = (db as any).externalLinks ?? [];
+                if (!links.some((link: any) =>
+                  String(link.entry_id) === String(memory.entry_id) &&
+                  link.provider === "obsidian" &&
+                  link.object_type === "memory" &&
+                  String(link.vault_id) === vaultId
+                )) return false;
+              }
+              return true;
+            })
+            .sort((left: any, right: any) =>
+              Number(right.observed_at ?? right.created_at ?? 0) -
+              Number(left.observed_at ?? left.created_at ?? 0)
+            )
+            .slice(0, limit)
+            .map((memory: any) => {
+              const entry = db.entries.find((item: any) => String(item.id) === String(memory.entry_id));
+              const firstSource = db.memorySources
+                .filter((source: any) => String(source.memory_id) === String(memory.id))
+                .sort((left: any, right: any) =>
+                  Number(left.created_at ?? 0) - Number(right.created_at ?? 0) ||
+                  String(left.id).localeCompare(String(right.id))
+                )[0];
+              const observation = db.observations.find((item: any) =>
+                String(item.id) === String(firstSource?.observation_id)
+              );
+              return {
+                id: memory.id,
+                entry_id: memory.entry_id,
+                parent_version_id: memory.parent_version_id ?? null,
+                content: memory.content,
+                content_hash: memory.content_hash,
+                kind: memory.kind ?? "semantic",
+                importance: memory.importance ?? 0,
+                confidence: memory.confidence ?? 0,
+                claim_status: memory.claim_status ?? "supported",
+                created_at: memory.observed_at ?? memory.created_at ?? 0,
+                tags: entry?.tags ?? "[]",
+                source: entry?.source ?? observation?.source_channel ?? observation?.source ?? "claim",
+              };
+            });
+          return { results };
         }
         if (
           s.includes("SELECT m.id, m.entry_id, m.content, m.claim_status") &&

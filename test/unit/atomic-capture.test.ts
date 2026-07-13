@@ -444,7 +444,7 @@ describe("captureEntry atomic dual-write", () => {
 
     expect(result).toMatchObject({
       dryRun: true,
-      limit: 5,
+      limit: 3,
       due: 6,
       deferred: 1,
       exhausted: 1,

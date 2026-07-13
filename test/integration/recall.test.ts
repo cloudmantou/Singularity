@@ -208,8 +208,12 @@ describe("GET /recall", () => {
     expect(data.results[1].score).toBeLessThanOrEqual(data.results[0].score);
     expect(data.results[1]).toMatchObject({ id: "entry-2", content: "Second memory" });
     expect(typeof data.insight === "string" || data.insight === null).toBe(true);
+    expect(db.entries.map((entry) => entry.recall_count)).toEqual([0, 0]);
     const [, options] = queryMock.mock.calls[0];
-    expect(options.filter).toEqual({ embedding_fingerprint: expect.any(String) });
+    expect(options.filter).toEqual({
+      embedding_fingerprint: expect.any(String),
+      source: { $ne: "singularity-claim" },
+    });
   });
 
   it("does not hydrate dense matches that have no active claim evidence", async () => {
@@ -737,7 +741,10 @@ describe("GET /recall", () => {
     expect(data.results).toHaveLength(1);
     expect(data.results[0].id).toBe("entry-1");
     expect(queryMock).toHaveBeenCalledTimes(2);
-    expect(queryMock.mock.calls[0][1].filter).toEqual({ embedding_fingerprint: expect.any(String) });
+    expect(queryMock.mock.calls[0][1].filter).toEqual({
+      embedding_fingerprint: expect.any(String),
+      source: { $ne: "singularity-claim" },
+    });
     expect(queryMock.mock.calls[1][1].filter).toBeUndefined();
   });
 

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import worker, { initializeDatabase } from "../../src/index";
+import worker, { initializeDatabase, processExtractionQueue } from "../../src/index";
 import { createSelfhostEnv } from "../../src/selfhost/env";
 import { resetSettingsCache } from "../../src/settings/store";
 
@@ -42,7 +42,7 @@ function collectingCtx() {
 function atomicAiMock() {
   const response = JSON.stringify({
     facts: [{
-      content: "Keep Fact edges separate.",
+      content: "We decided to keep Fact edges separate.",
       subject: "Fact edges",
       predicate: "must_remain",
       object: "separate",
@@ -338,6 +338,128 @@ describe("Development session source adapter", () => {
     }
   });
 
+  it("supplements structured messages for an already archived transcript", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      const base = {
+        client: "codex" as const,
+        repository: "Singularity",
+        branch: "main",
+        sessionId: "session-legacy-upgrade",
+        transcript: "User: We decided to keep SQLite.\n\nAssistant: Recorded.",
+      };
+      expect((await worker.fetch(req(base), env, ctx())).status).toBe(200);
+      const response = await worker.fetch(req({
+        ...base,
+        messages: [
+          { role: "user", content: "We decided to keep SQLite.", messageId: "decision-1" },
+          { role: "assistant", content: "Recorded.", messageId: "assistant-1" },
+        ],
+      }), env, ctx());
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        status: "structured_messages_supplemented",
+        distillation: { userMessagesQueued: 1, assistantMessagesArchived: 1 },
+      });
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count FROM sb_observations
+         WHERE source_identity = 'codex:Singularity:main:session-legacy-upgrade'`
+      ).get()).toEqual({ count: 1 });
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count FROM sb_observations
+         WHERE source_identity LIKE 'codex:Singularity:main:session-legacy-upgrade:message:%'`
+      ).get()).toEqual({ count: 2 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("rejects a structured supplement that conflicts with a legacy stored message hash", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      const base = {
+        client: "codex" as const,
+        repository: "Singularity",
+        branch: "main",
+        sessionId: "session-legacy-hash",
+        transcript: "User: We decided to keep SQLite.\n\nAssistant: Recorded.",
+      };
+      expect((await worker.fetch(req(base), env, ctx())).status).toBe(200);
+      db.prepare(
+        `UPDATE sb_observations
+         SET metadata_json = json_set(metadata_json, '$.structured_messages_hash', 'legacy-hash')
+         WHERE source_identity = 'codex:Singularity:main:session-legacy-hash'`
+      ).run();
+
+      const response = await worker.fetch(req({
+        ...base,
+        messages: [
+          { role: "user", content: "We decided to keep SQLite.", messageId: "decision-1" },
+          { role: "assistant", content: "Recorded.", messageId: "assistant-1" },
+        ],
+      }), env, ctx());
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({
+        ok: false,
+        error: "development_session_structured_messages_conflict",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("queues only factual user intents and performs no inline extraction", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      const ai = atomicAiMock();
+      env.AI = ai;
+      env.SELFHOST = "0";
+      const response = await worker.fetch(req({
+        client: "codex",
+        repository: "Singularity",
+        branch: "main",
+        sessionId: "session-intents",
+        transcript: [
+          "User: What database should we use?",
+          "User: We decided to keep SQLite.",
+          "User: Please update the migration.",
+          "Assistant: I will do that.",
+        ].join("\n\n"),
+        messages: [
+          { role: "user", content: "What database should we use?", messageId: "q1" },
+          { role: "user", content: "We decided to keep SQLite.", messageId: "d1" },
+          { role: "user", content: "Please update the migration.", messageId: "i1" },
+          { role: "assistant", content: "I will do that.", messageId: "a1" },
+        ],
+      }), env, ctx());
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        distillation: { userMessagesQueued: 1, assistantMessagesArchived: 1 },
+      });
+      const rows = db.prepare(
+        `SELECT extraction_status, metadata_json
+         FROM sb_observations
+         WHERE source_identity LIKE '%session-intents:message:%'`
+      ).all() as Array<{ extraction_status: string; metadata_json: string }>;
+      const byIntent = new Map(rows.map((row) => {
+        const metadata = JSON.parse(row.metadata_json);
+        return [metadata.message_intent, row];
+      }));
+      expect(byIntent.get("decision")?.extraction_status).toBe("pending");
+      expect(byIntent.get("question")?.extraction_status).toBe("succeeded");
+      expect(byIntent.get("instruction")?.extraction_status).toBe("succeeded");
+      expect(db.prepare(`SELECT COUNT(*) AS count FROM entries`).get()).toEqual({ count: 0 });
+      expect(ai.run).not.toHaveBeenCalled();
+    } finally {
+      db.close();
+    }
+  });
+
   it("distills only user messages into recallable Claims and preserves assistant text as non-factual Evidence", async () => {
     const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
     try {
@@ -350,9 +472,9 @@ describe("Development session source adapter", () => {
         repository: "Singularity",
         branch: "main",
         sessionId: "session-distill",
-        transcript: "User: Keep Fact edges separate.\n\nAssistant: I will apply that change.",
+        transcript: "User: We decided to keep Fact edges separate.\n\nAssistant: I will apply that change.",
         messages: [
-          { role: "user", content: "Keep Fact edges separate." },
+          { role: "user", content: "We decided to keep Fact edges separate." },
           { role: "assistant", content: "I will apply that change." },
         ],
       }), env, pending.context);
@@ -362,6 +484,8 @@ describe("Development session source adapter", () => {
         distillation: { userMessagesQueued: 1, assistantMessagesArchived: 1 },
       });
 
+      expect(db.prepare(`SELECT COUNT(*) AS count FROM entries`).get()).toEqual({ count: 0 });
+      await processExtractionQueue(env, pending.context, 3);
       await pending.drain();
 
       const observations = db.prepare(
@@ -395,12 +519,12 @@ describe("Development session source adapter", () => {
       ).get()).toEqual({ count: 0 });
 
       const recall = await worker.fetch(new Request(
-        "http://localhost/recall?query=Keep%20Fact%20edges%20separate&topK=3",
+        "http://localhost/recall?query=We%20decided%20to%20keep%20Fact%20edges%20separate&topK=3",
         { headers: { Authorization: "Bearer test-token" } }
       ), env, ctx());
       expect(recall.status).toBe(200);
       expect(await recall.json()).toMatchObject({
-        directEvidence: [{ content: "Keep Fact edges separate." }],
+        directEvidence: [{ content: "We decided to keep Fact edges separate." }],
       });
     } finally {
       db.close();

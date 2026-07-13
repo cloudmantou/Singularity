@@ -107,6 +107,33 @@ describe("Entity Merge Executor", () => {
   afterEach(() => raw.close());
 
   it("merges all identity and graph references in one reviewed operation", async () => {
+    raw.prepare(
+      `INSERT INTO sb_observations (
+         id, content, source, content_hash, root_evidence_id, revision, author_type, created_at
+       ) VALUES
+         ('obs-1', 'source revision', 'obsidian', 'hash-a1', 'root-a', 1, 'user', 1),
+         ('obs-ai', 'AI-derived revision', 'system', 'hash-a2', 'root-a', 2, 'assistant', 2),
+         ('obs-2', 'independent source', 'mcp', 'hash-b1', 'root-b', 1, 'user', 3)`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_memories (id, content, claim_status, entities_json, created_at)
+       VALUES ('memory-1', 'independent support', 'supported', '[]', 1),
+              ('memory-2', 'source support', 'supported', '[]', 2),
+              ('memory-3', 'derived support', 'supported', '[]', 3)`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_memory_sources (
+         id, memory_id, observation_id, role, relation, evidence_root_id, created_at
+       ) VALUES
+         ('ms-1', 'memory-1', 'obs-2', 'supports', 'supports', 'root-b', 1),
+         ('ms-2', 'memory-2', 'obs-1', 'supports', 'supports', 'root-a', 2),
+         ('ms-3', 'memory-3', 'obs-ai', 'derived', 'derived_from', 'root-a', 3)`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_fact_sources (id, relation_id, memory_id, observation_id, created_at)
+       VALUES ('fs-source-ai', 'relation-source', 'memory-3', 'obs-ai', 2)`
+    ).run();
+
     const result = await new D1EntityMergeExecutor(db).resolve({
       candidateId: "merge-candidate",
       decision: "accept",
@@ -177,7 +204,14 @@ describe("Entity Merge Executor", () => {
     expect(raw.prepare(
       `SELECT memory_id FROM sb_fact_sources
        WHERE relation_id = 'relation-target' ORDER BY memory_id`
-    ).all()).toEqual([{ memory_id: "memory-1" }, { memory_id: "memory-2" }]);
+    ).all()).toEqual([
+      { memory_id: "memory-1" },
+      { memory_id: "memory-2" },
+      { memory_id: "memory-3" },
+    ]);
+    expect(raw.prepare(
+      `SELECT evidence_count FROM sb_entity_relations WHERE id = 'relation-target'`
+    ).get()).toEqual({ evidence_count: 2 });
     expect(raw.prepare(
       `SELECT relation_id, target_relation_id FROM sb_fact_resolutions
        WHERE id = 'resolution-duplicate'`

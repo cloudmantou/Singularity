@@ -31,16 +31,22 @@ describe("web memory mutation API contract", () => {
     expect(html).toContain("await importEntriesInBatches(entries");
   });
 
-  it("preserves graph recall evidence into source cards and chat context", () => {
+  it("creates digests only through POST", () => {
+    expect(html).toMatch(/async function runDigest[\s\S]*?fetch\(`\$\{WORKER_URL\}\/digest`, \{[\s\S]*?method: 'POST'/);
+    expect(html).toContain("body: JSON.stringify({ tag })");
+    expect(html).not.toContain("/digest?tag=");
+  });
+
+  it("preserves graph recall evidence in source cards and trusts only the verified server answer", () => {
     expect(html).toContain("scoreDetails: m.score_details || {}");
     expect(html).toContain("matchedEntities: m.matched_entities || []");
     expect(html).toContain("graphFacts: m.graph_facts || []");
     expect(html).toContain("timeBasis: m.time_basis || null");
-    expect(html).toContain("Time basis:");
     expect(html).toContain("语义向量服务不可用，当前使用关键词 + 知识图谱降级召回。");
     expect(html).toContain("Matched entities:");
     expect(html).toContain("Current graph facts:");
-    expect(html).toContain("const graphContext = [");
+    expect(html).toContain("String(data.insight || 'Retrieved direct evidence is insufficient for a verified answer.')");
+    expect(html).not.toContain("fetch(`${WORKER_URL}/chat`");
     expect(html).toContain("class=\"recall-explain\"");
     expect(html).toContain("<summary>Why recalled</summary>");
     expect(html).toContain("recall-signal-grid");

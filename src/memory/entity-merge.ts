@@ -1,4 +1,5 @@
 import { ensureEntityDataModel, ensureEntityResolutionDataModel } from "./entities";
+import { distinctFactEvidenceCountSql } from "./fact-evidence";
 import { prepareComplianceAuditEvent } from "./quality";
 
 export type EntityMergeDecision = "accept" | "reject";
@@ -711,12 +712,14 @@ export class D1EntityMergeExecutor {
         `DELETE FROM sb_entity_relations WHERE id = ? AND ${guardSql()}`
       ).bind(relation.id, ...guardBindings(lock)));
     }
+    const mergedEvidenceCountSql = distinctFactEvidenceCountSql({
+      relationIdSql: "?",
+      floorAtOne: true,
+    });
     for (const relationId of touchedCanonicalIds) {
       statements.push(this.db.prepare(
         `UPDATE sb_entity_relations
-         SET evidence_count = MAX(1, (
-           SELECT COUNT(*) FROM sb_fact_sources WHERE relation_id = ?
-         ))
+         SET evidence_count = ${mergedEvidenceCountSql}
          WHERE id = ? AND ${guardSql()}`
       ).bind(relationId, relationId, ...guardBindings(lock)));
     }

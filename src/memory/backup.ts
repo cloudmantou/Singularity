@@ -179,6 +179,9 @@ export async function inspectMemoryBackupIntegrity(db: D1Database): Promise<Back
        (SELECT COUNT(*) FROM sb_parent_version_claims pvc
         LEFT JOIN sb_memories m ON m.id = pvc.memory_id
         WHERE m.id IS NULL) as parent_version_claims_missing_memory,
+       (SELECT COUNT(*) FROM sb_claim_vectors cv
+        LEFT JOIN sb_memories m ON m.id = cv.claim_id
+        WHERE m.id IS NULL) as claim_vectors_missing_claim,
        (SELECT COUNT(*) FROM sb_association_edges ae
         LEFT JOIN sb_parent_units pu ON pu.parent_id = ae.source_parent_id
         WHERE pu.parent_id IS NULL) as association_edges_missing_source_parent,

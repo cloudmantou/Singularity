@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { synthesizeInsight } from "../../src/index";
+import { synthesizeInsight, synthesizeVerifiedInsight } from "../../src/index";
 import { makeTestEnv } from "../helpers/make-env";
 
 function makeSseStream(response: string) {
@@ -16,7 +16,30 @@ function aiMock(response: string) {
   return { run: vi.fn().mockResolvedValue(makeSseStream(response)) } as unknown as Ai;
 }
 
+function structuredClaim(text: string, refs = ["C1"], kind: "fact" | "conflict" = "fact") {
+  return JSON.stringify({ answer: "", claims: [{ text, refs, kind }] });
+}
+
 describe("synthesizeInsight()", () => {
+  it("refuses to synthesize facts from Association-only navigation context", async () => {
+    const env = makeTestEnv();
+    const result = await synthesizeVerifiedInsight("query", {
+      directEvidence: [],
+      relatedContext: [{
+        id: "related-1",
+        content: "Navigation only",
+        associationType: "related_to",
+        hop: 1,
+      }],
+    }, env);
+    expect(result).toEqual({
+      answer: "Retrieved direct evidence is insufficient for a verified answer.",
+      verifiedClaims: [],
+      unverifiedClaims: [],
+    });
+    expect(env.AI.run).not.toHaveBeenCalled();
+  });
+
   it("returns empty string immediately when rows is empty — AI not called", async () => {
     const env = makeTestEnv();
     const result = await synthesizeInsight("some query", [], env);
@@ -25,13 +48,15 @@ describe("synthesizeInsight()", () => {
   });
 
   it("returns LLM response on happy path", async () => {
-    const env = makeTestEnv(undefined, { AI: aiMock("Use JWT with short expiry [E1].") });
+    const env = makeTestEnv(undefined, {
+      AI: aiMock(structuredClaim("We chose JWT with 1hr expiry")),
+    });
     const result = await synthesizeInsight(
       "auth strategy",
       [{ id: "1", content: "We chose JWT with 1hr expiry" }],
       env
     );
-    expect(result).toBe("Use JWT with short expiry [E1].");
+    expect(result).toBe("We chose JWT with 1hr expiry [C1]");
   });
 
   it("returns empty string when LLM throws — does not propagate error", async () => {
@@ -49,9 +74,9 @@ describe("synthesizeInsight()", () => {
   });
 
   it("trims whitespace from LLM response", async () => {
-    const env = makeTestEnv(undefined, { AI: aiMock("  padded insight [E1]  ") });
+    const env = makeTestEnv(undefined, { AI: aiMock(`  ${structuredClaim("content")}  `) });
     const result = await synthesizeInsight("query", [{ id: "1", content: "content" }], env);
-    expect(result).toBe("padded insight [E1]");
+    expect(result).toBe("content [C1]");
   });
 
   it("includes the query in the prompt sent to LLM", async () => {
@@ -78,7 +103,7 @@ describe("synthesizeInsight()", () => {
     const [, { messages }] = (env.AI.run as ReturnType<typeof vi.fn>).mock.calls[0];
     const prompt = (messages[0].content as string).toLowerCase();
     expect(prompt).toContain("only");
-    expect(prompt).toContain("[e1]");
+    expect(prompt).toContain("[c1]");
     expect(prompt).toContain("insufficient");
     expect(prompt).toMatch(/speculate|guess|infer/);
   });
@@ -137,7 +162,9 @@ describe("synthesizeInsight()", () => {
   });
 
   it("separates direct Evidence refs from non-citable Association context refs", async () => {
-    const env = makeTestEnv(undefined, { AI: aiMock("The project uses SQLite [E1].") });
+    const env = makeTestEnv(undefined, {
+      AI: aiMock(structuredClaim("The project uses SQLite")),
+    });
     const result = await synthesizeInsight(
       "project database",
       {
@@ -152,10 +179,12 @@ describe("synthesizeInsight()", () => {
       env
     );
 
-    expect(result).toBe("The project uses SQLite [E1].");
+    expect(result).toBe("The project uses SQLite [C1]");
     const [, { messages }] = (env.AI.run as ReturnType<typeof vi.fn>).mock.calls[0];
     const prompt = messages[0].content as string;
-    expect(prompt).toContain("[E1]\nThe project uses SQLite");
+    expect(prompt).toContain("[E1] evidence_id=entry-direct");
+    expect(prompt).toContain("[C1] claim=legacy-entry");
+    expect(prompt).toContain("statement=The project uses SQLite");
     expect(prompt).toContain("[R1] association=references; hop=1");
     expect(prompt).not.toContain("A related project uses Postgres");
     expect(prompt).toMatch(/R\*.*cannot|R1.*cannot|not factual evidence/i);
@@ -204,8 +233,12 @@ describe("synthesizeInsight()", () => {
   });
 
   it("rejects missing and unknown direct Evidence refs", async () => {
-    const missingRefEnv = makeTestEnv(undefined, { AI: aiMock("The project uses SQLite.") });
-    const unknownRefEnv = makeTestEnv(undefined, { AI: aiMock("The project uses SQLite [E2].") });
+    const missingRefEnv = makeTestEnv(undefined, {
+      AI: aiMock(structuredClaim("The project uses SQLite", [])),
+    });
+    const unknownRefEnv = makeTestEnv(undefined, {
+      AI: aiMock(structuredClaim("The project uses SQLite", ["C2"])),
+    });
 
     await expect(synthesizeInsight(
       "project database",

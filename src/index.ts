@@ -36,6 +36,7 @@ import {
   setStoredModelSettingsCache,
 } from "./settings/store";
 import { importEntries, parseImportPayload, type ImportMode } from "./import-entries";
+import { isKnownWorkerRoute } from "./selfhost/request-routing";
 import {
   bindTelemetryDb,
   aggregateTelemetryHour,
@@ -105,10 +106,13 @@ import {
   type AssociationEdgeType,
 } from "./memory/associations";
 import {
+  INSUFFICIENT_VERIFIED_EVIDENCE,
   normalizeInsightContext,
-  validateInsightEvidenceReferences,
+  validateStructuredInsightResponse,
+  type CitableInsightClaim,
   type InsightContextPackage,
   type InsightEvidenceRow,
+  type VerifiedInsightResult,
 } from "./memory/recall-context";
 import {
   prepareMemoryRevision,
@@ -243,6 +247,8 @@ export interface Env {
   SITE_URL?: string;
   /** Optional comma/newline-separated redirect origins allowed to authorize. */
   OAUTH_ALLOWED_REDIRECT_ORIGINS?: string;
+  /** Optional comma/newline-separated browser origins allowed to call management APIs. */
+  DASHBOARD_ALLOWED_ORIGINS?: string;
   /** OpenAI-compatible chat API (DeepSeek / MiniMax / MiMo / OpenAI). */
   LLM_BASE_URL?: string;
   LLM_API_KEY?: string;
@@ -259,10 +265,40 @@ export interface Env {
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 
 const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
 };
+
+function configuredDashboardOrigins(env: Env): Set<string> {
+  return new Set((env.DASHBOARD_ALLOWED_ORIGINS ?? "")
+    .split(/[\n,]/)
+    .map((value) => value.trim().replace(/\/$/, ""))
+    .filter(Boolean));
+}
+
+function applyManagementCors(request: Request, response: Response, env: Env): Response {
+  const headers = new Headers(response.headers);
+  headers.delete("Access-Control-Allow-Origin");
+  const url = new URL(request.url);
+  const requestOrigin = request.headers.get("Origin")?.trim().replace(/\/$/, "") ?? "";
+  const publicCors = ["/config", "/config.json", "/health"].includes(url.pathname);
+  if (publicCors) {
+    headers.set("Access-Control-Allow-Origin", "*");
+  } else if (
+    requestOrigin &&
+    (requestOrigin === url.origin || configuredDashboardOrigins(env).has(requestOrigin))
+  ) {
+    headers.set("Access-Control-Allow-Origin", requestOrigin);
+    const vary = headers.get("Vary");
+    headers.set("Vary", vary ? `${vary}, Origin` : "Origin");
+  }
+  for (const [name, value] of Object.entries(CORS_HEADERS)) headers.set(name, value);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
 
 const AssociationEdgeTypeSchema = z.enum(
   [...ASSOCIATION_EDGE_TYPES] as [AssociationEdgeType, ...AssociationEdgeType[]]
@@ -552,7 +588,7 @@ function isAuthorized(request: Request, env: Env): boolean {
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data, null, 2), {
     status,
-    headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+    headers: { "Content-Type": "application/json" },
   });
 }
 
@@ -3759,7 +3795,10 @@ async function queryActiveVectors(
   const queryOptions = {
     topK,
     returnMetadata: "all" as const,
-    filter: { embedding_fingerprint: fingerprint },
+    filter: {
+      embedding_fingerprint: fingerprint,
+      source: { $ne: CLAIM_VECTOR_SOURCE },
+    },
   };
   try {
     const result = env.SELFHOST === "1"
@@ -6571,28 +6610,79 @@ async function appendToEntry(
 
 // ─── Synthesize insight from retrieved memories ───────────────────────────────
 
-export async function synthesizeInsight(
+function buildCitableInsightClaims(
+  context: InsightContextPackage<RecallClaimContext>
+): CitableInsightClaim[] {
+  const claims: CitableInsightClaim[] = [];
+  for (const evidence of context.directEvidence) {
+    if (evidence.claims?.length) {
+      for (const claim of evidence.claims) {
+        claims.push({
+          ref: `C${claims.length + 1}`,
+          evidenceId: evidence.id,
+          claimId: claim.id,
+          statement: claim.statement,
+          status: claim.status,
+          conflictIds: [...claim.conflictIds],
+        });
+      }
+      continue;
+    }
+    claims.push({
+      ref: `C${claims.length + 1}`,
+      evidenceId: evidence.id,
+      claimId: null,
+      statement: evidence.content,
+      status: "supported",
+      conflictIds: [],
+    });
+  }
+  return claims;
+}
+
+function renderSingleVerifiedInsight(
+  context: InsightContextPackage<RecallClaimContext>
+): VerifiedInsightResult {
+  const citableClaims = buildCitableInsightClaims(context);
+  const claim = citableClaims[0];
+  if (!claim) return { answer: "", verifiedClaims: [], unverifiedClaims: [] };
+  return validateStructuredInsightResponse(JSON.stringify({
+    answer: "",
+    claims: [{ text: claim.statement, refs: [claim.ref], kind: "fact" }],
+  }), citableClaims);
+}
+
+export async function synthesizeVerifiedInsight(
   query: string,
   contextInput:
     | InsightContextPackage<RecallClaimContext>
     | InsightEvidenceRow<RecallClaimContext>[],
   env: Env,
-  conflicts: RecallConflictContext[] = []
-): Promise<string> {
+  conflicts: RecallConflictContext[] = [],
+  options: { asOf?: number } = {}
+): Promise<VerifiedInsightResult> {
   const context = normalizeInsightContext(contextInput);
-  if (!context.directEvidence.length && !context.relatedContext.length) return "";
+  if (!context.directEvidence.length && !context.relatedContext.length) {
+    return { answer: "", verifiedClaims: [], unverifiedClaims: [] };
+  }
   if (!context.directEvidence.length) {
-    return validateInsightEvidenceReferences("", 0) ||
-      "Retrieved direct evidence is insufficient for a verified answer.";
+    return {
+      answer: INSUFFICIENT_VERIFIED_EVIDENCE,
+      verifiedClaims: [],
+      unverifiedClaims: [],
+    };
   }
 
+  const citableClaims = buildCitableInsightClaims(context);
   const memoriesList = context.directEvidence
     .map((r, i) => {
-      const claimLines = (r.claims ?? []).map((claim) =>
-        `[Claim ${claim.id}] status=${claim.status}; verification=${claim.verificationStatus}; ` +
-        `conflicts=${claim.conflictIds.join(",") || "none"}; statement=${claim.statement}`
-      );
-      return `[E${i + 1}]\n${r.content}${claimLines.length ? `\n${claimLines.join("\n")}` : ""}`;
+      const claimLines = citableClaims
+        .filter((claim) => claim.evidenceId === r.id)
+        .map((claim) =>
+          `[${claim.ref}] claim=${claim.claimId ?? "legacy-entry"}; status=${claim.status}; ` +
+          `conflicts=${claim.conflictIds.join(",") || "none"}; statement=${claim.statement}`
+        );
+      return `[E${i + 1}] evidence_id=${r.id}\n${claimLines.join("\n")}`;
     })
     .join("\n\n");
   const relatedContextList = context.relatedContext.length
@@ -6622,15 +6712,14 @@ Unresolved conflicts:
 ${conflictsList}
 
 Rules:
-- Use ONLY the information in the memories above. Do not add, infer, guess, or speculate, and do not use hedging language like "might" or "it seems".
-- Cite supporting evidence with the local references like E1 or E2 when you state a fact.
-- R* references are navigation hints only. They cannot support a factual statement and must never be cited in the answer.
-- Related Association Context may only help identify missing direct Evidence or explain where to search next.
-- Never silently choose one side of an unresolved conflict. Explicitly state that the Claims conflict and identify both sides.
-- These memories are a retrieved subset, not the user's full memory store.
-- If the memories do not support answering the query, say the retrieved evidence is insufficient and briefly state only what the evidence does contain.
-
-Write a brief insight (2-4 sentences).`;
+- Return exactly one JSON object and no markdown: {"answer":"","claims":[{"text":"","refs":["C1"],"kind":"fact"}]}.
+- C* references are the only citable Claims. E* labels identify Evidence containers and R* labels are navigation-only; never place E* or R* in refs.
+- For kind="fact", copy text exactly from one referenced C* statement. Do not paraphrase, combine, infer, guess, or add facts.
+- A contested Claim or a Claim with conflicts cannot be emitted as kind="fact".
+- To disclose an unresolved conflict, use kind="conflict" and cite at least two C* refs that share the same conflict ID. The server will render the conflict text.
+- The answer field is advisory and will not be trusted. Every factual unit must be represented in claims.
+- If no Claim supports an answer, treat the verified evidence as insufficient and return {"answer":"","claims":[]}.
+- These Claims are a retrieved subset, not the user's full memory store.`;
 
   let insight = "";
   try {
@@ -6640,9 +6729,42 @@ Write a brief insight (2-4 sentences).`;
     );
   } catch (e) {
     console.error("synthesizeInsight LLM call failed (non-fatal):", e);
+    return { answer: "", verifiedClaims: [], unverifiedClaims: [] };
   }
 
-  return validateInsightEvidenceReferences(insight, context.directEvidence.length);
+  let revalidatedClaims = citableClaims;
+  if (options.asOf !== undefined && citableClaims.some((claim) => claim.claimId)) {
+    const refreshed = await loadRecallConflictContext(
+      env.DB,
+      context.directEvidence.map((row) => row.id),
+      options.asOf
+    );
+    const refreshedById = new Map(
+      [...refreshed.claimsByEntry.values()].flat().map((claim) => [claim.id, claim])
+    );
+    revalidatedClaims = citableClaims.flatMap((claim) => {
+      if (!claim.claimId) return [claim];
+      const current = refreshedById.get(claim.claimId);
+      return current ? [{
+        ...claim,
+        statement: current.statement,
+        status: current.status,
+        conflictIds: [...current.conflictIds],
+      }] : [];
+    });
+  }
+  return validateStructuredInsightResponse(insight, revalidatedClaims);
+}
+
+export async function synthesizeInsight(
+  query: string,
+  contextInput:
+    | InsightContextPackage<RecallClaimContext>
+    | InsightEvidenceRow<RecallClaimContext>[],
+  env: Env,
+  conflicts: RecallConflictContext[] = []
+): Promise<string> {
+  return (await synthesizeVerifiedInsight(query, contextInput, env, conflicts)).answer;
 }
 
 // ─── Async pattern derivation ─────────────────────────────────────────────────
@@ -6952,6 +7074,9 @@ async function runScheduledMaintenance(env: Env, ctx: ExecutionContext): Promise
 
 export interface RecallMatch {
   id: string;
+  claimId?: string;
+  parentVersionId?: string | null;
+  snapshotAt?: number;
   content: string;
   score: number;
   createdAt: number;
@@ -6976,6 +7101,10 @@ export interface RecallSearchResult {
   directEvidence?: RecallMatch[];
   relatedContext?: RecallMatch[];
   insight: string;
+  retrievalMode?: "entry_projection" | "claim_snapshot";
+  snapshotAt?: number;
+  verifiedClaims?: VerifiedInsightResult["verifiedClaims"];
+  unverifiedClaims?: VerifiedInsightResult["unverifiedClaims"];
   conflicts?: RecallConflictContext[];
   degraded?: boolean;
   degradedReason?: string;
@@ -7367,7 +7496,8 @@ async function lexicalVectorRows(
 async function buildGraphRecallSignals(
   query: string,
   env: Env,
-  asOf: number
+  asOf: number,
+  options: { claimSnapshot?: boolean } = {}
 ): Promise<Map<string, GraphRecallSignal>> {
   const normalizedQuery = normalizeEntityName(query);
   if (normalizedQuery.length < 2) return new Map();
@@ -7428,9 +7558,9 @@ async function buildGraphRecallSignals(
             me.entity_id, me.score AS entity_score, e.name AS entity_name
      FROM sb_memory_entities me
      JOIN sb_memories m ON m.id = me.memory_id
-     JOIN entries en_graph
+     ${options.claimSnapshot ? "" : `JOIN entries en_graph
        ON en_graph.id = m.entry_id
-      AND en_graph.content_hash = m.content_hash
+      AND en_graph.content_hash = m.content_hash`}
      JOIN sb_entities e ON e.id = me.entity_id
      WHERE me.entity_id IN (${placeholders})
        AND m.entry_id IS NOT NULL
@@ -7475,9 +7605,9 @@ async function buildGraphRecallSignals(
      FROM sb_entity_relations r
      LEFT JOIN sb_fact_sources rfs ON rfs.relation_id = r.id
      JOIN sb_memories m ON m.id = COALESCE(rfs.memory_id, r.memory_id)
-     JOIN entries en_graph
+     ${options.claimSnapshot ? "" : `JOIN entries en_graph
        ON en_graph.id = m.entry_id
-      AND en_graph.content_hash = m.content_hash
+      AND en_graph.content_hash = m.content_hash`}
      JOIN sb_entities fe ON fe.id = r.from_entity_id
      JOIN sb_entities te ON te.id = r.to_entity_id
      WHERE (r.from_entity_id IN (${relationWhere}) OR r.to_entity_id IN (${relationWhere}))
@@ -7689,6 +7819,419 @@ function fuseDenseAndKeyword(
   return out;
 }
 
+const CLAIM_VECTOR_SOURCE = "singularity-claim";
+
+interface ClaimSnapshotRow {
+  id: string;
+  entry_id: string;
+  parent_version_id: string | null;
+  content: string;
+  content_hash: string;
+  kind: string | null;
+  importance: number | null;
+  confidence: number | null;
+  claim_status: string;
+  created_at: number;
+  tags: string | null;
+  source: string | null;
+}
+
+async function indexClaimSnapshotVector(
+  env: Env,
+  input: {
+    claimId: string;
+    entryId: string;
+    parentVersionId: string | null;
+    content: string;
+    contentHash: string;
+    createdAt: number;
+  },
+  snapshot?: ActiveEmbeddingSnapshot
+): Promise<void> {
+  const active = snapshot ?? await loadActiveEmbeddingSnapshot(env);
+  const existing = await env.DB.prepare(
+    `SELECT content_hash
+     FROM sb_claim_vectors
+     WHERE claim_id = ? AND embedding_fingerprint = ?`
+  ).bind(input.claimId, active.fingerprint).first<{ content_hash: string }>();
+  if (existing?.content_hash === input.contentHash) return;
+
+  const prepared = await prepareEntryVectors(
+    env,
+    input.claimId,
+    input.content,
+    [],
+    CLAIM_VECTOR_SOURCE,
+    input.createdAt,
+    crypto.randomUUID(),
+    active.fingerprint,
+    "active",
+    undefined,
+    active.provider
+  );
+  const claimVectors: PreparedEntryVectors = {
+    vectorIds: [...prepared.vectorIds],
+    vectors: prepared.vectors.map((vector) => ({
+      ...vector,
+      metadata: {
+        ...vector.metadata,
+        source: CLAIM_VECTOR_SOURCE,
+        parentId: input.claimId,
+        claimId: input.claimId,
+        entryId: input.entryId,
+        parentVersionId: input.parentVersionId,
+        content_hash: input.contentHash,
+      },
+    })),
+  };
+  await insertPreparedVectors(env, claimVectors);
+  try {
+    const mappingWrite = await env.DB.prepare(
+      `INSERT INTO sb_claim_vectors (
+         claim_id, embedding_fingerprint, parent_version_id,
+         content_hash, vector_ids_json, indexed_at
+       )
+       SELECT ?, ?, ?, ?, ?, ?
+       WHERE EXISTS (
+         SELECT 1 FROM sb_memories
+         WHERE id = ? AND content_hash = ?
+       )
+       ON CONFLICT(claim_id, embedding_fingerprint) DO UPDATE SET
+         parent_version_id = excluded.parent_version_id,
+         content_hash = excluded.content_hash,
+         vector_ids_json = excluded.vector_ids_json,
+         indexed_at = excluded.indexed_at`
+    ).bind(
+      input.claimId,
+      active.fingerprint,
+      input.parentVersionId,
+      input.contentHash,
+      JSON.stringify(claimVectors.vectorIds),
+      Date.now(),
+      input.claimId,
+      input.contentHash
+    ).run();
+    if (Number(mappingWrite.meta?.changes ?? 0) !== 1) {
+      await cleanupPreparedVectors(env, claimVectors.vectorIds, "Stale Claim vector mapping");
+    }
+  } catch (error) {
+    await cleanupPreparedVectors(env, claimVectors.vectorIds, "Claim vector mapping write");
+    throw error;
+  }
+}
+
+async function backfillHistoricalClaimVectors(
+  env: Env,
+  asOf: number,
+  snapshot: ActiveEmbeddingSnapshot,
+  limit = 20
+): Promise<void> {
+  const { results } = await env.DB.prepare(
+    `SELECT m.id, m.entry_id, m.parent_version_id, m.content, m.content_hash, m.created_at
+     FROM sb_memories m
+     WHERE m.entry_id IS NOT NULL
+       AND m.content_hash IS NOT NULL
+       AND ${activeMemoryClaimPredicate("m", String(asOf), { requireActiveParentLink: true })}
+       AND NOT EXISTS (
+         SELECT 1 FROM sb_claim_vectors cv
+         WHERE cv.claim_id = m.id
+           AND cv.embedding_fingerprint = ?
+           AND cv.content_hash = m.content_hash
+       )
+     ORDER BY m.created_at DESC
+     LIMIT ?`
+  ).bind(snapshot.fingerprint, Math.max(1, Math.min(limit, 50))).all<{
+    id: string;
+    entry_id: string;
+    parent_version_id: string | null;
+    content: string;
+    content_hash: string;
+    created_at: number;
+  }>();
+  for (const row of results ?? []) {
+    await indexClaimSnapshotVector(env, {
+      claimId: row.id,
+      entryId: row.entry_id,
+      parentVersionId: row.parent_version_id,
+      content: row.content,
+      contentHash: row.content_hash,
+      createdAt: Number(row.created_at),
+    }, snapshot);
+  }
+}
+
+async function queryHistoricalClaimVectors(
+  env: Env,
+  vector: number[],
+  fingerprint: string,
+  queryText: string
+): Promise<{ scores: Map<string, number>; degraded: boolean }> {
+  let matches: VectorizeMatch[] = [];
+  let degraded = false;
+  try {
+    const options = {
+      topK: 50,
+      returnMetadata: "all" as const,
+      filter: { embedding_fingerprint: fingerprint, source: CLAIM_VECTOR_SOURCE },
+    };
+    const result = env.SELFHOST === "1"
+      ? await (env.VECTORIZE as any).query(vector, { ...options, queryText })
+      : await env.VECTORIZE.query(vector, options);
+    matches = result.matches as VectorizeMatch[];
+  } catch (error) {
+    degraded = true;
+    console.error("Claim vector source filtering unavailable; using metadata fallback:", error);
+    const options = {
+      topK: 50,
+      returnMetadata: "all" as const,
+      filter: { embedding_fingerprint: fingerprint },
+    };
+    const result = env.SELFHOST === "1"
+      ? await (env.VECTORIZE as any).query(vector, { ...options, queryText })
+      : await env.VECTORIZE.query(vector, options);
+    matches = (result.matches as VectorizeMatch[]).filter(
+      (match) => (match.metadata as Record<string, unknown> | undefined)?.source === CLAIM_VECTOR_SOURCE
+    );
+  }
+  const claimIds = [...new Set(matches.map((match) =>
+    String((match.metadata as Record<string, unknown> | undefined)?.claimId ?? "")
+  ).filter(Boolean))];
+  const mappings = new Map<string, Set<string>>();
+  for (let offset = 0; offset < claimIds.length; offset += D1_MAX_BOUND_PARAMS) {
+    const batch = claimIds.slice(offset, offset + D1_MAX_BOUND_PARAMS);
+    const placeholders = batch.map(() => "?").join(", ");
+    const { results } = await env.DB.prepare(
+      `SELECT claim_id, vector_ids_json
+       FROM sb_claim_vectors
+       WHERE embedding_fingerprint = ? AND claim_id IN (${placeholders})`
+    ).bind(fingerprint, ...batch).all<{ claim_id: string; vector_ids_json: string }>();
+    for (const row of results ?? []) mappings.set(row.claim_id, new Set(parseVectorIds(row.vector_ids_json)));
+  }
+  const scores = new Map<string, number>();
+  for (const match of matches) {
+    const claimId = String((match.metadata as Record<string, unknown> | undefined)?.claimId ?? "");
+    if (!claimId || mappings.get(claimId)?.has(match.id) !== true) continue;
+    scores.set(claimId, Math.max(scores.get(claimId) ?? 0, Number(match.score ?? 0)));
+  }
+  return { scores, degraded };
+}
+
+async function recallHistoricalClaims(
+  params: {
+    query: string;
+    topK: number;
+    tag?: string;
+    after?: number;
+    before: number;
+    kind?: MemoryKind;
+  },
+  env: Env,
+  ctx: ExecutionContext,
+  vaultFilter: string | null,
+  runtimeOptions: { recordUsage?: boolean; allowClaimVectorBackfill?: boolean }
+): Promise<RecallSearchResult> {
+  const tokens = tokenizeQuery(params.query);
+  const graphSignals = await buildGraphRecallSignals(
+    params.query,
+    env,
+    params.before,
+    { claimSnapshot: true }
+  ).catch((error) => {
+    console.error("Historical graph recall signals failed (non-fatal):", error);
+    return new Map<string, GraphRecallSignal>();
+  });
+  const graphEntryIds = [...graphSignals.keys()];
+  let snapshot: ActiveEmbeddingSnapshot | null = null;
+  let semanticScores = new Map<string, number>();
+  let degraded = false;
+  try {
+    snapshot = await loadActiveEmbeddingSnapshot(env);
+    if (runtimeOptions.allowClaimVectorBackfill !== false) {
+      await backfillHistoricalClaimVectors(env, params.before, snapshot);
+    }
+    const queryVector = await embedWithProvider(snapshot.provider, params.query, "query");
+    const queried = await queryHistoricalClaimVectors(
+      env,
+      queryVector,
+      snapshot.fingerprint,
+      params.query
+    );
+    semanticScores = queried.scores;
+    degraded = queried.degraded;
+  } catch (error) {
+    degraded = true;
+    console.error("Historical Claim vector recall failed; using immutable keyword recall:", error);
+  }
+
+  const semanticClaimIds = [...semanticScores.keys()];
+  const lexicalClauses = tokens.map(() => "m.content LIKE ?");
+  const candidateClauses = [...lexicalClauses];
+  if (semanticClaimIds.length) {
+    candidateClauses.push(`m.id IN (${semanticClaimIds.map(() => "?").join(", ")})`);
+  }
+  if (graphEntryIds.length) {
+    candidateClauses.push(`m.entry_id IN (${graphEntryIds.map(() => "?").join(", ")})`);
+  }
+  if (!candidateClauses.length) return {
+    matches: [],
+    directEvidence: [],
+    relatedContext: [],
+    insight: "",
+    conflicts: [],
+    degraded,
+    degradedReason: degraded ? "embedding_failed" : undefined,
+  };
+  const bindings: Array<string | number> = [
+    ...tokens.map((token) => `%${token}%`),
+    ...semanticClaimIds,
+    ...graphEntryIds,
+  ];
+  let sql = `SELECT
+      m.id, m.entry_id, m.parent_version_id, m.content, m.content_hash,
+      m.kind, m.importance, m.confidence, m.claim_status,
+      COALESCE(m.observed_at, m.created_at) AS created_at,
+      e.tags, COALESCE(e.source, o.source_channel, o.source, 'claim') AS source
+    FROM sb_memories m
+    LEFT JOIN entries e ON e.id = m.entry_id
+    LEFT JOIN sb_memory_sources ms ON ms.id = (
+      SELECT ms_first.id FROM sb_memory_sources ms_first
+      WHERE ms_first.memory_id = m.id
+      ORDER BY ms_first.created_at ASC, ms_first.id ASC LIMIT 1
+    )
+    LEFT JOIN sb_observations o ON o.id = ms.observation_id
+    WHERE m.entry_id IS NOT NULL
+      AND m.content_hash IS NOT NULL
+      AND (${candidateClauses.join(" OR ")})
+      AND ${activeMemoryClaimPredicate("m", String(params.before))}`;
+  if (params.after !== undefined) {
+    sql += graphEntryIds.length
+      ? ` AND (COALESCE(m.observed_at, m.created_at) >= ? OR m.entry_id IN (${graphEntryIds.map(() => "?").join(", ")}))`
+      : ` AND COALESCE(m.observed_at, m.created_at) >= ?`;
+    bindings.push(params.after);
+    if (graphEntryIds.length) bindings.push(...graphEntryIds);
+  }
+  sql += ` AND COALESCE(m.observed_at, m.created_at) <= ?`;
+  bindings.push(params.before);
+  if (params.kind && (KIND_VALUES as readonly string[]).includes(params.kind)) {
+    sql += ` AND m.kind = ?`;
+    bindings.push(params.kind);
+  }
+  if (params.tag) {
+    sql += ` AND COALESCE(e.tags, '[]') LIKE ?`;
+    bindings.push(`%"${params.tag}"%`);
+  }
+  if (vaultFilter) {
+    sql += ` AND EXISTS (
+      SELECT 1 FROM sb_external_links l
+      WHERE l.entry_id = m.entry_id
+        AND l.provider = 'obsidian'
+        AND l.object_type = 'memory'
+        AND l.vault_id = ?
+    )`;
+    bindings.push(vaultFilter);
+  }
+  sql += ` ORDER BY COALESCE(m.observed_at, m.created_at) DESC LIMIT ?`;
+  bindings.push(Math.max(params.topK * 10, 50));
+  const { results } = await env.DB.prepare(sql).bind(...bindings).all<ClaimSnapshotRow>();
+
+  const scored = (results ?? []).map((row) => {
+    const lower = row.content.toLowerCase();
+    const keywordHits = tokens.filter((token) => lower.includes(token.toLowerCase())).length;
+    const keywordScore = tokens.length ? keywordHits / tokens.length : 0;
+    const semantic = semanticScores.get(row.id) ?? 0;
+    const evidence = Math.max(0, Math.min(1, Number(row.confidence ?? 0)));
+    const graph = graphSignals.get(row.entry_id);
+    return {
+      row,
+      score: semantic * 0.55 + keywordScore * 0.25 + evidence * 0.05 + (graph?.boost ?? 0),
+      semantic,
+      keywordScore,
+      graph,
+    };
+  }).sort((left, right) => right.score - left.score || right.row.created_at - left.row.created_at)
+    .slice(0, params.topK);
+  const maxScore = Math.max(0, ...scored.map((candidate) => candidate.score));
+  const matches: RecallMatch[] = scored.map(({ row, score, semantic, keywordScore, graph }) => {
+    let tags: string[] = [];
+    try {
+      const parsed = JSON.parse(row.tags || "[]");
+      tags = Array.isArray(parsed) ? parsed.map(String) : [];
+    } catch {
+      tags = [];
+    }
+    if (row.kind && !tags.includes(`kind:${row.kind}`)) tags = [...tags, `kind:${row.kind}`];
+    const normalizedScore = maxScore > 0 ? score / maxScore : 1;
+    return {
+      id: row.entry_id,
+      claimId: row.id,
+      parentVersionId: row.parent_version_id,
+      content: row.content,
+      score: normalizedScore,
+      createdAt: Number(row.created_at),
+      tags,
+      source: row.source ?? "claim",
+      isUpdate: row.claim_status === "superseded",
+      scoreDetails: roundScoreDetails({
+        semantic,
+        keyword: keywordScore,
+        entity: graph?.entity,
+        temporal: graph?.temporal,
+        relation: graph?.relation,
+        confidence: Number(row.confidence ?? 0),
+        importance: Math.max(0, Math.min(1, Number(row.importance ?? 0) / 5)),
+        final: normalizedScore,
+      }),
+      matchedEntities: graph?.entityNames.slice(0, 8),
+      graphFacts: graph?.facts.slice(0, 5),
+      timeBasis: graph?.temporalEvidence,
+    };
+  });
+  const conflictContext = await loadRecallConflictContext(
+    env.DB,
+    matches.map((match) => match.id),
+    params.before
+  );
+  for (const match of matches) {
+    match.claims = (conflictContext.claimsByEntry.get(match.id) ?? [])
+      .filter((claim) => claim.id === match.claimId);
+  }
+  const insightRows = matches.map((match) => ({
+    id: match.id,
+    content: match.content,
+    claims: match.claims,
+  }));
+  const synthesized = insightRows.length > 1
+    ? await synthesizeVerifiedInsight(
+      params.query,
+      { directEvidence: insightRows, relatedContext: [] },
+      env,
+      conflictContext.conflicts,
+      { asOf: params.before }
+    )
+    : insightRows.length === 1
+      ? renderSingleVerifiedInsight({ directEvidence: insightRows, relatedContext: [] })
+      : { answer: "", verifiedClaims: [], unverifiedClaims: [] };
+  if (runtimeOptions.recordUsage !== false) {
+    ctx.waitUntil(Promise.all(matches.map((match) =>
+      env.DB.prepare(`UPDATE entries SET recall_count = recall_count + 1 WHERE id = ?`)
+        .bind(match.id).run()
+    )).catch((error) => console.error("historical recall_count update failed (non-fatal):", error)));
+  }
+  return {
+    matches,
+    directEvidence: [...matches],
+    relatedContext: [],
+    insight: synthesized.answer,
+    verifiedClaims: synthesized.verifiedClaims,
+    unverifiedClaims: synthesized.unverifiedClaims,
+    conflicts: conflictContext.conflicts,
+    retrievalMode: "claim_snapshot",
+    snapshotAt: params.before,
+    degraded,
+    degradedReason: degraded ? "embedding_failed" : undefined,
+  };
+}
+
 export async function recallEntries(
   params: {
     query: string;
@@ -7702,7 +8245,8 @@ export async function recallEntries(
   },
   env: Env,
   ctx: ExecutionContext,
-  vaultFilter: string | null = null
+  vaultFilter: string | null = null,
+  runtimeOptions: { recordUsage?: boolean; allowClaimVectorBackfill?: boolean } = {}
 ): Promise<RecallSearchResult> {
   const { query, topK } = params;
   const associationHops = Math.max(0, Math.min(2, Math.trunc(params.hops ?? 0)));
@@ -7717,6 +8261,17 @@ export async function recallEntries(
     after = parsed.after;
     before = parsed.before;
     embedQuery = parsed.cleanQuery;
+  }
+
+  if (before !== undefined && before < now) {
+    return recallHistoricalClaims({
+      query: embedQuery,
+      topK,
+      tag,
+      after,
+      before,
+      kind,
+    }, env, ctx, vaultFilter, runtimeOptions);
   }
 
   const tokens = tokenizeQuery(embedQuery);
@@ -8105,13 +8660,15 @@ export async function recallEntries(
   });
 
   // Increment recall_count for entries actually shown.
-  ctx.waitUntil(
-    Promise.all(
-      matches.map(match =>
-        env.DB.prepare(`UPDATE entries SET recall_count = recall_count + 1 WHERE id = ?`).bind(match.id).run()
-      )
-    ).catch(e => console.error("recall_count update failed (non-fatal):", e))
-  );
+  if (runtimeOptions.recordUsage !== false) {
+    ctx.waitUntil(
+      Promise.all(
+        matches.map(match =>
+          env.DB.prepare(`UPDATE entries SET recall_count = recall_count + 1 WHERE id = ?`).bind(match.id).run()
+        )
+      ).catch(e => console.error("recall_count update failed (non-fatal):", e))
+    );
+  }
 
   // Normalize fused scores to 0–1 (top = 1.0) as a relative rank scale — not probability
   // or semantic similarity. Callers should label with formatRelevanceLabel(), not "% match".
@@ -8224,26 +8781,28 @@ export async function recallEntries(
     row.claims = conflictContext.claimsByEntry.get(row.id) ?? [];
   }
 
-  const insight = directInsightRows.length + relatedInsightRows.length > 1
-    ? await synthesizeInsight(embedQuery, {
+  const synthesized = directInsightRows.length + relatedInsightRows.length > 1
+    ? await synthesizeVerifiedInsight(embedQuery, {
         directEvidence: directInsightRows,
         relatedContext: relatedInsightRows,
-      }, env, conflictContext.conflicts)
-    : "";
-
-  if (directInsightRows.length >= 5) {
-    ctx.waitUntil(
-      derivePattern(directInsightRows, env, ctx)
-        .catch(e => console.error("derivePattern failed (non-fatal):", e))
-    );
-  }
+      }, env, conflictContext.conflicts, { asOf: recallAsOf })
+    : directInsightRows.length === 1
+      ? renderSingleVerifiedInsight({
+        directEvidence: directInsightRows,
+        relatedContext: relatedInsightRows,
+      })
+      : { answer: "", verifiedClaims: [], unverifiedClaims: [] };
 
   return {
     matches,
     directEvidence: directMatches,
     relatedContext: matches.filter((match) => Boolean(match.association)),
-    insight,
+    insight: synthesized.answer,
+    verifiedClaims: synthesized.verifiedClaims,
+    unverifiedClaims: synthesized.unverifiedClaims,
     conflicts: conflictContext.conflicts,
+    retrievalMode: "entry_projection",
+    snapshotAt: recallAsOf,
     degraded: embeddingFailed || vectorQueryDegraded,
     degradedReason: embeddingFailed
       ? "embedding_failed"
@@ -9056,7 +9615,7 @@ export async function extractAtomicFacts(
 const ATOMIC_EXTRACTION_BASE_BACKOFF_MS = 60_000;
 const ATOMIC_EXTRACTION_DEFAULT_LIMIT = 10;
 const ATOMIC_EXTRACTION_SELFHOST_LIMIT = 50;
-const ATOMIC_EXTRACTION_CLOUDFLARE_LIMIT = 10;
+const ATOMIC_EXTRACTION_CLOUDFLARE_LIMIT = 3;
 
 interface ObservationExtractionRow {
   id: string;
@@ -10128,6 +10687,7 @@ async function captureSingleFact(
   })).statement);
   await env.DB.batch(statements);
 
+  let atomicMemoryId: string | null = null;
   if (options.observationId) {
     const atomicWrite = await dualWriteAtomicMemory(env, {
       entryId: id,
@@ -10157,6 +10717,7 @@ async function captureSingleFact(
         reason: atomicWrite.error,
       };
     }
+    atomicMemoryId = atomicWrite.memoryId;
     if (contradiction.detected && contradiction.conflicting_id) {
       try {
         await linkPendingEntryConflictClaims(env.DB, {
@@ -10184,11 +10745,25 @@ async function captureSingleFact(
     }, source);
   }
 
-  ctx.waitUntil(
-    storeEntry(env, id, c, finalTags, source, now)
-      .then(() => logMemoryEvent(id, "vectorized", {}, source))
-      .catch(e => console.error("Vectorize insert failed (non-fatal):", e))
-  );
+  const entryVectorTask = storeEntry(env, id, c, finalTags, source, now);
+  ctx.waitUntil(entryVectorTask
+    .then(() => logMemoryEvent(id, "vectorized", {}, source))
+    .catch(e => console.error("Vectorize insert failed (non-fatal):", e)));
+  if (atomicMemoryId) {
+    ctx.waitUntil(entryVectorTask
+      .then(() => indexClaimSnapshotVector(env, {
+        claimId: atomicMemoryId,
+        entryId: id,
+        parentVersionId: options.parentVersionId ?? null,
+        content: c,
+        contentHash,
+        createdAt: now,
+      }))
+      .catch(error => console.error(
+        "Claim vector indexing failed; historical keyword recall remains available:",
+        error
+      )));
+  }
 
   // Skip async classify when extractor already provided kind + scores.
   if (!options.atomic?.kind) {
@@ -10976,7 +11551,11 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
         directEvidence = matches.filter((match) => !match.association),
         relatedContext = matches.filter((match) => Boolean(match.association)),
         insight,
+        verifiedClaims = [],
+        unverifiedClaims = [],
         conflicts = [],
+        retrievalMode = "entry_projection",
+        snapshotAt,
         degraded,
         degradedReason,
       } = await recallEntries({
@@ -11027,7 +11606,14 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
           `- ${conflict.id}: ${conflict.claimIds.join(" vs ")}${conflict.reason ? ` (${conflict.reason})` : ""}`
         ).join("\n")}\n\n---\n\n`
         : "";
-      const finalText = degradedText + conflictText + (insight ? `**Insight:** ${insight}\n\n---\n\n${text}` : text);
+      const rejectedText = unverifiedClaims.length
+        ? `**Rejected unsupported claims:** ${unverifiedClaims.length}\n\n---\n\n`
+        : "";
+      const verifiedText = verifiedClaims.length
+        ? `**Verified answer claims:** ${verifiedClaims.length}\n\n`
+        : "";
+      const finalText = degradedText + conflictText + rejectedText + verifiedText +
+        (insight ? `**Insight:** ${insight}\n\n---\n\n${text}` : text);
       return { content: [{ type: "text", text: finalText }] };
     }
   );
@@ -11442,7 +12028,10 @@ async function withRequestTelemetry(
 
 const defaultHandler = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    return withRequestTelemetry(request, env, ctx, async () => {
+    if (request.method === "OPTIONS") {
+      return applyManagementCors(request, new Response(null, { status: 200 }), env);
+    }
+    const response = await withRequestTelemetry(request, env, ctx, async () => {
     const url = new URL(request.url);
 
     // OAuth authorize endpoint — hosted login page for browser-based MCP clients.
@@ -11533,10 +12122,6 @@ const defaultHandler = {
 
     await ensureDatabase(env);
 
-    if (request.method === "OPTIONS") {
-      return new Response(null, { headers: CORS_HEADERS });
-    }
-
     // GET /config — public site URLs for UI / deployers (no secrets)
     if (
       (url.pathname === "/config" || url.pathname === "/config.json") &&
@@ -11612,13 +12197,16 @@ const defaultHandler = {
       const sourceIdentity = `${body.client}:${body.repository}:${body.branch}:${body.sessionId}`;
       const contentHash = await contentFingerprint(body.transcript);
       const structuredMessagesHash = sessionMessages.length
-        ? await contentFingerprint(JSON.stringify(sessionMessages))
+        ? await contentFingerprint(JSON.stringify(sessionMessages.map((message) => ({
+          role: message.role,
+          content: message.content,
+        }))))
         : null;
       const auditAfterHash = structuredMessagesHash
         ? await contentFingerprint(JSON.stringify({ contentHash, structuredMessagesHash }))
         : contentHash;
       const previous = await env.DB.prepare(
-        `SELECT id, content_hash, revision
+        `SELECT id, content_hash, revision, metadata_json
          FROM sb_observations
          WHERE source_channel = ? AND source_identity = ?
          ORDER BY revision DESC, created_at DESC
@@ -11627,8 +12215,36 @@ const defaultHandler = {
         id: string;
         content_hash: string | null;
         revision: number;
+        metadata_json: string | null;
       }>();
-      if (previous?.content_hash === contentHash) {
+      let previousMetadata: Record<string, unknown> = {};
+      try {
+        previousMetadata = JSON.parse(previous?.metadata_json || "{}");
+      } catch {
+        previousMetadata = {};
+      }
+      const previousStructuredMessagesHash = typeof previousMetadata.structured_messages_hash === "string"
+        ? previousMetadata.structured_messages_hash
+        : null;
+      const supplementsStructuredMessages = Boolean(
+        previous?.content_hash === contentHash &&
+        structuredMessagesHash &&
+        !previousStructuredMessagesHash &&
+        structuredMessagesHash !== previousStructuredMessagesHash
+      );
+      if (
+        previous?.content_hash === contentHash &&
+        previousStructuredMessagesHash &&
+        structuredMessagesHash &&
+        previousStructuredMessagesHash !== structuredMessagesHash
+      ) {
+        return json({
+          ok: false,
+          error: "development_session_structured_messages_conflict",
+          currentRevision: Number(previous.revision),
+        }, 409);
+      }
+      if (previous?.content_hash === contentHash && !supplementsStructuredMessages) {
         return json({
           ok: true,
           source: body.client,
@@ -11636,8 +12252,10 @@ const defaultHandler = {
           observationId: previous.id,
         });
       }
-      const revision = body.revision ?? Math.max(1, Number(previous?.revision ?? 0) + 1);
-      if (previous && revision <= Number(previous.revision)) {
+      const revision = supplementsStructuredMessages
+        ? Number(previous?.revision ?? 1)
+        : body.revision ?? Math.max(1, Number(previous?.revision ?? 0) + 1);
+      if (previous && !supplementsStructuredMessages && revision <= Number(previous.revision)) {
         return json({
           ok: false,
           error: "stale_development_session_revision",
@@ -11655,7 +12273,9 @@ const defaultHandler = {
           sessionId: body.sessionId,
         },
       });
-      const observationId = crypto.randomUUID();
+      const observationId = supplementsStructuredMessages && previous
+        ? previous.id
+        : crypto.randomUUID();
       const createdAt = Date.now();
       const messagePlans = planDevelopmentSessionEvidence(sessionMessages, {
         sourceIdentity,
@@ -11663,6 +12283,7 @@ const defaultHandler = {
         capturedAt: provenance.sourceTimestamp ?? createdAt,
       });
       const metadata = {
+        ...previousMetadata,
         content_stage: "raw_evidence",
         evidence_type: provenance.evidenceType,
         extraction_skipped_reason: messagePlans.length
@@ -11677,7 +12298,9 @@ const defaultHandler = {
       };
       const auditEvent = await prepareComplianceAuditEvent(env.DB, {
         ...auditActorFromPrincipal(auth.principal),
-        action: "evidence.development_session_captured",
+        action: supplementsStructuredMessages
+          ? "evidence.development_session_structured_messages_supplemented"
+          : "evidence.development_session_captured",
         objectType: "observation",
         objectId: observationId,
         afterHash: auditAfterHash,
@@ -11700,7 +12323,7 @@ const defaultHandler = {
            ORDER BY revision DESC, created_at DESC
            LIMIT 1`
         ).bind(body.client, plan.sourceIdentity).first<{ id: string }>();
-        const parent = plan.role === "user" ? {
+        const parent = plan.extractionStatus === "pending" ? {
           parentId: `development:${plan.sourceIdentity}`,
           versionId: crypto.randomUUID(),
           versionNumber: revision,
@@ -11710,6 +12333,7 @@ const defaultHandler = {
           content_stage: plan.role === "user" ? "message_evidence" : "ai_projection",
           evidence_type: plan.evidenceType,
           message_role: plan.role,
+          message_intent: plan.messageIntent,
           message_id: plan.messageId ?? null,
           message_index: plan.messageIndex,
           session_observation_id: observationId,
@@ -11757,8 +12381,13 @@ const defaultHandler = {
           createdAt,
         }),
       ]);
-      await env.DB.batch([
-        prepareObservationInsert(env.DB, {
+      const transcriptStatement = supplementsStructuredMessages
+        ? env.DB.prepare(
+          `UPDATE sb_observations
+           SET metadata_json = ?
+           WHERE id = ? AND content_hash = ?`
+        ).bind(JSON.stringify(metadata), observationId, contentHash)
+        : prepareObservationInsert(env.DB, {
           id: observationId,
           content: body.transcript,
           source: body.client,
@@ -11775,50 +12404,31 @@ const defaultHandler = {
           extractionStatus: "succeeded",
           processedAt: createdAt,
           createdAt,
-        }),
+        });
+      await env.DB.batch([
+        transcriptStatement,
         ...messageStatements,
         auditEvent.statement,
       ]);
-      const userMessages = plannedMessages.filter((message) => message.plan.role === "user");
-      if (userMessages.length) {
-        ctx.waitUntil(
-          Promise.all(userMessages.map(async (message) => {
-            const result = await processObservationExtraction({
-              id: message.id,
-              content: message.plan.content,
-              source: body.client,
-              metadata_json: message.metadataJson,
-              created_at: createdAt,
-              content_hash: message.contentHash,
-              extraction_status: "pending",
-              extraction_version: ATOMIC_EXTRACTION_VERSION,
-              extraction_attempts: 0,
-              extraction_error: null,
-              next_attempt_at: null,
-              processing_started_at: null,
-              processed_at: null,
-              needs_reprocess: 0,
-              previous_evidence_id: message.previousEvidenceId,
-              root_evidence_id: message.plan.rootEvidenceId,
-              source_identity: message.plan.sourceIdentity,
-              source_channel: body.client,
-              revision,
-            }, env, ctx);
-            if (result.status === "failed") {
-              console.error("Development session message distillation failed:", result.error);
-            }
-          })).then(() => undefined)
-        );
-      }
+      const queuedUserMessages = plannedMessages.filter(
+        (message) => message.plan.role === "user" && message.plan.extractionStatus === "pending"
+      );
+      const archivedUserMessages = plannedMessages.filter(
+        (message) => message.plan.role === "user" && message.plan.extractionStatus !== "pending"
+      );
+      const assistantMessages = plannedMessages.filter((message) => message.plan.role === "assistant");
       return json({
         ok: true,
         source: body.client,
-        status: "stored_raw_evidence",
+        status: supplementsStructuredMessages
+          ? "structured_messages_supplemented"
+          : "stored_raw_evidence",
         observationId,
         revision,
         distillation: {
-          userMessagesQueued: userMessages.length,
-          assistantMessagesArchived: plannedMessages.length - userMessages.length,
+          userMessagesQueued: queuedUserMessages.length,
+          userMessagesArchived: archivedUserMessages.length,
+          assistantMessagesArchived: assistantMessages.length,
         },
       });
     }
@@ -12559,7 +13169,11 @@ const defaultHandler = {
         directEvidence = matches.filter((match) => !match.association),
         relatedContext = matches.filter((match) => Boolean(match.association)),
         insight,
+        verifiedClaims = [],
+        unverifiedClaims = [],
         conflicts = [],
+        retrievalMode = "entry_projection",
+        snapshotAt,
         degraded,
         degradedReason,
       } = await recallEntries({
@@ -12571,7 +13185,10 @@ const defaultHandler = {
         kind,
         hops,
         associationDirection,
-      }, env, ctx, vaultId);
+      }, env, ctx, vaultId, {
+        recordUsage: false,
+        allowClaimVectorBackfill: false,
+      });
 
       if (!matches.length) {
         return json({
@@ -12586,10 +13203,15 @@ const defaultHandler = {
       return json({
         ok: true,
         mode: "semantic",
+        retrieval_mode: retrievalMode,
+        snapshot_at: snapshotAt ?? null,
         degraded_mode: Boolean(degraded),
         degraded_reason: degradedReason ?? null,
         results: matches.map(m => ({
           id: m.id,
+          claim_id: m.claimId ?? null,
+          parent_version_id: m.parentVersionId ?? null,
+          snapshot_at: m.snapshotAt ?? null,
           content: m.content,
           // Relative rank score 0–100 (top=100). Not probability or cosine accuracy.
           score: parseFloat((m.score * 100).toFixed(1)),
@@ -12611,6 +13233,14 @@ const defaultHandler = {
           content: match.content,
           claims: match.claims ?? [],
         })),
+        claim_context: buildCitableInsightClaims({
+          directEvidence: directEvidence.map((match) => ({
+            id: match.id,
+            content: match.content,
+            claims: match.claims,
+          })),
+          relatedContext: [],
+        }),
         relatedContext: relatedContext.map((match, index) => ({
           ref: `R${index + 1}`,
           id: match.id,
@@ -12619,6 +13249,8 @@ const defaultHandler = {
         })),
         conflicts,
         insight: insight || null,
+        verified_claims: verifiedClaims,
+        unverified_claims: unverifiedClaims,
       });
     }
 
@@ -13104,12 +13736,41 @@ const defaultHandler = {
       });
     }
 
-    // GET /digest
-    if (url.pathname === "/digest" && request.method === "GET") {
+    // GET /digest/preview — inspect digest eligibility without creating data.
+    if (url.pathname === "/digest/preview" && request.method === "GET") {
       const auth = requireAuth(request, env);
       if (!auth.ok) return auth.response;
       const tag = url.searchParams.get("tag")?.trim();
       if (!tag) return json({ ok: false, error: "tag parameter is required" }, 400);
+      if (!isD1SafeTag(tag)) return json({ ok: false, error: "invalid tag" }, 400);
+      const row = await env.DB.prepare(
+        `SELECT COUNT(*) AS count FROM entries
+         WHERE tags LIKE ?
+           AND tags NOT LIKE '%"status:deprecated"%'
+           AND tags NOT LIKE '%"auto-pattern"%'`
+      ).bind(`%"${tag}"%`).first<{ count: number }>();
+      const sourceCount = Number(row?.count ?? 0);
+      return json({
+        ok: true,
+        tag,
+        source_count: sourceCount,
+        eligible: sourceCount >= 20,
+      });
+    }
+
+    // POST /digest — explicitly create a digest projection.
+    if (url.pathname === "/digest" && request.method === "POST") {
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
+      let body: { tag?: string } = {};
+      try {
+        body = await request.json();
+      } catch {
+        /* empty body may use the query parameter */
+      }
+      const tag = body.tag?.trim() || url.searchParams.get("tag")?.trim();
+      if (!tag) return json({ ok: false, error: "tag is required" }, 400);
+      if (!isD1SafeTag(tag)) return json({ ok: false, error: "invalid tag" }, 400);
 
       const result = await compressTag(tag, env, ctx);
 
@@ -13121,10 +13782,7 @@ const defaultHandler = {
     }
 
     // GET/POST /extract-pending
-    // Bounded, resumable atomic extraction worker. Capture still processes the
-    // current observation inline for compatibility; this endpoint repairs
-    // retryable and fallback observations without re-capturing raw input.
-    // Use dryRun=true to inspect upgrade/backlog risk without invoking the LLM.
+    // GET is always read-only queue inspection. POST performs a bounded drain.
     if (
       url.pathname === "/extract-pending" &&
       (request.method === "POST" || request.method === "GET")
@@ -13142,11 +13800,9 @@ const defaultHandler = {
       }
       const queryLimit = Number(url.searchParams.get("limit"));
       const limit = body.limit ?? (Number.isFinite(queryLimit) && queryLimit > 0 ? queryLimit : undefined);
-      const dryRun =
-        body.dryRun === true ||
-        url.searchParams.get("dryRun") === "1" ||
-        url.searchParams.get("dryRun") === "true";
-      if (dryRun) return json(await inspectExtractionQueue(env, limit));
+      if (request.method === "GET" || body.dryRun === true) {
+        return json(await inspectExtractionQueue(env, limit));
+      }
       return json(await processExtractionQueue(env, ctx, limit));
     }
 
@@ -14655,6 +15311,7 @@ const defaultHandler = {
 
     return new Response("Not found", { status: 404 });
     }); // withRequestTelemetry
+    return applyManagementCors(request, response, env);
   },
 };
 
@@ -14816,6 +15473,18 @@ export default {
     // enforce that scope at the MCP route. Reject misleading token scopes here.
     const tokenScopeError = await rejectUnsupportedOAuthTokenScope(req, url.pathname);
     if (tokenScopeError) return tokenScopeError;
+
+    // Reject scanner traffic before OAuthProvider, telemetry, or schema setup.
+    // The self-host server uses the same policy before forwarding to this Worker.
+    if (!isKnownWorkerRoute(req.method, url.pathname)) {
+      return new Response(JSON.stringify({ ok: false, error: "Not found" }), {
+        status: 404,
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": "no-store",
+        },
+      });
+    }
 
     // 3) Normalize origin so token WWW-Authenticate + redirects use public HTTPS
     const normalized = rewriteRequestPublicOrigin(

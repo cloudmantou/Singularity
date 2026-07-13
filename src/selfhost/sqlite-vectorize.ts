@@ -1095,6 +1095,14 @@ export class SqliteVectorizeIndex {
     if (typeof filter.source === "string") {
       clauses.push(`json_extract(${metadataExpression}, '$.source') = ?`);
       params.push(filter.source);
+    } else if (
+      filter.source &&
+      typeof filter.source === "object" &&
+      !Array.isArray(filter.source) &&
+      typeof (filter.source as Record<string, unknown>).$ne === "string"
+    ) {
+      clauses.push(`COALESCE(json_extract(${metadataExpression}, '$.source'), '') <> ?`);
+      params.push((filter.source as Record<string, unknown>).$ne);
     }
     if (typeof filter.embedding_fingerprint === "string") {
       clauses.push(`json_extract(${metadataExpression}, '$.embedding_fingerprint') = ?`);

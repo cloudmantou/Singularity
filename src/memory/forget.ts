@@ -1,5 +1,6 @@
 import { prepareMemoryRevision } from "./revisions";
 import { ensureAssociationDataModel } from "./associations";
+import { distinctFactEvidenceCountSql } from "./fact-evidence";
 
 const DERIVED_RELATION_TYPES = ["digest_of", "derived_from"] as const;
 const QUERY_BATCH_SIZE = 100;
@@ -258,6 +259,26 @@ async function loadAtomicGraphRows(
   };
 }
 
+async function loadClaimVectorIds(
+  db: D1Database,
+  memoryIds: string[]
+): Promise<string[] | null> {
+  const vectorIds: string[] = [];
+  for (const batch of chunks(memoryIds, QUERY_BATCH_SIZE)) {
+    const { results } = await db.prepare(
+      `SELECT vector_ids_json
+       FROM sb_claim_vectors
+       WHERE claim_id IN (${placeholders(batch.length)})`
+    ).bind(...batch).all<{ vector_ids_json: string }>();
+    for (const row of results) {
+      const parsed = parseVectorIds(row.vector_ids_json);
+      if (!parsed) return null;
+      vectorIds.push(...parsed);
+    }
+  }
+  return vectorIds;
+}
+
 function prepareDatabaseErase(
   db: D1Database,
   ids: string[],
@@ -312,6 +333,11 @@ function prepareDatabaseErase(
   });
   const atomicMemoryStatements = chunks(atomicGraph.memoryIds, DELETE_BATCH_SIZE).flatMap(batch => {
     const inList = placeholders(batch.length);
+    const survivingEvidenceCountSql = distinctFactEvidenceCountSql({
+      relationIdSql: "sb_entity_relations.id",
+      excludeMemoryIdCount: batch.length,
+      floorAtOne: true,
+    });
     return [
       db.prepare(
         `DELETE FROM sb_conflict_cases
@@ -334,11 +360,7 @@ function prepareDatabaseErase(
       ).bind(...batch, ...batch, ...batch, ...batch, ...batch, ...batch),
       db.prepare(
         `UPDATE sb_entity_relations
-         SET evidence_count = (
-               SELECT COUNT(*) FROM sb_fact_sources
-               WHERE relation_id = sb_entity_relations.id
-                 AND (memory_id IS NULL OR memory_id NOT IN (${inList}))
-             ),
+         SET evidence_count = ${survivingEvidenceCountSql},
              memory_id = (
                SELECT memory_id FROM sb_fact_sources
                WHERE relation_id = sb_entity_relations.id
@@ -440,6 +462,7 @@ function prepareDatabaseErase(
          WHERE source_parent_id NOT IN (SELECT parent_id FROM sb_parent_units)
             OR target_parent_id NOT IN (SELECT parent_id FROM sb_parent_units)`
       ),
+      db.prepare(`DELETE FROM sb_claim_vectors WHERE claim_id IN (${inList})`).bind(...batch),
       db.prepare(`DELETE FROM sb_memories WHERE id IN (${inList})`).bind(...batch),
     ];
   });
@@ -574,8 +597,10 @@ export async function forgetMemoryGraph(
   );
   if (!survivingDigestSources) return { status: "delete_failed" };
   const atomicGraph = await loadAtomicGraphRows(db, [...trackedIds]);
+  const claimVectorIds = await loadClaimVectorIds(db, atomicGraph.memoryIds);
+  if (!claimVectorIds) return { status: "delete_failed" };
 
-  const vectorIds: string[] = [];
+  const vectorIds: string[] = [...claimVectorIds];
   const rebuildExitCounts = new Map<string, number>();
   for (const row of rows) {
     const parsed = parseVectorIds(row.vector_ids);

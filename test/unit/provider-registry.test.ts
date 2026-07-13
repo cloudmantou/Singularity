@@ -57,4 +57,16 @@ describe("Knowledge Source Provider Registry", () => {
     expect(() => new KnowledgeSourceRegistry([OBSIDIAN_SOURCE_PROVIDER, duplicate]))
       .toThrow("Duplicate knowledge source provider: obsidian");
   });
+
+  it("normalizes lookup ids and rejects empty or unknown providers", () => {
+    const registry = new KnowledgeSourceRegistry([OBSIDIAN_SOURCE_PROVIDER]);
+    expect(registry.get(" OBSIDIAN ")).toBe(OBSIDIAN_SOURCE_PROVIDER);
+    expect(registry.get("missing")).toBeNull();
+    expect(registry.require("obsidian")).toBe(OBSIDIAN_SOURCE_PROVIDER);
+    expect(() => registry.require("missing")).toThrow("Unknown knowledge source provider: missing");
+    expect(() => new KnowledgeSourceRegistry([{
+      ...OBSIDIAN_SOURCE_PROVIDER,
+      id: "   ",
+    }])).toThrow("Knowledge source provider id is required");
+  });
 });

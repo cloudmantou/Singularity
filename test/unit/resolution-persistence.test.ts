@@ -260,20 +260,22 @@ describe("resolution persistence", () => {
     });
   });
 
-  it("counts revisions of one Evidence root as one independent Fact source", async () => {
+  it("counts revisions and AI derivations of one Evidence root as one independent Fact source", async () => {
     raw.prepare(
       `INSERT INTO sb_observations (
-         id, content, source, content_hash, root_evidence_id, revision, created_at
+         id, content, source, content_hash, root_evidence_id, revision, author_type, created_at
        ) VALUES
-         ('obs-root-a-v1', 'first revision', 'obsidian', 'hash-a1', 'root-a', 1, 1),
-         ('obs-root-a-v2', 'second revision', 'obsidian', 'hash-a2', 'root-a', 2, 2),
-         ('obs-root-b-v1', 'independent source', 'mcp', 'hash-b1', 'root-b', 1, 3)`
+         ('obs-root-a-v1', 'first revision', 'obsidian', 'hash-a1', 'root-a', 1, 'user', 1),
+         ('obs-root-a-v2', 'second revision', 'obsidian', 'hash-a2', 'root-a', 2, 'user', 2),
+         ('obs-root-a-ai', 'derived summary', 'system', 'hash-a3', 'root-a', 3, 'assistant', 3),
+         ('obs-root-b-v1', 'independent source', 'mcp', 'hash-b1', 'root-b', 1, 'user', 4)`
     ).run();
     raw.prepare(
       `INSERT INTO sb_memories (id, content, claim_status, entities_json, created_at)
        VALUES ('claim-a1', 'mtzs uses SQLite', 'supported', '[]', 1),
               ('claim-a2', 'mtzs uses SQLite', 'supported', '[]', 2),
-              ('claim-b1', 'mtzs uses SQLite', 'supported', '[]', 3)`
+              ('claim-ai', 'mtzs uses SQLite', 'supported', '[]', 3),
+              ('claim-b1', 'mtzs uses SQLite', 'supported', '[]', 4)`
     ).run();
     raw.prepare(
       `INSERT INTO sb_memory_sources (
@@ -281,7 +283,8 @@ describe("resolution persistence", () => {
        ) VALUES
          ('ms-a1', 'claim-a1', 'obs-root-a-v1', 'supports', 'supports', 'root-a', 1),
          ('ms-a2', 'claim-a2', 'obs-root-a-v2', 'supports', 'supports', 'root-a', 2),
-         ('ms-b1', 'claim-b1', 'obs-root-b-v1', 'supports', 'supports', 'root-b', 3)`
+         ('ms-ai', 'claim-ai', 'obs-root-a-ai', 'derived', 'derived_from', 'root-a', 3),
+         ('ms-b1', 'claim-b1', 'obs-root-b-v1', 'supports', 'supports', 'root-b', 4)`
     ).run();
     const resolver = new D1EntityResolver(db);
     const project = await resolver.resolve({ name: "mtzs", entityType: "project" }, { now: 1 });
@@ -291,7 +294,8 @@ describe("resolution persistence", () => {
     for (const [memoryId, observationId, createdAt] of [
       ["claim-a1", "obs-root-a-v1", 1],
       ["claim-a2", "obs-root-a-v2", 2],
-      ["claim-b1", "obs-root-b-v1", 3],
+      ["claim-ai", "obs-root-a-ai", 3],
+      ["claim-b1", "obs-root-b-v1", 4],
     ] as const) {
       const result = await resolveAndInsertEntityRelation(db, {
         fromEntityId: project.entityId,

@@ -96,6 +96,33 @@ describe("POST /capture", () => {
     expect(run).not.toHaveBeenCalled();
   });
 
+  it("keeps GET extraction inspection read-only even without dryRun", async () => {
+    const run = vi.fn();
+    env = makeTestEnv(db, { AI: { run } as unknown as Ai });
+    db.observations.push({
+      id: "pending-read-only",
+      content: "pending fact",
+      source: "api",
+      metadata_json: "{}",
+      extraction_status: "pending",
+      extraction_attempts: 0,
+      next_attempt_at: null,
+      processing_started_at: null,
+      extraction_version: 1,
+      needs_reprocess: 0,
+      created_at: 1,
+    });
+
+    const { ctx } = makeCtx();
+    const res = await worker.fetch(req("GET", "/extract-pending?limit=3"), env, ctx);
+    const body = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(body.dryRun).toBe(true);
+    expect(db.observations[0].extraction_status).toBe("pending");
+    expect(run).not.toHaveBeenCalled();
+  });
+
   it("stores valid entry and returns id", async () => {
     const { ctx } = makeCtx();
     const res = await worker.fetch(req("POST", "/capture", { body: { content: "Test note" } }), env, ctx);

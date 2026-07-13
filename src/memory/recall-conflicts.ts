@@ -109,9 +109,6 @@ async function loadEligibleClaims(
   const { results } = await db.prepare(
     `SELECT m.id, m.entry_id, m.content, m.claim_status
      FROM sb_memories m
-     JOIN entries e
-       ON e.id = m.entry_id
-      AND e.content_hash = m.content_hash
      WHERE m.id IN (${placeholders})
        AND m.entry_id IS NOT NULL
        AND m.content_hash IS NOT NULL
@@ -133,9 +130,6 @@ export async function loadRecallConflictContext(
   const { results: matchedClaims } = await db.prepare(
     `SELECT m.id, m.entry_id, m.content, m.claim_status
      FROM sb_memories m
-     JOIN entries e
-       ON e.id = m.entry_id
-      AND e.content_hash = m.content_hash
      WHERE m.entry_id IN (${entryPlaceholders})
        AND m.content_hash IS NOT NULL
        AND ${activeMemoryClaimPredicate("m", String(asOf), { requireActiveParentLink: true })}
