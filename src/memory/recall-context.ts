@@ -172,6 +172,54 @@ function answerHasNonClaimReference(answer: string): boolean {
   return /\[\s*[ER]\d+(?:\s*,\s*[ER]\d+)*\s*\]/i.test(answer);
 }
 
+function renderStructuredAnswer(
+  value: unknown,
+  unverifiedClaims: UnverifiedInsightClaim[]
+): string {
+  if (typeof value === "string") return value.trim();
+  if (!Array.isArray(value)) return "";
+  if (value.length > 5) {
+    unverifiedClaims.push({
+      text: "",
+      refs: [],
+      reason: "invalid_structured_response",
+    });
+    return "";
+  }
+
+  const paragraphs: string[] = [];
+  for (const paragraph of value) {
+    if (!paragraph || typeof paragraph !== "object" || Array.isArray(paragraph)) {
+      unverifiedClaims.push({ text: "", refs: [], reason: "invalid_structured_response" });
+      continue;
+    }
+    const record = paragraph as Record<string, unknown>;
+    const text = typeof record.text === "string"
+      ? normalizeClaimText(record.text).slice(0, 4_000)
+      : "";
+    const rawRefs = Array.isArray(record.refs) ? record.refs : [];
+    const refs = [...new Set(rawRefs
+      .filter((ref): ref is string => typeof ref === "string")
+      .map((ref) => ref.trim().toUpperCase())
+      .filter(Boolean))];
+    if (!text || rawRefs.some((ref) => typeof ref !== "string")) {
+      unverifiedClaims.push({ text, refs, reason: "invalid_structured_response" });
+      continue;
+    }
+    if (rawRefs.length > 10 || refs.length > 10) {
+      unverifiedClaims.push({ text, refs: refs.slice(0, 10), reason: "too_many_claim_refs" });
+      continue;
+    }
+    if (extractAnswerClaimRefs(text).length || answerHasNonClaimReference(text)) {
+      unverifiedClaims.push({ text, refs, reason: "invalid_answer_citation" });
+      continue;
+    }
+    const citationSuffix = refs.map((ref) => `[${ref}]`).join("");
+    paragraphs.push(citationSuffix ? `${text} ${citationSuffix}` : text);
+  }
+  return paragraphs.join("\n\n");
+}
+
 function buildInsightCitations(
   claims: readonly CitableInsightClaim[],
   verifiedClaims: readonly VerifiedInsightClaim[]
@@ -314,7 +362,7 @@ export function validateStructuredInsightResponse(
   }
 
   const answerValue = (parsed as Record<string, unknown>).answer;
-  const answer = typeof answerValue === "string" ? answerValue.trim() : "";
+  const answer = renderStructuredAnswer(answerValue, unverifiedClaims);
   const responseMetadata = {
     ...(answerabilityWarnings.length ? { answerabilityWarnings } : {}),
     ...(answerabilityMode !== "enforce" ? { answerabilityMode } : {}),

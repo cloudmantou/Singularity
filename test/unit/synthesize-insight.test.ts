@@ -74,7 +74,10 @@ describe("synthesizeInsight()", () => {
       expect(requestBody.response_format).toEqual({ type: "json_object" });
       expect(requestBody.max_tokens).toBeGreaterThanOrEqual(800);
       expect(requestBody.messages[0].content).toContain(
-        '{"answer":"","claims":[{"refs":["C1"],"kind":"fact"}]}'
+        '{"answer":[{"text":"","refs":["C1"]}],"claims":[{"refs":["C1"],"kind":"fact"}]}'
+      );
+      expect(requestBody.messages[0].content).toContain(
+        "The server renders Claim citations from each paragraph's refs"
       );
       expect(requestBody.messages[0].content).not.toContain(
         '{"answer":"","claims":[{"text":"","refs"'

@@ -205,10 +205,13 @@ describe("GET /recall", () => {
     );
     seedActiveClaimsForEntries(db, ["recent-singularity", "recent-mtzs"]);
     const activityAnswer = `<think>Group the current projects and cite each fact.</think>\n\n\`\`\`json\n${JSON.stringify({
-      answer: "你最近主要在推进 Singularity 和 mtzs 两个项目。[C1][C2]",
+      answer: [{
+        text: "你最近主要在推进 Singularity 和 mtzs 两个项目。",
+        refs: ["C1", "C2"],
+      }],
       claims: [
-        { text: "Singularity 当前正在完善自然语言 Recall 回答。", refs: ["C1"], kind: "fact" },
-        { text: "mtzs 当前正在验证设备运行时清理流程。", refs: ["C2"], kind: "fact" },
+        { refs: ["C1"], kind: "fact" },
+        { refs: ["C2"], kind: "fact" },
       ],
     })}\n\`\`\``;
     env = makeTestEnv(db, { AI: makeContradictionAI(activityAnswer) });
@@ -222,7 +225,7 @@ describe("GET /recall", () => {
 
     expect(res.status).toBe(200);
     expect(data.mode).toBe("recent_activity");
-    expect(data.answer).toBe("你最近主要在推进 Singularity 和 mtzs 两个项目。[C1][C2]");
+    expect(data.answer).toBe("你最近主要在推进 Singularity 和 mtzs 两个项目。 [C1][C2]");
     expect(data.answer).not.toBe(data.results.map((entry: any) => entry.content).join("\n"));
     expect(data.citations).toEqual(expect.arrayContaining([
       expect.objectContaining({ ref: "C1", evidenceId: "recent-singularity" }),

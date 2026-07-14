@@ -7066,10 +7066,10 @@ Unresolved conflicts:
 ${conflictsList}
 
 Rules:
-  - Return exactly one JSON object and no markdown: {"answer":"","claims":[{"refs":["C1"],"kind":"fact"}]}.
+  - Return exactly one JSON object and no markdown: {"answer":[{"text":"","refs":["C1"]}],"claims":[{"refs":["C1"],"kind":"fact"}]}.
   - C* references are the only citable Claims. E* labels identify Evidence containers and R* labels are navigation-only; never place E* or R* in refs.
-  - The answer field must be a concise natural-language answer in the user's language. You may paraphrase, combine, and organize supported Claims, but you must not infer, guess, or add facts.
-  - Put one or more local citations such as [C1] or [C1][C2] in every factual paragraph of the answer. Do not cite Evidence labels or Association labels in the answer.
+  - The answer field must contain one to five concise natural-language paragraph objects in the user's language. You may paraphrase, combine, and organize supported Claims, but you must not infer, guess, or add facts.
+  - Put the C* refs supporting each paragraph in that paragraph object's refs array. Do not write citation markers inside text. The server renders Claim citations from each paragraph's refs.
   - The claims array is a source ledger, not the answer. Select refs and kind only; do not copy Claim text. The server resolves the immutable Claim text from each ref.
 - ${answerabilityMode === "shadow"
     ? "Answerability is evaluated after model selection; choose the most relevant Claims from the evidence without relying on a server answerability label."
@@ -7077,8 +7077,8 @@ Rules:
 - A contested Claim or a Claim with conflicts cannot be emitted as kind="fact".
 - A Claim listed under Conflict-only Claims cannot support kind="fact".
 - To disclose an unresolved conflict, use kind="conflict" and cite at least two C* refs that share the same conflict ID. The server will render the conflict text.
-  - The server will reject prose whose citations do not map to the verified claims or whose factual paragraphs lack citations.
-  - If no Claim supports an answer, treat the verified evidence as insufficient and return {"answer":"","claims":[]}.
+  - The server will reject paragraph refs that do not map to the verified Claim ledger or factual paragraphs without refs.
+  - If no Claim supports an answer, treat the verified evidence as insufficient and return {"answer":[],"claims":[]}.
 - These Claims are a retrieved subset, not the user's full memory store.${activityRules}`;
 
   let insight = "";

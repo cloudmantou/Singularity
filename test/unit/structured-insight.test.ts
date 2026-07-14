@@ -18,6 +18,39 @@ const sqliteClaim: CitableInsightClaim = {
 };
 
 describe("validateStructuredInsightResponse", () => {
+  it("renders structured answer paragraphs with server-owned Claim citations", () => {
+    const result = validateStructuredInsightResponse(JSON.stringify({
+      answer: [{
+        text: "根据已验证记忆，项目当前使用 SQLite。",
+        refs: ["C1"],
+      }],
+      claims: [{ refs: ["C1"], kind: "fact" }],
+    }), [sqliteClaim]);
+
+    expect(result.answer).toBe("根据已验证记忆，项目当前使用 SQLite。 [C1]");
+    expect(result.verifiedClaims).toEqual([{
+      text: sqliteClaim.statement,
+      refs: ["C1"],
+      kind: "fact",
+    }]);
+    expect(result.citations).toEqual([expect.objectContaining({
+      ref: "C1",
+      claimId: "claim-1",
+      evidenceId: "entry-1",
+    })]);
+    expect(result.unverifiedClaims).toEqual([]);
+  });
+
+  it("rejects a structured answer paragraph whose ref is not in the verified ledger", () => {
+    const result = validateStructuredInsightResponse(JSON.stringify({
+      answer: [{ text: "项目当前使用 SQLite。", refs: ["C2"] }],
+      claims: [{ refs: ["C1"], kind: "fact" }],
+    }), [sqliteClaim]);
+
+    expect(result.answer).toBe(INSUFFICIENT_VERIFIED_EVIDENCE);
+    expect(result.unverifiedClaims[0]?.reason).toBe("unknown_claim_ref");
+  });
+
   it("accepts a ref-only Claim ledger and resolves the statement server-side", () => {
     const result = validateStructuredInsightResponse(JSON.stringify({
       answer: "根据已验证记忆，项目当前使用 SQLite。[C1]",
