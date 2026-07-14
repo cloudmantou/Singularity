@@ -314,6 +314,8 @@ export interface PreparedComplianceAuditEvent {
   statement: D1PreparedStatement;
 }
 
+export type ComplianceAuditEventRecord = PreparedComplianceAuditEvent["record"];
+
 export interface ComplianceAuditChainVerification {
   valid: boolean;
   complete: boolean;
@@ -451,6 +453,19 @@ export async function acquireAuditImportLock(
   if (Number(result.meta?.changes ?? 0) !== 1) throw new Error("audit_import_in_progress");
 }
 
+export async function renewAuditImportLock(
+  db: D1Database,
+  ownerId: string,
+  now = Date.now()
+): Promise<void> {
+  const result = await db.prepare(
+    `UPDATE sb_maintenance_locks
+     SET expires_at = ?
+     WHERE lock_name = ? AND owner_id = ? AND expires_at > ?`
+  ).bind(now + AUDIT_IMPORT_LOCK_MS, AUDIT_IMPORT_LOCK_NAME, ownerId, now).run();
+  if (Number(result.meta?.changes ?? 0) !== 1) throw new Error("audit_import_lock_lost");
+}
+
 export async function releaseAuditImportLock(db: D1Database, ownerId: string): Promise<void> {
   await db.prepare(
     `DELETE FROM sb_maintenance_locks WHERE lock_name = ? AND owner_id = ?`
@@ -463,6 +478,12 @@ async function sha256Hex(value: string): Promise<string> {
   return Array.from(new Uint8Array(digest), (byte) =>
     byte.toString(16).padStart(2, "0")
   ).join("");
+}
+
+export async function computeComplianceAuditEventHash(
+  record: Omit<ComplianceAuditEventRecord, "event_hash"> | ComplianceAuditEventRecord
+): Promise<string> {
+  return sha256Hex(stableJson({ ...record, event_hash: "" }));
 }
 
 async function latestAuditEventHash(db: D1Database): Promise<string | null> {
@@ -523,7 +544,7 @@ export async function verifyComplianceAuditChain(
 
   for (let index = 0; index < rows.length; index++) {
     const row = rows[index];
-    const expected = await sha256Hex(stableJson({ ...row, event_hash: "" }));
+    const expected = await computeComplianceAuditEventHash(row);
     if (expected !== row.event_hash) {
       return {
         valid: false,
@@ -653,7 +674,7 @@ export async function prepareComplianceAuditEvent(
     previous_event_hash: previousEventHash,
     event_hash: "",
   };
-  record.event_hash = await sha256Hex(stableJson(record));
+  record.event_hash = await computeComplianceAuditEventHash(record);
   const entryGuard = input.writeGuard?.entryId && input.writeGuard.entryContentHash != null
     ? `WHERE EXISTS (
          SELECT 1 FROM entries audit_entry_guard
@@ -715,6 +736,18 @@ export async function recordComplianceAuditEvent(
   db: D1Database,
   input: ComplianceAuditEventInput
 ): Promise<void> {
-  const prepared = await prepareComplianceAuditEvent(db, input);
-  await prepared.statement.run();
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const prepared = await prepareComplianceAuditEvent(db, input);
+      await prepared.statement.run();
+      return;
+    } catch (error) {
+      lastError = error;
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes("audit_chain_head_conflict") || attempt === 2) throw error;
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }

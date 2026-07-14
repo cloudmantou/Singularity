@@ -3,9 +3,12 @@ import { ensureEntityResolutionDataModel } from "./entities";
 import {
   acquireAuditImportLock,
   analyzeAuditChainRows,
+  computeComplianceAuditEventHash,
   ensureConflictClaimSchema,
   releaseAuditImportLock,
+  renewAuditImportLock,
   type AuditChainNode,
+  type ComplianceAuditEventRecord,
 } from "./quality";
 import { ensureAssociationDataModel } from "./associations";
 import { MEMORY_MUTATION_SCHEMA_STATEMENTS } from "./mutations";
@@ -38,8 +41,12 @@ const MEMORY_BACKUP_FEATURES = [
   "entry-mutation-journal-audit-only",
 ] as const;
 
-export const AUDIT_IMPORT_MODES = ["replace_empty", "append_verified", "separate_chain"] as const;
+export const AUDIT_IMPORT_MODES = ["replace_empty", "append_verified"] as const;
 export type AuditImportMode = (typeof AUDIT_IMPORT_MODES)[number];
+export type AuditImportModeInput = AuditImportMode | "separate_chain";
+
+const AUDIT_IMPORT_BATCH_SIZE = 80;
+const auditLockHeartbeats = new WeakMap<object, () => Promise<void>>();
 
 const GRAPH_ARRAY_KEYS = [
   "scopes",
@@ -133,7 +140,9 @@ export interface MemoryBackupImportResult extends ImportResult {
 }
 
 export interface MemoryBackupImportOptions extends ImportOptions {
-  auditMode?: AuditImportMode;
+  auditMode?: AuditImportModeInput;
+  /** Use a self-host SQLite transaction around the complete restore. */
+  atomic?: boolean;
 }
 
 function arrayFrom(value: unknown): BackupRow[] {
@@ -654,6 +663,10 @@ function insertVerb(mode: ImportMode): "INSERT OR IGNORE" | "INSERT OR REPLACE" 
   return mode === "overwrite" ? "INSERT OR REPLACE" : "INSERT OR IGNORE";
 }
 
+async function heartbeatAuditImport(db: D1Database): Promise<void> {
+  await auditLockHeartbeats.get(db)?.();
+}
+
 async function importTable(
   db: D1Database,
   rows: BackupRow[],
@@ -666,26 +679,75 @@ async function importTable(
     failed: 0,
   };
   if (rows.length === 0) return stats;
-  const statements = rows.map(prepare);
-  const results = await db.batch(statements);
-  for (const result of results) {
-    const changes = Number(result.meta?.changes ?? 0);
-    if (changes > 0) stats.imported += 1;
-    else stats.skipped += 1;
+  for (let offset = 0; offset < rows.length; offset += AUDIT_IMPORT_BATCH_SIZE) {
+    await heartbeatAuditImport(db);
+    const statements = rows.slice(offset, offset + AUDIT_IMPORT_BATCH_SIZE).map(prepare);
+    const results = await db.batch(statements);
+    for (const result of results) {
+      const changes = Number(result.meta?.changes ?? 0);
+      if (changes > 0) stats.imported += 1;
+      else stats.skipped += 1;
+    }
+    await heartbeatAuditImport(db);
   }
   return stats;
 }
 
 interface AuditImportPlan {
-  mode: Exclude<AuditImportMode, "separate_chain">;
+  mode: AuditImportMode;
   rows: BackupRow[];
 }
 
-function auditNodeFromBackupRow(row: BackupRow): AuditChainNode {
+function auditRecordFromBackupRow(row: BackupRow): ComplianceAuditEventRecord {
   return {
-    eventHash: requiredText(row, "event_hash"),
-    previousEventHash: textOrNull(row, "previous_event_hash"),
+    id: requiredText(row, "id"),
+    occurred_at: intOrDefault(row, "occurred_at", Date.now()),
+    trace_id: textOrNull(row, "trace_id"),
+    actor_type: textOrDefault(row, "actor_type", "system"),
+    actor_id: textOrNull(row, "actor_id"),
+    token_id: textOrNull(row, "token_id"),
+    action: textOrDefault(row, "action", "imported"),
+    object_type: textOrDefault(row, "object_type", "unknown"),
+    object_id: textOrNull(row, "object_id"),
+    vault_id: textOrNull(row, "vault_id"),
+    before_hash: textOrNull(row, "before_hash"),
+    after_hash: textOrNull(row, "after_hash"),
+    success: intOrDefault(row, "success", 1),
+    error_code: textOrNull(row, "error_code"),
+    metadata_json: jsonText(row, "metadata_json", "{}"),
+    previous_event_hash: textOrNull(row, "previous_event_hash"),
+    event_hash: requiredText(row, "event_hash"),
   };
+}
+
+function auditNodeFromRecord(record: ComplianceAuditEventRecord): AuditChainNode {
+  return {
+    eventHash: record.event_hash,
+    previousEventHash: record.previous_event_hash,
+  };
+}
+
+function auditNodeFromBackupRow(row: BackupRow): AuditChainNode {
+  return auditNodeFromRecord(auditRecordFromBackupRow(row));
+}
+
+async function verifyAuditBackupRows(
+  db: D1Database,
+  rows: BackupRow[]
+): Promise<{ records: ComplianceAuditEventRecord[]; nodes: AuditChainNode[] }> {
+  const records: ComplianceAuditEventRecord[] = [];
+  for (let index = 0; index < rows.length; index++) {
+    if (index % AUDIT_IMPORT_BATCH_SIZE === 0) await heartbeatAuditImport(db);
+    const record = auditRecordFromBackupRow(rows[index]);
+    const expectedHash = await computeComplianceAuditEventHash(record);
+    if (expectedHash !== record.event_hash) {
+      throw new Error(`audit_event_hash_mismatch:${record.id}`);
+    }
+    records.push(record);
+  }
+  const nodes = records.map(auditNodeFromRecord);
+  await heartbeatAuditImport(db);
+  return { records, nodes };
 }
 
 function sortAuditRows(rows: BackupRow[], shape: ReturnType<typeof analyzeAuditChainRows>): BackupRow[] {
@@ -726,54 +788,70 @@ async function rejectExistingAuditHashes(
 async function prepareAuditImport(
   db: D1Database,
   rows: BackupRow[],
-  requestedMode?: AuditImportMode
+  requestedMode?: AuditImportModeInput
 ): Promise<AuditImportPlan | null> {
   if (rows.length === 0) return null;
   if (requestedMode === "separate_chain") {
-    throw new Error("audit_separate_chain_requires_chain_id_support");
+    throw new Error("audit_separate_chain_not_implemented");
   }
   if (requestedMode && !AUDIT_IMPORT_MODES.includes(requestedMode)) {
     throw new Error("unsupported_audit_import_mode");
   }
 
-  const sourceNodes = rows.map(auditNodeFromBackupRow);
+  const source = await verifyAuditBackupRows(db, rows);
 
   const targetRows = (await db.prepare(
-    `SELECT event_hash, previous_event_hash FROM sb_audit_events`
-  ).all<{ event_hash: string; previous_event_hash: string | null }>()).results ?? [];
-  const targetShape = analyzeAuditChainRows(targetRows.map((row) => ({
-    eventHash: row.event_hash,
-    previousEventHash: row.previous_event_hash,
-  })));
+    `SELECT id, occurred_at, trace_id, actor_type, actor_id, token_id,
+            action, object_type, object_id, vault_id, before_hash, after_hash,
+            success, error_code, metadata_json, previous_event_hash, event_hash
+     FROM sb_audit_events`
+  ).all<ComplianceAuditEventRecord>()).results ?? [];
+  const target = await verifyAuditBackupRows(db, targetRows);
+
+  const sourceShape = analyzeAuditChainRows(source.nodes);
+  const targetShape = analyzeAuditChainRows(target.nodes);
 
   if (targetRows.length === 0) {
     if (requestedMode && requestedMode !== "replace_empty") {
       throw new Error("audit_import_requires_replace_empty");
     }
-    const sourceShape = analyzeAuditChainRows(sourceNodes);
     if (!sourceShape.valid) throw new Error(sourceShape.error);
     return { mode: "replace_empty", rows: sortAuditRows(rows, sourceShape) };
   }
   if (requestedMode !== "append_verified") {
     throw new Error("audit_import_requires_append_verified");
   }
-  if (!targetShape.valid || !targetShape.tailHash) {
+  if (!targetShape.valid || !targetShape.tailHash || !targetShape.rootHash) {
     throw new Error(`existing_audit_chain_invalid:${targetShape.error ?? "unknown"}`);
   }
-  const sourceHashes = new Set(sourceNodes.map((node) => node.eventHash));
-  const fragmentRoots = sourceNodes.filter((node) =>
-    node.previousEventHash === null || !sourceHashes.has(node.previousEventHash)
+
+  const targetByHash = new Map(target.records.map((record) => [record.event_hash, record]));
+  const sourceByHash = new Map(source.records.map((record) => [record.event_hash, record]));
+  if (sourceShape.valid) {
+    const sourceIsTargetPrefix = sourceShape.rootHash === targetShape.rootHash && !target.records.some((record) => {
+      const sourceRecord = sourceByHash.get(record.event_hash);
+      return !sourceRecord || sourceRecord.previous_event_hash !== record.previous_event_hash;
+    });
+    if (!sourceIsTargetPrefix) throw new Error("audit_import_chain_prefix_mismatch");
+  }
+
+  const suffixRows = rows.filter((row) => !targetByHash.has(auditRecordFromBackupRow(row).event_hash));
+  if (suffixRows.length === 0) throw new Error("audit_import_no_new_events");
+  const suffixRecords = suffixRows.map(auditRecordFromBackupRow);
+  const suffixRoot = suffixRecords.filter((record) =>
+    record.previous_event_hash === targetShape.tailHash
   );
-  const sourceRoot = fragmentRoots.length === 1 ? fragmentRoots[0] : null;
-  if (!sourceRoot || sourceRoot.previousEventHash !== targetShape.tailHash) {
+  if (suffixRoot.length !== 1) {
     throw new Error("audit_import_previous_hash_mismatch");
   }
-  const normalizedSourceShape = analyzeAuditChainRows(sourceNodes.map((node) =>
-    node === sourceRoot ? { ...node, previousEventHash: null } : node
+  const normalizedSuffixShape = analyzeAuditChainRows(suffixRecords.map((record) =>
+    record.event_hash === suffixRoot[0].event_hash
+      ? { eventHash: record.event_hash, previousEventHash: null }
+      : auditNodeFromRecord(record)
   ));
-  if (!normalizedSourceShape.valid) throw new Error(normalizedSourceShape.error);
-  await rejectExistingAuditHashes(db, rows);
-  return { mode: "append_verified", rows: sortAuditRows(rows, normalizedSourceShape) };
+  if (!normalizedSuffixShape.valid) throw new Error(normalizedSuffixShape.error);
+  await rejectExistingAuditHashes(db, suffixRows);
+  return { mode: "append_verified", rows: sortAuditRows(suffixRows, normalizedSuffixShape) };
 }
 
 async function importAuditEvents(
@@ -782,11 +860,17 @@ async function importAuditEvents(
   prepare: (row: BackupRow) => D1PreparedStatement
 ): Promise<TableImportStats> {
   if (!plan) return { total: 0, imported: 0, skipped: 0, failed: 0 };
-  const results = await db.batch(plan.rows.map(prepare));
   const stats: TableImportStats = { total: plan.rows.length, imported: 0, skipped: 0, failed: 0 };
-  for (const result of results) {
-    if (Number(result.meta?.changes ?? 0) > 0) stats.imported += 1;
-    else stats.skipped += 1;
+  for (let offset = 0; offset < plan.rows.length; offset += AUDIT_IMPORT_BATCH_SIZE) {
+    await heartbeatAuditImport(db);
+    const results = await db.batch(
+      plan.rows.slice(offset, offset + AUDIT_IMPORT_BATCH_SIZE).map(prepare)
+    );
+    for (const result of results) {
+      if (Number(result.meta?.changes ?? 0) > 0) stats.imported += 1;
+      else stats.skipped += 1;
+    }
+    await heartbeatAuditImport(db);
   }
   return stats;
 }
@@ -1459,9 +1543,24 @@ export async function importMemoryBackup(
 
   const ownerId = crypto.randomUUID();
   await acquireAuditImportLock(db, ownerId);
+  auditLockHeartbeats.set(db, () => renewAuditImportLock(db, ownerId));
+  const useTransaction = options.atomic === true;
   try {
-    return await importMemoryBackupUnlocked(db, body, options);
+    if (useTransaction) await db.exec("BEGIN IMMEDIATE");
+    const result = await importMemoryBackupUnlocked(db, body, options);
+    if (useTransaction) await db.exec("COMMIT");
+    return result;
+  } catch (error) {
+    if (useTransaction) {
+      try {
+        await db.exec("ROLLBACK");
+      } catch {
+        // Preserve the original restore failure when rollback itself fails.
+      }
+    }
+    throw error;
   } finally {
+    auditLockHeartbeats.delete(db);
     await releaseAuditImportLock(db, ownerId);
   }
 }

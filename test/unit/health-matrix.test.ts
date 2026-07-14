@@ -9,6 +9,7 @@ import {
   MEMORY_QUALITY_SCHEMA_STATEMENTS,
   prepareComplianceAuditEvent,
   releaseAuditImportLock,
+  renewAuditImportLock,
 } from "../../src/memory/quality";
 import { SqliteD1Database } from "../../src/selfhost/sqlite-d1";
 
@@ -312,6 +313,18 @@ describe("Health Matrix", () => {
       objectType: "memory",
       occurredAt: 102,
     })).resolves.toBeDefined();
+  });
+
+  it("renews an audit import lock only for its current owner", async () => {
+    await acquireAuditImportLock(db, "restore-owner", 1_000);
+    await renewAuditImportLock(db, "restore-owner", 2_000);
+    const renewed = raw.prepare(
+      `SELECT owner_id, expires_at FROM sb_maintenance_locks WHERE lock_name = 'audit_import'`
+    ).get() as { owner_id: string; expires_at: number };
+    expect(renewed.owner_id).toBe("restore-owner");
+    expect(renewed.expires_at).toBeGreaterThan(2_000);
+    await expect(renewAuditImportLock(db, "other-owner", 2_000)).rejects.toThrow("audit_import_lock_lost");
+    await releaseAuditImportLock(db, "restore-owner");
   });
 
   it("marks a bounded audit sample as degraded instead of claiming full health", async () => {

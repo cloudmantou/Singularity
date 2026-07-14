@@ -178,7 +178,7 @@ import {
   isMemoryBackupPayload,
   MEMORY_BACKUP_SCHEMA_VERSION,
   memoryBackupRowCount,
-  type AuditImportMode,
+  type AuditImportModeInput,
 } from "./memory/backup";
 import {
   attachEntitiesToMemory,
@@ -15270,7 +15270,7 @@ const defaultHandler = {
             : {}) as {
             mode?: ImportMode;
             extraTags?: string[];
-            auditMode?: AuditImportMode;
+            auditMode?: AuditImportModeInput;
           };
           const result = await importMemoryBackup(env.DB, body as Record<string, unknown>, {
             mode: opts.mode === "overwrite" ? "overwrite" : "skip",
@@ -15278,6 +15278,7 @@ const defaultHandler = {
               ? opts.extraTags.map(String)
               : [],
             auditMode: opts.auditMode,
+            atomic: env.SELFHOST === "1",
           });
           return json({
             ...result,
@@ -15307,7 +15308,11 @@ const defaultHandler = {
           entries = parseImportPayload(body);
         }
       } catch (e) {
-        return json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 400);
+        const error = e instanceof Error ? e.message : String(e);
+        if (error === "audit_separate_chain_not_implemented") {
+          return json({ ok: false, error }, 501);
+        }
+        return json({ ok: false, error }, 400);
       }
 
       if (env.SELFHOST !== "1" && entries.length > CLOUDFLARE_IMPORT_MAX_ROWS) {

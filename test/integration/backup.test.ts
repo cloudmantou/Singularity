@@ -69,9 +69,90 @@ describe("full memory backup import/export", () => {
         schemaVersion: 15,
         auditEvents: [first.record],
       })).rejects.toThrow("audit_import_requires_append_verified");
+
+      const fourth = await prepareComplianceAuditEvent(source.env.DB, {
+        actorType: "system",
+        action: "fourth",
+        objectType: "memory",
+        occurredAt: 500,
+      });
+      await fourth.statement.run();
+      const completeBackup = await exportMemoryBackup(source.env.DB, { source: "test" });
+      await importMemoryBackup(target.env.DB, completeBackup as unknown as Record<string, unknown>, {
+        auditMode: "append_verified",
+      });
+      expect(target.db.prepare(`SELECT COUNT(*) AS count FROM sb_audit_events`).get()).toEqual({ count: 4 });
     } finally {
       source.db.close();
       target.db.close();
+    }
+  });
+
+  it("rejects tampered audit event bodies before importing business rows", async () => {
+    const source = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    const target = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(source.env);
+      await initializeDatabase(target.env);
+      const event = await prepareComplianceAuditEvent(source.env.DB, {
+        actorType: "system",
+        action: "original",
+        objectType: "memory",
+      });
+      await event.statement.run();
+      const backup = await exportMemoryBackup(source.env.DB, { source: "test" });
+      const tampered = {
+        ...backup,
+        entries: [{ id: "must-not-import", content: "business row" }],
+        auditEvents: backup.auditEvents.map((row) => ({ ...row, action: "tampered" })),
+      };
+
+      await expect(importMemoryBackup(
+        target.env.DB,
+        tampered as unknown as Record<string, unknown>
+      )).rejects.toThrow("audit_event_hash_mismatch");
+      expect(target.db.prepare(`SELECT COUNT(*) AS count FROM entries`).get()).toEqual({ count: 0 });
+      expect(target.db.prepare(`SELECT COUNT(*) AS count FROM sb_audit_events`).get()).toEqual({ count: 0 });
+    } finally {
+      source.db.close();
+      target.db.close();
+    }
+  });
+
+  it("rolls back a self-host restore when a later graph table fails", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    await initializeDatabase(env);
+    try {
+      await expect(importMemoryBackup(env.DB, {
+        backupFormat: "singularity-memory-backup",
+        schemaVersion: 15,
+        entries: [{ id: "rollback-entry", content: "must roll back" }],
+        scopes: [{ scope_id: "broken-scope" }],
+      }, { atomic: true })).rejects.toThrow("canonical_name is required");
+      expect(db.prepare(`SELECT COUNT(*) AS count FROM entries WHERE id = 'rollback-entry'`).get()).toEqual({ count: 0 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("does not advertise separate-chain restore as implemented", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    await initializeDatabase(env);
+    try {
+      const event = await prepareComplianceAuditEvent(env.DB, {
+        actorType: "system",
+        action: "chain",
+        objectType: "memory",
+      });
+      await event.statement.run();
+      const backup = await exportMemoryBackup(env.DB, { source: "test" });
+      await expect(importMemoryBackup(
+        env.DB,
+        backup as unknown as Record<string, unknown>,
+        { auditMode: "separate_chain" }
+      )).rejects.toThrow("audit_separate_chain_not_implemented");
+    } finally {
+      db.close();
     }
   });
 
