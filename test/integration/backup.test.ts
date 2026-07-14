@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 import worker, { initializeDatabase } from "../../src/index";
 import { ensureAssociationDataModel } from "../../src/memory/associations";
+import { exportMemoryBackup, importMemoryBackup } from "../../src/memory/backup";
 import { ensureEntityResolutionDataModel } from "../../src/memory/entities";
+import {
+  acquireAuditImportLock,
+  prepareComplianceAuditEvent,
+  releaseAuditImportLock,
+} from "../../src/memory/quality";
 import { createExecutionContext, createSelfhostEnv } from "../../src/selfhost/env";
 
 function auth(path: string, init: RequestInit = {}) {
@@ -16,6 +22,76 @@ function auth(path: string, init: RequestInit = {}) {
 }
 
 describe("full memory backup import/export", () => {
+  it("restores audit events in chain order and rejects silent chain merges", async () => {
+    const source = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    const target = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(source.env);
+      await initializeDatabase(target.env);
+
+      const first = await prepareComplianceAuditEvent(source.env.DB, {
+        actorType: "system",
+        action: "first",
+        objectType: "memory",
+        occurredAt: 100,
+      });
+      await first.statement.run();
+      const second = await prepareComplianceAuditEvent(source.env.DB, {
+        actorType: "system",
+        action: "second",
+        objectType: "memory",
+        occurredAt: 300,
+      });
+      await second.statement.run();
+      const backup = await exportMemoryBackup(source.env.DB, { source: "test" });
+
+      await importMemoryBackup(target.env.DB, backup as unknown as Record<string, unknown>);
+      expect(target.db.prepare(
+        `SELECT event_hash FROM sb_audit_chain_head WHERE id = 1`
+      ).get()).toEqual({ event_hash: second.record.event_hash });
+
+      const third = await prepareComplianceAuditEvent(source.env.DB, {
+        actorType: "system",
+        action: "third",
+        objectType: "memory",
+        occurredAt: 400,
+      });
+      await third.statement.run();
+      await importMemoryBackup(target.env.DB, {
+        backupFormat: "singularity-memory-backup",
+        schemaVersion: 15,
+        auditEvents: [third.record],
+      }, { auditMode: "append_verified" });
+      expect(target.db.prepare(`SELECT COUNT(*) AS count FROM sb_audit_events`).get()).toEqual({ count: 3 });
+
+      await expect(importMemoryBackup(target.env.DB, {
+        backupFormat: "singularity-memory-backup",
+        schemaVersion: 15,
+        auditEvents: [first.record],
+      })).rejects.toThrow("audit_import_requires_append_verified");
+    } finally {
+      source.db.close();
+      target.db.close();
+    }
+  });
+
+  it("serializes all backup imports while an audit restore is active", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    await initializeDatabase(env);
+    await acquireAuditImportLock(env.DB, "restore-owner", Date.now());
+    try {
+      await expect(importMemoryBackup(env.DB, {
+        backupFormat: "singularity-memory-backup",
+        schemaVersion: 15,
+        entries: [],
+      })).rejects.toThrow("audit_import_in_progress");
+      expect(db.prepare("SELECT COUNT(*) AS count FROM entries").get()).toEqual({ count: 0 });
+    } finally {
+      await releaseAuditImportLock(env.DB, "restore-owner");
+      db.close();
+    }
+  });
+
   it("exports and restores four-layer memory graph data with integrity checks", async () => {
     const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
     await initializeDatabase(env);
@@ -428,6 +504,7 @@ describe("full memory backup import/export", () => {
       entry_id: "entry-1",
       claim_id: "mem-1",
     });
+    expect(backup.memoryMutationBackupMode).toBe("audit_only");
     expect(backup.memoryMutations[0]).not.toHaveProperty("idempotency_key");
     expect(backup.memoryMutations[0]).not.toHaveProperty("request_hash");
     expect(backup.memoryMutations[0]).not.toHaveProperty("result_content");

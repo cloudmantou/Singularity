@@ -3,9 +3,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { collectHealthMatrix } from "../../src/operations/health";
 import { ensureMemoryDataModel } from "../../src/memory/schema";
 import {
+  acquireAuditImportLock,
+  analyzeAuditChainRows,
   ensureConflictClaimSchema,
   MEMORY_QUALITY_SCHEMA_STATEMENTS,
   prepareComplianceAuditEvent,
+  releaseAuditImportLock,
 } from "../../src/memory/quality";
 import { SqliteD1Database } from "../../src/selfhost/sqlite-d1";
 
@@ -271,6 +274,44 @@ describe("Health Matrix", () => {
     await first.statement.run();
     await expect(stale.statement.run()).rejects.toThrow("audit_chain_head_conflict");
     expect(raw.prepare(`SELECT COUNT(*) AS count FROM sb_audit_events`).get()).toEqual({ count: 1 });
+  });
+
+  it("requires one connected root and one tail for an audit chain", () => {
+    expect(analyzeAuditChainRows([
+      { eventHash: "a", previousEventHash: null },
+      { eventHash: "b", previousEventHash: "a" },
+      { eventHash: "c", previousEventHash: "a" },
+    ])).toMatchObject({ valid: false, error: "audit_chain_fork" });
+
+    expect(analyzeAuditChainRows([
+      { eventHash: "a", previousEventHash: null },
+      { eventHash: "b", previousEventHash: null },
+    ])).toMatchObject({ valid: false, error: "audit_chain_root_count" });
+
+    expect(analyzeAuditChainRows([
+      { eventHash: "a", previousEventHash: "b" },
+      { eventHash: "b", previousEventHash: "a" },
+    ])).toMatchObject({ valid: false, error: "audit_chain_root_count" });
+  });
+
+  it("blocks normal audit writes while an audit import lock is held", async () => {
+    await acquireAuditImportLock(db, "restore-owner", Date.now());
+    try {
+      await expect(prepareComplianceAuditEvent(db, {
+        actorType: "system",
+        action: "blocked",
+        objectType: "memory",
+        occurredAt: 101,
+      })).rejects.toThrow("audit_import_in_progress");
+    } finally {
+      await releaseAuditImportLock(db, "restore-owner");
+    }
+    await expect(prepareComplianceAuditEvent(db, {
+      actorType: "system",
+      action: "after-restore",
+      objectType: "memory",
+      occurredAt: 102,
+    })).resolves.toBeDefined();
   });
 
   it("marks a bounded audit sample as degraded instead of claiming full health", async () => {

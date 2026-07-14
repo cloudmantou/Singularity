@@ -178,6 +178,7 @@ import {
   isMemoryBackupPayload,
   MEMORY_BACKUP_SCHEMA_VERSION,
   memoryBackupRowCount,
+  type AuditImportMode,
 } from "./memory/backup";
 import {
   attachEntitiesToMemory,
@@ -15269,12 +15270,14 @@ const defaultHandler = {
             : {}) as {
             mode?: ImportMode;
             extraTags?: string[];
+            auditMode?: AuditImportMode;
           };
           const result = await importMemoryBackup(env.DB, body as Record<string, unknown>, {
             mode: opts.mode === "overwrite" ? "overwrite" : "skip",
             extraTags: Array.isArray(opts.extraTags)
               ? opts.extraTags.map(String)
               : [],
+            auditMode: opts.auditMode,
           });
           return json({
             ...result,

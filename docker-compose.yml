@@ -10,6 +10,9 @@ services:
       DATABASE_PATH: /app/data/memory.db
       HOST: 0.0.0.0
       PORT: "8787"
+      # Production self-hosting must fail closed; use ANSWERABILITY_MODE=shadow
+      # explicitly only for evaluation/data-collection environments.
+      ANSWERABILITY_MODE: ${ANSWERABILITY_MODE:-enforce}
     volumes:
       - ./data:/app/data
     restart: unless-stopped

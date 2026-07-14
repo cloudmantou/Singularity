@@ -1,10 +1,17 @@
 import { importEntries, type ImportMode, type ImportOptions, type ImportResult } from "../import-entries";
 import { ensureEntityResolutionDataModel } from "./entities";
-import { ensureConflictClaimSchema } from "./quality";
+import {
+  acquireAuditImportLock,
+  analyzeAuditChainRows,
+  ensureConflictClaimSchema,
+  releaseAuditImportLock,
+  type AuditChainNode,
+} from "./quality";
 import { ensureAssociationDataModel } from "./associations";
 import { MEMORY_MUTATION_SCHEMA_STATEMENTS } from "./mutations";
 
 export const MEMORY_BACKUP_SCHEMA_VERSION = 15;
+export const MEMORY_MUTATION_BACKUP_MODE = "audit_only" as const;
 const MEMORY_BACKUP_FORMAT = "singularity-memory-backup";
 const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
 const MEMORY_BACKUP_FEATURES = [
@@ -28,7 +35,11 @@ const MEMORY_BACKUP_FEATURES = [
   "association-graph",
   "association-validity-windows",
   "entry-mutation-journal",
+  "entry-mutation-journal-audit-only",
 ] as const;
+
+export const AUDIT_IMPORT_MODES = ["replace_empty", "append_verified", "separate_chain"] as const;
+export type AuditImportMode = (typeof AUDIT_IMPORT_MODES)[number];
 
 const GRAPH_ARRAY_KEYS = [
   "scopes",
@@ -81,6 +92,7 @@ export interface MemoryBackup {
   features: Array<(typeof MEMORY_BACKUP_FEATURES)[number]>;
   exportedAt: string;
   source: string;
+  memoryMutationBackupMode: typeof MEMORY_MUTATION_BACKUP_MODE;
   totals: Record<string, number>;
   integrity: BackupIntegrityReport;
   scopes: BackupRow[];
@@ -115,8 +127,13 @@ export interface MemoryBackup {
 
 export interface MemoryBackupImportResult extends ImportResult {
   schemaVersion: 15;
+  memoryMutationBackupMode: typeof MEMORY_MUTATION_BACKUP_MODE;
   graph: Record<GraphArrayKey, TableImportStats>;
   integrity: BackupIntegrityReport;
+}
+
+export interface MemoryBackupImportOptions extends ImportOptions {
+  auditMode?: AuditImportMode;
 }
 
 function arrayFrom(value: unknown): BackupRow[] {
@@ -506,6 +523,7 @@ export async function exportMemoryBackup(
     features: [...MEMORY_BACKUP_FEATURES],
     exportedAt: new Date().toISOString(),
     source: input.source,
+    memoryMutationBackupMode: MEMORY_MUTATION_BACKUP_MODE,
     totals: {
       scopes: countRows(scopes),
       parentUnits: countRows(parentUnits),
@@ -658,51 +676,130 @@ async function importTable(
   return stats;
 }
 
-async function importAuditEvents(
+interface AuditImportPlan {
+  mode: Exclude<AuditImportMode, "separate_chain">;
+  rows: BackupRow[];
+}
+
+function auditNodeFromBackupRow(row: BackupRow): AuditChainNode {
+  return {
+    eventHash: requiredText(row, "event_hash"),
+    previousEventHash: textOrNull(row, "previous_event_hash"),
+  };
+}
+
+function sortAuditRows(rows: BackupRow[], shape: ReturnType<typeof analyzeAuditChainRows>): BackupRow[] {
+  if (!shape.rootHash) return [];
+  const byHash = new Map(rows.map((row) => [auditNodeFromBackupRow(row).eventHash, row]));
+  const nextByPrevious = new Map<string, BackupRow>();
+  for (const row of rows) {
+    const node = auditNodeFromBackupRow(row);
+    if (node.previousEventHash) nextByPrevious.set(node.previousEventHash, row);
+  }
+  const ordered: BackupRow[] = [];
+  let current = shape.rootHash;
+  while (current) {
+    const row = byHash.get(current);
+    if (!row) break;
+    ordered.push(row);
+    const next = nextByPrevious.get(current);
+    current = next ? auditNodeFromBackupRow(next).eventHash : "";
+  }
+  return ordered;
+}
+
+async function rejectExistingAuditHashes(
+  db: D1Database,
+  rows: BackupRow[]
+): Promise<void> {
+  const hashes = rows.map((row) => auditNodeFromBackupRow(row).eventHash);
+  for (let offset = 0; offset < hashes.length; offset += 80) {
+    const batch = hashes.slice(offset, offset + 80);
+    const placeholders = batch.map(() => "?").join(", ");
+    const existing = await db.prepare(
+      `SELECT event_hash FROM sb_audit_events WHERE event_hash IN (${placeholders}) LIMIT 1`
+    ).bind(...batch).first<{ event_hash: string }>();
+    if (existing) throw new Error("audit_event_already_exists");
+  }
+}
+
+async function prepareAuditImport(
   db: D1Database,
   rows: BackupRow[],
+  requestedMode?: AuditImportMode
+): Promise<AuditImportPlan | null> {
+  if (rows.length === 0) return null;
+  if (requestedMode === "separate_chain") {
+    throw new Error("audit_separate_chain_requires_chain_id_support");
+  }
+  if (requestedMode && !AUDIT_IMPORT_MODES.includes(requestedMode)) {
+    throw new Error("unsupported_audit_import_mode");
+  }
+
+  const sourceNodes = rows.map(auditNodeFromBackupRow);
+
+  const targetRows = (await db.prepare(
+    `SELECT event_hash, previous_event_hash FROM sb_audit_events`
+  ).all<{ event_hash: string; previous_event_hash: string | null }>()).results ?? [];
+  const targetShape = analyzeAuditChainRows(targetRows.map((row) => ({
+    eventHash: row.event_hash,
+    previousEventHash: row.previous_event_hash,
+  })));
+
+  if (targetRows.length === 0) {
+    if (requestedMode && requestedMode !== "replace_empty") {
+      throw new Error("audit_import_requires_replace_empty");
+    }
+    const sourceShape = analyzeAuditChainRows(sourceNodes);
+    if (!sourceShape.valid) throw new Error(sourceShape.error);
+    return { mode: "replace_empty", rows: sortAuditRows(rows, sourceShape) };
+  }
+  if (requestedMode !== "append_verified") {
+    throw new Error("audit_import_requires_append_verified");
+  }
+  if (!targetShape.valid || !targetShape.tailHash) {
+    throw new Error(`existing_audit_chain_invalid:${targetShape.error ?? "unknown"}`);
+  }
+  const sourceHashes = new Set(sourceNodes.map((node) => node.eventHash));
+  const fragmentRoots = sourceNodes.filter((node) =>
+    node.previousEventHash === null || !sourceHashes.has(node.previousEventHash)
+  );
+  const sourceRoot = fragmentRoots.length === 1 ? fragmentRoots[0] : null;
+  if (!sourceRoot || sourceRoot.previousEventHash !== targetShape.tailHash) {
+    throw new Error("audit_import_previous_hash_mismatch");
+  }
+  const normalizedSourceShape = analyzeAuditChainRows(sourceNodes.map((node) =>
+    node === sourceRoot ? { ...node, previousEventHash: null } : node
+  ));
+  if (!normalizedSourceShape.valid) throw new Error(normalizedSourceShape.error);
+  await rejectExistingAuditHashes(db, rows);
+  return { mode: "append_verified", rows: sortAuditRows(rows, normalizedSourceShape) };
+}
+
+async function importAuditEvents(
+  db: D1Database,
+  plan: AuditImportPlan | null,
   prepare: (row: BackupRow) => D1PreparedStatement
 ): Promise<TableImportStats> {
-  let enforcementDisabled = false;
-  try {
-    await db.prepare(
-      `UPDATE sb_audit_chain_head SET enforcement_enabled = 0 WHERE id = 1`
-    ).run();
-    enforcementDisabled = true;
-  } catch {
-    // Older databases may not have the chain head until the next migration.
+  if (!plan) return { total: 0, imported: 0, skipped: 0, failed: 0 };
+  const results = await db.batch(plan.rows.map(prepare));
+  const stats: TableImportStats = { total: plan.rows.length, imported: 0, skipped: 0, failed: 0 };
+  for (const result of results) {
+    if (Number(result.meta?.changes ?? 0) > 0) stats.imported += 1;
+    else stats.skipped += 1;
   }
-  try {
-    return await importTable(db, rows, prepare);
-  } finally {
-    if (enforcementDisabled) {
-      await db.prepare(
-        `UPDATE sb_audit_chain_head
-         SET event_hash = (
-               SELECT event_hash FROM sb_audit_events
-               ORDER BY occurred_at DESC, id DESC LIMIT 1
-             ),
-             version = (SELECT COUNT(*) FROM sb_audit_events),
-             enforcement_enabled = 1
-         WHERE id = 1`
-      ).run();
-    }
-  }
+  return stats;
 }
 
 function rowsFor(body: Record<string, unknown>, key: GraphArrayKey): BackupRow[] {
   return arrayFrom(body[key]);
 }
 
-export async function importMemoryBackup(
+async function importMemoryBackupUnlocked(
   db: D1Database,
   body: Record<string, unknown>,
-  options: ImportOptions = {}
+  options: MemoryBackupImportOptions = {}
 ): Promise<MemoryBackupImportResult> {
-  await ensureEntityResolutionDataModel(db);
-  await ensureConflictClaimSchema(db);
-  await ensureAssociationDataModel(db);
-  for (const statement of MEMORY_MUTATION_SCHEMA_STATEMENTS) await db.exec(statement);
   const rawSchemaVersion = body.schemaVersion == null ? 4 : Number(body.schemaVersion);
   if (!Number.isFinite(rawSchemaVersion) || rawSchemaVersion < 4) {
     throw new Error("Unsupported memory backup schemaVersion");
@@ -713,6 +810,11 @@ export async function importMemoryBackup(
     );
   }
   const mode: ImportMode = options.mode === "overwrite" ? "overwrite" : "skip";
+  const auditImportPlan = await prepareAuditImport(
+    db,
+    rowsFor(body, "auditEvents"),
+    options.auditMode
+  );
   const entries = arrayFrom(body.entries);
   const entryResult = await importEntries(db, entries, {
     ...options,
@@ -1300,9 +1402,9 @@ export async function importMemoryBackup(
     )
   );
 
-  graph.auditEvents = await importAuditEvents(db, rowsFor(body, "auditEvents"), (row) =>
+  graph.auditEvents = await importAuditEvents(db, auditImportPlan, (row) =>
     db.prepare(
-      `${insertVerb(mode)} INTO sb_audit_events (
+      `INSERT INTO sb_audit_events (
          id, occurred_at, trace_id, actor_type, actor_id, token_id,
          action, object_type, object_id, vault_id, before_hash, after_hash,
          success, error_code, metadata_json, previous_event_hash, event_hash
@@ -1339,7 +1441,27 @@ export async function importMemoryBackup(
   return {
     ...entryResult,
     schemaVersion: MEMORY_BACKUP_SCHEMA_VERSION,
+    memoryMutationBackupMode: MEMORY_MUTATION_BACKUP_MODE,
     graph,
     integrity,
   };
+}
+
+export async function importMemoryBackup(
+  db: D1Database,
+  body: Record<string, unknown>,
+  options: MemoryBackupImportOptions = {}
+): Promise<MemoryBackupImportResult> {
+  await ensureEntityResolutionDataModel(db);
+  await ensureConflictClaimSchema(db);
+  await ensureAssociationDataModel(db);
+  for (const statement of MEMORY_MUTATION_SCHEMA_STATEMENTS) await db.exec(statement);
+
+  const ownerId = crypto.randomUUID();
+  await acquireAuditImportLock(db, ownerId);
+  try {
+    return await importMemoryBackupUnlocked(db, body, options);
+  } finally {
+    await releaseAuditImportLock(db, ownerId);
+  }
 }

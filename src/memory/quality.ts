@@ -118,15 +118,76 @@ export const MEMORY_QUALITY_SCHEMA_STATEMENTS = [
     version INTEGER NOT NULL DEFAULT 0,
     enforcement_enabled INTEGER NOT NULL DEFAULT 1 CHECK (enforcement_enabled IN (0, 1))
   )`,
+  `CREATE TABLE IF NOT EXISTS sb_maintenance_locks (
+    lock_name TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_sb_maintenance_locks_expiry
+   ON sb_maintenance_locks(expires_at)`,
   `INSERT OR IGNORE INTO sb_audit_chain_head (id, event_hash, version, enforcement_enabled)
    SELECT 1,
-          (SELECT event_hash FROM sb_audit_events ORDER BY occurred_at DESC, id DESC LIMIT 1),
+          NULL,
           (SELECT COUNT(*) FROM sb_audit_events),
           1`,
-  `UPDATE sb_audit_chain_head
-   SET event_hash = (SELECT event_hash FROM sb_audit_events ORDER BY occurred_at DESC, id DESC LIMIT 1),
+  `WITH RECURSIVE
+     roots AS (
+       SELECT event_hash
+       FROM sb_audit_events
+       WHERE previous_event_hash IS NULL
+     ),
+     chain(event_hash, path) AS (
+       SELECT event_hash, '|' || event_hash || '|'
+       FROM roots
+       UNION ALL
+       SELECT successor.event_hash,
+              chain.path || successor.event_hash || '|'
+       FROM sb_audit_events successor
+       JOIN chain ON successor.previous_event_hash = chain.event_hash
+       WHERE instr(chain.path, '|' || successor.event_hash || '|') = 0
+     ),
+     tails AS (
+       SELECT event.event_hash
+       FROM sb_audit_events event
+       WHERE NOT EXISTS (
+         SELECT 1 FROM sb_audit_events successor
+         WHERE successor.previous_event_hash = event.event_hash
+       )
+     ),
+     forks AS (
+       SELECT previous_event_hash
+       FROM sb_audit_events
+       WHERE previous_event_hash IS NOT NULL
+       GROUP BY previous_event_hash
+       HAVING COUNT(*) > 1
+     ),
+     missing_predecessors AS (
+       SELECT event.event_hash
+       FROM sb_audit_events event
+       WHERE event.previous_event_hash IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM sb_audit_events predecessor
+           WHERE predecessor.event_hash = event.previous_event_hash
+         )
+     ),
+     shape AS (
+       SELECT CASE WHEN
+         (SELECT COUNT(*) FROM sb_audit_events) = 0
+         OR (
+           (SELECT COUNT(*) FROM roots) = 1
+           AND (SELECT COUNT(*) FROM tails) = 1
+           AND (SELECT COUNT(*) FROM forks) = 0
+           AND (SELECT COUNT(*) FROM missing_predecessors) = 0
+           AND (SELECT COUNT(DISTINCT event_hash) FROM chain) =
+               (SELECT COUNT(*) FROM sb_audit_events)
+         ) THEN 1 ELSE 0 END AS is_valid
+     )
+   UPDATE sb_audit_chain_head
+   SET event_hash = CASE WHEN (SELECT is_valid FROM shape) = 1
+                    THEN (SELECT event_hash FROM tails)
+                    ELSE NULL END,
        version = (SELECT COUNT(*) FROM sb_audit_events),
-       enforcement_enabled = 1
+       enforcement_enabled = (SELECT is_valid FROM shape)
    WHERE id = 1`,
   `CREATE TRIGGER IF NOT EXISTS trg_sb_audit_chain_head_guard
    BEFORE INSERT ON sb_audit_events
@@ -134,9 +195,10 @@ export const MEMORY_QUALITY_SCHEMA_STATEMENTS = [
      SELECT CASE WHEN NOT EXISTS (
        SELECT 1 FROM sb_audit_chain_head
        WHERE id = 1
+         AND enforcement_enabled = 1
          AND (
-           enforcement_enabled = 0
-           OR event_hash IS NEW.previous_event_hash
+           (version = 0 AND NEW.previous_event_hash IS NULL)
+           OR (version > 0 AND event_hash IS NEW.previous_event_hash)
          )
      ) THEN RAISE(ABORT, 'audit_chain_head_conflict') END;
    END`,
@@ -260,6 +322,29 @@ export interface ComplianceAuditChainVerification {
   error?: string;
 }
 
+export interface AuditChainNode {
+  eventHash: string;
+  previousEventHash: string | null;
+}
+
+export interface AuditChainShape {
+  valid: boolean;
+  eventCount: number;
+  rootHash: string | null;
+  tailHash: string | null;
+  error?:
+    | "audit_chain_duplicate_hash"
+    | "audit_chain_root_count"
+    | "audit_chain_missing_predecessor"
+    | "audit_chain_fork"
+    | "audit_chain_tail_count"
+    | "audit_chain_cycle"
+    | "audit_chain_disconnected";
+}
+
+export const AUDIT_IMPORT_LOCK_NAME = "audit_import";
+const AUDIT_IMPORT_LOCK_MS = 15 * 60_000;
+
 function boundedText(value: unknown, max = 512): string | null {
   if (value == null) return null;
   const text = String(value).trim();
@@ -290,6 +375,88 @@ function stableJson(value: unknown): string {
   return JSON.stringify(sorted);
 }
 
+export function analyzeAuditChainRows(rows: readonly AuditChainNode[]): AuditChainShape {
+  if (rows.length === 0) {
+    return { valid: true, eventCount: 0, rootHash: null, tailHash: null };
+  }
+
+  const byHash = new Map<string, AuditChainNode>();
+  for (const row of rows) {
+    if (byHash.has(row.eventHash)) {
+      return { valid: false, eventCount: rows.length, rootHash: null, tailHash: null, error: "audit_chain_duplicate_hash" };
+    }
+    byHash.set(row.eventHash, row);
+  }
+
+  const roots = rows.filter((row) => row.previousEventHash === null);
+  if (roots.length !== 1) {
+    return {
+      valid: false,
+      eventCount: rows.length,
+      rootHash: roots.length === 1 ? roots[0].eventHash : null,
+      tailHash: null,
+      error: "audit_chain_root_count",
+    };
+  }
+
+  const successors = new Map<string, string>();
+  for (const row of rows) {
+    if (row.previousEventHash === null) continue;
+    if (row.previousEventHash === row.eventHash) {
+      return { valid: false, eventCount: rows.length, rootHash: roots[0].eventHash, tailHash: null, error: "audit_chain_cycle" };
+    }
+    if (!byHash.has(row.previousEventHash)) {
+      return { valid: false, eventCount: rows.length, rootHash: roots[0].eventHash, tailHash: null, error: "audit_chain_missing_predecessor" };
+    }
+    if (successors.has(row.previousEventHash)) {
+      return { valid: false, eventCount: rows.length, rootHash: roots[0].eventHash, tailHash: null, error: "audit_chain_fork" };
+    }
+    successors.set(row.previousEventHash, row.eventHash);
+  }
+
+  const tails = rows.filter((row) => !successors.has(row.eventHash));
+  if (tails.length !== 1) {
+    return { valid: false, eventCount: rows.length, rootHash: roots[0].eventHash, tailHash: null, error: "audit_chain_tail_count" };
+  }
+
+  const visited = new Set<string>();
+  let current = roots[0].eventHash;
+  while (current) {
+    if (visited.has(current)) {
+      return { valid: false, eventCount: rows.length, rootHash: roots[0].eventHash, tailHash: tails[0].eventHash, error: "audit_chain_cycle" };
+    }
+    visited.add(current);
+    current = successors.get(current) ?? "";
+  }
+  if (visited.size !== rows.length) {
+    return { valid: false, eventCount: rows.length, rootHash: roots[0].eventHash, tailHash: tails[0].eventHash, error: "audit_chain_disconnected" };
+  }
+  return { valid: true, eventCount: rows.length, rootHash: roots[0].eventHash, tailHash: tails[0].eventHash };
+}
+
+export async function acquireAuditImportLock(
+  db: D1Database,
+  ownerId: string,
+  now = Date.now()
+): Promise<void> {
+  const result = await db.prepare(
+    `INSERT INTO sb_maintenance_locks (lock_name, owner_id, expires_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(lock_name) DO UPDATE SET
+       owner_id = excluded.owner_id,
+       expires_at = excluded.expires_at
+     WHERE sb_maintenance_locks.expires_at <= ?
+        OR sb_maintenance_locks.owner_id = ?`
+  ).bind(AUDIT_IMPORT_LOCK_NAME, ownerId, now + AUDIT_IMPORT_LOCK_MS, now, ownerId).run();
+  if (Number(result.meta?.changes ?? 0) !== 1) throw new Error("audit_import_in_progress");
+}
+
+export async function releaseAuditImportLock(db: D1Database, ownerId: string): Promise<void> {
+  await db.prepare(
+    `DELETE FROM sb_maintenance_locks WHERE lock_name = ? AND owner_id = ?`
+  ).bind(AUDIT_IMPORT_LOCK_NAME, ownerId).run();
+}
+
 async function sha256Hex(value: string): Promise<string> {
   const bytes = new TextEncoder().encode(value);
   const digest = await crypto.subtle.digest("SHA-256", bytes);
@@ -300,11 +467,13 @@ async function sha256Hex(value: string): Promise<string> {
 
 async function latestAuditEventHash(db: D1Database): Promise<string | null> {
   const row = await db.prepare(
-    `SELECT event_hash FROM sb_audit_events
-     ORDER BY occurred_at DESC, id DESC
-     LIMIT 1`
+    `SELECT event_hash FROM sb_audit_chain_head WHERE id = 1`
   ).first<{ event_hash: string }>();
-  return boundedText(row?.event_hash, 128);
+  if (row) return boundedText(row.event_hash, 128);
+  const fallback = await db.prepare(
+    `SELECT event_hash FROM sb_audit_events ORDER BY occurred_at DESC, id DESC LIMIT 1`
+  ).first<{ event_hash: string }>();
+  return boundedText(fallback?.event_hash, 128);
 }
 
 export async function verifyComplianceAuditChain(
@@ -314,21 +483,32 @@ export async function verifyComplianceAuditChain(
   const events = Number((await db.prepare(
     `SELECT COUNT(*) AS count FROM sb_audit_events`
   ).first<{ count: number }>())?.count ?? 0);
-  const fork = await db.prepare(
-    `SELECT previous_event_hash, COUNT(*) AS successors
-     FROM sb_audit_events
-     WHERE previous_event_hash IS NOT NULL
-     GROUP BY previous_event_hash
-     HAVING COUNT(*) > 1
-     LIMIT 1`
-  ).first<{ previous_event_hash: string; successors: number }>();
-  if (fork) {
+  const shapeRows = (await db.prepare(
+    `SELECT event_hash, previous_event_hash FROM sb_audit_events`
+  ).all<{ event_hash: string; previous_event_hash: string | null }>()).results ?? [];
+  const shape = analyzeAuditChainRows(shapeRows.map((row) => ({
+    eventHash: row.event_hash,
+    previousEventHash: row.previous_event_hash,
+  })));
+  if (!shape.valid) {
     return {
       valid: false,
       complete: true,
       events,
       checked: 0,
-      error: "audit_chain_fork",
+      error: shape.error,
+    };
+  }
+  const head = await db.prepare(
+    `SELECT event_hash, version FROM sb_audit_chain_head WHERE id = 1`
+  ).first<{ event_hash: string | null; version: number }>();
+  if (head && (boundedText(head.event_hash, 128) !== shape.tailHash || Number(head.version) !== events)) {
+    return {
+      valid: false,
+      complete: true,
+      events,
+      checked: 0,
+      error: "audit_chain_head_mismatch",
     };
   }
   const limit = Math.max(1, Math.min(Math.trunc(maxEvents), 1000));
@@ -446,6 +626,13 @@ export async function prepareComplianceAuditEvent(
   db: D1Database,
   input: ComplianceAuditEventInput
 ): Promise<PreparedComplianceAuditEvent> {
+  const lock = await db.prepare(
+    `SELECT owner_id, expires_at FROM sb_maintenance_locks
+     WHERE lock_name = ? LIMIT 1`
+  ).bind(AUDIT_IMPORT_LOCK_NAME).first<{ owner_id: string; expires_at: number }>();
+  if (lock && Number(lock.expires_at) > Date.now()) {
+    throw new Error("audit_import_in_progress");
+  }
   const previousEventHash = await latestAuditEventHash(db);
   const record = {
     id: crypto.randomUUID(),
