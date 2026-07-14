@@ -17,7 +17,11 @@ import {
   PARENT_VERSION_TEMPORAL_MIGRATIONS,
 } from "./evidence-contract";
 import { CLAIM_VECTOR_QUEUE_SCHEMA_STATEMENTS } from "./claim-vector-queue";
-import { MEMORY_MUTATION_SCHEMA_STATEMENTS } from "./mutations";
+import {
+  MEMORY_MUTATION_COLUMN_MIGRATIONS,
+  MEMORY_MUTATION_RECOVERY_INDEX_STATEMENTS,
+  MEMORY_MUTATION_SCHEMA_STATEMENTS,
+} from "./mutations";
 
 const MEMORY_SCHEMA_STATEMENTS = [
   ...ATOMIC_SCHEMA_STATEMENTS,
@@ -105,6 +109,7 @@ export async function ensureMemoryDataModel(db: D1Database): Promise<void> {
   await applyColumnMigrations(db, "sb_memory_sources", MEMORY_SOURCE_PROVENANCE_MIGRATIONS);
   await applyColumnMigrations(db, "sb_parent_versions", PARENT_VERSION_TEMPORAL_MIGRATIONS);
   await applyColumnMigrations(db, "sb_parent_versions", PARENT_VERSION_METADATA_MIGRATIONS);
+  await applyColumnMigrations(db, "sb_memory_mutations", MEMORY_MUTATION_COLUMN_MIGRATIONS);
   for (const statement of PARENT_VERSION_TEMPORAL_BACKFILL_STATEMENTS) {
     await db.exec(statement);
   }
@@ -115,6 +120,9 @@ export async function ensureMemoryDataModel(db: D1Database): Promise<void> {
     await db.exec(statement);
   }
   for (const statement of EVIDENCE_CONTRACT_INDEX_STATEMENTS) {
+    await db.exec(statement);
+  }
+  for (const statement of MEMORY_MUTATION_RECOVERY_INDEX_STATEMENTS) {
     await db.exec(statement);
   }
   for (const statement of ATOMIC_SCHEMA_BACKFILL_STATEMENTS) {

@@ -1,4 +1,5 @@
 import type { EvidenceAuthorType } from "./evidence-contract";
+import type { ClaimVectorProjectionResult } from "./claim-vector-queue";
 
 export type MutationEvidenceType =
   | "direct_user_statement"
@@ -77,13 +78,14 @@ export async function commitAtomicMutationWithProjection<T extends {
   memoryId: string;
 }>(
   commit: () => Promise<T>,
-  enqueueProjection: (memoryId: string) => Promise<boolean>,
+  enqueueProjection: (memoryId: string) => Promise<boolean | ClaimVectorProjectionResult>,
   onProjectionError?: (error: unknown) => void
 ): Promise<T & AtomicMutationProjectionResult> {
   const committed = await commit();
   let claimVectorQueued = false;
   try {
-    claimVectorQueued = await enqueueProjection(committed.memoryId);
+    const result = await enqueueProjection(committed.memoryId);
+    claimVectorQueued = result === true || result === "queued" || result === "already_indexed";
   } catch (error) {
     onProjectionError?.(error);
   }

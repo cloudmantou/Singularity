@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker, { initializeDatabase } from "../../src/index";
 import { ensureMemoryDataModel } from "../../src/memory/schema";
 import { createSelfhostEnv } from "../../src/selfhost/env";
+import { activeEmbeddingOf, embeddingFingerprintOf } from "../../src/settings/model-settings";
+import { getEffectiveModelSettings } from "../../src/settings/store";
 import { resetSettingsCache } from "../../src/settings/store";
 
 function context(): ExecutionContext {
@@ -293,6 +295,59 @@ describe("Append mutation idempotency", () => {
       expect(db.prepare(
         `SELECT COUNT(*) AS count FROM sb_memories WHERE entry_id = 'entry-1'`
       ).get()).toEqual({ count: 0 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("converges projection_pending when the Claim vector was already indexed", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      const effective = (await getEffectiveModelSettings(env)).effective;
+      const fingerprint = effective.embeddingFingerprint ?? embeddingFingerprintOf(activeEmbeddingOf(effective));
+      db.exec(`
+        INSERT INTO entries (id, content, tags, source, created_at, vector_ids, content_hash)
+        VALUES ('entry-projection', 'projection content', '[]', 'api', 1, '[]', 'entry-hash');
+        INSERT INTO sb_observations (id, content, source, content_hash, created_at)
+        VALUES ('obs-projection', 'projection evidence', 'api', 'obs-hash', 1);
+        INSERT INTO sb_parent_units (parent_id, active_version_id, created_at, updated_at)
+        VALUES ('parent-projection', 'version-projection', 1, 1);
+        INSERT INTO sb_parent_versions (version_id, parent_id, version_number, state, created_at, updated_at)
+        VALUES ('version-projection', 'parent-projection', 1, 'active', 1, 1);
+        INSERT INTO sb_memories (id, content, entry_id, parent_version_id, content_hash, claim_status, created_at)
+        VALUES ('claim-projection', 'projection content', 'entry-projection', 'version-projection', 'entry-hash', 'confirmed', 1);
+        INSERT INTO sb_memory_sources (id, memory_id, observation_id, role, relation, evidence_root_id, created_at)
+        VALUES ('source-projection', 'claim-projection', 'obs-projection', 'supports', 'supports', 'root-projection', 1);
+        INSERT INTO sb_parent_version_claims (parent_version_id, memory_id, relation, created_at)
+        VALUES ('version-projection', 'claim-projection', 'supports', 1);
+        INSERT INTO sb_claim_vectors (
+          claim_id, embedding_fingerprint, parent_version_id, content_hash, vector_ids_json, indexed_at
+        ) VALUES ('claim-projection', '${fingerprint}', 'version-projection', 'entry-hash', '[\"claim-vector\"]', 1);
+        INSERT INTO sb_memory_mutations (
+          mutation_id, idempotency_key, source_channel, operation, entry_id,
+          request_hash, state, result_content, result_content_hash,
+          result_vector_count, observation_id, claim_id, warnings_json,
+          created_at, updated_at
+        ) VALUES (
+          'mutation-projection-pending', 'projection-pending', 'api', 'update', 'entry-projection',
+          'request-hash', 'projection_pending', 'projection content', 'entry-hash',
+          1, 'obs-projection', 'claim-projection', '[\"claim_vector_enqueue_failed\"]', 1, 1
+        );
+      `);
+
+      const response = await worker.fetch(new Request("http://localhost/maintenance/mutations/reconcile", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer test-token",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ limit: 10 }),
+      }), env, context());
+      expect(await response.json()).toMatchObject({ ok: true, scanned: 1, reconciled: 1, failed: 0 });
+      expect(db.prepare(
+        `SELECT state, warnings_json FROM sb_memory_mutations WHERE mutation_id = 'mutation-projection-pending'`
+      ).get()).toEqual({ state: "completed", warnings_json: "[]" });
     } finally {
       db.close();
     }

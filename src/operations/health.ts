@@ -1,4 +1,5 @@
 import { verifyComplianceAuditChain } from "../memory/quality";
+import { getMemoryMutationHealth, type MemoryMutationHealth } from "../memory/mutations";
 import {
   queueAttentionCount,
   readClassificationQueueSnapshot,
@@ -67,6 +68,8 @@ export interface HealthMatrix {
       entryCommitted: number;
       knowledgeCommitted: number;
       projectionPending: number;
+      retryableFailed: number;
+      terminalFailed: number;
       stale: number;
     };
   };
@@ -142,11 +145,7 @@ export async function collectHealthMatrix(input: HealthMatrixInput): Promise<Hea
     entityMerge,
     factReview,
     degradedParents,
-    mutationPreparing,
-    mutationEntryCommitted,
-    mutationKnowledgeCommitted,
-    mutationProjectionPending,
-    staleMutations,
+    mutationHealth,
     auditChain,
   ] = await Promise.all([
     readExtractionQueueSnapshot(input.db),
@@ -159,18 +158,18 @@ export async function collectHealthMatrix(input: HealthMatrixInput): Promise<Hea
     ),
     countQuery(input.db, `SELECT COUNT(*) AS count FROM sb_fact_resolutions WHERE requires_review = 1`),
     countQuery(input.db, `SELECT COUNT(*) AS count FROM sb_parent_versions WHERE state = 'active_degraded'`),
-    countQuery(input.db, `SELECT COUNT(*) AS count FROM sb_memory_mutations WHERE state = 'preparing'`),
-    countQuery(input.db, `SELECT COUNT(*) AS count FROM sb_memory_mutations WHERE state = 'entry_committed'`),
-    countQuery(input.db, `SELECT COUNT(*) AS count FROM sb_memory_mutations WHERE state = 'knowledge_committed'`),
-    countQuery(input.db, `SELECT COUNT(*) AS count FROM sb_memory_mutations WHERE state = 'projection_pending'`),
-    countQuery(
-      input.db,
-      `SELECT COUNT(*) AS count
-       FROM sb_memory_mutations
-       WHERE state IN ('preparing', 'entry_committed', 'knowledge_committed', 'projection_pending')
-         AND updated_at <= ?`,
-      Date.now() - 15 * 60_000
-    ),
+    getMemoryMutationHealth(input.db).catch((): MemoryMutationHealth => ({
+      preparing: 0,
+      entry_committed: 0,
+      knowledge_committed: 0,
+      projection_pending: 0,
+      failed: 0,
+      completed: 0,
+      incomplete: 0,
+      stale_incomplete: 0,
+      retryable_failed: 0,
+      terminal_failed: 0,
+    })),
     verifyComplianceAuditChain(input.db).catch((error) => ({
       valid: false,
       complete: false,
@@ -197,7 +196,11 @@ export async function collectHealthMatrix(input: HealthMatrixInput): Promise<Hea
     graphReviewPending > 0 ? "degraded" : "healthy",
     extraction + classification > 0 ? "degraded" : "healthy",
     auditStatus,
-    staleMutations > 0 ? "degraded" : "healthy",
+    mutationHealth.terminal_failed > 0
+      ? "unhealthy"
+      : mutationHealth.retryable_failed > 0 || mutationHealth.stale_incomplete > 0
+        ? "degraded"
+        : "healthy",
     ...providers.map((provider) => provider.status),
   ];
   const status: HealthStatus = componentStatuses.includes("unhealthy")
@@ -243,11 +246,13 @@ export async function collectHealthMatrix(input: HealthMatrixInput): Promise<Hea
       factReview,
       degradedParents,
       mutations: {
-        preparing: mutationPreparing,
-        entryCommitted: mutationEntryCommitted,
-        knowledgeCommitted: mutationKnowledgeCommitted,
-        projectionPending: mutationProjectionPending,
-        stale: staleMutations,
+        preparing: mutationHealth.preparing,
+        entryCommitted: mutationHealth.entry_committed,
+        knowledgeCommitted: mutationHealth.knowledge_committed,
+        projectionPending: mutationHealth.projection_pending,
+        retryableFailed: mutationHealth.retryable_failed,
+        terminalFailed: mutationHealth.terminal_failed,
+        stale: mutationHealth.stale_incomplete,
       },
     },
     queueDetails: {

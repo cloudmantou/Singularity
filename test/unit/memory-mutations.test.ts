@@ -2,6 +2,8 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   beginMemoryMutation,
+  getMemoryMutationHealth,
+  listRecoverableMemoryMutations,
   markMemoryMutationEntryCommitted,
   markMemoryMutationFailed,
   markMemoryMutationProjectionResult,
@@ -115,6 +117,56 @@ describe("memory mutation lifecycle", () => {
     ).get(started.mutation.mutationId) as { last_error: string };
     expect(row.last_error).toHaveLength(500);
     expect(row.last_error.startsWith("sensitive-provider-payload")).toBe(true);
+  });
+
+  it("classifies failed mutations and exposes retryable work to the reconciler", async () => {
+    const started = await beginMemoryMutation(db, {
+      idempotencyKey: "request-retryable",
+      sourceChannel: "api",
+      operation: "update",
+      entryId: "entry-retryable",
+      requestHash: "request-hash-retryable",
+      now: 1_000,
+    });
+    await markMemoryMutationFailed(db, {
+      mutationId: started.mutation.mutationId,
+      leaseOwner: started.leaseOwner!,
+      error: "temporary database unavailable",
+      failureClass: "retryable",
+      now: 1_100,
+    });
+
+    await expect(getMemoryMutationHealth(db, 10_000)).resolves.toMatchObject({
+      failed: 1,
+      retryable_failed: 1,
+      terminal_failed: 0,
+    });
+    await expect(listRecoverableMemoryMutations(db, { now: 10_000 })).resolves.toHaveLength(1);
+  });
+
+  it("keeps terminal mutation failures out of automatic recovery", async () => {
+    const started = await beginMemoryMutation(db, {
+      idempotencyKey: "request-terminal",
+      sourceChannel: "api",
+      operation: "update",
+      entryId: "entry-terminal",
+      requestHash: "request-hash-terminal",
+      now: 2_000,
+    });
+    await markMemoryMutationFailed(db, {
+      mutationId: started.mutation.mutationId,
+      leaseOwner: started.leaseOwner!,
+      error: "mutation_reconcile_entry_projection_is_stale",
+      failureClass: "terminal",
+      now: 2_100,
+    });
+
+    await expect(getMemoryMutationHealth(db, 10_000)).resolves.toMatchObject({
+      failed: 1,
+      retryable_failed: 0,
+      terminal_failed: 1,
+    });
+    await expect(listRecoverableMemoryMutations(db, { now: 10_000 })).resolves.toHaveLength(0);
   });
 
   it("recovers entry and knowledge stages from persisted intents", async () => {

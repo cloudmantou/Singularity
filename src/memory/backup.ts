@@ -658,6 +658,38 @@ async function importTable(
   return stats;
 }
 
+async function importAuditEvents(
+  db: D1Database,
+  rows: BackupRow[],
+  prepare: (row: BackupRow) => D1PreparedStatement
+): Promise<TableImportStats> {
+  let enforcementDisabled = false;
+  try {
+    await db.prepare(
+      `UPDATE sb_audit_chain_head SET enforcement_enabled = 0 WHERE id = 1`
+    ).run();
+    enforcementDisabled = true;
+  } catch {
+    // Older databases may not have the chain head until the next migration.
+  }
+  try {
+    return await importTable(db, rows, prepare);
+  } finally {
+    if (enforcementDisabled) {
+      await db.prepare(
+        `UPDATE sb_audit_chain_head
+         SET event_hash = (
+               SELECT event_hash FROM sb_audit_events
+               ORDER BY occurred_at DESC, id DESC LIMIT 1
+             ),
+             version = (SELECT COUNT(*) FROM sb_audit_events),
+             enforcement_enabled = 1
+         WHERE id = 1`
+      ).run();
+    }
+  }
+}
+
 function rowsFor(body: Record<string, unknown>, key: GraphArrayKey): BackupRow[] {
   return arrayFrom(body[key]);
 }
@@ -1268,7 +1300,7 @@ export async function importMemoryBackup(
     )
   );
 
-  graph.auditEvents = await importTable(db, rowsFor(body, "auditEvents"), (row) =>
+  graph.auditEvents = await importAuditEvents(db, rowsFor(body, "auditEvents"), (row) =>
     db.prepare(
       `${insertVerb(mode)} INTO sb_audit_events (
          id, occurred_at, trace_id, actor_type, actor_id, token_id,

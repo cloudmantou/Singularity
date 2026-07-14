@@ -21,6 +21,13 @@ describe("rankClaimAnswerability", () => {
     )).toMatchObject({ answerability: "answerable" });
   });
 
+  it("does not treat a query with no informative tokens as universally answerable", () => {
+    expect(rankClaimAnswerability("是什么吗", "The project uses SQLite.")).toMatchObject({
+      queryRelevance: 0,
+      answerability: "irrelevant",
+    });
+  });
+
   it("recognizes deterministic domain concepts and optional semantic scores", () => {
     expect(rankClaimAnswerability(
       "Which database is used?",

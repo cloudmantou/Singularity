@@ -22,10 +22,13 @@ export const INSUFFICIENT_VERIFIED_EVIDENCE =
 export const ANSWERABILITY_MODES = ["shadow", "warn", "enforce"] as const;
 export type AnswerabilityMode = (typeof ANSWERABILITY_MODES)[number];
 
-export function normalizeAnswerabilityMode(value: unknown): AnswerabilityMode {
+export function normalizeAnswerabilityMode(
+  value: unknown,
+  fallback: AnswerabilityMode = "enforce"
+): AnswerabilityMode {
   return ANSWERABILITY_MODES.includes(value as AnswerabilityMode)
     ? value as AnswerabilityMode
-    : "enforce";
+    : fallback;
 }
 
 export interface CitableInsightClaim {

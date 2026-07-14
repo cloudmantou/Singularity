@@ -69,6 +69,12 @@ export interface ClaimVectorQueueStatus {
   terminal_failed: number;
 }
 
+export type ClaimVectorProjectionResult =
+  | "queued"
+  | "already_indexed"
+  | "terminal_failed"
+  | "ineligible";
+
 const MAX_ATTEMPTS = 6;
 export const DEFAULT_CLAIM_VECTOR_LEASE_MS = 5 * 60_000;
 
@@ -223,22 +229,25 @@ export async function enqueueClaimVectorJob(
     rebuildId?: string | null;
     now?: number;
   }
-): Promise<boolean> {
+): Promise<ClaimVectorProjectionResult> {
   const now = input.now ?? Date.now();
   const claim = await db.prepare(
     `SELECT m.id, m.entry_id, m.parent_version_id, m.content, m.content_hash, m.created_at
      FROM sb_memories m
      WHERE m.id = ?
        AND ${indexableClaimPredicate("m")}
-       AND NOT EXISTS (
-         SELECT 1 FROM sb_claim_vectors cv
-         WHERE cv.claim_id = m.id
-           AND cv.embedding_fingerprint = ?
-           AND cv.content_hash = m.content_hash
-       )
      LIMIT 1`
-  ).bind(input.claimId, input.targetFingerprint).first<IndexableClaimRow>();
-  if (!claim) return false;
+  ).bind(input.claimId).first<IndexableClaimRow>();
+  if (!claim) return "ineligible";
+  const existingMapping = await db.prepare(
+    `SELECT 1 AS ok
+     FROM sb_claim_vectors
+     WHERE claim_id = ?
+       AND embedding_fingerprint = ?
+       AND content_hash = ?
+     LIMIT 1`
+  ).bind(input.claimId, input.targetFingerprint, claim.content_hash).first<{ ok: number }>();
+  if (Number(existingMapping?.ok ?? 0) === 1) return "already_indexed";
   const result = await db.prepare(
     `INSERT INTO sb_claim_vector_jobs (
        id, claim_id, target_fingerprint, content_hash, parent_version_id,
@@ -294,7 +303,13 @@ export async function enqueueClaimVectorJob(
     now,
     now
   ).run();
-  return Number(result.meta?.changes ?? 0) > 0;
+  if (Number(result.meta?.changes ?? 0) > 0) return "queued";
+  const job = await db.prepare(
+    `SELECT status FROM sb_claim_vector_jobs
+     WHERE claim_id = ? AND target_fingerprint = ? AND content_hash = ?
+     LIMIT 1`
+  ).bind(input.claimId, input.targetFingerprint, claim.content_hash).first<{ status: string }>();
+  return job?.status === "failed" ? "terminal_failed" : "ineligible";
 }
 
 export async function getClaimVectorQueueStatus(

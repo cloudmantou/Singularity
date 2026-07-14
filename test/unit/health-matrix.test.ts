@@ -186,6 +186,35 @@ describe("Health Matrix", () => {
     expect(matrix.status).toBe("degraded");
   });
 
+  it("surfaces retryable and terminal Mutation failures in health status", async () => {
+    raw.prepare(
+      `INSERT INTO sb_memory_mutations (
+         mutation_id, idempotency_key, source_channel, operation, entry_id,
+         request_hash, state, failure_class, terminal, retry_count,
+         created_at, updated_at
+       ) VALUES
+         ('mutation-retryable', 'retryable', 'api', 'update', 'entry-1', 'hash-1',
+          'failed', 'retryable', 0, 1, 1, 1),
+         ('mutation-terminal', 'terminal', 'api', 'update', 'entry-2', 'hash-2',
+          'failed', 'terminal', 1, 1, 1, 1)`
+    ).run();
+
+    const matrix = await collectHealthMatrix({
+      db,
+      vectorize: { describe: vi.fn().mockResolvedValue({ dimensions: 384 }) },
+      mode: "selfhost",
+      llmConfigured: true,
+      embeddingConfigured: true,
+      providers: [],
+    });
+
+    expect(matrix.queues.mutations).toMatchObject({
+      retryableFailed: 1,
+      terminalFailed: 1,
+    });
+    expect(matrix.status).toBe("unhealthy");
+  });
+
   it("accepts valid predecessor links even when equal timestamps sort by random ids", async () => {
     const uuid = vi.spyOn(crypto, "randomUUID")
       .mockReturnValueOnce("z-event")
@@ -223,6 +252,25 @@ describe("Health Matrix", () => {
       events: 2,
       checked: 2,
     });
+  });
+
+  it("rejects a stale audit event prepared from an old chain head", async () => {
+    const first = await prepareComplianceAuditEvent(db, {
+      actorType: "system",
+      action: "first",
+      objectType: "memory",
+      occurredAt: 100,
+    });
+    const stale = await prepareComplianceAuditEvent(db, {
+      actorType: "system",
+      action: "stale",
+      objectType: "memory",
+      occurredAt: 101,
+    });
+
+    await first.statement.run();
+    await expect(stale.statement.run()).rejects.toThrow("audit_chain_head_conflict");
+    expect(raw.prepare(`SELECT COUNT(*) AS count FROM sb_audit_events`).get()).toEqual({ count: 1 });
   });
 
   it("marks a bounded audit sample as degraded instead of claiming full health", async () => {

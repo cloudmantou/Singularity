@@ -102,6 +102,21 @@ describe("Claim vector queue", () => {
     });
   });
 
+  it("reports an existing Claim mapping separately from enqueue failure", async () => {
+    raw.prepare(
+      `INSERT INTO sb_claim_vectors (
+         claim_id, embedding_fingerprint, parent_version_id,
+         content_hash, vector_ids_json, indexed_at
+       ) VALUES ('claim-1', 'fp-v1', 'parent-v1', 'claim-hash-v1', '[\"vector-1\"]', 100)`
+    ).run();
+
+    await expect(enqueueClaimVectorJob(db, {
+      claimId: "claim-1",
+      targetFingerprint: "fp-v1",
+      now: 100,
+    })).resolves.toBe("already_indexed");
+  });
+
   it("persists retryable jobs and completes only after the Claim mapping is durable", async () => {
     expect(await enqueueMissingClaimVectorJobs(db, {
       targetFingerprint: "fp-v1",

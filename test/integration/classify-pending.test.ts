@@ -205,9 +205,10 @@ describe("POST /classify-pending", () => {
     // audit event indexes, evidence/claim/provenance contracts, and parent
     // version snapshots, parent-version claim links, Claim vector mappings,
     // durable Claim vector jobs, Parent metadata snapshot migrations, and the
-    // two-statement idempotent entry-mutation journal;
+    // two-statement idempotent entry-mutation journal, retryable mutation
+    // recovery indexes, and the audit chain-head guard/advance triggers;
     // keep a bounded D1 headroom check instead of letting init grow unnoticed.
-    expect(db.statementCount).toBeLessThanOrEqual(215);
+    expect(db.statementCount).toBeLessThanOrEqual(230);
   });
 
   it("skips entries whose durable classification status is already succeeded", async () => {

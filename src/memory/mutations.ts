@@ -8,6 +8,8 @@ export type MemoryMutationState =
   | "completed"
   | "failed";
 
+export type MemoryMutationFailureClass = "retryable" | "terminal";
+
 export interface MemoryMutationRecord {
   mutationId: string;
   idempotencyKey: string;
@@ -23,6 +25,10 @@ export interface MemoryMutationRecord {
   claimId: string | null;
   warnings: string[];
   lastError: string | null;
+  retryCount: number;
+  nextRetryAt: number | null;
+  failureClass: MemoryMutationFailureClass | null;
+  terminal: boolean;
   leaseOwner: string | null;
   leaseExpiresAt: number | null;
   createdAt: number;
@@ -48,6 +54,10 @@ interface MemoryMutationRow {
   claim_id: string | null;
   warnings_json: string;
   last_error: string | null;
+  retry_count: number;
+  next_retry_at: number | null;
+  failure_class: MemoryMutationFailureClass | null;
+  terminal: number;
   lease_owner: string | null;
   lease_expires_at: number | null;
   created_at: number;
@@ -63,6 +73,8 @@ export interface MemoryMutationHealth {
   completed: number;
   incomplete: number;
   stale_incomplete: number;
+  retryable_failed: number;
+  terminal_failed: number;
 }
 
 const MUTATION_LEASE_MS = 5 * 60 * 1000;
@@ -90,6 +102,10 @@ export const MEMORY_MUTATION_SCHEMA_STATEMENTS = [
     claim_id TEXT,
     warnings_json TEXT NOT NULL DEFAULT '[]',
     last_error TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    next_retry_at INTEGER,
+    failure_class TEXT,
+    terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1)),
     lease_owner TEXT,
     lease_expires_at INTEGER,
     created_at INTEGER NOT NULL,
@@ -97,7 +113,19 @@ export const MEMORY_MUTATION_SCHEMA_STATEMENTS = [
     UNIQUE(source_channel, operation, idempotency_key)
   )`,
   `CREATE INDEX IF NOT EXISTS idx_sb_memory_mutations_state
-    ON sb_memory_mutations(state, lease_expires_at, updated_at)`,
+    ON sb_memory_mutations(state, terminal, next_retry_at, lease_expires_at, updated_at)`,
+] as const;
+
+export const MEMORY_MUTATION_COLUMN_MIGRATIONS = [
+  { column: "retry_count", statement: "ALTER TABLE sb_memory_mutations ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0" },
+  { column: "next_retry_at", statement: "ALTER TABLE sb_memory_mutations ADD COLUMN next_retry_at INTEGER" },
+  { column: "failure_class", statement: "ALTER TABLE sb_memory_mutations ADD COLUMN failure_class TEXT" },
+  { column: "terminal", statement: "ALTER TABLE sb_memory_mutations ADD COLUMN terminal INTEGER NOT NULL DEFAULT 0" },
+] as const;
+
+export const MEMORY_MUTATION_RECOVERY_INDEX_STATEMENTS = [
+  `CREATE INDEX IF NOT EXISTS idx_sb_memory_mutations_recovery
+   ON sb_memory_mutations(state, terminal, next_retry_at, updated_at)`,
 ] as const;
 
 function changes(result: D1Result<unknown>): number {
@@ -129,6 +157,10 @@ function toRecord(row: MemoryMutationRow): MemoryMutationRecord {
     claimId: row.claim_id,
     warnings: parseWarnings(row.warnings_json),
     lastError: row.last_error,
+    retryCount: Number(row.retry_count ?? 0),
+    nextRetryAt: row.next_retry_at,
+    failureClass: row.failure_class,
+    terminal: Number(row.terminal ?? 0) === 1,
     leaseOwner: row.lease_owner,
     leaseExpiresAt: row.lease_expires_at,
     createdAt: row.created_at,
@@ -185,15 +217,26 @@ export async function getMemoryMutationHealth(
   const entryCommitted = counts.get("entry_committed") ?? 0;
   const knowledgeCommitted = counts.get("knowledge_committed") ?? 0;
   const projectionPending = counts.get("projection_pending") ?? 0;
+  const failed = counts.get("failed") ?? 0;
+  const retryableFailed = await db.prepare(
+    `SELECT COUNT(*) AS count FROM sb_memory_mutations
+     WHERE state = 'failed' AND COALESCE(terminal, 0) = 0`
+  ).first<{ count: number }>();
+  const terminalFailed = await db.prepare(
+    `SELECT COUNT(*) AS count FROM sb_memory_mutations
+     WHERE state = 'failed' AND COALESCE(terminal, 0) = 1`
+  ).first<{ count: number }>();
   return {
     preparing,
     entry_committed: entryCommitted,
     knowledge_committed: knowledgeCommitted,
     projection_pending: projectionPending,
-    failed: counts.get("failed") ?? 0,
+    failed,
     completed: counts.get("completed") ?? 0,
     incomplete: preparing + entryCommitted + knowledgeCommitted + projectionPending,
     stale_incomplete: Number(stale?.count ?? 0),
+    retryable_failed: Number(retryableFailed?.count ?? 0),
+    terminal_failed: Number(terminalFailed?.count ?? 0),
   };
 }
 
@@ -204,11 +247,14 @@ export async function listRecoverableMemoryMutations(
   const now = input.now ?? Date.now();
   const { results } = await db.prepare(
     `SELECT * FROM sb_memory_mutations
-     WHERE state IN ('preparing', 'entry_committed', 'knowledge_committed', 'projection_pending')
+     WHERE (
+       state IN ('preparing', 'entry_committed', 'knowledge_committed', 'projection_pending')
+       OR (state = 'failed' AND COALESCE(terminal, 0) = 0 AND COALESCE(next_retry_at, 0) <= ?)
+     )
        AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
      ORDER BY updated_at ASC, mutation_id ASC
      LIMIT ?`
-  ).bind(now, mutationLimit(input.limit ?? 25)).all<MemoryMutationRow>();
+  ).bind(now, now, mutationLimit(input.limit ?? 25)).all<MemoryMutationRow>();
   return (results ?? []).map(toRecord);
 }
 
@@ -223,9 +269,12 @@ export async function claimMemoryMutationLease(
     `UPDATE sb_memory_mutations
      SET lease_owner = ?, lease_expires_at = ?, updated_at = ?
      WHERE mutation_id = ?
-       AND state IN ('preparing', 'entry_committed', 'knowledge_committed', 'projection_pending')
+       AND (
+         state IN ('preparing', 'entry_committed', 'knowledge_committed', 'projection_pending')
+         OR (state = 'failed' AND COALESCE(terminal, 0) = 0 AND COALESCE(next_retry_at, 0) <= ?)
+       )
        AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)`
-  ).bind(leaseOwner, leaseExpiresAt, now, input.mutationId, now).run();
+  ).bind(leaseOwner, leaseExpiresAt, now, input.mutationId, now, now).run();
   if (changes(result) !== 1) return null;
   const mutation = await loadMemoryMutation(db, input.mutationId);
   return mutation ? { mutation, leaseOwner } : null;
@@ -306,6 +355,9 @@ export async function beginMemoryMutation(
   if (existing.entryId !== input.entryId || existing.requestHash !== input.requestHash) {
     return { status: "conflict", mutation: existing };
   }
+  if (existing.state === "failed" && existing.terminal) {
+    return { status: "conflict", mutation: existing };
+  }
   if (existing.state === "completed") {
     const projection = existing.resultContent != null && existing.resultContentHash != null
       ? await db.prepare(
@@ -362,6 +414,7 @@ export async function beginMemoryMutation(
          lease_owner = ?, lease_expires_at = ?, last_error = NULL, updated_at = ?
      WHERE mutation_id = ?
        AND state != 'completed'
+       AND (state != 'failed' OR COALESCE(terminal, 0) = 0)
        AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)`
   ).bind(leaseOwner, leaseExpiresAt, now, existing.mutationId, now).run();
   if (changes(acquired) !== 1) return { status: "in_progress", mutation: existing };
@@ -470,6 +523,26 @@ export async function reopenMemoryMutationProjection(
      WHERE mutation_id = ? AND lease_owner = ? AND state = 'projection_pending'
        AND lease_expires_at > ?`
   ).bind(now, input.mutationId, input.leaseOwner, now).run();
+  return changes(result) === 1;
+}
+
+export async function reopenFailedMemoryMutation(
+  db: D1Database,
+  input: {
+    mutationId: string;
+    leaseOwner: string;
+    state: Exclude<MemoryMutationState, "failed" | "completed">;
+    now?: number;
+  }
+): Promise<boolean> {
+  const now = input.now ?? Date.now();
+  const result = await db.prepare(
+    `UPDATE sb_memory_mutations
+     SET state = ?, failure_class = NULL, terminal = 0,
+         next_retry_at = NULL, last_error = NULL, updated_at = ?
+     WHERE mutation_id = ? AND lease_owner = ? AND state = 'failed'
+       AND COALESCE(terminal, 0) = 0`
+  ).bind(input.state, now, input.mutationId, input.leaseOwner).run();
   return changes(result) === 1;
 }
 
@@ -587,16 +660,44 @@ export async function markMemoryMutationFailed(
     mutationId: string;
     leaseOwner: string;
     error: string;
+    failureClass?: MemoryMutationFailureClass;
     now?: number;
   }
 ): Promise<boolean> {
   const now = input.now ?? Date.now();
   const error = input.error.trim().slice(0, 500);
+  const failureClass = input.failureClass ?? classifyMemoryMutationFailure(error);
+  const terminal = failureClass === "terminal";
+  const retryCount = await db.prepare(
+    `SELECT retry_count FROM sb_memory_mutations WHERE mutation_id = ?`
+  ).bind(input.mutationId).first<{ retry_count: number }>();
+  const nextRetryCount = Number(retryCount?.retry_count ?? 0) + 1;
+  const nextRetryAt = terminal ? null : now + mutationRetryDelayMs(nextRetryCount);
   const result = await db.prepare(
     `UPDATE sb_memory_mutations
-     SET state = 'failed', last_error = ?, lease_owner = NULL,
-         lease_expires_at = NULL, updated_at = ?
+     SET state = 'failed', last_error = ?, retry_count = ?,
+         next_retry_at = ?, failure_class = ?, terminal = ?,
+         lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
      WHERE mutation_id = ? AND lease_owner = ?`
-  ).bind(error, now, input.mutationId, input.leaseOwner).run();
+  ).bind(
+    error,
+    nextRetryCount,
+    nextRetryAt,
+    failureClass,
+    terminal ? 1 : 0,
+    now,
+    input.mutationId,
+    input.leaseOwner
+  ).run();
   return changes(result) === 1;
+}
+
+function mutationRetryDelayMs(attempt: number): number {
+  return Math.min(60 * 60 * 1000, 5_000 * (2 ** Math.min(Math.max(attempt - 1, 0), 8)));
+}
+
+export function classifyMemoryMutationFailure(error: string): MemoryMutationFailureClass {
+  return /entry_projection_is_stale|missing_(entry|recovery|entry_intent)|projection_missing|hash_mismatch|content changed|tags changed/i.test(error)
+    ? "terminal"
+    : "retryable";
 }

@@ -112,6 +112,42 @@ export const MEMORY_QUALITY_SCHEMA_STATEMENTS = [
    ON sb_audit_events(vault_id, occurred_at DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_audit_events_token
    ON sb_audit_events(token_id, occurred_at DESC)`,
+  `CREATE TABLE IF NOT EXISTS sb_audit_chain_head (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    event_hash TEXT,
+    version INTEGER NOT NULL DEFAULT 0,
+    enforcement_enabled INTEGER NOT NULL DEFAULT 1 CHECK (enforcement_enabled IN (0, 1))
+  )`,
+  `INSERT OR IGNORE INTO sb_audit_chain_head (id, event_hash, version, enforcement_enabled)
+   SELECT 1,
+          (SELECT event_hash FROM sb_audit_events ORDER BY occurred_at DESC, id DESC LIMIT 1),
+          (SELECT COUNT(*) FROM sb_audit_events),
+          1`,
+  `UPDATE sb_audit_chain_head
+   SET event_hash = (SELECT event_hash FROM sb_audit_events ORDER BY occurred_at DESC, id DESC LIMIT 1),
+       version = (SELECT COUNT(*) FROM sb_audit_events),
+       enforcement_enabled = 1
+   WHERE id = 1`,
+  `CREATE TRIGGER IF NOT EXISTS trg_sb_audit_chain_head_guard
+   BEFORE INSERT ON sb_audit_events
+   BEGIN
+     SELECT CASE WHEN NOT EXISTS (
+       SELECT 1 FROM sb_audit_chain_head
+       WHERE id = 1
+         AND (
+           enforcement_enabled = 0
+           OR event_hash IS NEW.previous_event_hash
+         )
+     ) THEN RAISE(ABORT, 'audit_chain_head_conflict') END;
+   END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_sb_audit_chain_head_advance
+   AFTER INSERT ON sb_audit_events
+   BEGIN
+     UPDATE sb_audit_chain_head
+     SET event_hash = NEW.event_hash,
+         version = version + 1
+     WHERE id = 1;
+   END`,
 ] as const;
 
 export interface MemoryMergeCandidateInput {
@@ -278,6 +314,23 @@ export async function verifyComplianceAuditChain(
   const events = Number((await db.prepare(
     `SELECT COUNT(*) AS count FROM sb_audit_events`
   ).first<{ count: number }>())?.count ?? 0);
+  const fork = await db.prepare(
+    `SELECT previous_event_hash, COUNT(*) AS successors
+     FROM sb_audit_events
+     WHERE previous_event_hash IS NOT NULL
+     GROUP BY previous_event_hash
+     HAVING COUNT(*) > 1
+     LIMIT 1`
+  ).first<{ previous_event_hash: string; successors: number }>();
+  if (fork) {
+    return {
+      valid: false,
+      complete: true,
+      events,
+      checked: 0,
+      error: "audit_chain_fork",
+    };
+  }
   const limit = Math.max(1, Math.min(Math.trunc(maxEvents), 1000));
   const rows = (await db.prepare(
     `SELECT id, occurred_at, trace_id, actor_type, actor_id, token_id,

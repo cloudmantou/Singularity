@@ -46,11 +46,13 @@ describe("Claim vector mapping CAS", () => {
          ) VALUES ('job-1', 'claim-1', ?, 'claim-hash', 'parent-v1',
                    'processing', 1, 'lease-1', ?, 1, 1)`
       ).run(fingerprint, Date.now() + 60_000);
+      const deleteByIds = vi.fn().mockResolvedValue({ mutationId: "cleanup" });
       env.VECTORIZE = makeVectorizeMock({
         insert: vi.fn().mockImplementation(async () => {
           db.prepare(`DELETE FROM sb_claim_vector_jobs WHERE id = 'job-1'`).run();
           return { mutationId: "stale-write" };
         }),
+        deleteByIds,
       });
 
       await expect(indexClaimSnapshotVector(env, {
@@ -66,6 +68,7 @@ describe("Claim vector mapping CAS", () => {
         rebuildId: null,
       })).rejects.toThrow("claim_vector_mapping_cas_failed");
       expect(db.prepare(`SELECT COUNT(*) AS count FROM sb_claim_vectors`).get()).toEqual({ count: 0 });
+      expect(deleteByIds).toHaveBeenCalledTimes(1);
     } finally {
       db.close();
     }

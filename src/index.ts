@@ -107,6 +107,7 @@ import {
   memoryMutationKnowledgeProjectionExists,
   prepareMemoryMutationEntryCommit,
   reopenMemoryMutationProjection,
+  reopenFailedMemoryMutation,
   stageMemoryMutationEntryIntent,
   type MemoryMutationOperation,
   type MemoryMutationRecord,
@@ -6974,7 +6975,10 @@ export async function synthesizeVerifiedInsight(
   }
 
   const citableClaims = buildCitableInsightClaims(context, conflicts, query);
-  const answerabilityMode = normalizeAnswerabilityMode(env.ANSWERABILITY_MODE);
+  const answerabilityMode = normalizeAnswerabilityMode(
+    env.ANSWERABILITY_MODE,
+    env.SELFHOST === "1" ? "shadow" : "enforce"
+  );
   if (!citableClaims.length) {
     return {
       answer: INSUFFICIENT_VERIFIED_EVIDENCE,
@@ -6989,7 +6993,9 @@ export async function synthesizeVerifiedInsight(
         .map((claim) =>
           `[${claim.ref}] claim=${claim.claimId ?? "legacy-entry"}; status=${claim.status}; ` +
           `conflicts=${claim.conflictIds.join(",") || "none"}; ` +
-          `answerability=${claim.answerability}; relevance=${claim.queryRelevance}; statement=${claim.statement}`
+          (answerabilityMode === "shadow"
+            ? `statement=${claim.statement}`
+            : `answerability=${claim.answerability}; relevance=${claim.queryRelevance}; statement=${claim.statement}`)
         );
       return `[E${i + 1}] evidence_id=${r.id}\n${claimLines.join("\n")}`;
     })
@@ -7038,7 +7044,9 @@ Rules:
 - Return exactly one JSON object and no markdown: {"answer":"","claims":[{"text":"","refs":["C1"],"kind":"fact"}]}.
 - C* references are the only citable Claims. E* labels identify Evidence containers and R* labels are navigation-only; never place E* or R* in refs.
 - For kind="fact", copy text exactly from one referenced C* statement. Do not paraphrase, combine, infer, guess, or add facts.
-- Only cite a C* Claim whose answerability is "answerable". Related or irrelevant Claims cannot answer the query.
+- ${answerabilityMode === "shadow"
+    ? "Answerability is evaluated after model selection; choose the most relevant Claims from the evidence without relying on a server answerability label."
+    : "Only cite a C* Claim whose answerability is \"answerable\". Related or irrelevant Claims cannot answer the query."}
 - A contested Claim or a Claim with conflicts cannot be emitted as kind="fact".
 - A Claim listed under Conflict-only Claims cannot support kind="fact".
 - To disclose an unresolved conflict, use kind="conflict" and cite at least two C* refs that share the same conflict ID. The server will render the conflict text.
@@ -8323,7 +8331,6 @@ export async function indexClaimSnapshotVector(
       input.targetFingerprint
     ).run();
     if (Number(mappingWrite.meta?.changes ?? 0) !== 1) {
-      await cleanupPreparedVectors(env, claimVectors.vectorIds, "Stale Claim vector mapping");
       throw new Error("claim_vector_mapping_cas_failed");
     } else if (replacedVectorIds.length) {
       await cleanupPreparedVectors(env, replacedVectorIds, "Replaced Claim vector mapping");
@@ -8508,11 +8515,13 @@ async function executeEntryKnowledgeMutation(
   } else if (mutation.state === "knowledge_committed" && mutation.claimId) {
     try {
       const snapshot = await loadActiveEmbeddingSnapshot(env);
-      const queued = await enqueueClaimVectorJob(env.DB, {
+      const projection = await enqueueClaimVectorJob(env.DB, {
         claimId: mutation.claimId,
         targetFingerprint: snapshot.fingerprint,
       });
-      warnings = queued ? [] : ["claim_vector_enqueue_failed"];
+      warnings = projection === "queued" || projection === "already_indexed"
+        ? []
+        : [`claim_vector_${projection}`];
     } catch (error) {
       console.error("Claim vector re-enqueue failed during mutation resume:", error);
       warnings = ["claim_vector_enqueue_failed"];
@@ -8577,6 +8586,34 @@ async function reconcileMemoryMutations(
     const lease = { mutationId: candidate.mutationId, leaseOwner: claimed.leaseOwner };
     let mutation = claimed.mutation;
     try {
+      if (mutation.state === "failed") {
+        if (!mutation.resultContent || !mutation.resultContentHash) {
+          throw new Error("mutation_reconcile_missing_recovery_data");
+        }
+        const currentEntry = await env.DB.prepare(
+          `SELECT 1 AS ok FROM entries
+           WHERE id = ? AND content = ? AND content_hash = ?
+           LIMIT 1`
+        ).bind(
+          mutation.entryId,
+          mutation.resultContent,
+          mutation.resultContentHash
+        ).first<{ ok: number }>();
+        if (Number(currentEntry?.ok ?? 0) !== 1) {
+          throw new Error("mutation_reconcile_entry_projection_is_stale");
+        }
+        const state = await memoryMutationKnowledgeProjectionExists(env.DB, mutation)
+          ? "knowledge_committed"
+          : "entry_committed";
+        if (!await reopenFailedMemoryMutation(env.DB, {
+          ...lease,
+          state,
+        })) {
+          throw new Error("mutation_reconcile_failed_reopen");
+        }
+        mutation = await loadMemoryMutation(env.DB, mutation.mutationId) ?? mutation;
+      }
+
       if (mutation.state === "preparing") {
         if (!mutation.resultContent || !mutation.resultContentHash) {
           throw new Error("mutation_reconcile_missing_entry_intent");
@@ -8645,12 +8682,14 @@ async function reconcileMemoryMutations(
       if (mutation.claimId) {
         try {
           const snapshot = await loadActiveEmbeddingSnapshot(env);
-          const queued = await enqueueClaimVectorJob(env.DB, {
+          const projection = await enqueueClaimVectorJob(env.DB, {
             claimId: mutation.claimId,
             targetFingerprint: snapshot.fingerprint,
           });
-          warnings = queued ? [] : ["claim_vector_enqueue_failed"];
-          if (queued) result.projectionQueued += 1;
+          warnings = projection === "queued" || projection === "already_indexed"
+            ? []
+            : [`claim_vector_${projection}`];
+          if (projection === "queued") result.projectionQueued += 1;
         } catch (error) {
           console.error("Claim vector re-enqueue failed during mutation reconciliation:", error);
           warnings = ["claim_vector_enqueue_failed"];

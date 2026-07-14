@@ -194,19 +194,19 @@ describe("synthesizeInsight()", () => {
     const env = makeTestEnv(undefined, {
       AI: { run: vi.fn().mockRejectedValue(new Error("AI unavailable")) } as unknown as Ai,
     });
-    const result = await synthesizeInsight("query", [verifiedEvidence("1", "content")], env);
+    const result = await synthesizeInsight("content", [verifiedEvidence("1", "content")], env);
     expect(result).toBe("");
   });
 
   it("returns empty string when LLM response text is empty", async () => {
     const env = makeTestEnv(undefined, { AI: aiMock("") });
-    const result = await synthesizeInsight("query", [verifiedEvidence("1", "content")], env);
+    const result = await synthesizeInsight("content", [verifiedEvidence("1", "content")], env);
     expect(result).toBe("");
   });
 
   it("trims whitespace from LLM response", async () => {
     const env = makeTestEnv(undefined, { AI: aiMock(`  ${structuredClaim("content")}  `) });
-    const result = await synthesizeInsight("query", [verifiedEvidence("1", "content")], env);
+    const result = await synthesizeInsight("content", [verifiedEvidence("1", "content")], env);
     expect(result).toBe("content [C1]");
   });
 
@@ -226,6 +226,20 @@ describe("synthesizeInsight()", () => {
     const [, { messages }] = (env.AI.run as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(messages[0].content).toContain("JWT decision");
     expect(messages[0].content).toContain("switched to Postgres");
+  });
+
+  it("does not expose Answerability conclusions to the model in shadow mode", async () => {
+    const env = makeTestEnv(undefined, {
+      ANSWERABILITY_MODE: "shadow",
+      AI: aiMock(structuredClaim("The project uses SQLite")),
+    });
+    await synthesizeInsight("Which port is used?", [verifiedEvidence("1", "The project uses SQLite")], env);
+
+    const [, { messages }] = (env.AI.run as ReturnType<typeof vi.fn>).mock.calls[0];
+    const prompt = messages[0].content as string;
+    expect(prompt).not.toContain("answerability=irrelevant");
+    expect(prompt).not.toContain("Only cite a C* Claim whose answerability is");
+    expect(prompt).toContain("Answerability is evaluated after model selection");
   });
 
   it("grounds the prompt: local evidence refs, insufficient-evidence path, no speculation", async () => {

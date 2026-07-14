@@ -40,7 +40,7 @@ function informativeTokens(query: string): string[] {
 
 function lexicalCoverage(query: string, statement: string): number {
   const tokens = informativeTokens(query);
-  if (!tokens.length) return 1;
+  if (!tokens.length) return 0;
   const normalizedStatement = normalizeText(statement);
   const matches = tokens.filter((token) => normalizedStatement.includes(token)).length;
   return matches / tokens.length;

@@ -478,7 +478,7 @@ export const MIGRATIONS: Migration[] = [
   {
     id: "20260713_memory_quality_review_and_audit",
     name: "Memory quality review queues and compliance audit events",
-    checksum: "memory-quality-review-audit-v1",
+    checksum: "memory-quality-review-audit-v2-chain-head",
     statements: MEMORY_QUALITY_REVIEW_STATEMENTS,
   },
   {
