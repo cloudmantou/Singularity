@@ -62,6 +62,13 @@ export interface HealthMatrix {
     entityMerge: number;
     factReview: number;
     degradedParents: number;
+    mutations: {
+      preparing: number;
+      entryCommitted: number;
+      knowledgeCommitted: number;
+      projectionPending: number;
+      stale: number;
+    };
   };
   queueDetails: {
     extraction: QueueSnapshot;
@@ -135,6 +142,11 @@ export async function collectHealthMatrix(input: HealthMatrixInput): Promise<Hea
     entityMerge,
     factReview,
     degradedParents,
+    mutationPreparing,
+    mutationEntryCommitted,
+    mutationKnowledgeCommitted,
+    mutationProjectionPending,
+    staleMutations,
     auditChain,
   ] = await Promise.all([
     readExtractionQueueSnapshot(input.db),
@@ -147,6 +159,18 @@ export async function collectHealthMatrix(input: HealthMatrixInput): Promise<Hea
     ),
     countQuery(input.db, `SELECT COUNT(*) AS count FROM sb_fact_resolutions WHERE requires_review = 1`),
     countQuery(input.db, `SELECT COUNT(*) AS count FROM sb_parent_versions WHERE state = 'active_degraded'`),
+    countQuery(input.db, `SELECT COUNT(*) AS count FROM sb_memory_mutations WHERE state = 'preparing'`),
+    countQuery(input.db, `SELECT COUNT(*) AS count FROM sb_memory_mutations WHERE state = 'entry_committed'`),
+    countQuery(input.db, `SELECT COUNT(*) AS count FROM sb_memory_mutations WHERE state = 'knowledge_committed'`),
+    countQuery(input.db, `SELECT COUNT(*) AS count FROM sb_memory_mutations WHERE state = 'projection_pending'`),
+    countQuery(
+      input.db,
+      `SELECT COUNT(*) AS count
+       FROM sb_memory_mutations
+       WHERE state IN ('preparing', 'entry_committed', 'knowledge_committed', 'projection_pending')
+         AND updated_at <= ?`,
+      Date.now() - 15 * 60_000
+    ),
     verifyComplianceAuditChain(input.db).catch((error) => ({
       valid: false,
       complete: false,
@@ -173,6 +197,7 @@ export async function collectHealthMatrix(input: HealthMatrixInput): Promise<Hea
     graphReviewPending > 0 ? "degraded" : "healthy",
     extraction + classification > 0 ? "degraded" : "healthy",
     auditStatus,
+    staleMutations > 0 ? "degraded" : "healthy",
     ...providers.map((provider) => provider.status),
   ];
   const status: HealthStatus = componentStatuses.includes("unhealthy")
@@ -217,6 +242,13 @@ export async function collectHealthMatrix(input: HealthMatrixInput): Promise<Hea
       entityMerge,
       factReview,
       degradedParents,
+      mutations: {
+        preparing: mutationPreparing,
+        entryCommitted: mutationEntryCommitted,
+        knowledgeCommitted: mutationKnowledgeCommitted,
+        projectionPending: mutationProjectionPending,
+        stale: staleMutations,
+      },
     },
     queueDetails: {
       extraction: extractionDetails,

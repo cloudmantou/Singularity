@@ -87,6 +87,7 @@ export function createSelfhostEnv(options: SelfhostOptions = {}): {
     EMBEDDING_MODEL: process.env.EMBEDDING_MODEL,
     EMBEDDING_PROVIDER: process.env.EMBEDDING_PROVIDER,
     EMBEDDING_DIM: process.env.EMBEDDING_DIM,
+    ANSWERABILITY_MODE: process.env.ANSWERABILITY_MODE,
   };
 
   return { env, db: raw, databasePath };

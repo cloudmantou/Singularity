@@ -64,6 +64,25 @@ describe("validateStructuredInsightResponse", () => {
     expect(result.unverifiedClaims[0]?.reason).toBe("claim_not_answerable");
   });
 
+  it("supports shadow and warn modes without silently dropping the Claim", () => {
+    const response = JSON.stringify({
+      claims: [{ text: sqliteClaim.statement, refs: ["C1"], kind: "fact" }],
+    });
+    const notAnswerable = { ...sqliteClaim, queryRelevance: 0, answerability: "irrelevant" as const };
+
+    const shadow = validateStructuredInsightResponse(response, [notAnswerable], "shadow");
+    expect(shadow.answer).toBe("The project uses SQLite. [C1]");
+    expect(shadow.answerabilityWarnings).toEqual([expect.objectContaining({
+      refs: ["C1"],
+      reason: "claim_not_answerable",
+      mode: "shadow",
+    })]);
+
+    const warn = validateStructuredInsightResponse(response, [notAnswerable], "warn");
+    expect(warn.answer).toBe("The project uses SQLite. [C1]");
+    expect(warn.answerabilityWarnings?.[0]?.mode).toBe("warn");
+  });
+
   it("rejects a fact when any attached Claim ref has a different statement", () => {
     const result = validateStructuredInsightResponse(JSON.stringify({
       claims: [{

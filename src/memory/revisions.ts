@@ -35,6 +35,11 @@ export interface MemoryRevisionRecord extends MemoryRevisionInput {
 export interface MemoryRevisionGuard {
   /** JSON-encoded vector generation that must be active after the write. */
   activeVectorIdsJson: string;
+  /** Optional content hash that must be visible on the committed Entry. */
+  entryContentHash?: string;
+  /** Optional mutation checkpoint that must have committed the Entry first. */
+  mutationId?: string;
+  mutationLeaseOwner?: string;
 }
 
 function buildMemoryRevision(input: MemoryRevisionInput): MemoryRevisionRecord {
@@ -76,15 +81,36 @@ function revisionStatement(
   ];
 
   if (guard) {
+    const entryContentHashClause = guard.entryContentHash != null
+      ? " AND content_hash = ?"
+      : "";
+    const mutationClause = guard.mutationId && guard.mutationLeaseOwner
+      ? ` AND EXISTS (
+           SELECT 1 FROM sb_memory_mutations mutation_revision_guard
+           WHERE mutation_revision_guard.mutation_id = ?
+             AND mutation_revision_guard.lease_owner = ?
+             AND mutation_revision_guard.state = 'entry_committed'
+         )`
+      : "";
+    const bindings: unknown[] = [
+      ...values,
+      revision.memoryId,
+      guard.activeVectorIdsJson,
+    ];
+    if (guard.entryContentHash != null) bindings.push(guard.entryContentHash);
+    if (guard.mutationId && guard.mutationLeaseOwner) {
+      bindings.push(guard.mutationId, guard.mutationLeaseOwner);
+    }
     return db
       .prepare(
         `${insert}
          SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          WHERE EXISTS (
-           SELECT 1 FROM entries WHERE id = ? AND vector_ids = ?
-         )`
+           SELECT 1 FROM entries
+           WHERE id = ? AND vector_ids = ?${entryContentHashClause}
+         )${mutationClause}`
       )
-      .bind(...values, revision.memoryId, guard.activeVectorIdsJson);
+      .bind(...bindings);
   }
 
   return db

@@ -86,6 +86,7 @@ import {
   indexableClaimPredicate,
   listClaimVectorIdsForFingerprint,
   processClaimVectorJobs,
+  reclaimExpiredClaimVectorJobs,
   retryFailedClaimVectorJobs,
 } from "./memory/claim-vector-queue";
 import { vectorStillReferenced as isVectorStillReferenced } from "./memory/vector-references";
@@ -97,8 +98,15 @@ import {
   beginMemoryMutation,
   loadMemoryMutation,
   markMemoryMutationFailed,
+  markMemoryMutationEntryCommitted,
+  markMemoryMutationKnowledgeCommitted,
   markMemoryMutationProjectionResult,
+  claimMemoryMutationLease,
+  getMemoryMutationHealth,
+  listRecoverableMemoryMutations,
+  memoryMutationKnowledgeProjectionExists,
   prepareMemoryMutationEntryCommit,
+  reopenMemoryMutationProjection,
   stageMemoryMutationEntryIntent,
   type MemoryMutationOperation,
   type MemoryMutationRecord,
@@ -133,6 +141,7 @@ import {
 } from "./memory/associations";
 import {
   INSUFFICIENT_VERIFIED_EVIDENCE,
+  normalizeAnswerabilityMode,
   normalizeInsightContext,
   validateStructuredInsightResponse,
   type CitableInsightClaim,
@@ -292,6 +301,8 @@ export interface Env {
   EMBEDDING_MODEL?: string;
   EMBEDDING_PROVIDER?: string;
   EMBEDDING_DIM?: string;
+  /** Claim answerability policy: shadow, warn, or enforce. */
+  ANSWERABILITY_MODE?: string;
 }
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
@@ -4988,12 +4999,42 @@ function prepareVectorCleanupQueueInsert(
     rebuildId?: string | null;
     lastError?: string | null;
     now: number;
+    entryId?: string;
+    entryContentHash?: string;
+    mutationId?: string;
+    mutationLeaseOwner?: string;
   }
 ): D1PreparedStatement {
+  const entryGuard = input.entryId && input.entryContentHash != null
+    ? `WHERE EXISTS (
+         SELECT 1 FROM entries cleanup_entry_guard
+         WHERE cleanup_entry_guard.id = ?
+           AND cleanup_entry_guard.content_hash = ?
+       )`
+    : "";
+  const mutationGuard = input.mutationId && input.mutationLeaseOwner
+    ? `WHERE EXISTS (
+         SELECT 1 FROM sb_memory_mutations cleanup_mutation_guard
+         WHERE cleanup_mutation_guard.mutation_id = ?
+           AND cleanup_mutation_guard.lease_owner = ?
+           AND cleanup_mutation_guard.state = 'entry_committed'
+       )`
+    : "";
+  if (entryGuard && mutationGuard) throw new Error("vector_cleanup_guard_conflict");
+  const guard = entryGuard || mutationGuard;
+  const guardBindings = entryGuard
+    ? [input.entryId, input.entryContentHash]
+    : mutationGuard
+      ? [input.mutationId, input.mutationLeaseOwner]
+      : [];
+  const valuesClause = guard
+    ? `SELECT ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?
+       ${guard}`
+    : "VALUES (?, ?, ?, ?, 0, NULL, ?, ?, ?, ?)";
   return env.DB.prepare(
     `INSERT INTO sb_vector_cleanup_queue (
        id, vector_id, reason, state, attempts, next_attempt_at, rebuild_id, last_error, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, 0, NULL, ?, ?, ?, ?)
+     ) ${valuesClause}
      ON CONFLICT(vector_id) DO UPDATE SET
        reason = excluded.reason,
        state = excluded.state,
@@ -5008,7 +5049,8 @@ function prepareVectorCleanupQueueInsert(
     input.rebuildId ?? null,
     input.lastError ?? null,
     input.now,
-    input.now
+    input.now,
+    ...guardBindings
   );
 }
 
@@ -5722,6 +5764,7 @@ async function activatePendingVectorsAndSettings(
   const now = settingsToSave.updatedAt;
   const promotedFingerprint = settingsToSave.embeddingFingerprint ??
     embeddingFingerprintOf(activeEmbeddingOf(settingsToSave));
+  await reclaimExpiredClaimVectorJobs(env.DB, { rebuildId, now });
   const results = await env.DB.batch([
     env.DB.prepare(
       `UPDATE sb_vector_rebuilds
@@ -5753,6 +5796,7 @@ async function activatePendingVectorsAndSettings(
            SELECT 1
            FROM sb_claim_vector_jobs processing_claim_job
            WHERE processing_claim_job.status = 'processing'
+             AND COALESCE(processing_claim_job.lease_expires_at, 0) > ?
              AND processing_claim_job.target_fingerprint IN (
                sb_vector_rebuilds.active_fingerprint,
                sb_vector_rebuilds.pending_fingerprint
@@ -5770,7 +5814,7 @@ async function activatePendingVectorsAndSettings(
                  AND cv_claim_activation.content_hash = m_claim_activation.content_hash
              )
          )`
-    ).bind(now, rebuildId, rebuildId, promotedFingerprint),
+    ).bind(now, rebuildId, rebuildId, now, promotedFingerprint),
     env.DB.prepare(
       `UPDATE entries
        SET vector_ids = pending_vector_ids,
@@ -6397,20 +6441,6 @@ async function commitEntryVersion(
     throw error;
   }
 
-  const revision = prepareMemoryRevision(env.DB, {
-    memoryId: input.id,
-    eventType: input.eventType,
-    oldContent: input.oldContent,
-    newContent: input.newContent,
-    oldMetadata: { tags: input.oldTags, source: input.source },
-    newMetadata: { tags: input.newTags, source: input.source },
-    reason: input.reason,
-    actor: input.actor,
-    createdAt: now,
-  }, {
-    activeVectorIdsJson: JSON.stringify(prepared.vectorIds),
-  });
-
   let switchResult: D1Result;
   try {
     const newHash = await contentFingerprint(input.newContent);
@@ -6431,6 +6461,10 @@ async function commitEntryVersion(
         state: "ready",
         rebuildId: openRebuild?.id ?? null,
         now,
+        entryId: input.mutation ? undefined : input.id,
+        entryContentHash: input.mutation ? undefined : newHash,
+        mutationId: input.mutation?.mutationId,
+        mutationLeaseOwner: input.mutation?.leaseOwner,
       })
     );
     const auditEvent = await prepareComplianceAuditEvent(env.DB, {
@@ -6447,6 +6481,12 @@ async function commitEntryVersion(
         event_type: input.eventType,
         old_tags: input.oldTags,
         new_tags: input.newTags,
+      },
+      writeGuard: {
+        entryId: input.mutation ? undefined : input.id,
+        entryContentHash: input.mutation ? undefined : newHash,
+        mutationId: input.mutation?.mutationId,
+        mutationLeaseOwner: input.mutation?.leaseOwner,
       },
     });
     const mutationNow = Date.now();
@@ -6488,6 +6528,22 @@ async function commitEntryVersion(
           now: mutationNow,
         })
       : null;
+    const revision = prepareMemoryRevision(env.DB, {
+      memoryId: input.id,
+      eventType: input.eventType,
+      oldContent: input.oldContent,
+      newContent: input.newContent,
+      oldMetadata: { tags: input.oldTags, source: input.source },
+      newMetadata: { tags: input.newTags, source: input.source },
+      reason: input.reason,
+      actor: input.actor,
+      createdAt: now,
+    }, {
+      activeVectorIdsJson: JSON.stringify(prepared.vectorIds),
+      entryContentHash: newHash,
+      mutationId: input.mutation?.mutationId,
+      mutationLeaseOwner: input.mutation?.leaseOwner,
+    });
     if (input.mutation) {
       const staged = await stageMemoryMutationEntryIntent(env.DB, {
         ...input.mutation,
@@ -6525,16 +6581,16 @@ async function commitEntryVersion(
            )
            ${mutationGuard}`
       ).bind(...updateBindings),
+      ...(mutationCheckpoint ? [mutationCheckpoint] : []),
       revision.statement,
       ...cleanupStatements,
       auditEvent.statement,
-      ...(mutationCheckpoint ? [mutationCheckpoint] : []),
     ]);
     switchResult = results[0];
     if (
       Number(switchResult.meta?.changes ?? 0) !== 0 &&
       mutationCheckpoint &&
-      Number(results[results.length - 1]?.meta?.changes ?? 0) !== 1
+      Number(results[1]?.meta?.changes ?? 0) !== 1
     ) {
       throw new Error(`memory_mutation_entry_checkpoint_failed:${input.mutation?.mutationId}`);
     }
@@ -6663,17 +6719,6 @@ async function appendToEntry(
     throw error;
   }
 
-  const appendRevision = prepareMemoryRevision(env.DB, {
-    memoryId: id,
-    eventType: "APPEND",
-    oldContent: existingContent,
-    newContent,
-    oldMetadata: { tags, source },
-    newMetadata: { tags, source },
-    actor: source,
-  }, {
-    activeVectorIdsJson: JSON.stringify([...activeVectorIds, newChunkId]),
-  });
   let switchResult: D1Result;
   try {
     const newHash = await contentFingerprint(newContent);
@@ -6687,6 +6732,10 @@ async function appendToEntry(
         state: "ready",
         rebuildId: openRebuild?.id ?? null,
         now: Date.now(),
+        entryId: mutation ? undefined : id,
+        entryContentHash: mutation ? undefined : newHash,
+        mutationId: mutation?.mutationId,
+        mutationLeaseOwner: mutation?.leaseOwner,
       })
     );
     const auditEvent = await prepareComplianceAuditEvent(env.DB, {
@@ -6701,6 +6750,12 @@ async function appendToEntry(
         source,
         append_mode: "single-vector",
         tags,
+      },
+      writeGuard: {
+        entryId: mutation ? undefined : id,
+        entryContentHash: mutation ? undefined : newHash,
+        mutationId: mutation?.mutationId,
+        mutationLeaseOwner: mutation?.leaseOwner,
       },
     });
     const mutationNow = Date.now();
@@ -6739,6 +6794,20 @@ async function appendToEntry(
           now: mutationNow,
         })
       : null;
+    const appendRevision = prepareMemoryRevision(env.DB, {
+      memoryId: id,
+      eventType: "APPEND",
+      oldContent: existingContent,
+      newContent,
+      oldMetadata: { tags, source },
+      newMetadata: { tags, source },
+      actor: source,
+    }, {
+      activeVectorIdsJson: JSON.stringify([...activeVectorIds, newChunkId]),
+      entryContentHash: newHash,
+      mutationId: mutation?.mutationId,
+      mutationLeaseOwner: mutation?.leaseOwner,
+    });
     if (mutation) {
       const staged = await stageMemoryMutationEntryIntent(env.DB, {
         ...mutation,
@@ -6776,16 +6845,16 @@ async function appendToEntry(
            )
            ${mutationGuard}`
       ).bind(...updateBindings),
+      ...(mutationCheckpoint ? [mutationCheckpoint] : []),
       appendRevision.statement,
       ...cleanupStatements,
       auditEvent.statement,
-      ...(mutationCheckpoint ? [mutationCheckpoint] : []),
     ]);
     switchResult = results[0];
     if (
       Number(switchResult.meta?.changes ?? 0) !== 0 &&
       mutationCheckpoint &&
-      Number(results[results.length - 1]?.meta?.changes ?? 0) !== 1
+      Number(results[1]?.meta?.changes ?? 0) !== 1
     ) {
       throw new Error(`memory_mutation_entry_checkpoint_failed:${mutation?.mutationId ?? "unknown"}`);
     }
@@ -6905,6 +6974,7 @@ export async function synthesizeVerifiedInsight(
   }
 
   const citableClaims = buildCitableInsightClaims(context, conflicts, query);
+  const answerabilityMode = normalizeAnswerabilityMode(env.ANSWERABILITY_MODE);
   if (!citableClaims.length) {
     return {
       answer: INSUFFICIENT_VERIFIED_EVIDENCE,
@@ -7022,7 +7092,19 @@ Rules:
       }] : [];
     });
   }
-  return validateStructuredInsightResponse(insight, revalidatedClaims);
+  const validated = validateStructuredInsightResponse(insight, revalidatedClaims, answerabilityMode);
+  if (answerabilityMode !== "enforce" || validated.answerabilityWarnings?.length) {
+    logMemoryEvent("answerability", "answerability_evaluated", {
+      mode: answerabilityMode,
+      query_length: query.trim().length,
+      short_query: query.trim().length <= 12,
+      citable_claims: revalidatedClaims.length,
+      answerable_claims: revalidatedClaims.filter((claim) => claim.answerability === "answerable").length,
+      warning_count: validated.answerabilityWarnings?.length ?? 0,
+      verified_count: validated.verifiedClaims.length,
+    }, "system");
+  }
+  return validated;
 }
 
 export async function synthesizeInsight(
@@ -7299,6 +7381,12 @@ async function runNightlyCompression(env: Env, ctx: ExecutionContext): Promise<v
 
 async function runScheduledMaintenance(env: Env, ctx: ExecutionContext): Promise<void> {
   await ensureDatabase(env);
+
+  try {
+    await reconcileMemoryMutations(env, env.SELFHOST === "1" ? 25 : 5);
+  } catch (e) {
+    console.error("Memory mutation reconciliation failed (non-fatal):", e);
+  }
 
   try {
     await processVectorCleanupQueue(env);
@@ -8453,6 +8541,134 @@ async function executeEntryKnowledgeMutation(
     idempotentReplay: false,
     resumed,
   };
+}
+
+interface MemoryMutationReconcileResult {
+  scanned: number;
+  claimed: number;
+  reconciled: number;
+  projectionQueued: number;
+  deferred: number;
+  failed: number;
+}
+
+async function reconcileMemoryMutations(
+  env: Env,
+  limit = 25
+): Promise<MemoryMutationReconcileResult> {
+  const candidates = await listRecoverableMemoryMutations(env.DB, { limit });
+  const result: MemoryMutationReconcileResult = {
+    scanned: candidates.length,
+    claimed: 0,
+    reconciled: 0,
+    projectionQueued: 0,
+    deferred: 0,
+    failed: 0,
+  };
+  for (const candidate of candidates) {
+    const claimed = await claimMemoryMutationLease(env.DB, {
+      mutationId: candidate.mutationId,
+    });
+    if (!claimed) {
+      result.deferred += 1;
+      continue;
+    }
+    result.claimed += 1;
+    const lease = { mutationId: candidate.mutationId, leaseOwner: claimed.leaseOwner };
+    let mutation = claimed.mutation;
+    try {
+      if (mutation.state === "preparing") {
+        if (!mutation.resultContent || !mutation.resultContentHash) {
+          throw new Error("mutation_reconcile_missing_entry_intent");
+        }
+        const entryCommitted = await markMemoryMutationEntryCommitted(env.DB, {
+          ...lease,
+          resultContent: mutation.resultContent,
+          resultContentHash: mutation.resultContentHash,
+          resultVectorCount: mutation.resultVectorCount ?? 0,
+          requireEntryProjection: true,
+        });
+        if (!entryCommitted) throw new Error("mutation_reconcile_entry_projection_missing");
+        mutation = await loadMemoryMutation(env.DB, mutation.mutationId) ?? mutation;
+      }
+
+      if (mutation.state === "projection_pending") {
+        const reopened = await reopenMemoryMutationProjection(env.DB, lease);
+        if (!reopened) throw new Error("mutation_reconcile_projection_reopen_failed");
+        mutation = await loadMemoryMutation(env.DB, mutation.mutationId) ?? mutation;
+      }
+
+      if (mutation.state === "entry_committed") {
+        if (!mutation.resultContent || !mutation.resultContentHash) {
+          throw new Error("mutation_reconcile_missing_entry_result");
+        }
+        const currentEntry = await env.DB.prepare(
+          `SELECT 1 AS ok FROM entries
+           WHERE id = ? AND content = ? AND content_hash = ?
+           LIMIT 1`
+        ).bind(
+          mutation.entryId,
+          mutation.resultContent,
+          mutation.resultContentHash
+        ).first<{ ok: number }>();
+        if (Number(currentEntry?.ok ?? 0) !== 1) {
+          throw new Error("mutation_reconcile_entry_projection_is_stale");
+        }
+        const knowledgeExists = await memoryMutationKnowledgeProjectionExists(env.DB, mutation);
+        if (knowledgeExists && mutation.observationId && mutation.claimId) {
+          const checkpointed = await markMemoryMutationKnowledgeCommitted(env.DB, {
+            ...lease,
+            observationId: mutation.observationId,
+            claimId: mutation.claimId,
+          });
+          if (!checkpointed) throw new Error("mutation_reconcile_knowledge_checkpoint_failed");
+        } else {
+          await replaceEntryAtomicMemoryAndEnqueue(env, {
+            entryId: mutation.entryId,
+            content: mutation.resultContent,
+            contentHash: mutation.resultContentHash,
+            source: mutation.sourceChannel,
+            actor: mutationActorForSource(mutation.sourceChannel),
+            eventType: mutation.operation,
+            createdAt: Date.now(),
+            mutationId: mutation.mutationId,
+            mutationLeaseOwner: lease.leaseOwner,
+          });
+        }
+        mutation = await loadMemoryMutation(env.DB, mutation.mutationId) ?? mutation;
+      }
+
+      if (mutation.state !== "knowledge_committed") {
+        throw new Error(`mutation_reconcile_unexpected_state:${mutation.state}`);
+      }
+      let warnings: string[] = [];
+      if (mutation.claimId) {
+        try {
+          const snapshot = await loadActiveEmbeddingSnapshot(env);
+          const queued = await enqueueClaimVectorJob(env.DB, {
+            claimId: mutation.claimId,
+            targetFingerprint: snapshot.fingerprint,
+          });
+          warnings = queued ? [] : ["claim_vector_enqueue_failed"];
+          if (queued) result.projectionQueued += 1;
+        } catch (error) {
+          console.error("Claim vector re-enqueue failed during mutation reconciliation:", error);
+          warnings = ["claim_vector_enqueue_failed"];
+        }
+      }
+      if (!await markMemoryMutationProjectionResult(env.DB, { ...lease, warnings })) {
+        throw new Error("mutation_reconcile_projection_checkpoint_failed");
+      }
+      result.reconciled += 1;
+    } catch (error) {
+      result.failed += 1;
+      await markMemoryMutationFailed(env.DB, {
+        ...lease,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return result;
 }
 
 async function queryHistoricalClaimVectors(
@@ -14522,6 +14738,25 @@ const defaultHandler = {
         ok: true,
         ...backfill(limit),
       });
+    }
+
+    if (url.pathname === "/maintenance/mutations/status" && request.method === "GET") {
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
+      return json({ ok: true, mutations: await getMemoryMutationHealth(env.DB) });
+    }
+
+    if (url.pathname === "/maintenance/mutations/reconcile" && request.method === "POST") {
+      const auth = requireAuth(request, env);
+      if (!auth.ok) return auth.response;
+      let body: { limit?: number } = {};
+      try {
+        body = await request.json();
+      } catch {
+        /* empty body uses the bounded default */
+      }
+      const limit = Math.min(Math.max(Math.trunc(Number(body.limit)) || 25, 1), 200);
+      return json({ ok: true, ...await reconcileMemoryMutations(env, limit) });
     }
 
     if (url.pathname === "/maintenance/claim-vectors/status" && request.method === "GET") {

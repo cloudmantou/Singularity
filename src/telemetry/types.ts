@@ -111,7 +111,8 @@ export type MemoryEventType =
   | "classified"
   | "vectorized"
   | "digest_created"
-  | "imported";
+  | "imported"
+  | "answerability_evaluated";
 
 export interface MemoryEventLog {
   id: string;

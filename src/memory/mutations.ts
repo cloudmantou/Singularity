@@ -54,6 +54,17 @@ interface MemoryMutationRow {
   updated_at: number;
 }
 
+export interface MemoryMutationHealth {
+  preparing: number;
+  entry_committed: number;
+  knowledge_committed: number;
+  projection_pending: number;
+  failed: number;
+  completed: number;
+  incomplete: number;
+  stale_incomplete: number;
+}
+
 const MUTATION_LEASE_MS = 5 * 60 * 1000;
 
 export const MEMORY_MUTATION_SCHEMA_STATEMENTS = [
@@ -147,6 +158,110 @@ export async function loadMemoryMutation(
     `SELECT * FROM sb_memory_mutations WHERE mutation_id = ?`
   ).bind(mutationId).first<MemoryMutationRow>();
   return row ? toRecord(row) : null;
+}
+
+function mutationLimit(value: number): number {
+  return Math.min(Math.max(Math.trunc(value) || 1, 1), 200);
+}
+
+export async function getMemoryMutationHealth(
+  db: D1Database,
+  now = Date.now(),
+  staleAfterMs = 15 * 60_000
+): Promise<MemoryMutationHealth> {
+  const { results } = await db.prepare(
+    `SELECT state, COUNT(*) AS count
+     FROM sb_memory_mutations
+     GROUP BY state`
+  ).all<{ state: MemoryMutationState; count: number }>();
+  const counts = new Map((results ?? []).map((row) => [row.state, Number(row.count ?? 0)]));
+  const stale = await db.prepare(
+    `SELECT COUNT(*) AS count
+     FROM sb_memory_mutations
+     WHERE state IN ('preparing', 'entry_committed', 'knowledge_committed', 'projection_pending')
+       AND updated_at <= ?`
+  ).bind(now - Math.max(0, staleAfterMs)).first<{ count: number }>();
+  const preparing = counts.get("preparing") ?? 0;
+  const entryCommitted = counts.get("entry_committed") ?? 0;
+  const knowledgeCommitted = counts.get("knowledge_committed") ?? 0;
+  const projectionPending = counts.get("projection_pending") ?? 0;
+  return {
+    preparing,
+    entry_committed: entryCommitted,
+    knowledge_committed: knowledgeCommitted,
+    projection_pending: projectionPending,
+    failed: counts.get("failed") ?? 0,
+    completed: counts.get("completed") ?? 0,
+    incomplete: preparing + entryCommitted + knowledgeCommitted + projectionPending,
+    stale_incomplete: Number(stale?.count ?? 0),
+  };
+}
+
+export async function listRecoverableMemoryMutations(
+  db: D1Database,
+  input: { now?: number; limit?: number } = {}
+): Promise<MemoryMutationRecord[]> {
+  const now = input.now ?? Date.now();
+  const { results } = await db.prepare(
+    `SELECT * FROM sb_memory_mutations
+     WHERE state IN ('preparing', 'entry_committed', 'knowledge_committed', 'projection_pending')
+       AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
+     ORDER BY updated_at ASC, mutation_id ASC
+     LIMIT ?`
+  ).bind(now, mutationLimit(input.limit ?? 25)).all<MemoryMutationRow>();
+  return (results ?? []).map(toRecord);
+}
+
+export async function claimMemoryMutationLease(
+  db: D1Database,
+  input: { mutationId: string; now?: number; leaseMs?: number }
+): Promise<{ mutation: MemoryMutationRecord; leaseOwner: string } | null> {
+  const now = input.now ?? Date.now();
+  const leaseOwner = crypto.randomUUID();
+  const leaseExpiresAt = now + Math.max(1_000, input.leaseMs ?? MUTATION_LEASE_MS);
+  const result = await db.prepare(
+    `UPDATE sb_memory_mutations
+     SET lease_owner = ?, lease_expires_at = ?, updated_at = ?
+     WHERE mutation_id = ?
+       AND state IN ('preparing', 'entry_committed', 'knowledge_committed', 'projection_pending')
+       AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)`
+  ).bind(leaseOwner, leaseExpiresAt, now, input.mutationId, now).run();
+  if (changes(result) !== 1) return null;
+  const mutation = await loadMemoryMutation(db, input.mutationId);
+  return mutation ? { mutation, leaseOwner } : null;
+}
+
+export async function memoryMutationKnowledgeProjectionExists(
+  db: D1Database,
+  mutation: Pick<MemoryMutationRecord, "entryId" | "observationId" | "claimId" | "resultContentHash">
+): Promise<boolean> {
+  if (!mutation.observationId || !mutation.claimId || !mutation.resultContentHash) return false;
+  const row = await db.prepare(
+    `SELECT 1 AS ok
+     FROM sb_memories projected_claim
+     JOIN sb_memory_sources projected_source
+       ON projected_source.memory_id = projected_claim.id
+      AND projected_source.observation_id = ?
+     JOIN sb_parent_version_claims projected_link
+       ON projected_link.memory_id = projected_claim.id
+      AND projected_link.relation = 'supports'
+     JOIN sb_parent_versions projected_version
+       ON projected_version.version_id = projected_link.parent_version_id
+      AND projected_version.state IN ('active', 'active_degraded')
+     JOIN sb_parent_units projected_parent
+       ON projected_parent.parent_id = projected_version.parent_id
+      AND projected_parent.active_version_id = projected_version.version_id
+     WHERE projected_claim.id = ?
+       AND projected_claim.entry_id = ?
+       AND projected_claim.content_hash = ?
+     LIMIT 1`
+  ).bind(
+    mutation.observationId,
+    mutation.claimId,
+    mutation.entryId,
+    mutation.resultContentHash
+  ).first<{ ok: number }>();
+  return Number(row?.ok ?? 0) === 1;
 }
 
 export async function beginMemoryMutation(
@@ -325,6 +440,36 @@ export async function markMemoryMutationEntryCommitted(
   }
 ): Promise<boolean> {
   const result = await prepareMemoryMutationEntryCommit(db, input).run();
+  return changes(result) === 1;
+}
+
+export async function markMemoryMutationKnowledgeCommitted(
+  db: D1Database,
+  input: {
+    mutationId: string;
+    leaseOwner: string;
+    observationId: string;
+    claimId: string;
+    now?: number;
+  }
+): Promise<boolean> {
+  return changes(await prepareMemoryMutationKnowledgeCommit(db, {
+    ...input,
+    requireKnowledgeProjection: true,
+  }).run()) === 1;
+}
+
+export async function reopenMemoryMutationProjection(
+  db: D1Database,
+  input: { mutationId: string; leaseOwner: string; now?: number }
+): Promise<boolean> {
+  const now = input.now ?? Date.now();
+  const result = await db.prepare(
+    `UPDATE sb_memory_mutations
+     SET state = 'knowledge_committed', last_error = NULL, updated_at = ?
+     WHERE mutation_id = ? AND lease_owner = ? AND state = 'projection_pending'
+       AND lease_expires_at > ?`
+  ).bind(now, input.mutationId, input.leaseOwner, now).run();
   return changes(result) === 1;
 }
 

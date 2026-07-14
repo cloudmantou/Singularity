@@ -19,6 +19,15 @@ export interface InsightContextPackage<TClaim = unknown> {
 export const INSUFFICIENT_VERIFIED_EVIDENCE =
   "Retrieved direct evidence is insufficient for a verified answer.";
 
+export const ANSWERABILITY_MODES = ["shadow", "warn", "enforce"] as const;
+export type AnswerabilityMode = (typeof ANSWERABILITY_MODES)[number];
+
+export function normalizeAnswerabilityMode(value: unknown): AnswerabilityMode {
+  return ANSWERABILITY_MODES.includes(value as AnswerabilityMode)
+    ? value as AnswerabilityMode
+    : "enforce";
+}
+
 export interface CitableInsightClaim {
   ref: string;
   evidenceId: string;
@@ -52,10 +61,19 @@ export interface UnverifiedInsightClaim {
     | "invalid_conflict_refs";
 }
 
+export interface AnswerabilityWarning {
+  text: string;
+  refs: string[];
+  reason: "claim_not_answerable";
+  mode: Exclude<AnswerabilityMode, "enforce">;
+}
+
 export interface VerifiedInsightResult {
   answer: string;
   verifiedClaims: VerifiedInsightClaim[];
   unverifiedClaims: UnverifiedInsightClaim[];
+  answerabilityWarnings?: AnswerabilityWarning[];
+  answerabilityMode?: AnswerabilityMode;
 }
 
 export function normalizeInsightContext<TClaim>(
@@ -109,7 +127,8 @@ function invalidStructuredResponse(raw: string): VerifiedInsightResult {
 
 export function validateStructuredInsightResponse(
   response: string,
-  citableClaims: readonly CitableInsightClaim[]
+  citableClaims: readonly CitableInsightClaim[],
+  answerabilityMode: AnswerabilityMode = "enforce"
 ): VerifiedInsightResult {
   const raw = response.trim();
   if (!raw) return invalidStructuredResponse("");
@@ -131,6 +150,7 @@ export function validateStructuredInsightResponse(
   const byRef = new Map(citableClaims.map((claim) => [claim.ref.toUpperCase(), claim]));
   const verifiedClaims: VerifiedInsightClaim[] = [];
   const unverifiedClaims: UnverifiedInsightClaim[] = [];
+  const answerabilityWarnings: AnswerabilityWarning[] = [];
 
   for (const candidate of candidateClaims) {
     if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
@@ -169,8 +189,17 @@ export function validateStructuredInsightResponse(
     const claims = referenced as CitableInsightClaim[];
 
     if (claims.some((claim) => claim.answerability !== "answerable")) {
-      unverifiedClaims.push({ text, refs, reason: "claim_not_answerable" });
-      continue;
+      if (answerabilityMode !== "enforce") {
+        answerabilityWarnings.push({
+          text,
+          refs,
+          reason: "claim_not_answerable",
+          mode: answerabilityMode,
+        });
+      } else {
+        unverifiedClaims.push({ text, refs, reason: "claim_not_answerable" });
+        continue;
+      }
     }
 
     if (kind === "conflict") {
@@ -212,5 +241,11 @@ export function validateStructuredInsightResponse(
   const answer = verifiedClaims.length
     ? verifiedClaims.map((claim) => `${claim.text} [${claim.refs.join(", ")}]`).join(" ")
     : INSUFFICIENT_VERIFIED_EVIDENCE;
-  return { answer, verifiedClaims, unverifiedClaims };
+  return {
+    answer,
+    verifiedClaims,
+    unverifiedClaims,
+    ...(answerabilityWarnings.length ? { answerabilityWarnings } : {}),
+    ...(answerabilityMode !== "enforce" ? { answerabilityMode } : {}),
+  };
 }

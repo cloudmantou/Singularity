@@ -9,6 +9,7 @@ import {
   enqueueMissingClaimVectorJobs,
   getClaimVectorQueueStatus,
   processClaimVectorJobs,
+  reclaimExpiredClaimVectorJobs,
   retryFailedClaimVectorJobs,
 } from "../../src/memory/claim-vector-queue";
 
@@ -72,6 +73,33 @@ describe("Claim vector queue", () => {
   it("reports terminal failures as an explicit activation blocker", () => {
     expect(claimVectorActivationBlock({ terminal_failed: 2 })).toBe("claim_vector_terminal_failures");
     expect(claimVectorActivationBlock({ terminal_failed: 0 })).toBeUndefined();
+  });
+
+  it("distinguishes live and expired processing leases", async () => {
+    raw.prepare(
+      `INSERT INTO sb_claim_vector_jobs (
+         id, claim_id, target_fingerprint, content_hash, parent_version_id,
+         status, attempts, lease_owner, lease_expires_at, created_at, updated_at
+       ) VALUES
+         ('job-live', 'claim-1', 'fp-v1', 'claim-hash-v1', 'parent-v1', 'processing', 1, 'lease-live', 2000, 1, 1),
+         ('job-expired', 'claim-2', 'fp-v1', 'claim-hash-v1', 'parent-v1', 'processing', 1, 'lease-old', 50, 1, 1)`
+    ).run();
+
+    await expect(getClaimVectorQueueStatus(db, "fp-v1", 100)).resolves.toMatchObject({
+      processing: 2,
+      processing_live: 1,
+      processing_expired: 1,
+    });
+    expect(await reclaimExpiredClaimVectorJobs(db, {
+      targetFingerprint: "fp-v1",
+      now: 100,
+    })).toBe(1);
+    expect(await getClaimVectorQueueStatus(db, "fp-v1", 100)).toMatchObject({
+      processing: 1,
+      processing_live: 1,
+      processing_expired: 0,
+      retryable_error: 1,
+    });
   });
 
   it("persists retryable jobs and completes only after the Claim mapping is durable", async () => {

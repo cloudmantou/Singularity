@@ -185,6 +185,12 @@ export interface ComplianceAuditEventInput {
   success?: boolean;
   errorCode?: string | null;
   metadata?: Record<string, unknown>;
+  writeGuard?: {
+    entryId?: string;
+    entryContentHash?: string;
+    mutationId?: string;
+    mutationLeaseOwner?: string;
+  };
 }
 
 export interface PreparedComplianceAuditEvent {
@@ -408,6 +414,32 @@ export async function prepareComplianceAuditEvent(
     event_hash: "",
   };
   record.event_hash = await sha256Hex(stableJson(record));
+  const entryGuard = input.writeGuard?.entryId && input.writeGuard.entryContentHash != null
+    ? `WHERE EXISTS (
+         SELECT 1 FROM entries audit_entry_guard
+         WHERE audit_entry_guard.id = ?
+           AND audit_entry_guard.content_hash = ?
+       )`
+    : "";
+  const mutationGuard = input.writeGuard?.mutationId && input.writeGuard.mutationLeaseOwner
+    ? `WHERE EXISTS (
+         SELECT 1 FROM sb_memory_mutations audit_mutation_guard
+         WHERE audit_mutation_guard.mutation_id = ?
+           AND audit_mutation_guard.lease_owner = ?
+           AND audit_mutation_guard.state = 'entry_committed'
+       )`
+    : "";
+  if (entryGuard && mutationGuard) throw new Error("audit_write_guard_conflict");
+  const guard = entryGuard || mutationGuard;
+  const valuesClause = guard
+    ? `SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+       ${guard}`
+    : "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+  const guardBindings = entryGuard
+    ? [input.writeGuard?.entryId, input.writeGuard?.entryContentHash]
+    : mutationGuard
+      ? [input.writeGuard?.mutationId, input.writeGuard?.mutationLeaseOwner]
+      : [];
   return {
     record,
     statement: db.prepare(
@@ -415,7 +447,7 @@ export async function prepareComplianceAuditEvent(
          id, occurred_at, trace_id, actor_type, actor_id, token_id,
          action, object_type, object_id, vault_id, before_hash, after_hash,
          success, error_code, metadata_json, previous_event_hash, event_hash
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       ) ${valuesClause}`
     ).bind(
       record.id,
       record.occurred_at,
@@ -433,7 +465,8 @@ export async function prepareComplianceAuditEvent(
       record.error_code,
       record.metadata_json,
       record.previous_event_hash,
-      record.event_hash
+      record.event_hash,
+      ...guardBindings
     ),
   };
 }

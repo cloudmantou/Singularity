@@ -168,4 +168,133 @@ describe("Append mutation idempotency", () => {
       db.close();
     }
   });
+
+  it("does not persist revision, audit, or cleanup side effects after an Entry CAS loss", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      db.prepare(
+        `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, content_hash)
+         VALUES ('entry-1', 'original', '[]', 'api', 1, '["old-vector"]', 'original-hash')`
+      ).run();
+      const originalBatch = env.DB.batch.bind(env.DB);
+      env.DB.batch = vi.fn(async (statements: D1PreparedStatement[]) => {
+        db.prepare(
+          `UPDATE entries SET content = 'concurrent content', vector_ids = '["concurrent-vector"]',
+           content_hash = 'concurrent-hash' WHERE id = 'entry-1'`
+        ).run();
+        return originalBatch(statements);
+      }) as unknown as D1Database["batch"];
+
+      const response = await worker.fetch(updateRequest("update-key-cas-loss"), env, context());
+      expect(response.status).toBe(503);
+      expect(db.prepare(
+        `SELECT content, vector_ids FROM entries WHERE id = 'entry-1'`
+      ).get()).toEqual({ content: "concurrent content", vector_ids: '["concurrent-vector"]' });
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count FROM sb_memory_revisions WHERE memory_id = 'entry-1'`
+      ).get()).toEqual({ count: 0 });
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count FROM sb_audit_events WHERE object_id = 'entry-1'`
+      ).get()).toEqual({ count: 0 });
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count FROM sb_vector_cleanup_queue WHERE vector_id = 'old-vector'`
+      ).get()).toEqual({ count: 0 });
+      expect(db.prepare(
+        `SELECT state FROM sb_memory_mutations WHERE idempotency_key = 'update-key-cas-loss'`
+      ).get()).toEqual({ state: "failed" });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("reconciles an abandoned entry_committed mutation without changing Entry again", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      db.prepare(
+        `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, content_hash)
+         VALUES ('entry-1', 'recovered content', '[]', 'api', 1, '[]', 'recovered-hash')`
+      ).run();
+      db.prepare(
+        `INSERT INTO sb_memory_mutations (
+           mutation_id, idempotency_key, source_channel, operation, entry_id,
+           request_hash, state, result_content, result_content_hash,
+           result_vector_count, created_at, updated_at
+         ) VALUES (
+           'mutation-reconcile-1', 'reconcile-key', 'api', 'update', 'entry-1',
+           'request-hash', 'entry_committed', 'recovered content', 'recovered-hash',
+           0, 1, 1
+         )`
+      ).run();
+
+      const response = await worker.fetch(new Request("http://localhost/maintenance/mutations/reconcile", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer test-token",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ limit: 10 }),
+      }), env, context());
+      const body = await response.json() as any;
+      expect(response.status).toBe(200);
+      expect(body).toMatchObject({ ok: true, scanned: 1, claimed: 1, reconciled: 1, failed: 0 });
+      expect(db.prepare(
+        `SELECT state FROM sb_memory_mutations WHERE mutation_id = 'mutation-reconcile-1'`
+      ).get()).toEqual({ state: "completed" });
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count FROM sb_memories WHERE entry_id = 'entry-1'`
+      ).get()).toEqual({ count: 1 });
+
+      const status = await worker.fetch(new Request("http://localhost/maintenance/mutations/status", {
+        headers: { Authorization: "Bearer test-token" },
+      }), env, context());
+      expect(await status.json()).toMatchObject({
+        ok: true,
+        mutations: { entry_committed: 0, incomplete: 0, completed: 1 },
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("does not reproject an entry_committed mutation superseded by a newer Entry", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      db.prepare(
+        `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, content_hash)
+         VALUES ('entry-1', 'newer content', '[]', 'api', 1, '[]', 'newer-hash')`
+      ).run();
+      db.prepare(
+        `INSERT INTO sb_memory_mutations (
+           mutation_id, idempotency_key, source_channel, operation, entry_id,
+           request_hash, state, result_content, result_content_hash,
+           result_vector_count, created_at, updated_at
+         ) VALUES (
+           'mutation-stale-1', 'stale-key', 'api', 'update', 'entry-1',
+           'request-hash', 'entry_committed', 'older content', 'older-hash',
+           1, 1, 1
+         )`
+      ).run();
+
+      const response = await worker.fetch(new Request("http://localhost/maintenance/mutations/reconcile", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer test-token",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ limit: 10 }),
+      }), env, context());
+      expect(await response.json()).toMatchObject({ ok: true, scanned: 1, failed: 1, reconciled: 0 });
+      expect(db.prepare(
+        `SELECT state, last_error FROM sb_memory_mutations WHERE mutation_id = 'mutation-stale-1'`
+      ).get()).toEqual({ state: "failed", last_error: "mutation_reconcile_entry_projection_is_stale" });
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count FROM sb_memories WHERE entry_id = 'entry-1'`
+      ).get()).toEqual({ count: 0 });
+    } finally {
+      db.close();
+    }
+  });
 });

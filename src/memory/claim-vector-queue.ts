@@ -59,6 +59,8 @@ export interface ClaimVectorQueueStatus {
   fingerprint: string;
   pending: number;
   processing: number;
+  processing_live: number;
+  processing_expired: number;
   retryable_error: number;
   succeeded: number;
   failed: number;
@@ -71,8 +73,10 @@ const MAX_ATTEMPTS = 6;
 export const DEFAULT_CLAIM_VECTOR_LEASE_MS = 5 * 60_000;
 
 export function claimVectorActivationBlock(
-  status: Pick<ClaimVectorQueueStatus, "terminal_failed">
-): "claim_vector_terminal_failures" | undefined {
+  status: Pick<ClaimVectorQueueStatus, "terminal_failed"> &
+    Partial<Pick<ClaimVectorQueueStatus, "processing_live">>
+): "claim_vector_terminal_failures" | "claim_vector_processing" | undefined {
+  if ((status.processing_live ?? 0) > 0) return "claim_vector_processing";
   return status.terminal_failed > 0 ? "claim_vector_terminal_failures" : undefined;
 }
 
@@ -332,13 +336,28 @@ export async function getClaimVectorQueueStatus(
            AND cv.content_hash = m.content_hash
        )`
   ).bind(targetFingerprint, targetFingerprint).first<{ count: number }>();
-  void now;
   const missingCount = Number(missing?.count ?? 0);
   const terminalFailedCount = Number(terminalFailed?.count ?? 0);
+  const liveProcessing = await db.prepare(
+    `SELECT COUNT(*) AS count
+     FROM sb_claim_vector_jobs
+     WHERE target_fingerprint = ?
+       AND status = 'processing'
+       AND COALESCE(lease_expires_at, 0) > ?`
+  ).bind(targetFingerprint, now).first<{ count: number }>();
+  const expiredProcessing = await db.prepare(
+    `SELECT COUNT(*) AS count
+     FROM sb_claim_vector_jobs
+     WHERE target_fingerprint = ?
+       AND status = 'processing'
+       AND COALESCE(lease_expires_at, 0) <= ?`
+  ).bind(targetFingerprint, now).first<{ count: number }>();
   return {
     fingerprint: targetFingerprint,
     pending: counts.get("pending") ?? 0,
     processing: counts.get("processing") ?? 0,
+    processing_live: Number(liveProcessing?.count ?? 0),
+    processing_expired: Number(expiredProcessing?.count ?? 0),
     retryable_error: counts.get("retryable_error") ?? 0,
     succeeded: counts.get("succeeded") ?? 0,
     failed: counts.get("failed") ?? 0,
@@ -346,6 +365,45 @@ export async function getClaimVectorQueueStatus(
     missing_retryable: Math.max(0, missingCount - terminalFailedCount),
     terminal_failed: terminalFailedCount,
   };
+}
+
+export async function reclaimExpiredClaimVectorJobs(
+  db: D1Database,
+  input: {
+    targetFingerprint?: string;
+    rebuildId?: string | null;
+    now?: number;
+    limit?: number;
+  } = {}
+): Promise<number> {
+  const now = input.now ?? Date.now();
+  const clauses = [
+    "status = 'processing'",
+    "COALESCE(lease_expires_at, 0) <= ?",
+  ];
+  const bindings: Array<string | number> = [now];
+  if (input.targetFingerprint) {
+    clauses.push("target_fingerprint = ?");
+    bindings.push(input.targetFingerprint);
+  }
+  if (input.rebuildId) {
+    clauses.push("rebuild_id = ?");
+    bindings.push(input.rebuildId);
+  }
+  bindings.push(boundedLimit(input.limit ?? 200));
+  const result = await db.prepare(
+    `UPDATE sb_claim_vector_jobs
+     SET status = 'retryable_error', next_attempt_at = ?,
+         lease_owner = NULL, lease_expires_at = NULL,
+         last_error = COALESCE(last_error, 'lease_expired_reclaimed'), updated_at = ?
+     WHERE id IN (
+       SELECT id FROM sb_claim_vector_jobs
+       WHERE ${clauses.join(" AND ")}
+       ORDER BY updated_at ASC, id ASC
+       LIMIT ?
+     )`
+  ).bind(now, now, ...bindings).run();
+  return Number(result.meta?.changes ?? 0);
 }
 
 export async function retryFailedClaimVectorJobs(
