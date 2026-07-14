@@ -18,6 +18,30 @@ const sqliteClaim: CitableInsightClaim = {
 };
 
 describe("validateStructuredInsightResponse", () => {
+  it("accepts one JSON object wrapped by model thinking and a markdown fence", () => {
+    const response = `<think>Need a concise cited answer.</think>\n\n\`\`\`json\n${JSON.stringify({
+      answer: "根据已验证记忆，项目当前使用 SQLite。[C1]",
+      claims: [{ text: sqliteClaim.statement, refs: ["C1"], kind: "fact" }],
+    })}\n\`\`\``;
+
+    const result = validateStructuredInsightResponse(response, [sqliteClaim]);
+
+    expect(result.answer).toBe("根据已验证记忆，项目当前使用 SQLite。[C1]");
+    expect(result.unverifiedClaims).toEqual([]);
+  });
+
+  it("still rejects a fenced JSON object followed by extra model prose", () => {
+    const response = `\`\`\`json\n${JSON.stringify({
+      answer: "项目当前使用 SQLite。[C1]",
+      claims: [{ text: sqliteClaim.statement, refs: ["C1"], kind: "fact" }],
+    })}\n\`\`\`\nThis is an extra explanation.`;
+
+    const result = validateStructuredInsightResponse(response, [sqliteClaim]);
+
+    expect(result.answer).toBe(INSUFFICIENT_VERIFIED_EVIDENCE);
+    expect(result.unverifiedClaims[0]?.reason).toBe("invalid_structured_response");
+  });
+
   it("accepts natural-language prose when its factual paragraph cites a verified Claim", () => {
     const result = validateStructuredInsightResponse(JSON.stringify({
       answer: "根据已验证记忆，项目当前使用 SQLite 作为数据库。[C1]",

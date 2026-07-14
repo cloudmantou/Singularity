@@ -147,6 +147,16 @@ function invalidStructuredResponse(raw: string): VerifiedInsightResult {
   };
 }
 
+function unwrapStructuredInsightResponse(raw: string): string {
+  const withoutBom = raw.replace(/^\uFEFF/, "").trim();
+  const withoutThinking = withoutBom.replace(
+    /^(?:<think>[\s\S]*?<\/think>\s*)+/i,
+    ""
+  ).trim();
+  const fenced = withoutThinking.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  return (fenced?.[1] ?? withoutThinking).trim();
+}
+
 function extractAnswerClaimRefs(answer: string): string[] {
   const refs: string[] = [];
   for (const match of answer.matchAll(/\[\s*(C\d+(?:\s*,\s*C\d+)*)\s*\]/gi)) {
@@ -195,10 +205,11 @@ export function validateStructuredInsightResponse(
 ): VerifiedInsightResult {
   const raw = response.trim();
   if (!raw) return invalidStructuredResponse("");
+  const structured = unwrapStructuredInsightResponse(raw);
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(structured);
   } catch {
     return invalidStructuredResponse(raw);
   }

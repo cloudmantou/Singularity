@@ -204,13 +204,13 @@ describe("GET /recall", () => {
       },
     );
     seedActiveClaimsForEntries(db, ["recent-singularity", "recent-mtzs"]);
-    const activityAnswer = JSON.stringify({
+    const activityAnswer = `<think>Group the current projects and cite each fact.</think>\n\n\`\`\`json\n${JSON.stringify({
       answer: "你最近主要在推进 Singularity 和 mtzs 两个项目。[C1][C2]",
       claims: [
         { text: "Singularity 当前正在完善自然语言 Recall 回答。", refs: ["C1"], kind: "fact" },
         { text: "mtzs 当前正在验证设备运行时清理流程。", refs: ["C2"], kind: "fact" },
       ],
-    });
+    })}\n\`\`\``;
     env = makeTestEnv(db, { AI: makeContradictionAI(activityAnswer) });
 
     const res = await worker.fetch(

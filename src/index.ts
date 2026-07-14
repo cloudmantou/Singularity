@@ -7085,7 +7085,7 @@ Rules:
   try {
     insight = await (await createLLM(env)).chat(
       [{ role: "user", content: prompt }],
-      { max_tokens: INSIGHT_MAX_TOKENS }
+      { max_tokens: INSIGHT_MAX_TOKENS, jsonMode: true }
     );
   } catch (e) {
     console.error("synthesizeInsight LLM call failed (non-fatal):", e);

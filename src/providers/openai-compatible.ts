@@ -27,6 +27,17 @@ function normalizeBaseURL(baseURL: string): string {
   return baseURL.replace(/\/+$/, "");
 }
 
+function supportsJsonObjectResponseFormat(baseURL: string, model: string): boolean {
+  const provider = `${baseURL} ${model}`.toLowerCase();
+  // MiniMax chat models reject OpenAI's json_object format. Their structured
+  // output support uses a different json_schema contract on selected models.
+  return !provider.includes("minimax");
+}
+
+function isUnsupportedJsonFormatError(status: number, body: string): boolean {
+  return status === 400 && /response[_ -]?format|json[_ -]?object/i.test(body);
+}
+
 /** Enrich provider 401/2049 messages with region/key-type hints (esp. MiniMax). */
 function enrichLlmHttpError(status: number, errBody: string, baseURL: string): string {
   const body = errBody.slice(0, 300);
@@ -182,22 +193,34 @@ export class OpenAICompatibleLLM implements LLMProvider {
       ...(this.defaultExtraBody ?? {}),
       ...(options.extraBody ?? {}),
     };
-    if (options.jsonMode) {
+    if (options.jsonMode && supportsJsonObjectResponseFormat(this.baseURL, this.model)) {
       body.response_format = { type: "json_object" };
     }
 
     try {
-      const response = await fetch(`${this.baseURL}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.apiKey}`,
-        },
-        body: JSON.stringify(body),
-      });
+      const send = (requestBody: Record<string, unknown>) =>
+        fetch(`${this.baseURL}/chat/completions`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${this.apiKey}`,
+          },
+          body: JSON.stringify(requestBody),
+        });
+      let response = await send(body);
+      let consumedErrorBody: string | null = null;
+      if (!response.ok && body.response_format) {
+        consumedErrorBody = await response.text().catch(() => "");
+        if (isUnsupportedJsonFormatError(response.status, consumedErrorBody)) {
+          const { response_format: ignoredResponseFormat, ...fallbackBody } = body;
+          void ignoredResponseFormat;
+          response = await send(fallbackBody);
+          consumedErrorBody = null;
+        }
+      }
 
       if (!response.ok) {
-        const errBody = await response.text().catch(() => "");
+        const errBody = consumedErrorBody ?? await response.text().catch(() => "");
         throw new Error(enrichLlmHttpError(response.status, errBody, this.baseURL));
       }
 
@@ -248,7 +271,9 @@ export class OpenAICompatibleLLM implements LLMProvider {
       ...(this.defaultExtraBody ?? {}),
       ...(options.extraBody ?? {}),
     };
-    if (options.jsonMode) body.response_format = { type: "json_object" };
+    if (options.jsonMode && supportsJsonObjectResponseFormat(this.baseURL, this.model)) {
+      body.response_format = { type: "json_object" };
+    }
 
     let recorded = false;
     const record = (

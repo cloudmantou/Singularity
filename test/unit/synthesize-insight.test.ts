@@ -3,6 +3,7 @@ import {
   resolveVerifiedRecallInsight,
   synthesizeInsight,
   synthesizeVerifiedInsight,
+  type Env,
 } from "../../src/index";
 import { makeTestEnv } from "../helpers/make-env";
 
@@ -45,6 +46,37 @@ function verifiedEvidence(id: string, content: string) {
 }
 
 describe("synthesizeInsight()", () => {
+  it("requests provider JSON mode for verified answer synthesis", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: structuredClaim("The project uses SQLite") } }],
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const env = {
+      ...makeTestEnv(),
+      DB: undefined,
+      SELFHOST: "1",
+      LLM_BASE_URL: "https://api.deepseek.com/v1",
+      LLM_API_KEY: "test-key",
+      LLM_MODEL: "deepseek-v4-flash",
+    } as unknown as Env;
+
+    try {
+      const result = await synthesizeVerifiedInsight("Which database is used?", {
+        directEvidence: [verifiedEvidence("entry-database", "The project uses SQLite")],
+        relatedContext: [],
+      }, env);
+
+      expect(result.answer).toContain("The project uses SQLite");
+      const requestBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+      expect(requestBody.response_format).toEqual({ type: "json_object" });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("checks query answerability even when recall returns one verified Claim", async () => {
     const env = makeTestEnv(undefined, {
       AI: aiMock(structuredClaim("The project uses SQLite")),

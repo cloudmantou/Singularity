@@ -23,6 +23,54 @@ describe("createLLM / createEmbedding", () => {
     expect(llm).toBeInstanceOf(OpenAICompatibleLLM);
   });
 
+  it("does not send unsupported json_object response format to MiniMax chat models", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: "{}" } }] }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const llm = new OpenAICompatibleLLM({
+      baseURL: "https://api.minimaxi.com/v1",
+      apiKey: "test-key",
+      model: "MiniMax-M3",
+    });
+
+    await llm.chat([{ role: "user", content: "Return JSON" }], { jsonMode: true });
+
+    const requestBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(requestBody.response_format).toBeUndefined();
+  });
+
+  it("retries once without json_object when a compatible provider rejects the field", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 400,
+        text: async () => "unsupported response_format",
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ choices: [{ message: { content: "{}" } }] }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    const llm = new OpenAICompatibleLLM({
+      baseURL: "https://gateway.example/v1",
+      apiKey: "test-key",
+      model: "custom-model",
+    });
+
+    await expect(llm.chat(
+      [{ role: "user", content: "Return JSON" }],
+      { jsonMode: true }
+    )).resolves.toBe("{}");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const firstBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    const secondBody = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body));
+    expect(firstBody.response_format).toEqual({ type: "json_object" });
+    expect(secondBody.response_format).toBeUndefined();
+  });
+
   it("falls back to Workers AI when external LLM env is unset", async () => {
     const llm = await createLLM({
       AI: { run: vi.fn() } as unknown as Ai,
