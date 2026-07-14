@@ -3,6 +3,7 @@ import { activeMemoryClaimPredicate } from "./claim-eligibility";
 export interface RecallClaimContext {
   id: string;
   entryId: string;
+  parentVersionId?: string | null;
   statement: string;
   status: string;
   verificationStatus: "confirmed" | "contested" | "supported";
@@ -14,6 +15,7 @@ export interface RecallClaimContext {
 export interface RecallConflictClaim {
   id: string;
   entryId: string;
+  parentVersionId?: string | null;
   statement: string;
   status: string;
 }
@@ -93,6 +95,7 @@ export async function linkPendingEntryConflictClaims(
 interface ClaimRow {
   id: string;
   entry_id: string;
+  parent_version_id: string | null;
   content: string;
   claim_status: string;
 }
@@ -118,7 +121,7 @@ async function loadEligibleClaims(
   if (claimIds.length === 0) return [];
   const placeholders = claimIds.map(() => "?").join(", ");
   const { results } = await db.prepare(
-    `SELECT m.id, m.entry_id, m.content, m.claim_status
+    `SELECT m.id, m.entry_id, m.parent_version_id, m.content, m.claim_status
      FROM sb_memories m
      WHERE m.id IN (${placeholders})
        AND m.entry_id IS NOT NULL
@@ -139,7 +142,7 @@ export async function loadRecallConflictContext(
 
   const entryPlaceholders = uniqueEntryIds.map(() => "?").join(", ");
   const { results: matchedClaims } = await db.prepare(
-    `SELECT m.id, m.entry_id, m.content, m.claim_status
+    `SELECT m.id, m.entry_id, m.parent_version_id, m.content, m.claim_status
      FROM sb_memories m
      WHERE m.entry_id IN (${entryPlaceholders})
        AND m.content_hash IS NOT NULL
@@ -182,6 +185,7 @@ export async function loadRecallConflictContext(
       claims: [oldClaim, newClaim].map((claim) => ({
         id: claim.id,
         entryId: claim.entry_id,
+        parentVersionId: claim.parent_version_id,
         statement: claim.content,
         status: claim.claim_status,
       })),
@@ -202,6 +206,7 @@ export async function loadRecallConflictContext(
     const context: RecallClaimContext = {
       id: claim.id,
       entryId: claim.entry_id,
+      parentVersionId: claim.parent_version_id,
       statement: claim.content,
       status: claim.claim_status,
       verificationStatus: verificationStatus(claim.claim_status),

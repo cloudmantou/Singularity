@@ -36,6 +36,7 @@ describe("validateStructuredInsightResponse", () => {
       memoryId: "claim-1",
       claimId: "claim-1",
       evidenceId: "entry-1",
+      versionId: null,
       statement: "The project uses SQLite.",
       kind: "fact",
     }]);

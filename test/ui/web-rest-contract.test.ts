@@ -45,7 +45,8 @@ describe("web memory mutation API contract", () => {
     expect(html).toContain("语义向量服务不可用，当前使用关键词 + 知识图谱降级召回。");
     expect(html).toContain("Matched entities:");
     expect(html).toContain("Current graph facts:");
-    expect(html).toContain("String(data.answer || 'Retrieved direct evidence is insufficient for a verified answer.')");
+    expect(html).toContain("String(data.answer || t('recall.answerUnavailable'))");
+    expect(html).not.toContain("entries.map((entry)");
     expect(html).toContain("Array.isArray(data.citations)");
     expect(html).toContain("citation.evidenceId");
     expect(html).not.toContain("fetch(`${WORKER_URL}/chat`");

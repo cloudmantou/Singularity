@@ -2,6 +2,10 @@ export interface InsightEvidenceRow<TClaim = unknown> {
   id: string;
   content: string;
   claims?: TClaim[];
+  createdAt?: number;
+  source?: string;
+  tags?: string[];
+  versionId?: string | null;
 }
 
 export interface InsightRelatedContextRow {
@@ -39,6 +43,7 @@ export interface CitableInsightClaim {
   status: string;
   conflictIds: string[];
   citationUse?: "fact" | "conflict_only";
+  versionId?: string | null;
   queryRelevance: number;
   answerability: "answerable" | "related" | "irrelevant";
 }
@@ -72,6 +77,7 @@ export interface InsightCitation {
   memoryId: string;
   claimId: string | null;
   evidenceId: string;
+  versionId: string | null;
   statement: string;
   kind: "fact" | "conflict";
 }
@@ -173,6 +179,7 @@ function buildInsightCitations(
         memoryId: claim.claimId ?? claim.evidenceId,
         claimId: claim.claimId,
         evidenceId: claim.evidenceId,
+        versionId: claim.versionId ?? null,
         statement: claim.statement,
         kind: verified.kind,
       });

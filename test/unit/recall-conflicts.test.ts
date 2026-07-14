@@ -79,6 +79,7 @@ describe("Recall conflict context", () => {
     expect(context.claimsByEntry.get("entry-old")).toEqual([{
       id: "claim-old",
       entryId: "entry-old",
+      parentVersionId: "version-old",
       statement: "mtzs uses installation_proxy",
       status: "contested",
       verificationStatus: "contested",
@@ -91,8 +92,8 @@ describe("Recall conflict context", () => {
       reason: "different_object",
       claimIds: ["claim-old", "claim-new"],
       claims: [
-        { id: "claim-old", entryId: "entry-old", statement: "mtzs uses installation_proxy", status: "contested" },
-        { id: "claim-new", entryId: "entry-new", statement: "mtzs uses new_installer", status: "contested" },
+        { id: "claim-old", entryId: "entry-old", parentVersionId: "version-old", statement: "mtzs uses installation_proxy", status: "contested" },
+        { id: "claim-new", entryId: "entry-new", parentVersionId: "version-new", statement: "mtzs uses new_installer", status: "contested" },
       ],
     }]);
   });

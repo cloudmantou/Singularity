@@ -3622,7 +3622,8 @@ export class D1Mock {
           return { results };
         }
         if (
-          s.includes("SELECT m.id, m.entry_id, m.content, m.claim_status") &&
+          (s.includes("SELECT m.id, m.entry_id, m.content, m.claim_status") ||
+            s.includes("SELECT m.id, m.entry_id, m.parent_version_id, m.content, m.claim_status")) &&
           s.includes("FROM sb_memories m") &&
           (s.includes("WHERE m.entry_id IN") || s.includes("WHERE m.id IN"))
         ) {
@@ -3647,6 +3648,7 @@ export class D1Mock {
               .map((memory: any) => ({
                 id: memory.id,
                 entry_id: memory.entry_id,
+                parent_version_id: memory.parent_version_id ?? null,
                 content: memory.content,
                 claim_status: memory.claim_status ?? "supported",
               })),

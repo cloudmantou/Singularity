@@ -179,7 +179,87 @@ describe("GET /recall", () => {
     expect(data.results).toHaveLength(30);
     expect(data.results[0].id).toBe("recent-0");
     expect(data.results.some((entry: any) => entry.id === "too-old")).toBe(false);
+    expect(data.answer).toBe(null);
     expect(queryMock).not.toHaveBeenCalled();
+  });
+
+  it("summarizes recent activity from current Claims and keeps entries as sources", async () => {
+    const now = Date.now();
+    db.entries.push(
+      {
+        id: "recent-singularity",
+        content: "Singularity 当前正在完善自然语言 Recall 回答。",
+        tags: '["work","project/singularity"]',
+        source: "codex",
+        created_at: now - 60_000,
+        vector_ids: "[]",
+      },
+      {
+        id: "recent-mtzs",
+        content: "mtzs 当前正在验证设备运行时清理流程。",
+        tags: '["work","project/mtzs"]',
+        source: "codex",
+        created_at: now - 120_000,
+        vector_ids: "[]",
+      },
+    );
+    seedActiveClaimsForEntries(db, ["recent-singularity", "recent-mtzs"]);
+    const activityAnswer = JSON.stringify({
+      answer: "你最近主要在推进 Singularity 和 mtzs 两个项目。[C1][C2]",
+      claims: [
+        { text: "Singularity 当前正在完善自然语言 Recall 回答。", refs: ["C1"], kind: "fact" },
+        { text: "mtzs 当前正在验证设备运行时清理流程。", refs: ["C2"], kind: "fact" },
+      ],
+    });
+    env = makeTestEnv(db, { AI: makeContradictionAI(activityAnswer) });
+
+    const res = await worker.fetch(
+      req("GET", `/recall?query=${encodeURIComponent("最近在忙什么")}`),
+      env,
+      ctx
+    );
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.mode).toBe("recent_activity");
+    expect(data.answer).toBe("你最近主要在推进 Singularity 和 mtzs 两个项目。[C1][C2]");
+    expect(data.answer).not.toBe(data.results.map((entry: any) => entry.content).join("\n"));
+    expect(data.citations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ref: "C1", evidenceId: "recent-singularity" }),
+      expect.objectContaining({ ref: "C2", evidenceId: "recent-mtzs" }),
+    ]));
+    expect(data.sources).toHaveLength(2);
+  });
+
+  it("does not expose raw recent activity when answer synthesis fails", async () => {
+    const now = Date.now();
+    db.entries.push({
+      id: "recent-failed-summary",
+      content: "Raw activity that must stay in sources",
+      tags: '["work"]',
+      source: "codex",
+      created_at: now - 60_000,
+      vector_ids: "[]",
+    });
+    seedActiveClaimsForEntries(db, ["recent-failed-summary"]);
+    env = makeTestEnv(db, {
+      AI: {
+        run: vi.fn().mockRejectedValue(new Error("AI unavailable")),
+      } as unknown as Ai,
+    });
+
+    const res = await worker.fetch(
+      req("GET", `/recall?query=${encodeURIComponent("最近在忙什么")}`),
+      env,
+      ctx
+    );
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(200);
+    expect(data.answer).toBe(null);
+    expect(data.results).toEqual([expect.objectContaining({ content: "Raw activity that must stay in sources" })]);
+    expect(data.sources).toEqual([expect.objectContaining({ content: "Raw activity that must stay in sources" })]);
+    expect(String(data.answer ?? "")).not.toContain("Raw activity");
   });
 
   it("returns ranked matches hydrated from D1", async () => {

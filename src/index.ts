@@ -6889,14 +6889,17 @@ async function appendToEntry(
 function buildCitableInsightClaims(
   context: InsightContextPackage<RecallClaimContext>,
   conflicts: readonly RecallConflictContext[] = [],
-  query = ""
+  query = "",
+  options: { activitySummary?: boolean } = {}
 ): CitableInsightClaim[] {
   const claims: CitableInsightClaim[] = [];
   const claimsById = new Map<string, CitableInsightClaim>();
   for (const evidence of context.directEvidence) {
     for (const claim of evidence.claims ?? []) {
       if (!claim.id || claimsById.has(claim.id)) continue;
-      const answerability = rankClaimAnswerability(query, claim.statement, claim.queryRelevance);
+      const answerability = options.activitySummary
+        ? { queryRelevance: 1, answerability: "answerable" as const }
+        : rankClaimAnswerability(query, claim.statement, claim.queryRelevance);
       const citable: CitableInsightClaim = {
         ref: `C${claims.length + 1}`,
         evidenceId: evidence.id,
@@ -6905,6 +6908,7 @@ function buildCitableInsightClaims(
         status: claim.status,
         conflictIds: [...claim.conflictIds],
         citationUse: "fact",
+        versionId: claim.parentVersionId ?? evidence.versionId ?? null,
         ...answerability,
       };
       claims.push(citable);
@@ -6934,7 +6938,10 @@ function buildCitableInsightClaims(
         status: claim.status,
         conflictIds: [conflict.id],
         citationUse: "conflict_only",
-        ...rankClaimAnswerability(query, claim.statement),
+        versionId: claim.parentVersionId ?? null,
+        ...(options.activitySummary
+          ? { queryRelevance: 1, answerability: "answerable" as const }
+          : rankClaimAnswerability(query, claim.statement)),
       };
       claims.push(citable);
       claimsById.set(claim.id, citable);
@@ -6961,7 +6968,7 @@ export async function synthesizeVerifiedInsight(
     | InsightEvidenceRow<RecallClaimContext>[],
   env: Env,
   conflicts: RecallConflictContext[] = [],
-  options: { asOf?: number } = {}
+  options: { asOf?: number; activitySummary?: boolean } = {}
 ): Promise<VerifiedInsightResult> {
   const context = normalizeInsightContext(contextInput);
   if (!context.directEvidence.length && !context.relatedContext.length) {
@@ -6975,7 +6982,12 @@ export async function synthesizeVerifiedInsight(
     };
   }
 
-  const citableClaims = buildCitableInsightClaims(context, conflicts, query);
+  const citableClaims = buildCitableInsightClaims(
+    context,
+    conflicts,
+    query,
+    { activitySummary: options.activitySummary }
+  );
   const answerabilityMode = normalizeAnswerabilityMode(
     env.ANSWERABILITY_MODE,
     env.SELFHOST === "1" ? "shadow" : "enforce"
@@ -6998,7 +7010,11 @@ export async function synthesizeVerifiedInsight(
             ? `statement=${claim.statement}`
             : `answerability=${claim.answerability}; relevance=${claim.queryRelevance}; statement=${claim.statement}`)
         );
-      return `[E${i + 1}] evidence_id=${r.id}\n${claimLines.join("\n")}`;
+      const activityMetadata = options.activitySummary
+        ? `; created_at=${r.createdAt ?? "unknown"}; source=${r.source ?? "unknown"}; ` +
+          `tags=${(r.tags ?? []).join(",") || "none"}`
+        : "";
+      return `[E${i + 1}] evidence_id=${r.id}${activityMetadata}\n${claimLines.join("\n")}`;
     })
     .join("\n\n");
   const relatedContextList = context.relatedContext.length
@@ -7025,6 +7041,14 @@ export async function synthesizeVerifiedInsight(
     }).join("\n")
     : "None";
 
+  const activityRules = options.activitySummary
+    ? `
+Activity-summary rules:
+  - Treat the time window as the retrieval scope; summarize the current state rather than listing entries.
+  - Group related changes by project or theme, deduplicate repeated progress, and prefer the newest compatible state over older versions.
+  - Clearly distinguish completed, in progress, blocked, and next steps when the evidence supports those labels.
+  - Return at most five key points.`
+    : "";
   const prompt = `You are a second brain assistant. Answer the user's query in natural language using ONLY the verified Claims below. The answer is shown to the user; it must be useful prose, not a pasted source record.
 
 Query: "${query}"
@@ -7055,7 +7079,7 @@ Rules:
 - To disclose an unresolved conflict, use kind="conflict" and cite at least two C* refs that share the same conflict ID. The server will render the conflict text.
   - The server will reject prose whose citations do not map to the verified claims or whose factual paragraphs lack citations.
   - If no Claim supports an answer, treat the verified evidence as insufficient and return {"answer":"","claims":[]}.
-- These Claims are a retrieved subset, not the user's full memory store.`;
+- These Claims are a retrieved subset, not the user's full memory store.${activityRules}`;
 
   let insight = "";
   try {
@@ -7116,6 +7140,40 @@ Rules:
     }, "system");
   }
   return validated;
+}
+
+export async function synthesizeRecentActivityAnswer(
+  query: string,
+  matches: readonly RecallMatch[],
+  plan: Pick<RecallRequestPlan, "before">,
+  env: Env
+): Promise<VerifiedInsightResult> {
+  if (!matches.length) return { answer: "", verifiedClaims: [], unverifiedClaims: [] };
+  const asOf = plan.before ?? Date.now();
+  const conflictContext = await loadRecallConflictContext(
+    env.DB,
+    matches.map((match) => match.id),
+    asOf
+  );
+  const directEvidence = matches.map((match) => ({
+    id: match.id,
+    content: match.content,
+    createdAt: match.createdAt,
+    source: match.source,
+    tags: match.tags,
+    versionId: match.parentVersionId ?? null,
+    claims: applyRecallClaimRelevance(
+      conflictContext.claimsByEntry.get(match.id) ?? [],
+      new Map<string, number>()
+    ),
+  }));
+  return synthesizeVerifiedInsight(
+    query,
+    { directEvidence, relatedContext: [] },
+    env,
+    conflictContext.conflicts,
+    { asOf, activitySummary: true }
+  );
 }
 
 export async function synthesizeInsight(
@@ -7492,6 +7550,11 @@ export interface RecallSearchResult {
   conflicts?: RecallConflictContext[];
   degraded?: boolean;
   degradedReason?: string;
+}
+
+function presentableRecallAnswer(value: string | null | undefined): string | null {
+  const answer = value?.trim() ?? "";
+  return answer && answer !== INSUFFICIENT_VERIFIED_EVIDENCE ? answer : null;
 }
 
 // ─── Hybrid recall: keyword search + Reciprocal Rank Fusion ────────────────────
@@ -9051,6 +9114,10 @@ async function recallHistoricalClaims(
   const insightRows = matches.map((match) => ({
     id: match.id,
     content: match.content,
+    createdAt: match.createdAt,
+    source: match.source,
+    tags: match.tags,
+    versionId: match.parentVersionId ?? null,
     claims: match.claims,
   }));
   const synthesized = insightRows.length
@@ -9627,6 +9694,10 @@ export async function recallEntries(
   const directInsightRows = directMatches.map((match) => ({
     id: match.id,
     content: match.content,
+    createdAt: match.createdAt,
+    source: match.source,
+    tags: match.tags,
+    versionId: match.parentVersionId ?? null,
     claims: match.claims,
   }));
   const relatedInsightRows = matches.flatMap((match) => match.association ? [{
@@ -12524,8 +12595,9 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
       const verifiedText = verifiedClaims.length
         ? `**Verified answer claims:** ${verifiedClaims.length}\n\n`
         : "";
+      const answerText = presentableRecallAnswer(answer ?? insight);
       const finalText = degradedText + conflictText + rejectedText + verifiedText +
-        (insight ? `**Insight:** ${insight}\n\n---\n\n${text}` : text);
+        (answerText ? `**Answer:** ${answerText}\n\n---\n\n${text}` : text);
       return { content: [{ type: "text", text: finalText }] };
     }
   );
@@ -14118,26 +14190,44 @@ const defaultHandler = {
             mode: activityPlan.mode,
             window: { after: activityPlan.after, before: activityPlan.before },
             results: [],
+            answer: null,
+            insight: null,
+            citations: [],
+            sources: [],
             message: "No recent activity found in that time window.",
           });
         }
+
+        const activityInsight = await synthesizeRecentActivityAnswer(
+          query,
+          matches,
+          activityPlan,
+          env
+        );
+        const activityAnswer = presentableRecallAnswer(activityInsight.answer);
+        const activitySources = matches.map((match) => ({
+          id: match.id,
+          content: match.content,
+          tags: match.tags,
+          source: match.source,
+          created_at: match.createdAt,
+        }));
 
         return json({
           ok: true,
           mode: activityPlan.mode,
           window: { after: activityPlan.after, before: activityPlan.before },
-          results: matches.map((match) => ({
-            id: match.id,
-            content: match.content,
+          results: activitySources.map((source) => ({
+            ...source,
             score: null,
-            tags: match.tags,
-            source: match.source,
-            created_at: match.createdAt,
             updated: false,
           })),
-          answer: null,
-          insight: null,
-          citations: [],
+          answer: activityAnswer,
+          insight: activityAnswer,
+          citations: activityInsight.citations ?? [],
+          verified_claims: activityInsight.verifiedClaims,
+          unverified_claims: activityInsight.unverifiedClaims,
+          sources: activitySources,
         });
       }
 
@@ -14183,11 +14273,22 @@ const defaultHandler = {
           results: [],
           message: "Nothing found matching that query.",
           answer: null,
+          insight: null,
           citations: [],
+          sources: [],
           degraded_mode: Boolean(degraded),
           degraded_reason: degradedReason ?? null,
         });
       }
+
+      const responseAnswer = presentableRecallAnswer(answer);
+      const responseSources = directEvidence.map((match) => ({
+        id: match.id,
+        content: match.content,
+        tags: match.tags,
+        source: match.source,
+        created_at: match.createdAt,
+      }));
 
       return json({
         ok: true,
@@ -14220,12 +14321,14 @@ const defaultHandler = {
           ref: `E${index + 1}`,
           id: match.id,
           content: match.content,
+          versionId: match.parentVersionId ?? null,
           claims: match.claims ?? [],
         })),
         claim_context: buildCitableInsightClaims({
           directEvidence: directEvidence.map((match) => ({
             id: match.id,
             content: match.content,
+            versionId: match.parentVersionId ?? null,
             claims: match.claims,
           })),
           relatedContext: [],
@@ -14237,9 +14340,10 @@ const defaultHandler = {
           association: match.association,
         })),
         conflicts,
-        answer: answer || null,
-        insight: insight || null,
+        answer: responseAnswer,
+        insight: responseAnswer,
         citations,
+        sources: responseSources,
         verified_claims: verifiedClaims,
         unverified_claims: unverifiedClaims,
       });

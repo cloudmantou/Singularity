@@ -4713,12 +4713,7 @@
             answerBubble.appendChild(answerEl)
             msgs.appendChild(answerBubble)
 
-            const verifiedAnswer = recentActivity
-              ? entries.map((entry) => {
-                  const date = new Date(entry.createdAt).toLocaleDateString()
-                  return `- ${date}: ${entry.content}`
-                }).join('\n')
-              : String(data.answer || 'Retrieved direct evidence is insufficient for a verified answer.')
+            const verifiedAnswer = String(data.answer || t('recall.answerUnavailable'))
             answerEl.innerHTML = renderAnswerMarkdown(verifiedAnswer)
 
             // 2. Sources toggle
