@@ -8,12 +8,19 @@ import { D1Mock } from "../helpers/d1-mock";
 // Returns an AI mock that always resolves a contradiction verdict (for captureEntry).
 function makeContradictionAI(response: string): Ai {
   return {
-    run: vi.fn().mockImplementation(async (model: string) => {
+    run: vi.fn().mockImplementation(async (model: string, options?: Record<string, any>) => {
       if (model === "@cf/baai/bge-small-en-v1.5")
         return { data: [new Array(384).fill(0.1)] };
+      const prompt = String(options?.messages?.[0]?.content ?? "");
+      const resolvedResponse = prompt.includes("strict evidence entailment verifier")
+        ? JSON.stringify({
+          paragraphs: [...new Set([...prompt.matchAll(/\"id\":\"(P\d+)\"/g)]
+            .map((match) => match[1]))].map((id) => ({ id, supported: true })),
+        })
+        : response;
       return new ReadableStream({
         start(c) {
-          c.enqueue(new TextEncoder().encode(`data: {"response":${JSON.stringify(response)}}\n\n`));
+          c.enqueue(new TextEncoder().encode(`data: {"response":${JSON.stringify(resolvedResponse)}}\n\n`));
           c.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
           c.close();
         },
@@ -208,11 +215,8 @@ describe("GET /recall", () => {
       answer: [{
         text: "你最近主要在推进 Singularity 和 mtzs 两个项目。",
         refs: ["C1", "C2"],
+        kind: "fact",
       }],
-      claims: [
-        { refs: ["C1"], kind: "fact" },
-        { refs: ["C2"], kind: "fact" },
-      ],
     })}\n\`\`\``;
     env = makeTestEnv(db, { AI: makeContradictionAI(activityAnswer) });
 
@@ -1185,11 +1189,13 @@ describe("GET /recall", () => {
 
     const res = await worker.fetch(req("GET", "/recall?query=work+meeting"), env, ctx);
     expect(res.status).toBe(200);
-    // "work" is a known tag and skips tag inference. The single remaining LLM call is
-    // the mandatory query-answerability pass over the retrieved Claim.
+    // "work" is a known tag and skips tag inference. The remaining LLM calls are
+    // answer synthesis plus its single bounded structured-output repair.
     const llmCalls = aiRun.mock.calls.filter((args: any[]) => args[0] !== "@cf/baai/bge-small-en-v1.5");
-    expect(llmCalls).toHaveLength(1);
-    expect(String(llmCalls[0][1]?.messages?.[0]?.content ?? "")).not.toContain("Which tags best match");
+    expect(llmCalls).toHaveLength(2);
+    expect(llmCalls.every((call: any[]) =>
+      !String(call[1]?.messages?.[0]?.content ?? "").includes("Which tags best match")
+    )).toBe(true);
   });
 
   it("excludes status:deprecated entries from recall results", async () => {

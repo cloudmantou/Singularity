@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   INSUFFICIENT_VERIFIED_EVIDENCE,
   validateInsightEvidenceReferences,
+  validateInsightEntailmentResponse,
   validateStructuredInsightResponse,
   type CitableInsightClaim,
 } from "../../src/memory/recall-context";
@@ -38,6 +39,31 @@ describe("validateStructuredInsightResponse", () => {
       claimId: "claim-1",
       evidenceId: "entry-1",
     })]);
+    expect(result.unverifiedClaims).toEqual([]);
+  });
+
+  it("derives the verified Claim ledger from paragraph refs when the model omits claims", () => {
+    const secondClaim: CitableInsightClaim = {
+      ...sqliteClaim,
+      ref: "C2",
+      evidenceId: "entry-2",
+      claimId: "claim-2",
+      statement: "The project listens on port 8787.",
+    };
+    const result = validateStructuredInsightResponse(JSON.stringify({
+      answer: [{
+        text: "项目当前使用 SQLite，并监听 8787 端口。",
+        refs: ["C1", "C2"],
+        kind: "fact",
+      }],
+    }), [sqliteClaim, secondClaim]);
+
+    expect(result.answer).toBe("项目当前使用 SQLite，并监听 8787 端口。 [C1][C2]");
+    expect(result.verifiedClaims).toEqual([
+      { text: sqliteClaim.statement, refs: ["C1"], kind: "fact" },
+      { text: secondClaim.statement, refs: ["C2"], kind: "fact" },
+    ]);
+    expect(result.citations).toHaveLength(2);
     expect(result.unverifiedClaims).toEqual([]);
   });
 
@@ -291,6 +317,36 @@ describe("validateStructuredInsightResponse", () => {
     }), contested);
     expect(conflict.answer).toBe("当前存在数据库选择冲突，系统尚未确认唯一方案。[C1][C2]");
     expect(conflict.verifiedClaims[0]?.text).toContain("Unresolved conflict");
+  });
+});
+
+describe("validateInsightEntailmentResponse", () => {
+  it("accepts one supported verdict for every expected paragraph", () => {
+    expect(validateInsightEntailmentResponse(JSON.stringify({
+      paragraphs: [
+        { id: "P1", supported: true },
+        { id: "P2", supported: true },
+      ],
+    }), ["P1", "P2"])).toBe(true);
+  });
+
+  it("fails closed on unsupported, missing, duplicate, or wrapped extra output", () => {
+    expect(validateInsightEntailmentResponse(JSON.stringify({
+      paragraphs: [{ id: "P1", supported: false }],
+    }), ["P1"])).toBe(false);
+    expect(validateInsightEntailmentResponse(JSON.stringify({
+      paragraphs: [{ id: "P1", supported: true }],
+    }), ["P1", "P2"])).toBe(false);
+    expect(validateInsightEntailmentResponse(JSON.stringify({
+      paragraphs: [
+        { id: "P1", supported: true },
+        { id: "P1", supported: true },
+      ],
+    }), ["P1", "P2"])).toBe(false);
+    expect(validateInsightEntailmentResponse(
+      '{"paragraphs":[{"id":"P1","supported":true}]} trailing',
+      ["P1"]
+    )).toBe(false);
   });
 });
 

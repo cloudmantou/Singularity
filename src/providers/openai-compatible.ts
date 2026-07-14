@@ -44,11 +44,30 @@ function isUnsupportedJsonFormatError(status: number, body: string): boolean {
 
 function isTransientMiniMaxError(status: number, body: string): boolean {
   if (status >= 500 && status <= 504) return true;
+  if (status === 529) return true;
   return status === 429 && /1000|1001|1002|1024|1033|server[_ -]?error|unknown error/i.test(body);
 }
 
-function waitBeforeTransientRetry(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 250));
+function waitBeforeTransientRetry(attempt: number): Promise<void> {
+  const delayMs = 250 * 2 ** Math.max(0, attempt - 1);
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+async function sendMiniMaxWithRetry(
+  send: (requestBody: Record<string, unknown>) => Promise<Response>,
+  requestBody: Record<string, unknown>,
+  attempt = 1
+): Promise<{ response: Response; errorBody: string | null }> {
+  const response = await send(requestBody);
+  if (response.ok) return { response, errorBody: null };
+
+  const errorBody = await response.text().catch(() => "");
+  if (attempt >= 3 || !isTransientMiniMaxError(response.status, errorBody)) {
+    return { response, errorBody };
+  }
+
+  await waitBeforeTransientRetry(attempt);
+  return sendMiniMaxWithRetry(send, requestBody, attempt + 1);
 }
 
 /** Enrich provider 401/2049 messages with region/key-type hints (esp. MiniMax). */
@@ -221,22 +240,17 @@ export class OpenAICompatibleLLM implements LLMProvider {
           },
           body: JSON.stringify(requestBody),
         });
-      let response = await send(body);
-      let consumedErrorBody: string | null = null;
+      const initial = miniMax
+        ? await sendMiniMaxWithRetry(send, body)
+        : { response: await send(body), errorBody: null };
+      let response = initial.response;
+      let consumedErrorBody = initial.errorBody;
       if (!response.ok && body.response_format) {
         consumedErrorBody = await response.text().catch(() => "");
         if (isUnsupportedJsonFormatError(response.status, consumedErrorBody)) {
           const { response_format: ignoredResponseFormat, ...fallbackBody } = body;
           void ignoredResponseFormat;
           response = await send(fallbackBody);
-          consumedErrorBody = null;
-        }
-      }
-      if (!response.ok && miniMax) {
-        consumedErrorBody ??= await response.text().catch(() => "");
-        if (isTransientMiniMaxError(response.status, consumedErrorBody)) {
-          await waitBeforeTransientRetry();
-          response = await send(body);
           consumedErrorBody = null;
         }
       }

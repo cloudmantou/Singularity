@@ -74,6 +74,67 @@ describe("createLLM / createEmbedding", () => {
     expect(secondBody).toEqual(firstBody);
   });
 
+  it("retries MiniMax peak-load 529 responses until a bounded attempt succeeds", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 529,
+        text: async () => JSON.stringify({
+          type: "error",
+          error: { type: "server_error", message: "peak-hour surge (1000)" },
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 500,
+        text: async () => JSON.stringify({
+          type: "error",
+          error: { type: "server_error", message: "unknown error, 500 (1000)" },
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ choices: [{ message: { content: "{}" } }] }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    const llm = new OpenAICompatibleLLM({
+      baseURL: "https://api.minimaxi.com/v1",
+      apiKey: "test-key",
+      model: "MiniMax-M3",
+    });
+
+    await expect(llm.chat(
+      [{ role: "user", content: "Return JSON" }],
+      { jsonMode: true }
+    )).resolves.toBe("{}");
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("stops MiniMax transient retries after the third failed HTTP attempt", async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => ({
+      ok: false,
+      status: 529,
+      text: async () => JSON.stringify({
+        type: "error",
+        error: { type: "server_error", message: "peak-hour surge (1000)" },
+      }),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const llm = new OpenAICompatibleLLM({
+      baseURL: "https://api.minimaxi.com/v1",
+      apiKey: "test-key",
+      model: "MiniMax-M3",
+    });
+
+    await expect(llm.chat(
+      [{ role: "user", content: "Return JSON" }],
+      { jsonMode: true }
+    )).rejects.toThrow(/529/);
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
   it("retries once without json_object when a compatible provider rejects the field", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({

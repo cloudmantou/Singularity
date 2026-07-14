@@ -69,7 +69,8 @@ export interface UnverifiedInsightClaim {
     | "claim_not_answerable"
     | "claim_text_not_supported"
     | "unresolved_conflict"
-    | "invalid_conflict_refs";
+    | "invalid_conflict_refs"
+    | "answer_language_mismatch";
 }
 
 export interface InsightCitation {
@@ -157,6 +158,47 @@ function unwrapStructuredInsightResponse(raw: string): string {
   return (fenced?.[1] ?? withoutThinking).trim();
 }
 
+export function parseInsightEntailmentVerdicts(
+  response: string,
+  expectedParagraphIds: readonly string[]
+): Map<string, boolean> | null {
+  const expected = [...new Set(expectedParagraphIds)];
+  if (!expected.length || expected.length !== expectedParagraphIds.length) return null;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(unwrapStructuredInsightResponse(response.trim()));
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const paragraphs = (parsed as Record<string, unknown>).paragraphs;
+  if (!Array.isArray(paragraphs) || paragraphs.length !== expected.length) return null;
+
+  const expectedSet = new Set(expected);
+  const verdicts = new Map<string, boolean>();
+  for (const paragraph of paragraphs) {
+    if (!paragraph || typeof paragraph !== "object" || Array.isArray(paragraph)) return null;
+    const record = paragraph as Record<string, unknown>;
+    const id = typeof record.id === "string" ? record.id.trim() : "";
+    if (
+      !expectedSet.has(id) ||
+      verdicts.has(id) ||
+      typeof record.supported !== "boolean"
+    ) return null;
+    verdicts.set(id, record.supported);
+  }
+  return verdicts.size === expected.length ? verdicts : null;
+}
+
+export function validateInsightEntailmentResponse(
+  response: string,
+  expectedParagraphIds: readonly string[]
+): boolean {
+  const verdicts = parseInsightEntailmentVerdicts(response, expectedParagraphIds);
+  return verdicts !== null && [...verdicts.values()].every(Boolean);
+}
+
 function extractAnswerClaimRefs(answer: string): string[] {
   const refs: string[] = [];
   for (const match of answer.matchAll(/\[\s*(C\d+(?:\s*,\s*C\d+)*)\s*\]/gi)) {
@@ -220,6 +262,24 @@ function renderStructuredAnswer(
   return paragraphs.join("\n\n");
 }
 
+function deriveClaimCandidatesFromAnswer(value: unknown): unknown[] | null {
+  if (!Array.isArray(value)) return null;
+
+  return value.flatMap((paragraph) => {
+    if (!paragraph || typeof paragraph !== "object" || Array.isArray(paragraph)) {
+      return [paragraph];
+    }
+    const record = paragraph as Record<string, unknown>;
+    const refs = Array.isArray(record.refs) ? record.refs : [];
+    if (record.kind === "conflict") {
+      return [{ refs, kind: "conflict" }];
+    }
+    return refs.length
+      ? refs.map((ref) => ({ refs: [ref], kind: "fact" }))
+      : [{ refs: [], kind: "fact" }];
+  });
+}
+
 function buildInsightCitations(
   claims: readonly CitableInsightClaim[],
   verifiedClaims: readonly VerifiedInsightClaim[]
@@ -264,7 +324,10 @@ export function validateStructuredInsightResponse(
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     return invalidStructuredResponse(raw);
   }
-  const candidateClaims = (parsed as Record<string, unknown>).claims;
+  const parsedRecord = parsed as Record<string, unknown>;
+  const answerValue = parsedRecord.answer;
+  const candidateClaims = deriveClaimCandidatesFromAnswer(answerValue)
+    ?? parsedRecord.claims;
   if (!Array.isArray(candidateClaims) || candidateClaims.length > 20) {
     return invalidStructuredResponse(raw);
   }
@@ -361,7 +424,6 @@ export function validateStructuredInsightResponse(
     verifiedClaims.push({ text: referencedStatements[0], refs, kind });
   }
 
-  const answerValue = (parsed as Record<string, unknown>).answer;
   const answer = renderStructuredAnswer(answerValue, unverifiedClaims);
   const responseMetadata = {
     ...(answerabilityWarnings.length ? { answerabilityWarnings } : {}),

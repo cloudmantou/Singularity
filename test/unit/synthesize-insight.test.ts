@@ -21,6 +21,14 @@ function aiMock(response: string) {
   return { run: vi.fn().mockResolvedValue(makeSseStream(response)) } as unknown as Ai;
 }
 
+function aiSequenceMock(...responses: string[]) {
+  const run = vi.fn();
+  for (const response of responses) {
+    run.mockResolvedValueOnce(makeSseStream(response));
+  }
+  return { run } as unknown as Ai;
+}
+
 function structuredClaim(text: string, refs = ["C1"], kind: "fact" | "conflict" = "fact") {
   const citations = refs.map((ref) => `[${ref}]`).join("");
   return JSON.stringify({
@@ -72,16 +80,20 @@ describe("synthesizeInsight()", () => {
       expect(result.answer).toContain("The project uses SQLite");
       const requestBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
       expect(requestBody.response_format).toEqual({ type: "json_object" });
-      expect(requestBody.max_tokens).toBeGreaterThanOrEqual(800);
+      expect(requestBody.max_tokens).toBe(1_600);
       expect(requestBody.messages[0].content).toContain(
-        '{"answer":[{"text":"","refs":["C1"]}],"claims":[{"refs":["C1"],"kind":"fact"}]}'
+        '{"answer":[{"text":"","refs":["C1"],"kind":"fact"}]}'
+      );
+      expect(requestBody.messages[0].content).toContain(
+        "Use two to four short sentences total and at most three paragraph objects"
+      );
+      expect(requestBody.messages[0].content).toContain(
+        "Each paragraph object must contain exactly one factual sentence about one project or theme"
       );
       expect(requestBody.messages[0].content).toContain(
         "The server renders Claim citations from each paragraph's refs"
       );
-      expect(requestBody.messages[0].content).not.toContain(
-        '{"answer":"","claims":[{"text":"","refs"'
-      );
+      expect(requestBody.messages[0].content).not.toContain('"claims"');
     } finally {
       vi.unstubAllGlobals();
     }
@@ -174,7 +186,10 @@ describe("synthesizeInsight()", () => {
       }],
     }];
     const conflictEnv = makeTestEnv(undefined, {
-      AI: aiMock(structuredClaim("Conflict", ["C1", "C2"], "conflict")),
+      AI: aiSequenceMock(
+        structuredClaim("Conflict", ["C1", "C2"], "conflict"),
+        JSON.stringify({ paragraphs: [{ id: "P1", supported: true }] })
+      ),
     });
     const disclosed = await synthesizeVerifiedInsight(
       "Which database is used?",
@@ -235,6 +250,173 @@ describe("synthesizeInsight()", () => {
     expect(result).toBe("Based on the verified memory, We chose JWT with 1hr expiry [C1]");
   });
 
+  it("accepts a paraphrased answer only after paragraph-to-Claim entailment passes", async () => {
+    const generated = JSON.stringify({
+      answer: [{
+        text: "The project currently relies on SQLite.",
+        refs: ["C1"],
+        kind: "fact",
+      }],
+    });
+    const verified = JSON.stringify({
+      paragraphs: [{ id: "P1", supported: true }],
+    });
+    const env = makeTestEnv(undefined, {
+      AI: aiSequenceMock(generated, verified),
+    });
+
+    const result = await synthesizeVerifiedInsight(
+      "Which database is used?",
+      [verifiedEvidence("1", "The project uses SQLite")],
+      env
+    );
+
+    expect(result.answer).toBe("The project currently relies on SQLite. [C1]");
+    expect(result.unverifiedClaims).toEqual([]);
+    expect(env.AI.run).toHaveBeenCalledTimes(2);
+    const [, verifierOptions] = (env.AI.run as ReturnType<typeof vi.fn>).mock.calls[1];
+    expect(verifierOptions.messages[0].content).toContain("strict evidence entailment verifier");
+  });
+
+  it("repairs an English answer when the user asked in Chinese", async () => {
+    const english = JSON.stringify({
+      answer: [{ text: "You are fixing Singularity recall.", refs: ["C1"], kind: "fact" }],
+    });
+    const chinese = JSON.stringify({
+      answer: [{ text: "你正在修复 Singularity Recall。", refs: ["C1"], kind: "fact" }],
+    });
+    const env = makeTestEnv(undefined, {
+      AI: aiSequenceMock(english, chinese),
+    });
+
+    const result = await synthesizeVerifiedInsight(
+      "我在忙什么？",
+      [verifiedEvidence("1", "你正在修复 Singularity Recall。")],
+      env,
+      [],
+      { activitySummary: true }
+    );
+
+    expect(result.answer).toBe("你正在修复 Singularity Recall。 [C1]");
+    expect(result.unverifiedClaims).toEqual([]);
+    expect(env.AI.run).toHaveBeenCalledTimes(2);
+    const [, repairOptions] = (env.AI.run as ReturnType<typeof vi.fn>).mock.calls[1];
+    expect(repairOptions.messages[0].content).toContain("answer_language_mismatch");
+  });
+
+  it("rejects a repair that still ignores the user's language", async () => {
+    const english = JSON.stringify({
+      answer: [{ text: "You are fixing Singularity recall.", refs: ["C1"], kind: "fact" }],
+    });
+    const env = makeTestEnv(undefined, {
+      AI: aiSequenceMock(english, english),
+    });
+
+    const result = await synthesizeVerifiedInsight(
+      "我在忙什么？",
+      [verifiedEvidence("1", "你正在修复 Singularity Recall。")],
+      env,
+      [],
+      { activitySummary: true }
+    );
+
+    expect(result.answer).toBe("Retrieved direct evidence is insufficient for a verified answer.");
+    expect(result.verifiedClaims).toEqual([]);
+    expect(result.unverifiedClaims).toEqual([
+      expect.objectContaining({ reason: "answer_language_mismatch", refs: ["C1"] }),
+    ]);
+    expect(env.AI.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails closed when a cited paragraph adds a fact absent from its Claims", async () => {
+    const generated = JSON.stringify({
+      answer: [{
+        text: "The project is production-ready.",
+        refs: ["C1"],
+        kind: "fact",
+      }],
+    });
+    const rejected = JSON.stringify({
+      paragraphs: [{ id: "P1", supported: false }],
+    });
+    const env = makeTestEnv(undefined, {
+      AI: aiSequenceMock(generated, rejected),
+    });
+
+    const result = await synthesizeVerifiedInsight(
+      "Which database is used?",
+      [verifiedEvidence("1", "The project uses SQLite")],
+      env
+    );
+
+    expect(result.answer).toBe("Retrieved direct evidence is insufficient for a verified answer.");
+    expect(result.verifiedClaims).toEqual([]);
+    expect(result.unverifiedClaims).toEqual([
+      expect.objectContaining({ reason: "claim_text_not_supported", refs: ["C1"] }),
+    ]);
+    expect(env.AI.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("drops an unsupported paragraph while preserving supported cited paragraphs", async () => {
+    const generated = JSON.stringify({
+      answer: [{
+        text: "The project currently relies on SQLite.",
+        refs: ["C1"],
+        kind: "fact",
+      }, {
+        text: "The project is production-ready.",
+        refs: ["C2"],
+        kind: "fact",
+      }],
+    });
+    const verdict = JSON.stringify({
+      paragraphs: [
+        { id: "P1", supported: true },
+        { id: "P2", supported: false },
+      ],
+    });
+    const env = makeTestEnv(undefined, {
+      AI: aiSequenceMock(generated, verdict),
+    });
+
+    const result = await synthesizeVerifiedInsight(
+      "What is the current project state?",
+      [{
+        id: "entry-project",
+        content: "Project state",
+        claims: [{
+          id: "claim-db",
+          entryId: "entry-project",
+          statement: "The project uses SQLite",
+          status: "confirmed",
+          verificationStatus: "confirmed",
+          conflictIds: [],
+          opposingClaimIds: [],
+        }, {
+          id: "claim-port",
+          entryId: "entry-project",
+          statement: "The project listens on port 8787",
+          status: "confirmed",
+          verificationStatus: "confirmed",
+          conflictIds: [],
+          opposingClaimIds: [],
+        }],
+      }],
+      env,
+      [],
+      { activitySummary: true }
+    );
+
+    expect(result.answer).toBe("The project currently relies on SQLite. [C1]");
+    expect(result.verifiedClaims).toEqual([
+      expect.objectContaining({ refs: ["C1"] }),
+    ]);
+    expect(result.citations).toEqual([
+      expect.objectContaining({ ref: "C1" }),
+    ]);
+    expect(result.unverifiedClaims).toEqual([]);
+  });
+
   it("returns empty string when LLM throws — does not propagate error", async () => {
     const env = makeTestEnv(undefined, {
       AI: { run: vi.fn().mockRejectedValue(new Error("AI unavailable")) } as unknown as Ai,
@@ -247,6 +429,117 @@ describe("synthesizeInsight()", () => {
     const env = makeTestEnv(undefined, { AI: aiMock("") });
     const result = await synthesizeInsight("content", [verifiedEvidence("1", "content")], env);
     expect(result).toBe("");
+  });
+
+  it("repairs one malformed successful model response with a bounded second call", async () => {
+    const repaired = JSON.stringify({
+      answer: [{
+        text: "根据已验证记忆，项目使用 SQLite。",
+        refs: ["C1"],
+        kind: "fact",
+      }],
+    });
+    const env = makeTestEnv(undefined, {
+      AI: aiSequenceMock(
+        "not valid JSON",
+        repaired,
+        JSON.stringify({ paragraphs: [{ id: "P1", supported: true }] })
+      ),
+    });
+
+    const result = await synthesizeVerifiedInsight(
+      "Which database is used?",
+      [verifiedEvidence("1", "The project uses SQLite")],
+      env
+    );
+
+    expect(result.answer).toBe("根据已验证记忆，项目使用 SQLite。 [C1]");
+    expect(env.AI.run).toHaveBeenCalledTimes(3);
+    const [, repairOptions] = (env.AI.run as ReturnType<typeof vi.fn>).mock.calls[1];
+    expect(repairOptions.messages[0].content).toContain("Strict repair attempt");
+    expect(repairOptions.messages[0].content).toContain("invalid_structured_response");
+    expect(repairOptions.messages[0].content).not.toContain("not valid JSON");
+  });
+
+  it("stops after one failed structured-response repair", async () => {
+    const env = makeTestEnv(undefined, {
+      AI: aiSequenceMock("not valid JSON", "still not valid JSON"),
+    });
+
+    const result = await synthesizeVerifiedInsight(
+      "Which database is used?",
+      [verifiedEvidence("1", "The project uses SQLite")],
+      env
+    );
+
+    expect(result.answer).toBe("Retrieved direct evidence is insufficient for a verified answer.");
+    expect(env.AI.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("regenerates from safe Claims when an activity summary mixes in a contested Claim", async () => {
+    const firstResponse = JSON.stringify({
+      answer: [{
+        text: "你最近在推进旧数据库方案和 Singularity 回答修复。",
+        refs: ["C1", "C2"],
+        kind: "fact",
+      }],
+    });
+    const safeResponse = JSON.stringify({
+      answer: [{
+        text: "你最近在推进 Singularity 回答修复。",
+        refs: ["C2"],
+        kind: "fact",
+      }],
+    });
+    const env = makeTestEnv(undefined, {
+      AI: aiSequenceMock(
+        firstResponse,
+        safeResponse,
+        JSON.stringify({ paragraphs: [{ id: "P1", supported: true }] })
+      ),
+    });
+
+    const result = await synthesizeVerifiedInsight(
+      "我在忙什么？",
+      {
+        directEvidence: [{
+          id: "entry-activity",
+          content: "Recent project activity",
+          claims: [{
+            id: "claim-contested",
+            entryId: "entry-activity",
+            statement: "你正在推进旧数据库方案。",
+            status: "contested",
+            verificationStatus: "contested",
+            conflictIds: ["conflict-database"],
+            opposingClaimIds: ["claim-current"],
+          }, {
+            id: "claim-safe",
+            entryId: "entry-activity",
+            statement: "你正在推进 Singularity 回答修复。",
+            status: "confirmed",
+            verificationStatus: "confirmed",
+            conflictIds: [],
+            opposingClaimIds: [],
+          }],
+        }],
+        relatedContext: [],
+      },
+      env,
+      [],
+      { activitySummary: true }
+    );
+
+    expect(result.answer).toBe("你最近在推进 Singularity 回答修复。 [C2]");
+    expect(result.unverifiedClaims).toEqual([]);
+    expect(env.AI.run).toHaveBeenCalledTimes(3);
+    const [, firstOptions] = (env.AI.run as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(firstOptions.messages[0].content).not.toContain("旧数据库方案");
+    const [, retryOptions] = (env.AI.run as ReturnType<typeof vi.fn>).mock.calls[1];
+    expect(retryOptions.messages[0].content).toContain("Allowed safe Claim data");
+    expect(retryOptions.messages[0].content).toContain("[C2]");
+    expect(retryOptions.messages[0].content).not.toContain("[C1]");
+    expect(retryOptions.messages[0].content).not.toContain("旧数据库方案");
   });
 
   it("trims whitespace from LLM response", async () => {
