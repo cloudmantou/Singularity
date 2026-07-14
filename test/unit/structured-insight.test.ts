@@ -18,6 +18,21 @@ const sqliteClaim: CitableInsightClaim = {
 };
 
 describe("validateStructuredInsightResponse", () => {
+  it("accepts a ref-only Claim ledger and resolves the statement server-side", () => {
+    const result = validateStructuredInsightResponse(JSON.stringify({
+      answer: "根据已验证记忆，项目当前使用 SQLite。[C1]",
+      claims: [{ refs: ["C1"], kind: "fact" }],
+    }), [sqliteClaim]);
+
+    expect(result.answer).toBe("根据已验证记忆，项目当前使用 SQLite。[C1]");
+    expect(result.verifiedClaims).toEqual([{
+      text: sqliteClaim.statement,
+      refs: ["C1"],
+      kind: "fact",
+    }]);
+    expect(result.unverifiedClaims).toEqual([]);
+  });
+
   it("accepts one JSON object wrapped by model thinking and a markdown fence", () => {
     const response = `<think>Need a concise cited answer.</think>\n\n\`\`\`json\n${JSON.stringify({
       answer: "根据已验证记忆，项目当前使用 SQLite。[C1]",

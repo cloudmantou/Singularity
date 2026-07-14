@@ -483,7 +483,7 @@ const CHUNK_OVERLAP_CHARS = 200;
 const CLASSIFY_MAX_TOKENS = 80;
 const CONTRADICTION_MAX_TOKENS = 80;
 const SMART_MERGE_MAX_TOKENS = 120;
-const INSIGHT_MAX_TOKENS = 300;
+const INSIGHT_MAX_TOKENS = 800;
 const PATTERN_MAX_TOKENS = 100;
 const DIGEST_MAX_TOKENS = 400;
 
@@ -7066,11 +7066,11 @@ Unresolved conflicts:
 ${conflictsList}
 
 Rules:
-  - Return exactly one JSON object and no markdown: {"answer":"","claims":[{"text":"","refs":["C1"],"kind":"fact"}]}.
+  - Return exactly one JSON object and no markdown: {"answer":"","claims":[{"refs":["C1"],"kind":"fact"}]}.
   - C* references are the only citable Claims. E* labels identify Evidence containers and R* labels are navigation-only; never place E* or R* in refs.
   - The answer field must be a concise natural-language answer in the user's language. You may paraphrase, combine, and organize supported Claims, but you must not infer, guess, or add facts.
   - Put one or more local citations such as [C1] or [C1][C2] in every factual paragraph of the answer. Do not cite Evidence labels or Association labels in the answer.
-  - The claims array is a source ledger, not the answer: for kind="fact", copy text exactly from each referenced C* statement. The server uses it to verify the facts behind your prose.
+  - The claims array is a source ledger, not the answer. Select refs and kind only; do not copy Claim text. The server resolves the immutable Claim text from each ref.
 - ${answerabilityMode === "shadow"
     ? "Answerability is evaluated after model selection; choose the most relevant Claims from the evidence without relying on a server answerability label."
     : "Only cite a C* Claim whose answerability is \"answerable\". Related or irrelevant Claims cannot answer the query."}
@@ -7128,7 +7128,18 @@ Rules:
     });
   }
   const validated = validateStructuredInsightResponse(insight, revalidatedClaims, answerabilityMode);
-  if (answerabilityMode !== "enforce" || validated.answerabilityWarnings?.length) {
+  const unverifiedReasonCounts = validated.unverifiedClaims.reduce<Record<string, number>>(
+    (counts, claim) => ({
+      ...counts,
+      [claim.reason]: (counts[claim.reason] ?? 0) + 1,
+    }),
+    {}
+  );
+  if (
+    answerabilityMode !== "enforce" ||
+    validated.answerabilityWarnings?.length ||
+    validated.unverifiedClaims.length
+  ) {
     logMemoryEvent("answerability", "answerability_evaluated", {
       mode: answerabilityMode,
       query_length: query.trim().length,
@@ -7137,6 +7148,8 @@ Rules:
       answerable_claims: revalidatedClaims.filter((claim) => claim.answerability === "answerable").length,
       warning_count: validated.answerabilityWarnings?.length ?? 0,
       verified_count: validated.verifiedClaims.length,
+      unverified_count: validated.unverifiedClaims.length,
+      unverified_reason_counts: unverifiedReasonCounts,
     }, "system");
   }
   return validated;

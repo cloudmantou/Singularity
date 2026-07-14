@@ -302,14 +302,15 @@ export function validateStructuredInsightResponse(
       unverifiedClaims.push({ text, refs, reason: "unresolved_conflict" });
       continue;
     }
-    const allRefsSupportText = claims.every(
-      (claim) => normalizeClaimText(claim.statement) === text
-    );
+    const referencedStatements = claims.map((claim) => normalizeClaimText(claim.statement));
+    const allRefsSupportText = text
+      ? referencedStatements.every((statement) => statement === text)
+      : new Set(referencedStatements).size === 1;
     if (!allRefsSupportText) {
       unverifiedClaims.push({ text, refs, reason: "claim_text_not_supported" });
       continue;
     }
-    verifiedClaims.push({ text: normalizeClaimText(claims[0].statement), refs, kind });
+    verifiedClaims.push({ text: referencedStatements[0], refs, kind });
   }
 
   const answerValue = (parsed as Record<string, unknown>).answer;

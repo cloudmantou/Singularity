@@ -41,6 +41,39 @@ describe("createLLM / createEmbedding", () => {
     expect(requestBody.response_format).toBeUndefined();
   });
 
+  it("uses MiniMax's recommended temperature and retries one transient server error", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 500,
+        text: async () => JSON.stringify({
+          type: "error",
+          error: { type: "server_error", message: "unknown error, 500 (1000)" },
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ choices: [{ message: { content: "{}" } }] }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    const llm = new OpenAICompatibleLLM({
+      baseURL: "https://api.minimaxi.com/v1",
+      apiKey: "test-key",
+      model: "MiniMax-M3",
+    });
+
+    await expect(llm.chat(
+      [{ role: "user", content: "Return JSON" }],
+      { jsonMode: true }
+    )).resolves.toBe("{}");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const firstBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    const secondBody = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body));
+    expect(firstBody.temperature).toBe(1);
+    expect(secondBody).toEqual(firstBody);
+  });
+
   it("retries once without json_object when a compatible provider rejects the field", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({

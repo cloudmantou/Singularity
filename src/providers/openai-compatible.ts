@@ -27,15 +27,28 @@ function normalizeBaseURL(baseURL: string): string {
   return baseURL.replace(/\/+$/, "");
 }
 
-function supportsJsonObjectResponseFormat(baseURL: string, model: string): boolean {
+function isMiniMaxChatProvider(baseURL: string, model: string): boolean {
   const provider = `${baseURL} ${model}`.toLowerCase();
+  return provider.includes("minimax");
+}
+
+function supportsJsonObjectResponseFormat(baseURL: string, model: string): boolean {
   // MiniMax chat models reject OpenAI's json_object format. Their structured
   // output support uses a different json_schema contract on selected models.
-  return !provider.includes("minimax");
+  return !isMiniMaxChatProvider(baseURL, model);
 }
 
 function isUnsupportedJsonFormatError(status: number, body: string): boolean {
   return status === 400 && /response[_ -]?format|json[_ -]?object/i.test(body);
+}
+
+function isTransientMiniMaxError(status: number, body: string): boolean {
+  if (status >= 500 && status <= 504) return true;
+  return status === 429 && /1000|1001|1002|1024|1033|server[_ -]?error|unknown error/i.test(body);
+}
+
+function waitBeforeTransientRetry(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 250));
 }
 
 /** Enrich provider 401/2049 messages with region/key-type hints (esp. MiniMax). */
@@ -184,10 +197,11 @@ export class OpenAICompatibleLLM implements LLMProvider {
   async chat(messages: ChatMessage[], options: ChatOptions = {}): Promise<string> {
     const started = Date.now();
     const inputPreview = messages.map((m) => m.content).join("\n").slice(0, 2000);
+    const miniMax = isMiniMaxChatProvider(this.baseURL, this.model);
     const body: Record<string, unknown> = {
       model: this.model,
       messages,
-      temperature: options.temperature ?? 0.2,
+      temperature: options.temperature ?? (miniMax ? 1 : 0.2),
       max_tokens: options.max_tokens,
       stream: false,
       ...(this.defaultExtraBody ?? {}),
@@ -215,6 +229,14 @@ export class OpenAICompatibleLLM implements LLMProvider {
           const { response_format: ignoredResponseFormat, ...fallbackBody } = body;
           void ignoredResponseFormat;
           response = await send(fallbackBody);
+          consumedErrorBody = null;
+        }
+      }
+      if (!response.ok && miniMax) {
+        consumedErrorBody ??= await response.text().catch(() => "");
+        if (isTransientMiniMaxError(response.status, consumedErrorBody)) {
+          await waitBeforeTransientRetry();
+          response = await send(body);
           consumedErrorBody = null;
         }
       }

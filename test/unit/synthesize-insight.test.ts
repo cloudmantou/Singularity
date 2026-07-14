@@ -72,6 +72,13 @@ describe("synthesizeInsight()", () => {
       expect(result.answer).toContain("The project uses SQLite");
       const requestBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
       expect(requestBody.response_format).toEqual({ type: "json_object" });
+      expect(requestBody.max_tokens).toBeGreaterThanOrEqual(800);
+      expect(requestBody.messages[0].content).toContain(
+        '{"answer":"","claims":[{"refs":["C1"],"kind":"fact"}]}'
+      );
+      expect(requestBody.messages[0].content).not.toContain(
+        '{"answer":"","claims":[{"text":"","refs"'
+      );
     } finally {
       vi.unstubAllGlobals();
     }
