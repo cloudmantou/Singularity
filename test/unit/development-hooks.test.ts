@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import { basename } from "node:path";
 import { describe, expect, it } from "vitest";
 
 const require = createRequire(import.meta.url);
@@ -51,7 +52,7 @@ describe("development session hook context", () => {
 
   it("derives the repository and branch from the current worktree", () => {
     const context = readProjectContext(process.cwd());
-    expect(context.repository).toBe("second-brain-cloudflare");
+    expect(context.repository).toBe(basename(context.root));
     expect(context.branch).toBeTruthy();
   });
 });
