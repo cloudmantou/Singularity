@@ -204,9 +204,10 @@ describe("POST /classify-pending", () => {
     // prechecks, unified sync2 etags, quality review queues, and compliance
     // audit event indexes, evidence/claim/provenance contracts, and parent
     // version snapshots, parent-version claim links, Claim vector mappings,
-    // durable Claim vector jobs, and Parent metadata snapshot migrations;
+    // durable Claim vector jobs, Parent metadata snapshot migrations, and the
+    // two-statement idempotent entry-mutation journal;
     // keep a bounded D1 headroom check instead of letting init grow unnoticed.
-    expect(db.statementCount).toBeLessThanOrEqual(205);
+    expect(db.statementCount).toBeLessThanOrEqual(215);
   });
 
   it("skips entries whose durable classification status is already succeeded", async () => {

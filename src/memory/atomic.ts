@@ -31,6 +31,10 @@ import {
   mutationActorForSource,
   type MutationActor,
 } from "./atomic-mutation";
+import {
+  prepareMemoryMutationKnowledgeCommit,
+  stageMemoryMutationKnowledgeIntent,
+} from "./mutations";
 
 export const MEMORY_CLASS_VALUES = [
   "fact",
@@ -662,6 +666,8 @@ export async function replaceEntryAtomicMemory(
     actor?: MutationActor;
     eventType: "append" | "update";
     createdAt: number;
+    mutationId?: string;
+    mutationLeaseOwner?: string;
   }
 ): Promise<{ observationId: string; memoryId: string }> {
   let lastError: unknown;
@@ -694,6 +700,8 @@ async function replaceEntryAtomicMemoryOnce(
     actor?: MutationActor;
     eventType: "append" | "update";
     createdAt: number;
+    mutationId?: string;
+    mutationLeaseOwner?: string;
   }
 ): Promise<{ observationId: string; memoryId: string }> {
   const observationId = crypto.randomUUID();
@@ -752,6 +760,17 @@ async function replaceEntryAtomicMemoryOnce(
   const parentVersionNumber = Math.max(1, Number(latestVersion?.version_number ?? 0) + 1);
   const evidenceRootId = parentId;
   const actor = input.actor ?? mutationActorForSource(input.source);
+  if (input.mutationId && input.mutationLeaseOwner) {
+    const staged = await stageMemoryMutationKnowledgeIntent(db, {
+      mutationId: input.mutationId,
+      leaseOwner: input.mutationLeaseOwner,
+      observationId,
+      claimId: memoryId,
+    });
+    if (!staged) {
+      throw new Error(`memory_mutation_knowledge_intent_failed:${input.mutationId}`);
+    }
+  }
   const entrySnapshot = await db.prepare(
     `SELECT tags, source FROM entries WHERE id = ? LIMIT 1`
   ).bind(input.entryId).first<{ tags: string | null; source: string | null }>();
@@ -805,6 +824,7 @@ async function replaceEntryAtomicMemoryOnce(
         evidence_root_id: evidenceRootId,
         evidence_type: actor.evidenceType,
         actor_id: actor.actorId,
+        mutation_id: input.mutationId ?? null,
       },
       contentHash: input.contentHash,
       sourceChannel: actor.sourceChannel,
@@ -935,11 +955,34 @@ async function replaceEntryAtomicMemoryOnce(
       )
   );
 
+  const mutationCheckpointIndex = input.mutationId && input.mutationLeaseOwner
+    ? statements.length
+    : null;
+  if (mutationCheckpointIndex !== null) {
+    const mutationCheckpointAt = Date.now();
+    statements.push(
+      prepareMemoryMutationKnowledgeCommit(db, {
+        mutationId: input.mutationId!,
+        leaseOwner: input.mutationLeaseOwner!,
+        observationId,
+        claimId: memoryId,
+        requireKnowledgeProjection: true,
+        now: mutationCheckpointAt,
+      })
+    );
+  }
+
   const results = await db.batch(statements);
   const activated = Number(results[activationStart]?.meta?.changes ?? 0);
   const parentUnitUpdated = Number(results[activationStart + 1]?.meta?.changes ?? 0);
   if (activated !== 1 || parentUnitUpdated !== 1) {
     throw new Error(`parent_version_activation_failed:${parentVersionId}`);
+  }
+  if (
+    mutationCheckpointIndex !== null &&
+    Number(results[mutationCheckpointIndex]?.meta?.changes ?? 0) !== 1
+  ) {
+    throw new Error(`memory_mutation_knowledge_checkpoint_failed:${input.mutationId}`);
   }
 
   return { observationId, memoryId };

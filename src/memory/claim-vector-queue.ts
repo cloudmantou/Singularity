@@ -25,6 +25,7 @@ export const CLAIM_VECTOR_QUEUE_SCHEMA_STATEMENTS = [
 
 export interface ClaimVectorJobWorkItem {
   jobId: string;
+  leaseOwner: string;
   claimId: string;
   entryId: string;
   parentVersionId: string | null;
@@ -62,10 +63,18 @@ export interface ClaimVectorQueueStatus {
   succeeded: number;
   failed: number;
   missing: number;
+  missing_retryable: number;
+  terminal_failed: number;
 }
 
 const MAX_ATTEMPTS = 6;
 export const DEFAULT_CLAIM_VECTOR_LEASE_MS = 5 * 60_000;
+
+export function claimVectorActivationBlock(
+  status: Pick<ClaimVectorQueueStatus, "terminal_failed">
+): "claim_vector_terminal_failures" | undefined {
+  return status.terminal_failed > 0 ? "claim_vector_terminal_failures" : undefined;
+}
 
 function boundedLimit(value: number, maximum = 200): number {
   return Math.min(Math.max(Math.trunc(value) || 1, 1), maximum);
@@ -117,9 +126,17 @@ async function listMissingClaims(
            AND cv.embedding_fingerprint = ?
            AND cv.content_hash = m.content_hash
        )
+       AND NOT EXISTS (
+         SELECT 1
+         FROM sb_claim_vector_jobs failed_job
+         WHERE failed_job.claim_id = m.id
+           AND failed_job.target_fingerprint = ?
+           AND failed_job.content_hash = m.content_hash
+           AND failed_job.status = 'failed'
+       )
      ORDER BY m.created_at ASC, m.id ASC
      LIMIT ?`
-  ).bind(targetFingerprint, boundedLimit(limit)).all<IndexableClaimRow>();
+  ).bind(targetFingerprint, targetFingerprint, boundedLimit(limit)).all<IndexableClaimRow>();
   return results ?? [];
 }
 
@@ -299,7 +316,25 @@ export async function getClaimVectorQueueStatus(
            AND cv.content_hash = m.content_hash
        )`
   ).bind(targetFingerprint).first<{ count: number }>();
+  const terminalFailed = await db.prepare(
+    `SELECT COUNT(*) AS count
+     FROM sb_memories m
+     JOIN sb_claim_vector_jobs failed_job
+       ON failed_job.claim_id = m.id
+      AND failed_job.target_fingerprint = ?
+      AND failed_job.content_hash = m.content_hash
+      AND failed_job.status = 'failed'
+     WHERE ${indexableClaimPredicate("m")}
+       AND NOT EXISTS (
+         SELECT 1 FROM sb_claim_vectors cv
+         WHERE cv.claim_id = m.id
+           AND cv.embedding_fingerprint = ?
+           AND cv.content_hash = m.content_hash
+       )`
+  ).bind(targetFingerprint, targetFingerprint).first<{ count: number }>();
   void now;
+  const missingCount = Number(missing?.count ?? 0);
+  const terminalFailedCount = Number(terminalFailed?.count ?? 0);
   return {
     fingerprint: targetFingerprint,
     pending: counts.get("pending") ?? 0,
@@ -307,7 +342,9 @@ export async function getClaimVectorQueueStatus(
     retryable_error: counts.get("retryable_error") ?? 0,
     succeeded: counts.get("succeeded") ?? 0,
     failed: counts.get("failed") ?? 0,
-    missing: Number(missing?.count ?? 0),
+    missing: missingCount,
+    missing_retryable: Math.max(0, missingCount - terminalFailedCount),
+    terminal_failed: terminalFailedCount,
   };
 }
 
@@ -454,6 +491,7 @@ export async function processClaimVectorJobs(
     try {
       await input.index({
         jobId: row.id,
+        leaseOwner,
         claimId: claim.id,
         entryId: claim.entry_id,
         parentVersionId: claim.parent_version_id,

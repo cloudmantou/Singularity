@@ -325,13 +325,33 @@ describe("full memory backup import/export", () => {
          conflict_type, state, created_at
        ) VALUES (?, ?, ?, ?, NULL, 'fact_resolution', 'pending', ?)`
     ).run("conflict-1", "entry-1", "entry-2", "mem-1", now - 500);
+    db.prepare(
+      `INSERT INTO sb_memory_mutations (
+         mutation_id, idempotency_key, source_channel, operation, entry_id,
+         request_hash, state, result_content, result_content_hash,
+         result_vector_count, observation_id, claim_id, warnings_json,
+         created_at, updated_at
+       ) VALUES (?, ?, ?, 'update', ?, ?, 'completed', ?, ?, 1, ?, ?, '[]', ?, ?)`
+    ).run(
+      "mutation-1",
+      "request-1",
+      "api",
+      "entry-1",
+      "request-hash-1",
+      "Singularity uses SQLite",
+      "hash-1",
+      "obs-1",
+      "mem-1",
+      now - 1000,
+      now - 500
+    );
 
     const exportResponse = await worker.fetch(auth("/export?full=true"), env, createExecutionContext());
     expect(exportResponse.status).toBe(200);
     const backup = await exportResponse.json() as any;
 
     expect(backup.backupFormat).toBe("singularity-memory-backup");
-    expect(backup.schemaVersion).toBe(13);
+    expect(backup.schemaVersion).toBe(15);
     expect(backup.features).toEqual(
       expect.arrayContaining([
         "atomic-memory",
@@ -348,6 +368,7 @@ describe("full memory backup import/export", () => {
         "fact-resolution",
         "claim-level-conflicts",
         "association-graph",
+        "entry-mutation-journal",
       ])
     );
     expect(backup.features).not.toContain("vector-rebuild-state");
@@ -358,6 +379,7 @@ describe("full memory backup import/export", () => {
       parentUnits: 2,
       parentVersions: 1,
       parentVersionClaims: 1,
+      memoryMutations: 1,
       associationEdges: 1,
       associationEdgeHistory: 1,
       entries: 2,
@@ -400,6 +422,17 @@ describe("full memory backup import/export", () => {
       memory_id: "mem-1",
       relation: "supports",
     });
+    expect(backup.memoryMutations[0]).toMatchObject({
+      mutation_id: "mutation-1",
+      state: "completed",
+      entry_id: "entry-1",
+      claim_id: "mem-1",
+    });
+    expect(backup.memoryMutations[0]).not.toHaveProperty("idempotency_key");
+    expect(backup.memoryMutations[0]).not.toHaveProperty("request_hash");
+    expect(backup.memoryMutations[0]).not.toHaveProperty("result_content");
+    expect(backup.memoryMutations[0]).not.toHaveProperty("last_error");
+    expect(backup.memoryMutations[0]).not.toHaveProperty("lease_owner");
     expect(backup.associationEdges[0]).toMatchObject({
       id: "association-1",
       source_parent_id: "parent-1",
@@ -459,12 +492,23 @@ describe("full memory backup import/export", () => {
     );
     expect(importResponse.status).toBe(200);
     const imported = await importResponse.json() as any;
-    expect(imported.schemaVersion).toBe(13);
+    expect(imported.schemaVersion).toBe(15);
     expect(imported.inserted).toBe(2);
     expect(imported.graph.scopes.imported).toBe(1);
     expect(imported.graph.parentUnits.imported).toBe(2);
     expect(imported.graph.parentVersions.imported).toBe(1);
     expect(imported.graph.parentVersionClaims.imported).toBe(1);
+    expect(imported.graph.memoryMutations.imported).toBe(1);
+    expect(restored.db.prepare(
+      `SELECT idempotency_key, source_channel, state, result_content, lease_owner
+       FROM sb_memory_mutations WHERE mutation_id = 'mutation-1'`
+    ).get()).toEqual({
+      idempotency_key: "restored:mutation-1",
+      source_channel: "backup_restore",
+      state: "failed",
+      result_content: null,
+      lease_owner: null,
+    });
     expect(imported.graph.associationEdges.imported).toBe(1);
     expect(imported.graph.associationEdgeHistory.imported).toBe(1);
     expect(imported.graph.memories.imported).toBe(1);
@@ -497,6 +541,7 @@ describe("full memory backup import/export", () => {
       source_snapshot: "obsidian",
       vault_snapshot: "vault-a",
       metadata_snapshot_hash: "snapshot-hash",
+      metadata_snapshot_source: "recorded",
     });
     expect(restoredBackup.associationEdges[0]).toMatchObject({
       directed: 1,
@@ -533,6 +578,7 @@ describe("full memory backup import/export", () => {
     expect(postForgetBackup.mergeCandidates).toEqual([]);
     expect(postForgetBackup.conflictCases).toEqual([]);
     expect(postForgetBackup.factResolutions).toEqual([]);
+    expect(postForgetBackup.memoryMutations).toEqual([]);
 
     const legacy = {
       ...backup,
@@ -547,6 +593,7 @@ describe("full memory backup import/export", () => {
       entityMergeCandidates: undefined,
       entityMergeHistory: undefined,
       factResolutions: undefined,
+      memoryMutations: undefined,
     };
     const legacyRestored = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
     await initializeDatabase(legacyRestored.env);
@@ -560,7 +607,7 @@ describe("full memory backup import/export", () => {
     );
     expect(legacyImportResponse.status).toBe(200);
     const legacyImported = await legacyImportResponse.json() as any;
-    expect(legacyImported.schemaVersion).toBe(13);
+    expect(legacyImported.schemaVersion).toBe(15);
     expect(legacyImported.graph.factSources.total).toBe(0);
     expect(legacyImported.graph.parentVersionClaims.total).toBe(1);
 
@@ -579,14 +626,14 @@ describe("full memory backup import/export", () => {
     const futureImportResponse = await worker.fetch(
       auth("/import", {
         method: "POST",
-        body: JSON.stringify({ ...backup, schemaVersion: 14 }),
+        body: JSON.stringify({ ...backup, schemaVersion: 16 }),
       }),
       legacyRestored.env,
       createExecutionContext()
     );
     expect(futureImportResponse.status).toBe(400);
     const futureImported = await futureImportResponse.json() as any;
-    expect(futureImported.error).toMatch(/schemaVersion 14/);
+    expect(futureImported.error).toMatch(/schemaVersion 16/);
 
     db.close();
     restored.db.close();

@@ -27,6 +27,8 @@ export interface CitableInsightClaim {
   status: string;
   conflictIds: string[];
   citationUse?: "fact" | "conflict_only";
+  queryRelevance: number;
+  answerability: "answerable" | "related" | "irrelevant";
 }
 
 export interface VerifiedInsightClaim {
@@ -44,6 +46,7 @@ export interface UnverifiedInsightClaim {
     | "unknown_claim_ref"
     | "too_many_claim_refs"
     | "conflict_only_ref"
+    | "claim_not_answerable"
     | "claim_text_not_supported"
     | "unresolved_conflict"
     | "invalid_conflict_refs";
@@ -164,6 +167,11 @@ export function validateStructuredInsightResponse(
       continue;
     }
     const claims = referenced as CitableInsightClaim[];
+
+    if (claims.some((claim) => claim.answerability !== "answerable")) {
+      unverifiedClaims.push({ text, refs, reason: "claim_not_answerable" });
+      continue;
+    }
 
     if (kind === "conflict") {
       const sharedConflict = claims.length >= 2 && claims[0].conflictIds.some((conflictId) =>

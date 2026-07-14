@@ -142,6 +142,7 @@ export class D1Mock {
   parentVersions: any[] = [];
   parentVersionClaims: any[] = [];
   claimVectors: any[] = [];
+  memoryMutations: any[] = [];
   observations: any[] = [];
   memories: any[] = [];
   memorySources: any[] = [];
@@ -191,6 +192,219 @@ export class D1Mock {
     const makeStmt = (args: any[]) => ({
       async run() {
         db.statementCount += 1;
+
+        if (s.startsWith("INSERT OR IGNORE INTO sb_memory_mutations")) {
+          const [
+            mutation_id,
+            idempotency_key,
+            source_channel,
+            operation,
+            entry_id,
+            request_hash,
+            lease_owner,
+            lease_expires_at,
+            created_at,
+            updated_at,
+          ] = args;
+          const duplicate = db.memoryMutations.some((row: any) =>
+            row.source_channel === source_channel &&
+            row.operation === operation &&
+            row.idempotency_key === idempotency_key
+          );
+          if (duplicate) return { meta: { changes: 0 } };
+          db.memoryMutations.push({
+            mutation_id,
+            idempotency_key,
+            source_channel,
+            operation,
+            entry_id,
+            request_hash,
+            state: "preparing",
+            result_content: null,
+            result_content_hash: null,
+            result_vector_count: null,
+            observation_id: null,
+            claim_id: null,
+            warnings_json: "[]",
+            last_error: null,
+            lease_owner,
+            lease_expires_at,
+            created_at,
+            updated_at,
+          });
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("UPDATE sb_memory_mutations SET state = CASE")) {
+          const [lease_owner, lease_expires_at, updated_at, mutation_id, now] = args;
+          const index = db.memoryMutations.findIndex((row: any) =>
+            row.mutation_id === mutation_id &&
+            row.state !== "completed" &&
+            (row.lease_owner == null || row.lease_expires_at == null || Number(row.lease_expires_at) <= Number(now))
+          );
+          if (index < 0) return { meta: { changes: 0 } };
+          const row = db.memoryMutations[index];
+          const projectedEntry = db.entries.some((entry: any) =>
+            entry.id === row.entry_id &&
+            entry.content === row.result_content &&
+            entry.content_hash === row.result_content_hash
+          );
+          const projectedClaim = db.memories.find((memory: any) =>
+            memory.id === row.claim_id &&
+            memory.entry_id === row.entry_id &&
+            memory.content_hash === row.result_content_hash
+          );
+          const projectedKnowledge = Boolean(projectedClaim) &&
+            db.memorySources.some((source: any) =>
+              source.memory_id === row.claim_id && source.observation_id === row.observation_id
+            ) &&
+            db.parentVersionClaims.some((link: any) => {
+              if (link.memory_id !== row.claim_id || link.relation !== "supports") return false;
+              const version = db.parentVersions.find((candidate: any) =>
+                candidate.version_id === link.parent_version_id &&
+                ["active", "active_degraded"].includes(candidate.state)
+              );
+              return Boolean(version) && db.parentUnits.some((unit: any) =>
+                unit.parent_id === version.parent_id &&
+                unit.active_version_id === version.version_id
+              );
+            });
+          let state = row.state;
+          if (["failed", "entry_committed"].includes(row.state) && projectedKnowledge) {
+            state = "knowledge_committed";
+          } else if (["failed", "preparing"].includes(row.state) && projectedEntry) {
+            state = "entry_committed";
+          } else if (row.state === "failed") {
+            state = "preparing";
+          } else if (row.state === "projection_pending") {
+            state = "knowledge_committed";
+          }
+          db.memoryMutations[index] = {
+            ...row,
+            state,
+            lease_owner,
+            lease_expires_at,
+            last_error: null,
+            updated_at,
+          };
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("UPDATE sb_memory_mutations SET result_content = ?")) {
+          const [result_content, result_content_hash, result_vector_count, updated_at, mutation_id, lease_owner, now] = args;
+          const index = db.memoryMutations.findIndex((row: any) =>
+            row.mutation_id === mutation_id && row.lease_owner === lease_owner &&
+            row.state === "preparing" && Number(row.lease_expires_at) > Number(now)
+          );
+          if (index < 0) return { meta: { changes: 0 } };
+          db.memoryMutations[index] = {
+            ...db.memoryMutations[index],
+            result_content,
+            result_content_hash,
+            result_vector_count,
+            updated_at,
+          };
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("UPDATE sb_memory_mutations SET observation_id = ?, claim_id = ?")) {
+          const [observation_id, claim_id, updated_at, mutation_id, lease_owner, now] = args;
+          const index = db.memoryMutations.findIndex((row: any) =>
+            row.mutation_id === mutation_id && row.lease_owner === lease_owner &&
+            row.state === "entry_committed" && Number(row.lease_expires_at) > Number(now)
+          );
+          if (index < 0) return { meta: { changes: 0 } };
+          db.memoryMutations[index] = {
+            ...db.memoryMutations[index],
+            observation_id,
+            claim_id,
+            updated_at,
+          };
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("UPDATE sb_memory_mutations SET state = 'entry_committed'")) {
+          const [result_content, result_content_hash, result_vector_count, updated_at, mutation_id, lease_owner, now] = args;
+          const index = db.memoryMutations.findIndex((row: any) =>
+            row.mutation_id === mutation_id && row.lease_owner === lease_owner &&
+            row.state === "preparing" && Number(row.lease_expires_at) > Number(now) &&
+            (!s.includes("entry_projection") || db.entries.some((entry: any) =>
+              entry.id === row.entry_id &&
+              entry.content === args[7] &&
+              entry.content_hash === args[8]
+            ))
+          );
+          if (index < 0) return { meta: { changes: 0 } };
+          db.memoryMutations[index] = {
+            ...db.memoryMutations[index],
+            state: "entry_committed",
+            result_content,
+            result_content_hash,
+            result_vector_count,
+            last_error: null,
+            updated_at,
+          };
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("UPDATE sb_memory_mutations SET state = 'knowledge_committed'")) {
+          const [observation_id, claim_id, updated_at, mutation_id, lease_owner, now] = args;
+          const index = db.memoryMutations.findIndex((row: any) =>
+            row.mutation_id === mutation_id && row.lease_owner === lease_owner &&
+            row.state === "entry_committed" && Number(row.lease_expires_at) > Number(now) &&
+            (!s.includes("FROM sb_observations WHERE id = ?") || (
+              db.observations.some((observation: any) => observation.id === args[6]) &&
+              db.memories.some((memory: any) => memory.id === args[7])
+            ))
+          );
+          if (index < 0) return { meta: { changes: 0 } };
+          db.memoryMutations[index] = {
+            ...db.memoryMutations[index],
+            state: "knowledge_committed",
+            observation_id,
+            claim_id,
+            last_error: null,
+            updated_at,
+          };
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("UPDATE sb_memory_mutations SET state = ?, warnings_json")) {
+          const [state, warnings_json, updated_at, mutation_id, lease_owner, now] = args;
+          const index = db.memoryMutations.findIndex((row: any) =>
+            row.mutation_id === mutation_id && row.lease_owner === lease_owner &&
+            row.state === "knowledge_committed" && Number(row.lease_expires_at) > Number(now)
+          );
+          if (index < 0) return { meta: { changes: 0 } };
+          db.memoryMutations[index] = {
+            ...db.memoryMutations[index],
+            state,
+            warnings_json,
+            lease_owner: null,
+            lease_expires_at: null,
+            last_error: null,
+            updated_at,
+          };
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("UPDATE sb_memory_mutations SET state = 'failed'")) {
+          const [last_error, updated_at, mutation_id, lease_owner] = args;
+          const index = db.memoryMutations.findIndex((row: any) =>
+            row.mutation_id === mutation_id && row.lease_owner === lease_owner
+          );
+          if (index < 0) return { meta: { changes: 0 } };
+          db.memoryMutations[index] = {
+            ...db.memoryMutations[index],
+            state: "failed",
+            last_error,
+            lease_owner: null,
+            lease_expires_at: null,
+            updated_at,
+          };
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("DELETE FROM sb_memory_mutations WHERE entry_id IN")) {
+          const deleting = new Set(args.map(String));
+          const before = db.memoryMutations.length;
+          db.memoryMutations = db.memoryMutations.filter((row: any) =>
+            !deleting.has(String(row.entry_id))
+          );
+          return { meta: { changes: before - db.memoryMutations.length } };
+        }
 
         if (s.startsWith("INSERT INTO sb_app_settings") && s.includes("SELECT 'model_settings'")) {
           const [value, updated_at, rebuild_id] = args;
@@ -2558,6 +2772,21 @@ export class D1Mock {
       },
       async first() {
         db.statementCount += 1;
+        if (s.includes("SELECT * FROM sb_memory_mutations WHERE source_channel = ?")) {
+          const [source_channel, operation, idempotency_key] = args;
+          return db.memoryMutations.find((row: any) =>
+            row.source_channel === source_channel &&
+            row.operation === operation &&
+            row.idempotency_key === idempotency_key
+          ) ?? null;
+        }
+        if (s.includes("SELECT * FROM sb_memory_mutations WHERE mutation_id = ?")) {
+          return db.memoryMutations.find((row: any) => row.mutation_id === args[0]) ?? null;
+        }
+        if (s === "SELECT content, content_hash FROM entries WHERE id = ?") {
+          const row = db.entries.find((entry: any) => entry.id === args[0]);
+          return row ? { content: row.content, content_hash: row.content_hash ?? null } : null;
+        }
         if (s.includes("SELECT content_hash") && s.includes("FROM sb_claim_vectors")) {
           const [claimId, fingerprint] = args.map(String);
           const row = db.claimVectors.find((item: any) =>
@@ -2697,12 +2926,16 @@ export class D1Mock {
           );
           return row ? { ...row } : null;
         }
-        if (s.includes("SELECT 1 as referenced") && s.includes("json_each")) {
-          const [activeId, pendingId] = args.map(String);
-          const referenced = db.entries.some((entry: any) =>
+        if (s.toLowerCase().includes("select 1 as referenced") && s.includes("json_each")) {
+          const [activeId, pendingId, claimId] = args.map(String);
+          const entryReferenced = db.entries.some((entry: any) =>
             parseJsonArray(entry.vector_ids).includes(activeId) ||
             parseJsonArray(entry.pending_vector_ids).includes(pendingId)
           );
+          const claimReferenced = db.claimVectors.some((mapping: any) =>
+            parseJsonArray(mapping.vector_ids_json).includes(claimId)
+          );
+          const referenced = entryReferenced || claimReferenced;
           return referenced ? { referenced: 1 } : null;
         }
         if (s.includes("SELECT value FROM sb_app_settings WHERE key = ?")) {
@@ -2754,6 +2987,15 @@ export class D1Mock {
             memory_relations_missing_from_entry: db.relations.filter((relation: any) => !has(db.entries, "id", relation.from_memory_id)).length,
             memory_relations_missing_to_entry: db.relations.filter((relation: any) => !has(db.entries, "id", relation.to_memory_id)).length,
             revisions_missing_entry: db.revisions.filter((revision: any) => !has(db.entries, "id", revision.memory_id)).length,
+            memory_mutations_missing_entry: db.memoryMutations.filter((mutation: any) =>
+              !has(db.entries, "id", mutation.entry_id)
+            ).length,
+            memory_mutations_missing_observation: db.memoryMutations.filter((mutation: any) =>
+              mutation.observation_id != null && !has(db.observations, "id", mutation.observation_id)
+            ).length,
+            memory_mutations_missing_claim: db.memoryMutations.filter((mutation: any) =>
+              mutation.claim_id != null && !has(db.memories, "id", mutation.claim_id)
+            ).length,
             merge_candidates_missing_source: db.mergeCandidates.filter((candidate: any) => !has(db.entries, "id", candidate.source_memory_id)).length,
             merge_candidates_missing_target: db.mergeCandidates.filter((candidate: any) => !has(db.entries, "id", candidate.target_memory_id)).length,
             conflict_cases_missing_old: db.conflictCases.filter((conflict: any) => !has(db.entries, "id", conflict.old_memory_id)).length,
@@ -3197,6 +3439,25 @@ export class D1Mock {
       },
       async all() {
         db.statementCount += 1;
+        if (
+          s.includes("SELECT cv.claim_id, cv.vector_ids_json") &&
+          s.includes("FROM sb_claim_vectors cv")
+        ) {
+          const fingerprint = String(args[0]);
+          const claimIds = new Set(args.slice(1).map(String));
+          return {
+            results: db.claimVectors.filter((mapping: any) => {
+              if (
+                String(mapping.embedding_fingerprint) !== fingerprint ||
+                !claimIds.has(String(mapping.claim_id))
+              ) return false;
+              const memory = db.memories.find((candidate: any) =>
+                String(candidate.id) === String(mapping.claim_id)
+              );
+              return Boolean(memory) && memory.content_hash === mapping.content_hash;
+            }),
+          };
+        }
         if (
           s.includes("SELECT id, name, name_normalized, entity_type, aliases_json") &&
           s.includes("FROM sb_entities") &&

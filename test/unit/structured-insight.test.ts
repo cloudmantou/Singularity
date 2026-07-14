@@ -13,6 +13,8 @@ const sqliteClaim: CitableInsightClaim = {
   statement: "The project uses SQLite.",
   status: "confirmed",
   conflictIds: [],
+  queryRelevance: 1,
+  answerability: "answerable",
 };
 
 describe("validateStructuredInsightResponse", () => {
@@ -46,6 +48,20 @@ describe("validateStructuredInsightResponse", () => {
       text: "It will migrate to Postgres next year.",
       reason: "claim_text_not_supported",
     })]);
+  });
+
+  it("rejects a supported Claim that the server ranked as not answerable", () => {
+    const result = validateStructuredInsightResponse(JSON.stringify({
+      claims: [{ text: sqliteClaim.statement, refs: ["C1"], kind: "fact" }],
+    }), [{
+      ...sqliteClaim,
+      queryRelevance: 0,
+      answerability: "irrelevant",
+    }]);
+
+    expect(result.answer).toBe(INSUFFICIENT_VERIFIED_EVIDENCE);
+    expect(result.verifiedClaims).toEqual([]);
+    expect(result.unverifiedClaims[0]?.reason).toBe("claim_not_answerable");
   });
 
   it("rejects a fact when any attached Claim ref has a different statement", () => {
@@ -136,6 +152,8 @@ describe("validateStructuredInsightResponse", () => {
         statement: "The project uses Postgres.",
         status: "contested",
         conflictIds: ["conflict-1"],
+        queryRelevance: 1,
+        answerability: "answerable",
       },
     ];
     const fact = validateStructuredInsightResponse(JSON.stringify({

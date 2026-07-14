@@ -43,7 +43,7 @@ function verifiedEvidence(id: string, content: string) {
 describe("synthesizeInsight()", () => {
   it("checks query answerability even when recall returns one verified Claim", async () => {
     const env = makeTestEnv(undefined, {
-      AI: aiMock(JSON.stringify({ answer: "", claims: [] })),
+      AI: aiMock(structuredClaim("The project uses SQLite")),
     });
     const result = await resolveVerifiedRecallInsight("What is the minimum iOS version?", {
       directEvidence: [verifiedEvidence("entry-database", "The project uses SQLite")],
@@ -53,6 +53,7 @@ describe("synthesizeInsight()", () => {
     expect(env.AI.run).toHaveBeenCalledTimes(1);
     expect(result.answer).toBe("Retrieved direct evidence is insufficient for a verified answer.");
     expect(result.verifiedClaims).toEqual([]);
+    expect(result.unverifiedClaims[0]?.reason).toBe("claim_not_answerable");
   });
 
   it("uses query-aware synthesis when one Entry contains multiple Claims", async () => {

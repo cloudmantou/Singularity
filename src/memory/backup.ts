@@ -2,10 +2,11 @@ import { importEntries, type ImportMode, type ImportOptions, type ImportResult }
 import { ensureEntityResolutionDataModel } from "./entities";
 import { ensureConflictClaimSchema } from "./quality";
 import { ensureAssociationDataModel } from "./associations";
+import { MEMORY_MUTATION_SCHEMA_STATEMENTS } from "./mutations";
 
-export const MEMORY_BACKUP_SCHEMA_VERSION = 13;
+export const MEMORY_BACKUP_SCHEMA_VERSION = 15;
 const MEMORY_BACKUP_FORMAT = "singularity-memory-backup";
-const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
 const MEMORY_BACKUP_FEATURES = [
   "atomic-memory",
   "temporal-facts",
@@ -19,12 +20,14 @@ const MEMORY_BACKUP_FEATURES = [
   "parent-version-time-windows",
   "parent-version-time-provenance",
   "parent-version-metadata-snapshots",
+  "parent-version-metadata-provenance",
   "entity-resolution",
   "entity-merge-execution",
   "fact-resolution",
   "claim-level-conflicts",
   "association-graph",
   "association-validity-windows",
+  "entry-mutation-journal",
 ] as const;
 
 const GRAPH_ARRAY_KEYS = [
@@ -32,6 +35,7 @@ const GRAPH_ARRAY_KEYS = [
   "parentUnits",
   "parentVersions",
   "parentVersionClaims",
+  "memoryMutations",
   "associationEdges",
   "associationEdgeHistory",
   "observations",
@@ -73,7 +77,7 @@ export interface BackupIntegrityReport {
 
 export interface MemoryBackup {
   backupFormat: typeof MEMORY_BACKUP_FORMAT;
-  schemaVersion: 13;
+  schemaVersion: 15;
   features: Array<(typeof MEMORY_BACKUP_FEATURES)[number]>;
   exportedAt: string;
   source: string;
@@ -83,6 +87,7 @@ export interface MemoryBackup {
   parentUnits: BackupRow[];
   parentVersions: BackupRow[];
   parentVersionClaims: BackupRow[];
+  memoryMutations: BackupRow[];
   associationEdges: BackupRow[];
   associationEdgeHistory: BackupRow[];
   entries: BackupRow[];
@@ -109,7 +114,7 @@ export interface MemoryBackup {
 }
 
 export interface MemoryBackupImportResult extends ImportResult {
-  schemaVersion: 13;
+  schemaVersion: 15;
   graph: Record<GraphArrayKey, TableImportStats>;
   integrity: BackupIntegrityReport;
 }
@@ -281,6 +286,15 @@ export async function inspectMemoryBackupIntegrity(db: D1Database): Promise<Back
        (SELECT COUNT(*) FROM sb_memory_revisions r
         LEFT JOIN entries e ON e.id = r.memory_id
         WHERE e.id IS NULL) as revisions_missing_entry,
+       (SELECT COUNT(*) FROM sb_memory_mutations mutation
+        LEFT JOIN entries e ON e.id = mutation.entry_id
+        WHERE e.id IS NULL) as memory_mutations_missing_entry,
+       (SELECT COUNT(*) FROM sb_memory_mutations mutation
+        LEFT JOIN sb_observations o ON o.id = mutation.observation_id
+        WHERE mutation.observation_id IS NOT NULL AND o.id IS NULL) as memory_mutations_missing_observation,
+       (SELECT COUNT(*) FROM sb_memory_mutations mutation
+        LEFT JOIN sb_memories m ON m.id = mutation.claim_id
+        WHERE mutation.claim_id IS NOT NULL AND m.id IS NULL) as memory_mutations_missing_claim,
        (SELECT COUNT(*) FROM sb_memory_merge_candidates c
         LEFT JOIN entries e ON e.id = c.source_memory_id
         WHERE e.id IS NULL) as merge_candidates_missing_source,
@@ -317,11 +331,13 @@ export async function exportMemoryBackup(
   await ensureEntityResolutionDataModel(db);
   await ensureConflictClaimSchema(db);
   await ensureAssociationDataModel(db);
+  for (const statement of MEMORY_MUTATION_SCHEMA_STATEMENTS) await db.exec(statement);
   const [
     scopes,
     parentUnits,
     parentVersions,
     parentVersionClaims,
+    memoryMutations,
     associationEdges,
     associationEdgeHistory,
     entries,
@@ -355,7 +371,7 @@ export async function exportMemoryBackup(
                 ORDER BY updated_at DESC, parent_id DESC`),
     allRows(db, `SELECT version_id, parent_id, version_number, source_observation_id,
                        source_snapshot_hash, tags_snapshot_json, source_snapshot,
-                       vault_snapshot, metadata_snapshot_hash,
+                       vault_snapshot, metadata_snapshot_hash, metadata_snapshot_source,
                        summary, state, summary_vector_ids,
                        activated_at, superseded_at, activation_time_source,
                        superseded_time_source, created_at, updated_at
@@ -364,6 +380,10 @@ export async function exportMemoryBackup(
     allRows(db, `SELECT parent_version_id, memory_id, relation, created_at
                 FROM sb_parent_version_claims
                 ORDER BY created_at DESC, parent_version_id DESC, memory_id DESC`),
+    allRows(db, `SELECT mutation_id, source_channel, operation, entry_id, state,
+                       observation_id, claim_id, created_at, updated_at
+                FROM sb_memory_mutations
+                ORDER BY updated_at DESC, mutation_id DESC`),
     allRows(db, `SELECT id, source_parent_id, target_parent_id, edge_type,
                        weight, provenance, metadata_json, directed, valid_from,
                        valid_to, deleted_at, created_at, updated_at
@@ -491,6 +511,7 @@ export async function exportMemoryBackup(
       parentUnits: countRows(parentUnits),
       parentVersions: countRows(parentVersions),
       parentVersionClaims: countRows(parentVersionClaims),
+      memoryMutations: countRows(memoryMutations),
       associationEdges: countRows(associationEdges),
       associationEdgeHistory: countRows(associationEdgeHistory),
       entries: countRows(entries),
@@ -520,6 +541,7 @@ export async function exportMemoryBackup(
     parentUnits,
     parentVersions,
     parentVersionClaims,
+    memoryMutations,
     associationEdges,
     associationEdgeHistory,
     entries,
@@ -648,6 +670,7 @@ export async function importMemoryBackup(
   await ensureEntityResolutionDataModel(db);
   await ensureConflictClaimSchema(db);
   await ensureAssociationDataModel(db);
+  for (const statement of MEMORY_MUTATION_SCHEMA_STATEMENTS) await db.exec(statement);
   const rawSchemaVersion = body.schemaVersion == null ? 4 : Number(body.schemaVersion);
   if (!Number.isFinite(rawSchemaVersion) || rawSchemaVersion < 4) {
     throw new Error("Unsupported memory backup schemaVersion");
@@ -699,6 +722,7 @@ export async function importMemoryBackup(
   );
 
   graph.parentVersions = await importTable(db, rowsFor(body, "parentVersions"), (row) => {
+    const versionId = requiredText(row, "version_id");
     const state = textOrDefault(row, "state", "building");
     const createdAt = intOrDefault(row, "created_at", Date.now());
     const updatedAt = intOrDefault(row, "updated_at", createdAt);
@@ -706,16 +730,20 @@ export async function importMemoryBackup(
     const isSuperseded = state === "superseded";
     const recordedActivatedAt = numberOrNull(row, "activated_at");
     const recordedSupersededAt = numberOrNull(row, "superseded_at");
+    const metadataSnapshotHash = textOrNull(row, "metadata_snapshot_hash") ?? `imported-unknown:${versionId}`;
+    const metadataSnapshotSource = textOrNull(row, "metadata_snapshot_source") ??
+      (textOrNull(row, "metadata_snapshot_hash") ? "recorded" : "unknown");
     return db.prepare(
       `${insertVerb(mode)} INTO sb_parent_versions (
          version_id, parent_id, version_number, source_observation_id,
          source_snapshot_hash, tags_snapshot_json, source_snapshot,
-         vault_snapshot, metadata_snapshot_hash, summary, state, summary_vector_ids,
+         vault_snapshot, metadata_snapshot_hash, metadata_snapshot_source,
+         summary, state, summary_vector_ids,
          activated_at, superseded_at, activation_time_source,
          superseded_time_source, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
-      requiredText(row, "version_id"),
+      versionId,
       requiredText(row, "parent_id"),
       intOrDefault(row, "version_number", 1),
       textOrNull(row, "source_observation_id"),
@@ -723,7 +751,8 @@ export async function importMemoryBackup(
       jsonText(row, "tags_snapshot_json", "[]"),
       textOrNull(row, "source_snapshot"),
       textOrNull(row, "vault_snapshot"),
-      textOrNull(row, "metadata_snapshot_hash"),
+      metadataSnapshotHash,
+      metadataSnapshotSource,
       textOrNull(row, "summary"),
       state,
       jsonText(row, "summary_vector_ids", "[]"),
@@ -733,6 +762,39 @@ export async function importMemoryBackup(
       textOrNull(row, "superseded_time_source") ?? (isSuperseded ? (recordedSupersededAt === null ? "inferred" : "recorded") : null),
       createdAt,
       updatedAt
+    );
+  });
+
+  graph.memoryMutations = await importTable(db, rowsFor(body, "memoryMutations"), (row) => {
+    const mutationId = requiredText(row, "mutation_id");
+    const operation = textOrDefault(row, "operation", "update");
+    if (operation !== "append" && operation !== "update") {
+      throw new Error("memory mutation operation must be append or update");
+    }
+    return db.prepare(
+      `${insertVerb(mode)} INTO sb_memory_mutations (
+         mutation_id, idempotency_key, source_channel, operation, entry_id,
+         request_hash, state, result_content, result_content_hash,
+         result_vector_count, observation_id, claim_id, warnings_json,
+         last_error, lease_owner, lease_expires_at, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`
+    ).bind(
+      mutationId,
+      `restored:${mutationId}`,
+      "backup_restore",
+      operation,
+      requiredText(row, "entry_id"),
+      `restored:${mutationId}`,
+      "failed",
+      null,
+      null,
+      null,
+      textOrNull(row, "observation_id"),
+      textOrNull(row, "claim_id"),
+      "[]",
+      "restored_mutation_audit_only",
+      intOrDefault(row, "created_at", Date.now()),
+      intOrDefault(row, "updated_at", Date.now())
     );
   });
 

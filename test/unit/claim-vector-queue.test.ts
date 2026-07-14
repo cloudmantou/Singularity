@@ -4,6 +4,7 @@ import { SqliteD1Database } from "../../src/selfhost/sqlite-d1";
 import { ensureMemoryDataModel } from "../../src/memory/schema";
 import {
   DEFAULT_CLAIM_VECTOR_LEASE_MS,
+  claimVectorActivationBlock,
   enqueueClaimVectorJob,
   enqueueMissingClaimVectorJobs,
   getClaimVectorQueueStatus,
@@ -66,6 +67,11 @@ describe("Claim vector queue", () => {
 
   it("uses a lease long enough for external embedding providers", () => {
     expect(DEFAULT_CLAIM_VECTOR_LEASE_MS).toBeGreaterThanOrEqual(5 * 60_000);
+  });
+
+  it("reports terminal failures as an explicit activation blocker", () => {
+    expect(claimVectorActivationBlock({ terminal_failed: 2 })).toBe("claim_vector_terminal_failures");
+    expect(claimVectorActivationBlock({ terminal_failed: 0 })).toBeUndefined();
   });
 
   it("persists retryable jobs and completes only after the Claim mapping is durable", async () => {
@@ -150,6 +156,11 @@ describe("Claim vector queue", () => {
       `SELECT status, attempts, last_error FROM sb_claim_vector_jobs
        WHERE claim_id = 'claim-1' AND target_fingerprint = 'fp-v1'`
     ).get()).toEqual({ status: "failed", attempts: 6, last_error: "terminal" });
+    expect(await getClaimVectorQueueStatus(db, "fp-v1", 200)).toMatchObject({
+      missing: 1,
+      missing_retryable: 0,
+      terminal_failed: 1,
+    });
 
     expect(await retryFailedClaimVectorJobs(db, {
       targetFingerprint: "fp-v1",
@@ -160,6 +171,49 @@ describe("Claim vector queue", () => {
       `SELECT status, attempts, last_error FROM sb_claim_vector_jobs
        WHERE claim_id = 'claim-1' AND target_fingerprint = 'fp-v1'`
     ).get()).toEqual({ status: "pending", attempts: 0, last_error: null });
+  });
+
+  it("skips terminal failed Claims so later missing Claims are not starved", async () => {
+    await enqueueClaimVectorJob(db, { claimId: "claim-1", targetFingerprint: "fp-v1", now: 100 });
+    raw.prepare(
+      `UPDATE sb_claim_vector_jobs
+       SET status = 'failed', attempts = 6, last_error = 'terminal'
+       WHERE claim_id = 'claim-1' AND target_fingerprint = 'fp-v1'`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_memories (
+         id, content, entry_id, parent_version_id, content_hash,
+         claim_status, entities_json, created_at
+       ) VALUES ('claim-2', 'later fact', 'entry-1', 'parent-v1', 'claim-hash-v2',
+                 'supported', '[]', 2)`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_memory_sources (
+         id, memory_id, observation_id, role, relation, evidence_root_id, created_at
+       ) VALUES ('source-2', 'claim-2', 'obs-1', 'supports', 'supports', 'root-1', 2)`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_parent_version_claims (parent_version_id, memory_id, relation, created_at)
+       VALUES ('parent-v1', 'claim-2', 'supports', 2)`
+    ).run();
+
+    expect(await enqueueMissingClaimVectorJobs(db, {
+      targetFingerprint: "fp-v1",
+      now: 200,
+      limit: 1,
+    })).toBe(1);
+    expect(raw.prepare(
+      `SELECT claim_id, status FROM sb_claim_vector_jobs
+       WHERE target_fingerprint = 'fp-v1' ORDER BY claim_id`
+    ).all()).toEqual([
+      { claim_id: "claim-1", status: "failed" },
+      { claim_id: "claim-2", status: "pending" },
+    ]);
+    expect(await getClaimVectorQueueStatus(db, "fp-v1", 200)).toMatchObject({
+      missing: 2,
+      missing_retryable: 1,
+      terminal_failed: 1,
+    });
   });
 
   it("rechecks Claim eligibility after leasing and refuses to index an unsupported Claim", async () => {

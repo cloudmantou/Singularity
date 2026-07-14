@@ -8,6 +8,7 @@ export interface RecallClaimContext {
   verificationStatus: "confirmed" | "contested" | "supported";
   conflictIds: string[];
   opposingClaimIds: string[];
+  queryRelevance?: number;
 }
 
 export interface RecallConflictClaim {
@@ -28,6 +29,16 @@ export interface RecallConflictContext {
 export interface LoadedRecallConflictContext {
   claimsByEntry: Map<string, RecallClaimContext[]>;
   conflicts: RecallConflictContext[];
+}
+
+export function applyRecallClaimRelevance(
+  claims: readonly RecallClaimContext[],
+  semanticScores: ReadonlyMap<string, number>
+): RecallClaimContext[] {
+  return claims.map((claim) => ({
+    ...claim,
+    queryRelevance: semanticScores.get(claim.id),
+  }));
 }
 
 export async function linkPendingEntryConflictClaims(

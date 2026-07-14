@@ -558,6 +558,9 @@ function prepareDatabaseErase(
       db
         .prepare(`DELETE FROM sb_memory_revisions WHERE memory_id IN (${inList})`)
         .bind(...batch),
+      db
+        .prepare(`DELETE FROM sb_memory_mutations WHERE entry_id IN (${inList})`)
+        .bind(...batch),
       db.prepare(`DELETE FROM entries WHERE id IN (${inList})`).bind(...batch),
     ];
   });

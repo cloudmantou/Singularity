@@ -79,6 +79,7 @@ import { planRecallRequest, type RecallRequestPlan } from "./query-intent";
 import { ensureMemoryDataModel } from "./memory/schema";
 import { activeMemoryClaimPredicate } from "./memory/claim-eligibility";
 import {
+  claimVectorActivationBlock,
   enqueueClaimVectorJob,
   enqueueMissingClaimVectorJobs,
   getClaimVectorQueueStatus,
@@ -87,11 +88,23 @@ import {
   processClaimVectorJobs,
   retryFailedClaimVectorJobs,
 } from "./memory/claim-vector-queue";
+import { vectorStillReferenced as isVectorStillReferenced } from "./memory/vector-references";
 import {
   commitAtomicMutationWithProjection,
   mutationActorForSource,
 } from "./memory/atomic-mutation";
 import {
+  beginMemoryMutation,
+  loadMemoryMutation,
+  markMemoryMutationFailed,
+  markMemoryMutationProjectionResult,
+  prepareMemoryMutationEntryCommit,
+  stageMemoryMutationEntryIntent,
+  type MemoryMutationOperation,
+  type MemoryMutationRecord,
+} from "./memory/mutations";
+import {
+  applyRecallClaimRelevance,
   linkPendingEntryConflictClaims,
   loadRecallConflictContext,
   type RecallClaimContext,
@@ -127,6 +140,7 @@ import {
   type InsightEvidenceRow,
   type VerifiedInsightResult,
 } from "./memory/recall-context";
+import { rankClaimAnswerability } from "./memory/query-answerability";
 import {
   prepareMemoryRevision,
   type MemoryRevisionEvent,
@@ -5448,7 +5462,7 @@ async function deleteVectorsOrQueue(
   const referenced: string[] = [];
   const deletable: string[] = [];
   for (const id of ids) {
-    if (await vectorStillReferenced(env, id)) referenced.push(id);
+    if (await isVectorStillReferenced(env.DB, id)) referenced.push(id);
     else deletable.push(id);
   }
   const blocked = await enqueueVectorCleanup(
@@ -5470,25 +5484,6 @@ async function deleteVectorsOrQueue(
     }
   }
   return { deleted, queued: 0, blocked };
-}
-
-async function vectorStillReferenced(env: Env, vectorId: string): Promise<boolean> {
-  const row = await env.DB.prepare(
-    `SELECT 1 as referenced
-     FROM entries e, json_each(CASE WHEN json_valid(e.vector_ids) THEN e.vector_ids ELSE '[]' END) active
-     WHERE active.value = ?
-     UNION ALL
-     SELECT 1 as referenced
-     FROM entries e, json_each(
-       CASE
-         WHEN json_valid(COALESCE(e.pending_vector_ids, '[]')) THEN COALESCE(e.pending_vector_ids, '[]')
-         ELSE '[]'
-       END
-     ) pending
-     WHERE pending.value = ?
-     LIMIT 1`
-  ).bind(vectorId, vectorId).first() as Record<string, any> | null;
-  return Boolean(row?.referenced);
 }
 
 async function prepareVectorCleanupBatches(
@@ -5552,7 +5547,7 @@ async function processVectorCleanupBatches(
     const referenced: string[] = [];
     const deletable: string[] = [];
     for (const id of ids) {
-      if (await vectorStillReferenced(env, id)) referenced.push(id);
+      if (await isVectorStillReferenced(env.DB, id)) referenced.push(id);
       else deletable.push(id);
     }
     try {
@@ -5640,7 +5635,7 @@ async function processVectorCleanupQueue(
     const referenced: string[] = [];
     const deletable: string[] = [];
     for (const id of ids) {
-      if (await vectorStillReferenced(env, id)) referenced.push(id);
+      if (await isVectorStillReferenced(env.DB, id)) referenced.push(id);
       else deletable.push(id);
     }
     if (referenced.length) {
@@ -5752,6 +5747,15 @@ async function activatePendingVectorsAndSettings(
                OR pending_metadata_hash IS NULL
                OR pending_content_hash != content_hash
                OR pending_metadata_hash != metadata_hash
+             )
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM sb_claim_vector_jobs processing_claim_job
+           WHERE processing_claim_job.status = 'processing'
+             AND processing_claim_job.target_fingerprint IN (
+               sb_vector_rebuilds.active_fingerprint,
+               sb_vector_rebuilds.pending_fingerprint
              )
          )
          AND NOT EXISTS (
@@ -6313,6 +6317,11 @@ async function deleteStaleVectors(env: Env, oldIds: string[], newIds: string[]):
   }
 }
 
+interface EntryMutationLease {
+  mutationId: string;
+  leaseOwner: string;
+}
+
 interface CommitEntryVersionInput {
   id: string;
   oldContent: string;
@@ -6323,6 +6332,7 @@ interface CommitEntryVersionInput {
   eventType: Extract<MemoryRevisionEvent, "UPDATE" | "APPEND">;
   actor: string;
   reason?: string;
+  mutation?: EntryMutationLease;
 }
 
 /**
@@ -6439,6 +6449,57 @@ async function commitEntryVersion(
         new_tags: input.newTags,
       },
     });
+    const mutationNow = Date.now();
+    const mutationGuard = input.mutation
+      ? `AND EXISTS (
+           SELECT 1 FROM sb_memory_mutations mutation_guard
+           WHERE mutation_guard.mutation_id = ?
+             AND mutation_guard.lease_owner = ?
+             AND mutation_guard.state = 'preparing'
+             AND mutation_guard.lease_expires_at > ?
+         )`
+      : "";
+    const updateBindings: unknown[] = [
+      input.newContent,
+      JSON.stringify(input.newTags),
+      JSON.stringify(prepared.vectorIds),
+      snapshot.fingerprint,
+      newHash,
+      metadataHash,
+      openRebuild ? "[]" : null,
+      openRebuild?.pendingFingerprint ?? null,
+      openRebuild?.id ?? null,
+      input.id,
+      input.oldContent,
+      activeTagsJson,
+      JSON.stringify(activeOldVectorIds),
+      snapshot.fingerprint,
+    ];
+    if (input.mutation) {
+      updateBindings.push(input.mutation.mutationId, input.mutation.leaseOwner, mutationNow);
+    }
+    const mutationCheckpoint = input.mutation
+      ? prepareMemoryMutationEntryCommit(env.DB, {
+          ...input.mutation,
+          resultContent: input.newContent,
+          resultContentHash: newHash,
+          resultVectorCount: prepared.vectorIds.length,
+          requireEntryProjection: true,
+          now: mutationNow,
+        })
+      : null;
+    if (input.mutation) {
+      const staged = await stageMemoryMutationEntryIntent(env.DB, {
+        ...input.mutation,
+        resultContent: input.newContent,
+        resultContentHash: newHash,
+        resultVectorCount: prepared.vectorIds.length,
+        now: mutationNow,
+      });
+      if (!staged) {
+        throw new Error(`memory_mutation_entry_intent_failed:${input.mutation.mutationId}`);
+      }
+    }
     const results = await env.DB.batch([
       env.DB.prepare(
         `UPDATE entries
@@ -6461,28 +6522,22 @@ async function commitEntryVersion(
                WHERE key = 'model_settings'
                  AND COALESCE(json_extract(value, '$.embeddingFingerprint'), '') = ?
              )
-           )`
-      ).bind(
-        input.newContent,
-        JSON.stringify(input.newTags),
-        JSON.stringify(prepared.vectorIds),
-        snapshot.fingerprint,
-        newHash,
-        metadataHash,
-        openRebuild ? "[]" : null,
-        openRebuild?.pendingFingerprint ?? null,
-        openRebuild?.id ?? null,
-        input.id,
-        input.oldContent,
-        activeTagsJson,
-        JSON.stringify(activeOldVectorIds),
-        snapshot.fingerprint
-      ),
+           )
+           ${mutationGuard}`
+      ).bind(...updateBindings),
       revision.statement,
       ...cleanupStatements,
       auditEvent.statement,
+      ...(mutationCheckpoint ? [mutationCheckpoint] : []),
     ]);
     switchResult = results[0];
+    if (
+      Number(switchResult.meta?.changes ?? 0) !== 0 &&
+      mutationCheckpoint &&
+      Number(results[results.length - 1]?.meta?.changes ?? 0) !== 1
+    ) {
+      throw new Error(`memory_mutation_entry_checkpoint_failed:${input.mutation?.mutationId}`);
+    }
   } catch (error) {
     await cleanupPreparedVectors(env, prepared.vectorIds, "Version switch");
     throw error;
@@ -6522,6 +6577,7 @@ async function appendToEntry(
   addition: string,
   tags: string[],
   source: string,
+  mutation?: EntryMutationLease,
   attempt = 0
 ): Promise<string> {
   if (getStatus(tags) === "deprecated") {
@@ -6546,6 +6602,7 @@ async function appendToEntry(
       eventType: "APPEND",
       actor: source,
       reason: "Large append required full re-embedding",
+      mutation,
     });
     return newContent;
   }
@@ -6646,6 +6703,54 @@ async function appendToEntry(
         tags,
       },
     });
+    const mutationNow = Date.now();
+    const mutationGuard = mutation
+      ? `AND EXISTS (
+           SELECT 1 FROM sb_memory_mutations mutation_guard
+           WHERE mutation_guard.mutation_id = ?
+             AND mutation_guard.lease_owner = ?
+             AND mutation_guard.state = 'preparing'
+             AND mutation_guard.lease_expires_at > ?
+         )`
+      : "";
+    const updateBindings: unknown[] = [
+      newContent,
+      JSON.stringify([...activeVectorIds, newChunkId]),
+      snapshot.fingerprint,
+      newHash,
+      metadataHash,
+      openRebuild ? "[]" : null,
+      openRebuild?.pendingFingerprint ?? null,
+      openRebuild?.id ?? null,
+      id,
+      existingContent,
+      activeTagsJson,
+      JSON.stringify(activeVectorIds),
+      snapshot.fingerprint,
+    ];
+    if (mutation) updateBindings.push(mutation.mutationId, mutation.leaseOwner, mutationNow);
+    const mutationCheckpoint = mutation
+      ? prepareMemoryMutationEntryCommit(env.DB, {
+          ...mutation,
+          resultContent: newContent,
+          resultContentHash: newHash,
+          resultVectorCount: activeVectorIds.length + 1,
+          requireEntryProjection: true,
+          now: mutationNow,
+        })
+      : null;
+    if (mutation) {
+      const staged = await stageMemoryMutationEntryIntent(env.DB, {
+        ...mutation,
+        resultContent: newContent,
+        resultContentHash: newHash,
+        resultVectorCount: activeVectorIds.length + 1,
+        now: mutationNow,
+      });
+      if (!staged) {
+        throw new Error(`memory_mutation_entry_intent_failed:${mutation.mutationId}`);
+      }
+    }
     const results = await env.DB.batch([
       env.DB.prepare(
         `UPDATE entries
@@ -6668,27 +6773,22 @@ async function appendToEntry(
                WHERE key = 'model_settings'
                  AND COALESCE(json_extract(value, '$.embeddingFingerprint'), '') = ?
              )
-           )`
-      ).bind(
-        newContent,
-        JSON.stringify([...activeVectorIds, newChunkId]),
-        snapshot.fingerprint,
-        newHash,
-        metadataHash,
-        openRebuild ? "[]" : null,
-        openRebuild?.pendingFingerprint ?? null,
-        openRebuild?.id ?? null,
-        id,
-        existingContent,
-        activeTagsJson,
-        JSON.stringify(activeVectorIds),
-        snapshot.fingerprint
-      ),
+           )
+           ${mutationGuard}`
+      ).bind(...updateBindings),
       appendRevision.statement,
       ...cleanupStatements,
       auditEvent.statement,
+      ...(mutationCheckpoint ? [mutationCheckpoint] : []),
     ]);
     switchResult = results[0];
+    if (
+      Number(switchResult.meta?.changes ?? 0) !== 0 &&
+      mutationCheckpoint &&
+      Number(results[results.length - 1]?.meta?.changes ?? 0) !== 1
+    ) {
+      throw new Error(`memory_mutation_entry_checkpoint_failed:${mutation?.mutationId ?? "unknown"}`);
+    }
   } catch (error) {
     await cleanupPreparedVectors(env, [newChunkId], "Append");
     throw error;
@@ -6696,7 +6796,7 @@ async function appendToEntry(
   if (switchResult.meta?.changes === 0) {
     await cleanupPreparedVectors(env, [newChunkId], "Stale append");
     if (attempt < 1 && !(await isActiveEmbeddingSnapshotCurrent(env, snapshot))) {
-      return appendToEntry(env, id, existingContent, addition, tags, source, attempt + 1);
+      return appendToEntry(env, id, existingContent, addition, tags, source, mutation, attempt + 1);
     }
     throw new Error("Entry changed while the append vector was being prepared");
   }
@@ -6717,13 +6817,15 @@ async function appendToEntry(
 
 function buildCitableInsightClaims(
   context: InsightContextPackage<RecallClaimContext>,
-  conflicts: readonly RecallConflictContext[] = []
+  conflicts: readonly RecallConflictContext[] = [],
+  query = ""
 ): CitableInsightClaim[] {
   const claims: CitableInsightClaim[] = [];
   const claimsById = new Map<string, CitableInsightClaim>();
   for (const evidence of context.directEvidence) {
     for (const claim of evidence.claims ?? []) {
       if (!claim.id || claimsById.has(claim.id)) continue;
+      const answerability = rankClaimAnswerability(query, claim.statement, claim.queryRelevance);
       const citable: CitableInsightClaim = {
         ref: `C${claims.length + 1}`,
         evidenceId: evidence.id,
@@ -6732,6 +6834,7 @@ function buildCitableInsightClaims(
         status: claim.status,
         conflictIds: [...claim.conflictIds],
         citationUse: "fact",
+        ...answerability,
       };
       claims.push(citable);
       claimsById.set(claim.id, citable);
@@ -6760,6 +6863,7 @@ function buildCitableInsightClaims(
         status: claim.status,
         conflictIds: [conflict.id],
         citationUse: "conflict_only",
+        ...rankClaimAnswerability(query, claim.statement),
       };
       claims.push(citable);
       claimsById.set(claim.id, citable);
@@ -6800,7 +6904,7 @@ export async function synthesizeVerifiedInsight(
     };
   }
 
-  const citableClaims = buildCitableInsightClaims(context, conflicts);
+  const citableClaims = buildCitableInsightClaims(context, conflicts, query);
   if (!citableClaims.length) {
     return {
       answer: INSUFFICIENT_VERIFIED_EVIDENCE,
@@ -6814,7 +6918,8 @@ export async function synthesizeVerifiedInsight(
         .filter((claim) => claim.evidenceId === r.id)
         .map((claim) =>
           `[${claim.ref}] claim=${claim.claimId ?? "legacy-entry"}; status=${claim.status}; ` +
-          `conflicts=${claim.conflictIds.join(",") || "none"}; statement=${claim.statement}`
+          `conflicts=${claim.conflictIds.join(",") || "none"}; ` +
+          `answerability=${claim.answerability}; relevance=${claim.queryRelevance}; statement=${claim.statement}`
         );
       return `[E${i + 1}] evidence_id=${r.id}\n${claimLines.join("\n")}`;
     })
@@ -6863,6 +6968,7 @@ Rules:
 - Return exactly one JSON object and no markdown: {"answer":"","claims":[{"text":"","refs":["C1"],"kind":"fact"}]}.
 - C* references are the only citable Claims. E* labels identify Evidence containers and R* labels are navigation-only; never place E* or R* in refs.
 - For kind="fact", copy text exactly from one referenced C* statement. Do not paraphrase, combine, infer, guess, or add facts.
+- Only cite a C* Claim whose answerability is "answerable". Related or irrelevant Claims cannot answer the query.
 - A contested Claim or a Claim with conflicts cannot be emitted as kind="fact".
 - A Claim listed under Conflict-only Claims cannot support kind="fact".
 - To disclose an unresolved conflict, use kind="conflict" and cite at least two C* refs that share the same conflict ID. The server will render the conflict text.
@@ -8013,19 +8119,26 @@ interface ClaimSnapshotRow {
   source: string | null;
 }
 
-async function indexClaimSnapshotVector(
+export async function indexClaimSnapshotVector(
   env: Env,
   input: {
+    jobId: string;
+    leaseOwner: string;
     claimId: string;
     entryId: string;
     parentVersionId: string | null;
     content: string;
     contentHash: string;
     createdAt: number;
+    targetFingerprint: string;
+    rebuildId: string | null;
   },
   snapshot?: ActiveEmbeddingSnapshot
 ): Promise<void> {
   const active = snapshot ?? await loadActiveEmbeddingSnapshot(env);
+  if (active.fingerprint !== input.targetFingerprint) {
+    throw new Error("claim_vector_fingerprint_changed");
+  }
   const existing = await env.DB.prepare(
     `SELECT content_hash, vector_ids_json
      FROM sb_claim_vectors
@@ -8067,6 +8180,7 @@ async function indexClaimSnapshotVector(
   };
   await insertPreparedVectors(env, claimVectors);
   try {
+    const indexedAt = Date.now();
     const mappingWrite = await env.DB.prepare(
       `INSERT INTO sb_claim_vectors (
          claim_id, embedding_fingerprint, parent_version_id,
@@ -8076,6 +8190,25 @@ async function indexClaimSnapshotVector(
        WHERE EXISTS (
          SELECT 1 FROM sb_memories
          WHERE id = ? AND content_hash = ?
+       )
+       AND EXISTS (
+         SELECT 1 FROM sb_claim_vector_jobs job
+         WHERE job.id = ?
+           AND job.claim_id = ?
+           AND job.target_fingerprint = ?
+           AND job.content_hash = ?
+           AND job.status = 'processing'
+           AND job.lease_owner = ?
+           AND COALESCE(job.lease_expires_at, 0) > ?
+       )
+       AND (
+         ? IS NULL
+         OR EXISTS (
+           SELECT 1 FROM sb_vector_rebuilds rebuild
+           WHERE rebuild.id = ?
+             AND rebuild.pending_fingerprint = ?
+             AND rebuild.state IN ('building', 'ready')
+         )
        )
        ON CONFLICT(claim_id, embedding_fingerprint) DO UPDATE SET
          parent_version_id = excluded.parent_version_id,
@@ -8088,12 +8221,22 @@ async function indexClaimSnapshotVector(
       input.parentVersionId,
       input.contentHash,
       JSON.stringify(claimVectors.vectorIds),
-      Date.now(),
+      indexedAt,
       input.claimId,
-      input.contentHash
+      input.contentHash,
+      input.jobId,
+      input.claimId,
+      input.targetFingerprint,
+      input.contentHash,
+      input.leaseOwner,
+      indexedAt,
+      input.rebuildId,
+      input.rebuildId,
+      input.targetFingerprint
     ).run();
     if (Number(mappingWrite.meta?.changes ?? 0) !== 1) {
       await cleanupPreparedVectors(env, claimVectors.vectorIds, "Stale Claim vector mapping");
+      throw new Error("claim_vector_mapping_cas_failed");
     } else if (replacedVectorIds.length) {
       await cleanupPreparedVectors(env, replacedVectorIds, "Replaced Claim vector mapping");
     }
@@ -8123,12 +8266,16 @@ async function processClaimVectorQueue(
         snapshots.set(job.targetFingerprint, snapshot);
       }
       await indexClaimSnapshotVector(env, {
+        jobId: job.jobId,
+        leaseOwner: job.leaseOwner,
         claimId: job.claimId,
         entryId: job.entryId,
         parentVersionId: job.parentVersionId,
         content: job.content,
         contentHash: job.contentHash,
         createdAt: job.createdAt,
+        targetFingerprint: job.targetFingerprint,
+        rebuildId: job.rebuildId,
       }, await snapshot);
     },
   });
@@ -8152,6 +8299,160 @@ async function replaceEntryAtomicMemoryAndEnqueue(
     },
     (error) => console.error("Claim vector enqueue failed after committed Atomic mutation:", error)
   );
+}
+
+class MemoryMutationExecutionError extends Error {
+  constructor(
+    readonly code: "idempotency_conflict" | "mutation_in_progress" | "entry_mutation_failed" | "atomic_sync_failed",
+    readonly mutationId: string | null,
+    readonly cause?: unknown
+  ) {
+    super(code);
+    this.name = "MemoryMutationExecutionError";
+  }
+}
+
+interface EntryKnowledgeMutationResult {
+  mutation: MemoryMutationRecord;
+  content: string;
+  vectorCount: number;
+  warnings: string[];
+  idempotentReplay: boolean;
+  resumed: boolean;
+}
+
+function validatedIdempotencyKey(value: string | null | undefined): string {
+  const key = value?.trim() ?? "";
+  if (!key) return `generated:${crypto.randomUUID()}`;
+  if (key.length > 200) throw new Error("idempotency_key_too_long");
+  return key;
+}
+
+async function executeEntryKnowledgeMutation(
+  env: Env,
+  input: {
+    idempotencyKey: string;
+    sourceChannel: string;
+    operation: MemoryMutationOperation;
+    entryId: string;
+    requestHash: string;
+    source: string;
+    actor: ReturnType<typeof mutationActorForSource>;
+    commitEntry: (lease: EntryMutationLease) => Promise<{ content: string; vectorCount: number }>;
+  }
+): Promise<EntryKnowledgeMutationResult> {
+  const begun = await beginMemoryMutation(env.DB, {
+    idempotencyKey: input.idempotencyKey,
+    sourceChannel: input.sourceChannel,
+    operation: input.operation,
+    entryId: input.entryId,
+    requestHash: input.requestHash,
+  });
+  if (begun.status === "conflict") {
+    throw new MemoryMutationExecutionError("idempotency_conflict", begun.mutation.mutationId);
+  }
+  if (begun.status === "in_progress") {
+    throw new MemoryMutationExecutionError("mutation_in_progress", begun.mutation.mutationId);
+  }
+  if (begun.status === "replay") {
+    if (begun.mutation.resultContent == null) {
+      throw new MemoryMutationExecutionError("entry_mutation_failed", begun.mutation.mutationId);
+    }
+    return {
+      mutation: begun.mutation,
+      content: begun.mutation.resultContent,
+      vectorCount: begun.mutation.resultVectorCount ?? 0,
+      warnings: [...begun.mutation.warnings],
+      idempotentReplay: true,
+      resumed: false,
+    };
+  }
+
+  if (!begun.leaseOwner) {
+    throw new MemoryMutationExecutionError("mutation_in_progress", begun.mutation.mutationId);
+  }
+  const lease: EntryMutationLease = {
+    mutationId: begun.mutation.mutationId,
+    leaseOwner: begun.leaseOwner,
+  };
+  const resumed = begun.status === "resumed";
+  let mutation = begun.mutation;
+
+  if (mutation.state === "preparing") {
+    try {
+      await input.commitEntry(lease);
+      mutation = await loadMemoryMutation(env.DB, mutation.mutationId) ?? mutation;
+      if (mutation.state !== "entry_committed" || mutation.resultContent == null) {
+        throw new Error("entry_mutation_checkpoint_missing");
+      }
+    } catch (error) {
+      await markMemoryMutationFailed(env.DB, {
+        ...lease,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw new MemoryMutationExecutionError("entry_mutation_failed", mutation.mutationId, error);
+    }
+  }
+
+  let warnings = [...mutation.warnings];
+  if (mutation.state === "entry_committed") {
+    try {
+      const atomic = await replaceEntryAtomicMemoryAndEnqueue(env, {
+        entryId: input.entryId,
+        content: mutation.resultContent!,
+        contentHash: mutation.resultContentHash ?? await contentFingerprint(mutation.resultContent!),
+        source: input.source,
+        actor: input.actor,
+        eventType: input.operation,
+        createdAt: Date.now(),
+        mutationId: mutation.mutationId,
+        mutationLeaseOwner: lease.leaseOwner,
+      });
+      warnings = atomic.warnings;
+      mutation = await loadMemoryMutation(env.DB, mutation.mutationId) ?? mutation;
+    } catch (error) {
+      await markMemoryMutationFailed(env.DB, {
+        ...lease,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw new MemoryMutationExecutionError("atomic_sync_failed", mutation.mutationId, error);
+    }
+  } else if (mutation.state === "knowledge_committed" && mutation.claimId) {
+    try {
+      const snapshot = await loadActiveEmbeddingSnapshot(env);
+      const queued = await enqueueClaimVectorJob(env.DB, {
+        claimId: mutation.claimId,
+        targetFingerprint: snapshot.fingerprint,
+      });
+      warnings = queued ? [] : ["claim_vector_enqueue_failed"];
+    } catch (error) {
+      console.error("Claim vector re-enqueue failed during mutation resume:", error);
+      warnings = ["claim_vector_enqueue_failed"];
+    }
+  }
+
+  if (mutation.state !== "knowledge_committed") {
+    throw new MemoryMutationExecutionError("atomic_sync_failed", mutation.mutationId);
+  }
+  const projectionSaved = await markMemoryMutationProjectionResult(env.DB, {
+    ...lease,
+    warnings,
+  });
+  if (!projectionSaved) {
+    throw new MemoryMutationExecutionError("atomic_sync_failed", mutation.mutationId);
+  }
+  const completed = await loadMemoryMutation(env.DB, mutation.mutationId);
+  if (!completed?.resultContent) {
+    throw new MemoryMutationExecutionError("atomic_sync_failed", mutation.mutationId);
+  }
+  return {
+    mutation: completed,
+    content: completed.resultContent,
+    vectorCount: completed.resultVectorCount ?? 0,
+    warnings: [...completed.warnings],
+    idempotentReplay: false,
+    resumed,
+  };
 }
 
 async function queryHistoricalClaimVectors(
@@ -8218,6 +8519,49 @@ async function queryHistoricalClaimVectors(
     degraded,
     degradedReason: degraded ? "vector_metadata_filter_unavailable" : undefined,
   };
+}
+
+async function scoreMappedClaimVectors(
+  env: Env,
+  claimIds: string[],
+  vector: number[],
+  fingerprint: string
+): Promise<Map<string, number>> {
+  const uniqueClaimIds = [...new Set(claimIds.filter(Boolean))];
+  if (!uniqueClaimIds.length) return new Map();
+  const vectorClaims = new Map<string, string[]>();
+  for (let offset = 0; offset < uniqueClaimIds.length; offset += D1_MAX_BOUND_PARAMS - 1) {
+    const batch = uniqueClaimIds.slice(offset, offset + D1_MAX_BOUND_PARAMS - 1);
+    const placeholders = batch.map(() => "?").join(", ");
+    const { results } = await env.DB.prepare(
+      `SELECT cv.claim_id, cv.vector_ids_json
+       FROM sb_claim_vectors cv
+       JOIN sb_memories m
+         ON m.id = cv.claim_id
+        AND m.content_hash = cv.content_hash
+       WHERE cv.embedding_fingerprint = ?
+         AND cv.claim_id IN (${placeholders})`
+    ).bind(fingerprint, ...batch).all<{ claim_id: string; vector_ids_json: string }>();
+    for (const row of results ?? []) {
+      for (const vectorId of parseVectorIds(row.vector_ids_json)) {
+        vectorClaims.set(vectorId, [...(vectorClaims.get(vectorId) ?? []), row.claim_id]);
+      }
+    }
+  }
+  const vectorIds = [...vectorClaims.keys()];
+  const scores = new Map<string, number>();
+  for (let offset = 0; offset < vectorIds.length; offset += VECTORIZE_GET_BY_IDS_BATCH) {
+    const vectors = await env.VECTORIZE.getByIds(
+      vectorIds.slice(offset, offset + VECTORIZE_GET_BY_IDS_BATCH)
+    );
+    for (const candidate of vectors) {
+      const score = cosineSim(vector, candidate.values as number[]);
+      for (const claimId of vectorClaims.get(candidate.id) ?? []) {
+        scores.set(claimId, Math.max(scores.get(claimId) ?? 0, score));
+      }
+    }
+  }
+  return scores;
 }
 
 async function recallHistoricalClaims(
@@ -8436,8 +8780,12 @@ async function recallHistoricalClaims(
     params.before
   );
   for (const match of matches) {
-    match.claims = (conflictContext.claimsByEntry.get(match.id) ?? [])
+    const claims = (conflictContext.claimsByEntry.get(match.id) ?? [])
       .filter((claim) => claim.id === match.claimId);
+    match.claims = applyRecallClaimRelevance(
+      claims,
+      new Map(match.claimId ? [[match.claimId, match.scoreDetails?.semantic ?? 0]] : [])
+    );
   }
   const insightRows = matches.map((match) => ({
     id: match.id,
@@ -8644,6 +8992,15 @@ export async function recallEntries(
       : denseLogicalLimit;
     results = { matches: activeMatches.slice(0, activeLimit) };
   }
+
+  const claimSemanticScoresPromise = values && activeFingerprint && !vectorQueryDegraded && !tag
+    ? queryHistoricalClaimVectors(env, values, activeFingerprint, embedQuery)
+        .then((result) => result.scores)
+        .catch((error) => {
+          console.error("Claim-level answerability retrieval failed (non-fatal):", error);
+          return new Map<string, number>();
+        })
+    : Promise.resolve(new Map<string, number>());
 
   // Always-on hybrid retrieval: fuse dense + keyword candidates via RRF. On the tag path
   // keyword is a re-ranking signal only (allowKeywordOnly=false); on the default path it can
@@ -9016,11 +9373,32 @@ export async function recallEntries(
     directMatches.map((match) => match.id),
     recallAsOf
   );
+  let claimSemanticScores = await claimSemanticScoresPromise;
+  if (tag && values && activeFingerprint) {
+    const claimIds = [...new Set(
+      [...conflictContext.claimsByEntry.values()].flat().map((claim) => claim.id)
+    )];
+    claimSemanticScores = await scoreMappedClaimVectors(
+      env,
+      claimIds,
+      values,
+      activeFingerprint
+    ).catch((error) => {
+      console.error("Tag-scoped Claim answerability scoring failed (non-fatal):", error);
+      return new Map<string, number>();
+    });
+  }
   for (const match of directMatches) {
-    match.claims = conflictContext.claimsByEntry.get(match.id) ?? [];
+    match.claims = applyRecallClaimRelevance(
+      conflictContext.claimsByEntry.get(match.id) ?? [],
+      claimSemanticScores
+    );
   }
   for (const row of directInsightRows) {
-    row.claims = conflictContext.claimsByEntry.get(row.id) ?? [];
+    row.claims = applyRecallClaimRelevance(
+      conflictContext.claimsByEntry.get(row.id) ?? [],
+      claimSemanticScores
+    );
   }
 
   const synthesized = directInsightRows.length
@@ -11620,9 +11998,10 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
       inputSchema: {
         id: z.string().describe("Entry ID to append to — from recall or list_recent"),
         addition: z.string().describe("The new information to add to the existing entry"),
+        idempotencyKey: z.string().max(200).optional().describe("Stable request key for safe retries"),
       },
     },
-    async ({ id, addition }) => {
+    async ({ id, addition, idempotencyKey }) => {
       const row = await env.DB.prepare(
         `SELECT id, content, tags, source FROM entries WHERE id = ?`
       ).bind(id).first() as Record<string, any> | null;
@@ -11644,44 +12023,43 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
         };
       }
 
-      let appendedContent: string;
+      let mutationResult: EntryKnowledgeMutationResult;
       try {
-        appendedContent = await appendToEntry(env, id, existingContent, a, tags, source);
-      } catch (e) {
-        console.error("Append failed:", e);
-        return {
-          content: [{ type: "text", text: "Append failed. No complete update was recorded; retry later." }],
-          isError: true,
-        };
-      }
-      let atomicWarnings: string[] = [];
-      try {
-        const atomicMutation = await replaceEntryAtomicMemoryAndEnqueue(env, {
+        mutationResult = await executeEntryKnowledgeMutation(env, {
+          idempotencyKey: validatedIdempotencyKey(idempotencyKey),
+          sourceChannel: "mcp",
+          operation: "append",
           entryId: id,
-          content: appendedContent,
-          contentHash: await contentFingerprint(appendedContent),
+          requestHash: await contentFingerprint(JSON.stringify({ id, addition: a })),
           source: "mcp",
           actor: mutationActorForSource("mcp"),
-          eventType: "append",
-          createdAt: Date.now(),
+          commitEntry: async (lease) => ({
+            content: await appendToEntry(env, id, existingContent, a, tags, source, lease),
+            vectorCount: 0,
+          }),
         });
-        atomicWarnings = atomicMutation.warnings;
       } catch (e) {
-        console.error("MCP atomic memory append sync failed (non-fatal):", e);
+        console.error("MCP append mutation failed:", e);
+        const message = e instanceof MemoryMutationExecutionError && e.code === "idempotency_conflict"
+          ? "Idempotency key was already used with a different append request."
+          : e instanceof MemoryMutationExecutionError && e.code === "mutation_in_progress"
+            ? "This append request is already being processed; retry with the same key."
+            : e instanceof MemoryMutationExecutionError && e.code === "atomic_sync_failed"
+              ? `Append changed entry ${id}, but Evidence/Claim sync failed. Retry with the same idempotency key.`
+              : "Append failed. No complete update was recorded; retry later.";
         return {
-          content: [{
-            type: "text",
-            text: `Append changed entry ${id}, but Evidence/Claim sync failed. Strict recall will exclude it until extraction repair succeeds.`,
-          }],
+          content: [{ type: "text", text: message }],
           isError: true,
         };
       }
-      scheduleClassifyAndTag(id, appendedContent, env, ctx);
+      if (!mutationResult.idempotentReplay) {
+        scheduleClassifyAndTag(id, mutationResult.content, env, ctx);
+      }
 
       return {
         content: [{
           type: "text",
-          text: `Appended to entry ${id}. The original content is preserved and your update has been added with today's date.${atomicWarnings.length ? " Claim vector indexing is queued for maintenance repair." : ""}`,
+          text: `Appended to entry ${id}. Mutation ${mutationResult.mutation.mutationId}${mutationResult.idempotentReplay ? " was replayed without changing the entry again" : " completed"}.${mutationResult.warnings.length ? " Claim vector indexing is queued for maintenance repair." : ""}`,
         }],
       };
     }
@@ -11695,9 +12073,10 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
       inputSchema: {
         id: z.string().describe("Entry ID to update — from recall or list_recent"),
         content: z.string().describe("The new content to replace the existing entry with"),
+        idempotencyKey: z.string().max(200).optional().describe("Stable request key for safe retries"),
       },
     },
-    async ({ id, content }) => {
+    async ({ id, content, idempotencyKey }) => {
       const newContent = content.trim();
       if (!newContent) {
         return { content: [{ type: "text", text: "Content cannot be empty." }] };
@@ -11718,57 +12097,54 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
       const tags = oldTags.filter((t: string) => t !== "rolled-up");
       const source = row.source as string;
 
-      let newVectorIds: string[];
+      let mutationResult: EntryKnowledgeMutationResult;
       try {
-        newVectorIds = await commitEntryVersion(env, {
-          id,
-          oldContent,
-          newContent,
-          oldTags,
-          newTags: tags,
-          source,
-          eventType: "UPDATE",
-          reason: "Full content replaced through MCP",
-          actor: "mcp",
-        });
-      } catch (error) {
-        console.error("Update vector switch failed:", error);
-        return {
-          content: [{
-            type: "text",
-            text: `Update failed for entry ${id}. The previous content and search index remain active.`,
-          }],
-          isError: true,
-        };
-      }
-      let atomicWarnings: string[] = [];
-      try {
-        const atomicMutation = await replaceEntryAtomicMemoryAndEnqueue(env, {
+        mutationResult = await executeEntryKnowledgeMutation(env, {
+          idempotencyKey: validatedIdempotencyKey(idempotencyKey),
+          sourceChannel: "mcp",
+          operation: "update",
           entryId: id,
-          content: newContent,
-          contentHash: await contentFingerprint(newContent),
+          requestHash: await contentFingerprint(JSON.stringify({ id, content: newContent })),
           source: "mcp",
           actor: mutationActorForSource("mcp"),
-          eventType: "update",
-          createdAt: Date.now(),
+          commitEntry: async (lease) => {
+            const vectorIds = await commitEntryVersion(env, {
+              id,
+              oldContent,
+              newContent,
+              oldTags,
+              newTags: tags,
+              source,
+              eventType: "UPDATE",
+              reason: "Full content replaced through MCP",
+              actor: "mcp",
+              mutation: lease,
+            });
+            return { content: newContent, vectorCount: vectorIds.length };
+          },
         });
-        atomicWarnings = atomicMutation.warnings;
-      } catch (e) {
-        console.error("MCP atomic memory update sync failed (non-fatal):", e);
+      } catch (error) {
+        console.error("MCP update mutation failed:", error);
+        const message = error instanceof MemoryMutationExecutionError && error.code === "idempotency_conflict"
+          ? "Idempotency key was already used with a different update request."
+          : error instanceof MemoryMutationExecutionError && error.code === "mutation_in_progress"
+            ? "This update request is already being processed; retry with the same key."
+            : error instanceof MemoryMutationExecutionError && error.code === "atomic_sync_failed"
+              ? `Update changed entry ${id}, but Evidence/Claim sync failed. Retry with the same idempotency key.`
+              : `Update failed for entry ${id}. The previous content and search index remain active.`;
         return {
-          content: [{
-            type: "text",
-            text: `Update changed entry ${id}, but Evidence/Claim sync failed. Strict recall will exclude it until extraction repair succeeds.`,
-          }],
+          content: [{ type: "text", text: message }],
           isError: true,
         };
       }
-      scheduleClassifyAndTag(id, newContent, env, ctx);
+      if (!mutationResult.idempotentReplay) {
+        scheduleClassifyAndTag(id, mutationResult.content, env, ctx);
+      }
 
       return {
         content: [{
           type: "text",
-          text: `Updated entry ${id}. Re-embedded as ${newVectorIds.length} vector(s).${atomicWarnings.length ? " Claim vector indexing is queued for maintenance repair." : ""}`,
+          text: `Updated entry ${id}. Mutation ${mutationResult.mutation.mutationId}${mutationResult.idempotentReplay ? " was replayed without changing the entry again" : ` re-embedded as ${mutationResult.vectorCount} vector(s)`}.${mutationResult.warnings.length ? " Claim vector indexing is queued for maintenance repair." : ""}`,
         }],
       };
     }
@@ -12250,7 +12626,7 @@ async function withRequestTelemetry(
           method: request.method,
           route: url.pathname,
           operation: routeToOperation(request.method, url.pathname),
-          source,
+          source: "api",
           status_code: 500,
           success: 0,
           started_at: started,
@@ -12824,13 +13200,21 @@ const defaultHandler = {
       const auth = requireAuth(request, env);
       if (!auth.ok) return auth.response;
 
-      let body: { id?: string; addition?: string };
+      let body: { id?: string; addition?: string; idempotencyKey?: string };
       try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
       if (!body.id?.trim()) return json({ ok: false, error: "id is required" }, 400);
       if (!body.addition?.trim()) return json({ ok: false, error: "addition is required" }, 400);
 
       const id = body.id.trim();
       const addition = body.addition.trim();
+      let idempotencyKey: string;
+      try {
+        idempotencyKey = validatedIdempotencyKey(
+          request.headers.get("Idempotency-Key") ?? body.idempotencyKey
+        );
+      } catch {
+        return json({ ok: false, error: "Idempotency-Key must be at most 200 characters" }, 400);
+      }
 
       const row = await env.DB.prepare(
         `SELECT id, content, tags, source FROM entries WHERE id = ?`
@@ -12844,40 +13228,52 @@ const defaultHandler = {
       const tags: string[] = JSON.parse(row.tags ?? "[]");
       const source = row.source as string;
 
-      let appendedContent: string;
+      let mutationResult: EntryKnowledgeMutationResult;
       try {
-        appendedContent = await appendToEntry(env, id, existingContent, addition, tags, source);
-      } catch (e) {
-        console.error("Append failed:", e);
-        return json({ ok: false, error: "Append failed. Retry later." }, 500);
-      }
-      let atomicWarnings: string[] = [];
-      try {
-        const atomicMutation = await replaceEntryAtomicMemoryAndEnqueue(env, {
+        mutationResult = await executeEntryKnowledgeMutation(env, {
+          idempotencyKey,
+          sourceChannel: "api",
+          operation: "append",
           entryId: id,
-          content: appendedContent,
-          contentHash: await contentFingerprint(appendedContent),
+          requestHash: await contentFingerprint(JSON.stringify({ id, addition })),
           source: "api",
           actor: mutationActorForSource("api"),
-          eventType: "append",
-          createdAt: Date.now(),
+          commitEntry: async (lease) => ({
+            content: await appendToEntry(env, id, existingContent, addition, tags, source, lease),
+            vectorCount: 0,
+          }),
         });
-        atomicWarnings = atomicMutation.warnings;
       } catch (e) {
-        console.error("Atomic memory append sync failed (non-fatal):", e);
+        console.error("Append mutation failed:", e);
+        if (e instanceof MemoryMutationExecutionError && e.code === "idempotency_conflict") {
+          return json({ ok: false, error: "idempotency_conflict", mutation_id: e.mutationId }, 409);
+        }
+        if (e instanceof MemoryMutationExecutionError && e.code === "mutation_in_progress") {
+          return json({ ok: false, error: "mutation_in_progress", mutation_id: e.mutationId }, 409);
+        }
+        if (e instanceof MemoryMutationExecutionError && e.code === "entry_mutation_failed") {
+          return json({ ok: false, error: "Append failed. Retry later.", mutation_id: e.mutationId }, 500);
+        }
         return json({
           ok: false,
           id,
           error: "atomic_sync_failed",
+          mutation_id: e instanceof MemoryMutationExecutionError ? e.mutationId : null,
           message: "Append changed the entry projection, but Evidence/Claim sync failed. The entry is excluded from strict recall until repair.",
         }, 503);
       }
-      scheduleClassifyAndTag(id, appendedContent, env, ctx);
+      if (!mutationResult.idempotentReplay) {
+        scheduleClassifyAndTag(id, mutationResult.content, env, ctx);
+      }
 
       return json({
         ok: true,
         id,
-        warnings: atomicWarnings,
+        mutation_id: mutationResult.mutation.mutationId,
+        mutation_state: mutationResult.mutation.state,
+        idempotent_replay: mutationResult.idempotentReplay,
+        resumed: mutationResult.resumed,
+        warnings: mutationResult.warnings,
         message: "Update appended successfully with timestamp",
       });
     }
@@ -12887,13 +13283,21 @@ const defaultHandler = {
       const auth = requireAuth(request, env);
       if (!auth.ok) return auth.response;
 
-      let body: { id?: string; content?: string };
+      let body: { id?: string; content?: string; idempotencyKey?: string };
       try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
       if (!body.id?.trim()) return json({ ok: false, error: "id is required" }, 400);
       if (!body.content?.trim()) return json({ ok: false, error: "content is required" }, 400);
 
       const id = body.id.trim();
       const newContent = body.content.trim();
+      let idempotencyKey: string;
+      try {
+        idempotencyKey = validatedIdempotencyKey(
+          request.headers.get("Idempotency-Key") ?? body.idempotencyKey
+        );
+      } catch {
+        return json({ ok: false, error: "Idempotency-Key must be at most 200 characters" }, 400);
+      }
 
       const row = await env.DB.prepare(
         `SELECT content, tags, source FROM entries WHERE id = ?`
@@ -12908,54 +13312,68 @@ const defaultHandler = {
       const source = row.source as string;
       const finalContent = cleanContent || newContent;
 
-      let newVectorIds: string[];
+      let mutationResult: EntryKnowledgeMutationResult;
       try {
-        newVectorIds = await commitEntryVersion(env, {
-          id,
-          oldContent,
-          newContent: finalContent,
-          oldTags: tags,
-          newTags: mergedTags,
-          source,
-          eventType: "UPDATE",
-          reason: "Full content replaced through HTTP API",
-          actor: "api",
-        });
-      } catch (error) {
-        console.error("Update vector switch failed:", error);
-        return json({
-          ok: false,
-          error: "Update could not be indexed. Previous content remains active; retry later.",
-        }, 503);
-      }
-      let atomicWarnings: string[] = [];
-      try {
-        const atomicMutation = await replaceEntryAtomicMemoryAndEnqueue(env, {
+        mutationResult = await executeEntryKnowledgeMutation(env, {
+          idempotencyKey,
+          sourceChannel: "api",
+          operation: "update",
           entryId: id,
-          content: finalContent,
-          contentHash: await contentFingerprint(finalContent),
+          requestHash: await contentFingerprint(JSON.stringify({ id, content: newContent })),
           source: "api",
           actor: mutationActorForSource("api"),
-          eventType: "update",
-          createdAt: Date.now(),
+          commitEntry: async (lease) => {
+            const vectorIds = await commitEntryVersion(env, {
+              id,
+              oldContent,
+              newContent: finalContent,
+              oldTags: tags,
+              newTags: mergedTags,
+              source,
+              eventType: "UPDATE",
+              reason: "Full content replaced through HTTP API",
+              actor: "api",
+              mutation: lease,
+            });
+            return { content: finalContent, vectorCount: vectorIds.length };
+          },
         });
-        atomicWarnings = atomicMutation.warnings;
       } catch (e) {
-        console.error("Atomic memory update sync failed (non-fatal):", e);
+        console.error("Update mutation failed:", e);
+        if (e instanceof MemoryMutationExecutionError && e.code === "idempotency_conflict") {
+          return json({ ok: false, error: "idempotency_conflict", mutation_id: e.mutationId }, 409);
+        }
+        if (e instanceof MemoryMutationExecutionError && e.code === "mutation_in_progress") {
+          return json({ ok: false, error: "mutation_in_progress", mutation_id: e.mutationId }, 409);
+        }
+        if (!(e instanceof MemoryMutationExecutionError) || e.code === "entry_mutation_failed") {
+          return json({
+            ok: false,
+            error: "Update could not be indexed. Previous content remains active; retry later.",
+            mutation_id: e instanceof MemoryMutationExecutionError ? e.mutationId : null,
+          }, 503);
+        }
         return json({
           ok: false,
           id,
           error: "atomic_sync_failed",
+          mutation_id: e.mutationId,
           message: "Update changed the entry projection, but Evidence/Claim sync failed. The entry is excluded from strict recall until repair.",
         }, 503);
       }
-      scheduleClassifyAndTag(id, finalContent, env, ctx);
+      if (!mutationResult.idempotentReplay) {
+        scheduleClassifyAndTag(id, mutationResult.content, env, ctx);
+      }
 
       return json({
         ok: true,
         id,
-        vectors: newVectorIds.length,
-        warnings: atomicWarnings,
+        vectors: mutationResult.vectorCount,
+        mutation_id: mutationResult.mutation.mutationId,
+        mutation_state: mutationResult.mutation.state,
+        idempotent_replay: mutationResult.idempotentReplay,
+        resumed: mutationResult.resumed,
+        warnings: mutationResult.warnings,
       });
     }
 
@@ -13533,7 +13951,7 @@ const defaultHandler = {
             claims: match.claims,
           })),
           relatedContext: [],
-        }, conflicts),
+        }, conflicts, query),
         relatedContext: relatedContext.map((match, index) => ({
           ref: `R${index + 1}`,
           id: match.id,
@@ -14361,7 +14779,8 @@ const defaultHandler = {
         env.DB,
         claimTargetFingerprint
       );
-      const claimVectorsRemaining = claimVectorStatus.missing;
+      const claimVectorsRemaining = claimVectorStatus.missing_retryable;
+      const claimVectorBlock = claimVectorActivationBlock(claimVectorStatus);
 
       const pendingQueueRemainingRow = usePendingProfile && pendingFingerprint
         ? await env.DB.prepare(
@@ -14398,6 +14817,9 @@ const defaultHandler = {
       let activationState = activeRebuild?.state ?? (usePendingProfile ? "failed" : "idle");
       let activationError: string | undefined;
       let retryable = true;
+      const rebuildQueueState = remainingN === 0 && failed === 0 && !claimVectorBlock
+        ? "ready"
+        : "building";
 
       if (openRebuildContext) {
         await env.DB.prepare(
@@ -14410,20 +14832,27 @@ const defaultHandler = {
                    AND pending_vector_ids IS NOT NULL
                    AND pending_vector_ids != '[]'
                ),
+               last_error = ?,
                updated_at = ?
            WHERE id = ?
              AND state IN ('queued', 'building', 'ready')`
         ).bind(
-          remainingN === 0 && failed === 0 ? "ready" : "building",
+          rebuildQueueState,
           openRebuildContext.id,
+          claimVectorBlock ?? null,
           Date.now(),
           openRebuildContext.id
         ).run();
-        activationState = remainingN === 0 && failed === 0 ? "ready" : "building";
+        activationState = rebuildQueueState;
+      }
+
+      if (claimVectorBlock) {
+        activationState = "blocked";
+        activationError = claimVectorBlock;
       }
 
       // Promote pending embedding fingerprint when full reindex completes cleanly
-      if (remainingN === 0 && failed === 0) {
+      if (remainingN === 0 && failed === 0 && !claimVectorBlock) {
         try {
           const stored = storedSettings ?? await loadStoredModelSettings(env.DB);
           if (stored?.pendingEmbeddingFingerprint && openRebuildContext) {

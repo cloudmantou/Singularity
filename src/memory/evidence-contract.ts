@@ -58,6 +58,7 @@ export const EVIDENCE_CONTRACT_SCHEMA_STATEMENTS = [
     source_snapshot TEXT,
     vault_snapshot TEXT,
     metadata_snapshot_hash TEXT,
+    metadata_snapshot_source TEXT,
     summary TEXT,
     state TEXT NOT NULL DEFAULT 'building',
     summary_vector_ids TEXT NOT NULL DEFAULT '[]',
@@ -101,6 +102,144 @@ export const PARENT_VERSION_METADATA_MIGRATIONS = [
   { column: "source_snapshot", statement: `ALTER TABLE sb_parent_versions ADD COLUMN source_snapshot TEXT` },
   { column: "vault_snapshot", statement: `ALTER TABLE sb_parent_versions ADD COLUMN vault_snapshot TEXT` },
   { column: "metadata_snapshot_hash", statement: `ALTER TABLE sb_parent_versions ADD COLUMN metadata_snapshot_hash TEXT` },
+  { column: "metadata_snapshot_source", statement: `ALTER TABLE sb_parent_versions ADD COLUMN metadata_snapshot_source TEXT` },
+] as const;
+
+export const PARENT_VERSION_METADATA_BACKFILL_STATEMENTS = [
+  `UPDATE sb_parent_versions
+   SET metadata_snapshot_source = 'recorded'
+   WHERE metadata_snapshot_hash IS NOT NULL
+     AND metadata_snapshot_source IS NULL`,
+  `UPDATE sb_parent_versions
+   SET tags_snapshot_json = COALESCE((
+         SELECT CASE
+           WHEN json_valid(COALESCE(o.metadata_json, ''))
+            AND json_type(o.metadata_json, '$.tags') = 'array'
+             THEN json_extract(o.metadata_json, '$.tags')
+           WHEN json_valid(COALESCE(o.metadata_json, ''))
+            AND json_type(o.metadata_json, '$.properties.tags') = 'array'
+             THEN json_extract(o.metadata_json, '$.properties.tags')
+           ELSE '[]'
+         END
+         FROM sb_observations o
+         WHERE o.id = sb_parent_versions.source_observation_id
+         LIMIT 1
+       ), '[]'),
+       source_snapshot = (
+         SELECT COALESCE(
+           NULLIF(o.source_channel, ''),
+           NULLIF(o.source, ''),
+           CASE WHEN json_valid(COALESCE(o.metadata_json, ''))
+             THEN COALESCE(
+               json_extract(o.metadata_json, '$.source_channel'),
+               json_extract(o.metadata_json, '$.provider'),
+               json_extract(o.metadata_json, '$.source')
+             ) END
+         )
+         FROM sb_observations o
+         WHERE o.id = sb_parent_versions.source_observation_id
+         LIMIT 1
+       ),
+       vault_snapshot = (
+         SELECT CASE WHEN json_valid(COALESCE(o.metadata_json, ''))
+           THEN COALESCE(
+             json_extract(o.metadata_json, '$.vault_id'),
+             json_extract(o.metadata_json, '$.vaultId'),
+             json_extract(o.metadata_json, '$.properties.vault_id')
+           ) END
+         FROM sb_observations o
+         WHERE o.id = sb_parent_versions.source_observation_id
+         LIMIT 1
+       ),
+       metadata_snapshot_hash = 'legacy-observation:' || version_id,
+       metadata_snapshot_source = 'inferred_from_observation'
+   WHERE metadata_snapshot_hash IS NULL
+     AND EXISTS (
+       SELECT 1 FROM sb_observations o
+       WHERE o.id = sb_parent_versions.source_observation_id
+     )`,
+  `UPDATE sb_parent_versions
+   SET tags_snapshot_json = COALESCE((
+         SELECT CASE
+           WHEN json_valid(COALESCE(r.new_metadata_json, ''))
+            AND json_type(r.new_metadata_json, '$.tags') = 'array'
+             THEN json_extract(r.new_metadata_json, '$.tags')
+           WHEN json_valid(COALESCE(r.new_metadata_json, ''))
+            AND json_type(r.new_metadata_json, '$.properties.tags') = 'array'
+             THEN json_extract(r.new_metadata_json, '$.properties.tags')
+           ELSE '[]'
+         END
+         FROM sb_memory_revisions r
+         WHERE r.memory_id IN (
+           sb_parent_versions.parent_id,
+           CASE WHEN sb_parent_versions.parent_id LIKE 'entry:%'
+             THEN substr(sb_parent_versions.parent_id, 7)
+             ELSE sb_parent_versions.parent_id END
+         )
+           AND r.created_at <= sb_parent_versions.created_at
+           AND r.new_metadata_json IS NOT NULL
+         ORDER BY r.created_at DESC, r.id DESC
+         LIMIT 1
+       ), '[]'),
+       source_snapshot = (
+         SELECT CASE WHEN json_valid(COALESCE(r.new_metadata_json, ''))
+           THEN COALESCE(
+             json_extract(r.new_metadata_json, '$.source_channel'),
+             json_extract(r.new_metadata_json, '$.provider'),
+             json_extract(r.new_metadata_json, '$.source')
+           ) END
+         FROM sb_memory_revisions r
+         WHERE r.memory_id IN (
+           sb_parent_versions.parent_id,
+           CASE WHEN sb_parent_versions.parent_id LIKE 'entry:%'
+             THEN substr(sb_parent_versions.parent_id, 7)
+             ELSE sb_parent_versions.parent_id END
+         )
+           AND r.created_at <= sb_parent_versions.created_at
+           AND r.new_metadata_json IS NOT NULL
+         ORDER BY r.created_at DESC, r.id DESC
+         LIMIT 1
+       ),
+       vault_snapshot = (
+         SELECT CASE WHEN json_valid(COALESCE(r.new_metadata_json, ''))
+           THEN COALESCE(
+             json_extract(r.new_metadata_json, '$.vault_id'),
+             json_extract(r.new_metadata_json, '$.vaultId'),
+             json_extract(r.new_metadata_json, '$.properties.vault_id')
+           ) END
+         FROM sb_memory_revisions r
+         WHERE r.memory_id IN (
+           sb_parent_versions.parent_id,
+           CASE WHEN sb_parent_versions.parent_id LIKE 'entry:%'
+             THEN substr(sb_parent_versions.parent_id, 7)
+             ELSE sb_parent_versions.parent_id END
+         )
+           AND r.created_at <= sb_parent_versions.created_at
+           AND r.new_metadata_json IS NOT NULL
+         ORDER BY r.created_at DESC, r.id DESC
+         LIMIT 1
+       ),
+       metadata_snapshot_hash = 'legacy-revision:' || version_id,
+       metadata_snapshot_source = 'inferred_from_revision'
+   WHERE metadata_snapshot_hash IS NULL
+     AND EXISTS (
+       SELECT 1 FROM sb_memory_revisions r
+       WHERE r.memory_id IN (
+         sb_parent_versions.parent_id,
+         CASE WHEN sb_parent_versions.parent_id LIKE 'entry:%'
+           THEN substr(sb_parent_versions.parent_id, 7)
+           ELSE sb_parent_versions.parent_id END
+       )
+         AND r.created_at <= sb_parent_versions.created_at
+         AND r.new_metadata_json IS NOT NULL
+     )`,
+  `UPDATE sb_parent_versions
+   SET tags_snapshot_json = '[]',
+       source_snapshot = NULL,
+       vault_snapshot = NULL,
+       metadata_snapshot_hash = 'legacy-unknown:' || version_id,
+       metadata_snapshot_source = 'unknown'
+   WHERE metadata_snapshot_hash IS NULL`,
 ] as const;
 
 export const PARENT_VERSION_TEMPORAL_BACKFILL_STATEMENTS = [
@@ -355,8 +494,9 @@ export function prepareParentVersionInsert(
     `INSERT INTO sb_parent_versions (
        version_id, parent_id, version_number, source_observation_id,
        source_snapshot_hash, tags_snapshot_json, source_snapshot, vault_snapshot,
-       metadata_snapshot_hash, summary, state, summary_vector_ids, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, '[]', ?, ?)`
+       metadata_snapshot_hash, metadata_snapshot_source, summary, state,
+       summary_vector_ids, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'recorded', NULL, ?, '[]', ?, ?)`
   ).bind(
     input.versionId,
     input.parentId,

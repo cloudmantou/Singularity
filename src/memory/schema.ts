@@ -11,11 +11,13 @@ import {
   MEMORY_CLAIM_MIGRATIONS,
   MEMORY_SOURCE_PROVENANCE_MIGRATIONS,
   OBSERVATION_EVIDENCE_MIGRATIONS,
+  PARENT_VERSION_METADATA_BACKFILL_STATEMENTS,
   PARENT_VERSION_METADATA_MIGRATIONS,
   PARENT_VERSION_TEMPORAL_BACKFILL_STATEMENTS,
   PARENT_VERSION_TEMPORAL_MIGRATIONS,
 } from "./evidence-contract";
 import { CLAIM_VECTOR_QUEUE_SCHEMA_STATEMENTS } from "./claim-vector-queue";
+import { MEMORY_MUTATION_SCHEMA_STATEMENTS } from "./mutations";
 
 const MEMORY_SCHEMA_STATEMENTS = [
   ...ATOMIC_SCHEMA_STATEMENTS,
@@ -60,6 +62,7 @@ const MEMORY_SCHEMA_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_sb_claim_vectors_parent
     ON sb_claim_vectors(parent_version_id, indexed_at DESC)`,
   ...CLAIM_VECTOR_QUEUE_SCHEMA_STATEMENTS,
+  ...MEMORY_MUTATION_SCHEMA_STATEMENTS,
 ] as const;
 
 async function tableColumns(db: D1Database, table: string): Promise<Set<string> | null> {
@@ -103,6 +106,9 @@ export async function ensureMemoryDataModel(db: D1Database): Promise<void> {
   await applyColumnMigrations(db, "sb_parent_versions", PARENT_VERSION_TEMPORAL_MIGRATIONS);
   await applyColumnMigrations(db, "sb_parent_versions", PARENT_VERSION_METADATA_MIGRATIONS);
   for (const statement of PARENT_VERSION_TEMPORAL_BACKFILL_STATEMENTS) {
+    await db.exec(statement);
+  }
+  for (const statement of PARENT_VERSION_METADATA_BACKFILL_STATEMENTS) {
     await db.exec(statement);
   }
   for (const statement of ATOMIC_POST_MIGRATION_INDEX_STATEMENTS) {
