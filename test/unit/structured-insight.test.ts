@@ -18,22 +18,31 @@ const sqliteClaim: CitableInsightClaim = {
 };
 
 describe("validateStructuredInsightResponse", () => {
-  it("renders only canonical text selected by valid local Claim refs", () => {
+  it("accepts natural-language prose when its factual paragraph cites a verified Claim", () => {
     const result = validateStructuredInsightResponse(JSON.stringify({
-      answer: "ignored model prose",
+      answer: "根据已验证记忆，项目当前使用 SQLite 作为数据库。[C1]",
       claims: [{ text: "The project uses SQLite.", refs: ["C1"], kind: "fact" }],
     }), [sqliteClaim]);
 
-    expect(result.answer).toBe("The project uses SQLite. [C1]");
+    expect(result.answer).toBe("根据已验证记忆，项目当前使用 SQLite 作为数据库。[C1]");
+    expect(result.answer).not.toBe("The project uses SQLite. [C1]");
     expect(result.verifiedClaims).toEqual([{
       text: "The project uses SQLite.",
       refs: ["C1"],
       kind: "fact",
     }]);
+    expect(result.citations).toEqual([{
+      ref: "C1",
+      memoryId: "claim-1",
+      claimId: "claim-1",
+      evidenceId: "entry-1",
+      statement: "The project uses SQLite.",
+      kind: "fact",
+    }]);
     expect(result.unverifiedClaims).toEqual([]);
   });
 
-  it("drops an unsupported extra factual sentence instead of passing it through", () => {
+  it("fails closed when the model adds an unsupported factual sentence", () => {
     const result = validateStructuredInsightResponse(JSON.stringify({
       answer: "The project uses SQLite. It will migrate to Postgres next year.",
       claims: [
@@ -42,12 +51,12 @@ describe("validateStructuredInsightResponse", () => {
       ],
     }), [sqliteClaim]);
 
-    expect(result.answer).toBe("The project uses SQLite. [C1]");
+    expect(result.answer).toBe(INSUFFICIENT_VERIFIED_EVIDENCE);
     expect(result.answer).not.toContain("Postgres");
-    expect(result.unverifiedClaims).toEqual([expect.objectContaining({
+    expect(result.unverifiedClaims).toEqual(expect.arrayContaining([expect.objectContaining({
       text: "It will migrate to Postgres next year.",
       reason: "claim_text_not_supported",
-    })]);
+    })]));
   });
 
   it("rejects a supported Claim that the server ranked as not answerable", () => {
@@ -66,6 +75,7 @@ describe("validateStructuredInsightResponse", () => {
 
   it("supports shadow and warn modes without silently dropping the Claim", () => {
     const response = JSON.stringify({
+      answer: "The project uses SQLite. [C1]",
       claims: [{ text: sqliteClaim.statement, refs: ["C1"], kind: "fact" }],
     });
     const notAnswerable = { ...sqliteClaim, queryRelevance: 0, answerability: "irrelevant" as const };
@@ -137,6 +147,26 @@ describe("validateStructuredInsightResponse", () => {
     expect(unknown.unverifiedClaims[0]?.reason).toBe("unknown_claim_ref");
   });
 
+  it("rejects a selected Claim when the model omits the natural-language answer", () => {
+    const result = validateStructuredInsightResponse(JSON.stringify({
+      answer: "",
+      claims: [{ text: sqliteClaim.statement, refs: ["C1"], kind: "fact" }],
+    }), [sqliteClaim]);
+
+    expect(result.answer).toBe(INSUFFICIENT_VERIFIED_EVIDENCE);
+    expect(result.unverifiedClaims[0]?.reason).toBe("missing_answer");
+  });
+
+  it("requires every non-empty answer paragraph to carry a local Claim citation", () => {
+    const result = validateStructuredInsightResponse(JSON.stringify({
+      answer: "项目当前使用 SQLite。[C1]\n\n下一步会迁移到 Postgres。",
+      claims: [{ text: sqliteClaim.statement, refs: ["C1"], kind: "fact" }],
+    }), [sqliteClaim]);
+
+    expect(result.answer).toBe(INSUFFICIENT_VERIFIED_EVIDENCE);
+    expect(result.unverifiedClaims[0]?.reason).toBe("missing_answer_citation");
+  });
+
   it("rejects malformed claim arrays and conflict refs that do not share one case", () => {
     expect(validateStructuredInsightResponse(JSON.stringify({ claims: {} }), [sqliteClaim]))
       .toMatchObject({ answer: INSUFFICIENT_VERIFIED_EVIDENCE });
@@ -183,12 +213,11 @@ describe("validateStructuredInsightResponse", () => {
     expect(fact.unverifiedClaims[0]?.reason).toBe("unresolved_conflict");
 
     const conflict = validateStructuredInsightResponse(JSON.stringify({
-      answer: "",
+      answer: "当前存在数据库选择冲突，系统尚未确认唯一方案。[C1][C2]",
       claims: [{ text: "Conflict", refs: ["C1", "C2"], kind: "conflict" }],
     }), contested);
-    expect(conflict.answer).toContain("Unresolved conflict");
-    expect(conflict.answer).toContain("The project uses SQLite.");
-    expect(conflict.answer).toContain("The project uses Postgres.");
+    expect(conflict.answer).toBe("当前存在数据库选择冲突，系统尚未确认唯一方案。[C1][C2]");
+    expect(conflict.verifiedClaims[0]?.text).toContain("Unresolved conflict");
   });
 });
 

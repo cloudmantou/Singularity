@@ -117,7 +117,7 @@ var SingularityClient = class {
     return response.json;
   }
   async recall(query) {
-    var _a, _b;
+    var _a, _b, _c, _d;
     this.assertConfigured();
     const response = await (0, import_obsidian.requestUrl)({
       url: this.endpoint(`/recall?query=${encodeURIComponent(query)}&topK=10&vaultId=${encodeURIComponent(this.settings.vaultId)}`),
@@ -129,7 +129,11 @@ var SingularityClient = class {
       const error = ((_a = response.json) == null ? void 0 : _a.error) || response.text || `HTTP ${response.status}`;
       throw new Error(String(error));
     }
-    return Array.isArray((_b = response.json) == null ? void 0 : _b.results) ? response.json.results : [];
+    return {
+      answer: typeof ((_b = response.json) == null ? void 0 : _b.answer) === "string" ? response.json.answer : null,
+      citations: Array.isArray((_c = response.json) == null ? void 0 : _c.citations) ? response.json.citations : [],
+      results: Array.isArray((_d = response.json) == null ? void 0 : _d.results) ? response.json.results : []
+    };
   }
   async ack(item) {
     var _a;
@@ -501,16 +505,22 @@ var SingularitySearchView = class extends import_obsidian.ItemView {
       resultsEl.empty();
       resultsEl.createEl("div", { text: "Searching..." });
       try {
-        const [results, links] = await Promise.all([
+        const [recall, links] = await Promise.all([
           this.plugin.client().recall(query),
           this.plugin.client().pull().catch(() => [])
         ]);
+        const results = recall.results;
         const linkByEntry = new Map(links.map((item) => [item.entryId, item]));
         resultsEl.empty();
         if (!results.length) {
           resultsEl.createEl("div", { text: "No results." });
           return;
         }
+        if (recall.answer) {
+          resultsEl.createEl("h4", { text: "Answer" });
+          resultsEl.createEl("p", { text: recall.answer });
+        }
+        resultsEl.createEl("h4", { text: "Sources" });
         for (const result of results) {
           const item = resultsEl.createDiv();
           item.addClass("singularity-result");

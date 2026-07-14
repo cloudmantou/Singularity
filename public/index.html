@@ -4718,21 +4718,27 @@
                   const date = new Date(entry.createdAt).toLocaleDateString()
                   return `- ${date}: ${entry.content}`
                 }).join('\n')
-              : String(data.insight || 'Retrieved direct evidence is insufficient for a verified answer.')
+              : String(data.answer || 'Retrieved direct evidence is insufficient for a verified answer.')
             answerEl.innerHTML = renderAnswerMarkdown(verifiedAnswer)
 
             // 2. Sources toggle
+            const citationIds = new Set((Array.isArray(data.citations) ? data.citations : [])
+              .flatMap((citation) => [citation.evidenceId, citation.memoryId, citation.claimId])
+              .filter(Boolean))
+            const sourceEntries = citationIds.size
+              ? entries.filter((entry) => citationIds.has(entry.id))
+              : entries
             const sourcesToggle = document.createElement('div')
             sourcesToggle.className = 'sources-toggle'
             const srcLabel =
-              entries.length === 1
-                ? t('recall.sourcesOne', { n: entries.length })
-                : t('recall.sourcesMany', { n: entries.length })
+              sourceEntries.length === 1
+                ? t('recall.sourcesOne', { n: sourceEntries.length })
+                : t('recall.sourcesMany', { n: sourceEntries.length })
             sourcesToggle.innerHTML = `<button onclick="this.nextElementSibling.style.display = this.nextElementSibling.style.display === 'none' ? 'flex' : 'none'">
             <i class="ti ti-files"></i> ${srcLabel}
           </button>
           <div class="brain-cards-wrapper" style="display:none"></div>`
-            entries.forEach((e) => sourcesToggle.querySelector('.brain-cards-wrapper').appendChild(makeRecallCard(e)))
+            sourceEntries.forEach((e) => sourcesToggle.querySelector('.brain-cards-wrapper').appendChild(makeRecallCard(e)))
             msgs.appendChild(sourcesToggle)
             document.getElementById('recall-clear-btn').style.display = 'flex'
           }

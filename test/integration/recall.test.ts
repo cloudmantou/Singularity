@@ -207,7 +207,9 @@ describe("GET /recall", () => {
     expect(data.results[0].score).toBe(100);
     expect(data.results[1].score).toBeLessThanOrEqual(data.results[0].score);
     expect(data.results[1]).toMatchObject({ id: "entry-2", content: "Second memory" });
+    expect(typeof data.answer === "string" || data.answer === null).toBe(true);
     expect(typeof data.insight === "string" || data.insight === null).toBe(true);
+    expect(Array.isArray(data.citations)).toBe(true);
     expect(db.entries.map((entry) => entry.recall_count)).toEqual([0, 0]);
     const [, options] = queryMock.mock.calls[0];
     expect(options.filter).toEqual({

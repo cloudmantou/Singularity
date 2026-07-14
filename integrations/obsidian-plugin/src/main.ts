@@ -31,6 +31,17 @@ interface RecallResult {
   created_at?: number;
 }
 
+interface RecallResponse {
+  answer?: string | null;
+  citations?: Array<{
+    ref: string;
+    memoryId: string;
+    claimId?: string | null;
+    evidenceId?: string;
+  }>;
+  results: RecallResult[];
+}
+
 interface PullResult {
   objectType?: "memory" | "aggregate";
   entryId: string;
@@ -190,7 +201,7 @@ class SingularityClient {
     return response.json as Record<string, unknown>;
   }
 
-  async recall(query: string): Promise<RecallResult[]> {
+  async recall(query: string): Promise<RecallResponse> {
     this.assertConfigured();
     const response = await requestUrl({
       url: this.endpoint(`/recall?query=${encodeURIComponent(query)}&topK=10&vaultId=${encodeURIComponent(this.settings.vaultId)}`),
@@ -202,7 +213,13 @@ class SingularityClient {
       const error = response.json?.error || response.text || `HTTP ${response.status}`;
       throw new Error(String(error));
     }
-    return Array.isArray(response.json?.results) ? response.json.results as RecallResult[] : [];
+    return {
+      answer: typeof response.json?.answer === "string" ? response.json.answer : null,
+      citations: Array.isArray(response.json?.citations)
+        ? response.json.citations as RecallResponse["citations"]
+        : [],
+      results: Array.isArray(response.json?.results) ? response.json.results as RecallResult[] : [],
+    };
   }
 
   async ack(item: PullResult): Promise<void> {
@@ -601,16 +618,22 @@ class SingularitySearchView extends ItemView {
       resultsEl.empty();
       resultsEl.createEl("div", { text: "Searching..." });
       try {
-        const [results, links] = await Promise.all([
+        const [recall, links] = await Promise.all([
           this.plugin.client().recall(query),
           this.plugin.client().pull().catch(() => [] as PullResult[]),
         ]);
+        const results = recall.results;
         const linkByEntry = new Map(links.map((item) => [item.entryId, item]));
         resultsEl.empty();
         if (!results.length) {
           resultsEl.createEl("div", { text: "No results." });
           return;
         }
+        if (recall.answer) {
+          resultsEl.createEl("h4", { text: "Answer" });
+          resultsEl.createEl("p", { text: recall.answer });
+        }
+        resultsEl.createEl("h4", { text: "Sources" });
         for (const result of results) {
           const item = resultsEl.createDiv();
           item.addClass("singularity-result");

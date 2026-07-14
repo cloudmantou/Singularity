@@ -54,6 +54,9 @@ export interface UnverifiedInsightClaim {
   refs: string[];
   reason:
     | "invalid_structured_response"
+    | "missing_answer"
+    | "missing_answer_citation"
+    | "invalid_answer_citation"
     | "missing_claim_ref"
     | "unknown_claim_ref"
     | "too_many_claim_refs"
@@ -62,6 +65,15 @@ export interface UnverifiedInsightClaim {
     | "claim_text_not_supported"
     | "unresolved_conflict"
     | "invalid_conflict_refs";
+}
+
+export interface InsightCitation {
+  ref: string;
+  memoryId: string;
+  claimId: string | null;
+  evidenceId: string;
+  statement: string;
+  kind: "fact" | "conflict";
 }
 
 export interface AnswerabilityWarning {
@@ -75,6 +87,7 @@ export interface VerifiedInsightResult {
   answer: string;
   verifiedClaims: VerifiedInsightClaim[];
   unverifiedClaims: UnverifiedInsightClaim[];
+  citations?: InsightCitation[];
   answerabilityWarnings?: AnswerabilityWarning[];
   answerabilityMode?: AnswerabilityMode;
 }
@@ -126,6 +139,46 @@ function invalidStructuredResponse(raw: string): VerifiedInsightResult {
       reason: "invalid_structured_response",
     }] : [],
   };
+}
+
+function extractAnswerClaimRefs(answer: string): string[] {
+  const refs: string[] = [];
+  for (const match of answer.matchAll(/\[\s*(C\d+(?:\s*,\s*C\d+)*)\s*\]/gi)) {
+    for (const ref of match[1].split(",")) {
+      const normalized = ref.trim().toUpperCase();
+      if (normalized && !refs.includes(normalized)) refs.push(normalized);
+    }
+  }
+  return refs;
+}
+
+function answerHasNonClaimReference(answer: string): boolean {
+  return /\[\s*[ER]\d+(?:\s*,\s*[ER]\d+)*\s*\]/i.test(answer);
+}
+
+function buildInsightCitations(
+  claims: readonly CitableInsightClaim[],
+  verifiedClaims: readonly VerifiedInsightClaim[]
+): InsightCitation[] {
+  const byRef = new Map(claims.map((claim) => [claim.ref.toUpperCase(), claim]));
+  const citations: InsightCitation[] = [];
+  const seen = new Set<string>();
+  for (const verified of verifiedClaims) {
+    for (const ref of verified.refs) {
+      const claim = byRef.get(ref.toUpperCase());
+      if (!claim || seen.has(claim.ref.toUpperCase())) continue;
+      seen.add(claim.ref.toUpperCase());
+      citations.push({
+        ref: claim.ref,
+        memoryId: claim.claimId ?? claim.evidenceId,
+        claimId: claim.claimId,
+        evidenceId: claim.evidenceId,
+        statement: claim.statement,
+        kind: verified.kind,
+      });
+    }
+  }
+  return citations;
 }
 
 export function validateStructuredInsightResponse(
@@ -241,14 +294,64 @@ export function validateStructuredInsightResponse(
     verifiedClaims.push({ text: normalizeClaimText(claims[0].statement), refs, kind });
   }
 
-  const answer = verifiedClaims.length
-    ? verifiedClaims.map((claim) => `${claim.text} [${claim.refs.join(", ")}]`).join(" ")
-    : INSUFFICIENT_VERIFIED_EVIDENCE;
-  return {
-    answer,
-    verifiedClaims,
-    unverifiedClaims,
+  const answerValue = (parsed as Record<string, unknown>).answer;
+  const answer = typeof answerValue === "string" ? answerValue.trim() : "";
+  const responseMetadata = {
     ...(answerabilityWarnings.length ? { answerabilityWarnings } : {}),
     ...(answerabilityMode !== "enforce" ? { answerabilityMode } : {}),
+  };
+
+  // A selected Claim is only a source ledger. It is never a fallback answer:
+  // the model must provide a natural-language answer with local citations.
+  if (verifiedClaims.length && !answer && !unverifiedClaims.length) {
+    unverifiedClaims.push({ text: "", refs: [], reason: "missing_answer" });
+  }
+
+  if (verifiedClaims.length && answer) {
+    const answerRefs = extractAnswerClaimRefs(answer);
+    const verifiedRefs = new Set(verifiedClaims.flatMap((claim) => claim.refs));
+    const paragraphs = answer.split(/\n\s*\n/).map((paragraph) => paragraph.trim()).filter(Boolean);
+    if (answerHasNonClaimReference(answer)) {
+      unverifiedClaims.push({
+        text: answer.slice(0, 500),
+        refs: answerRefs,
+        reason: "invalid_answer_citation",
+      });
+    } else if (!answerRefs.length) {
+      unverifiedClaims.push({
+        text: answer.slice(0, 500),
+        refs: [],
+        reason: "missing_answer_citation",
+      });
+    } else if (paragraphs.some((paragraph) => !extractAnswerClaimRefs(paragraph).length)) {
+      unverifiedClaims.push({
+        text: answer.slice(0, 500),
+        refs: answerRefs,
+        reason: "missing_answer_citation",
+      });
+    } else if (answerRefs.some((ref) => !verifiedRefs.has(ref))) {
+      unverifiedClaims.push({
+        text: answer.slice(0, 500),
+        refs: answerRefs,
+        reason: "unknown_claim_ref",
+      });
+    }
+  }
+
+  if (verifiedClaims.length && !unverifiedClaims.length && answer) {
+    return {
+      answer,
+      verifiedClaims,
+      unverifiedClaims,
+      citations: buildInsightCitations(citableClaims, verifiedClaims),
+      ...responseMetadata,
+    };
+  }
+
+  return {
+    answer: INSUFFICIENT_VERIFIED_EVIDENCE,
+    verifiedClaims: [],
+    unverifiedClaims,
+    ...responseMetadata,
   };
 }

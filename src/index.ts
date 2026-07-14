@@ -7025,7 +7025,7 @@ export async function synthesizeVerifiedInsight(
     }).join("\n")
     : "None";
 
-  const prompt = `You are a second brain assistant. Summarize what the user's stored memories below say in relation to their query. Base the insight ONLY on these memories.
+  const prompt = `You are a second brain assistant. Answer the user's query in natural language using ONLY the verified Claims below. The answer is shown to the user; it must be useful prose, not a pasted source record.
 
 Query: "${query}"
 
@@ -7042,17 +7042,19 @@ Unresolved conflicts:
 ${conflictsList}
 
 Rules:
-- Return exactly one JSON object and no markdown: {"answer":"","claims":[{"text":"","refs":["C1"],"kind":"fact"}]}.
-- C* references are the only citable Claims. E* labels identify Evidence containers and R* labels are navigation-only; never place E* or R* in refs.
-- For kind="fact", copy text exactly from one referenced C* statement. Do not paraphrase, combine, infer, guess, or add facts.
+  - Return exactly one JSON object and no markdown: {"answer":"","claims":[{"text":"","refs":["C1"],"kind":"fact"}]}.
+  - C* references are the only citable Claims. E* labels identify Evidence containers and R* labels are navigation-only; never place E* or R* in refs.
+  - The answer field must be a concise natural-language answer in the user's language. You may paraphrase, combine, and organize supported Claims, but you must not infer, guess, or add facts.
+  - Put one or more local citations such as [C1] or [C1][C2] in every factual paragraph of the answer. Do not cite Evidence labels or Association labels in the answer.
+  - The claims array is a source ledger, not the answer: for kind="fact", copy text exactly from each referenced C* statement. The server uses it to verify the facts behind your prose.
 - ${answerabilityMode === "shadow"
     ? "Answerability is evaluated after model selection; choose the most relevant Claims from the evidence without relying on a server answerability label."
     : "Only cite a C* Claim whose answerability is \"answerable\". Related or irrelevant Claims cannot answer the query."}
 - A contested Claim or a Claim with conflicts cannot be emitted as kind="fact".
 - A Claim listed under Conflict-only Claims cannot support kind="fact".
 - To disclose an unresolved conflict, use kind="conflict" and cite at least two C* refs that share the same conflict ID. The server will render the conflict text.
-- The answer field is advisory and will not be trusted. Every factual unit must be represented in claims.
-- If no Claim supports an answer, treat the verified evidence as insufficient and return {"answer":"","claims":[]}.
+  - The server will reject prose whose citations do not map to the verified claims or whose factual paragraphs lack citations.
+  - If no Claim supports an answer, treat the verified evidence as insufficient and return {"answer":"","claims":[]}.
 - These Claims are a retrieved subset, not the user's full memory store.`;
 
   let insight = "";
@@ -7480,11 +7482,13 @@ export interface RecallSearchResult {
   matches: RecallMatch[];
   directEvidence?: RecallMatch[];
   relatedContext?: RecallMatch[];
+  answer: string;
   insight: string;
   retrievalMode?: "entry_projection" | "claim_snapshot";
   snapshotAt?: number;
   verifiedClaims?: VerifiedInsightResult["verifiedClaims"];
   unverifiedClaims?: VerifiedInsightResult["unverifiedClaims"];
+  citations?: VerifiedInsightResult["citations"];
   conflicts?: RecallConflictContext[];
   degraded?: boolean;
   degradedReason?: string;
@@ -8880,6 +8884,7 @@ async function recallHistoricalClaims(
     matches: [],
     directEvidence: [],
     relatedContext: [],
+    answer: "",
     insight: "",
     conflicts: [],
     degraded,
@@ -9067,9 +9072,11 @@ async function recallHistoricalClaims(
     matches,
     directEvidence: [...matches],
     relatedContext: [],
+    answer: synthesized.answer,
     insight: synthesized.answer,
     verifiedClaims: synthesized.verifiedClaims,
     unverifiedClaims: synthesized.unverifiedClaims,
+    citations: synthesized.citations ?? [],
     conflicts: conflictContext.conflicts,
     retrievalMode: "claim_snapshot",
     snapshotAt: params.before,
@@ -9098,7 +9105,7 @@ export async function recallEntries(
   const associationHops = Math.max(0, Math.min(2, Math.trunc(params.hops ?? 0)));
   const associationDirection = params.associationDirection ?? "outgoing";
   let { tag, after, before, kind } = params;
-  if (tag && !isD1SafeTag(tag)) return { matches: [], insight: "" };
+  if (tag && !isD1SafeTag(tag)) return { matches: [], answer: "", insight: "" };
   const now = Date.now();
 
   let embedQuery = query;
@@ -9164,6 +9171,7 @@ export async function recallEntries(
     ).bind(`%"${tag}"%`).all();
     if (!tagRows.length) return {
       matches: [],
+      answer: "",
       insight: "",
       degraded: embeddingFailed,
       degradedReason: embeddingFailed ? "embedding_failed" : undefined,
@@ -9178,6 +9186,7 @@ export async function recallEntries(
       )];
       if (!vectorIds.length) return {
         matches: [],
+        answer: "",
         insight: "",
         degraded: embeddingFailed,
         degradedReason: embeddingFailed ? "embedding_failed" : undefined,
@@ -9271,6 +9280,7 @@ export async function recallEntries(
   fusedMatches = applyGraphRecallSignals(fusedMatches, graphSignals, !tag);
   if (!fusedMatches.length) return {
     matches: [],
+    answer: "",
     insight: "",
     degraded: embeddingFailed || vectorQueryDegraded,
     degradedReason: embeddingFailed
@@ -9397,6 +9407,7 @@ export async function recallEntries(
   });
   if (!fusedMatches.length) return {
     matches: [],
+    answer: "",
     insight: "",
     degraded: embeddingFailed || vectorQueryDegraded,
     degradedReason: embeddingFailed
@@ -9441,6 +9452,7 @@ export async function recallEntries(
 
   if (!deduped.length) return {
     matches: [],
+    answer: "",
     insight: "",
     degraded: embeddingFailed || vectorQueryDegraded,
     degradedReason: embeddingFailed
@@ -9668,9 +9680,11 @@ export async function recallEntries(
     matches,
     directEvidence: directMatches,
     relatedContext: matches.filter((match) => Boolean(match.association)),
+    answer: synthesized.answer,
     insight: synthesized.answer,
     verifiedClaims: synthesized.verifiedClaims,
     unverifiedClaims: synthesized.unverifiedClaims,
+    citations: synthesized.citations ?? [],
     conflicts: conflictContext.conflicts,
     retrievalMode: "entry_projection",
     snapshotAt: recallAsOf,
@@ -12446,9 +12460,11 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
         matches,
         directEvidence = matches.filter((match) => !match.association),
         relatedContext = matches.filter((match) => Boolean(match.association)),
+        answer,
         insight,
         verifiedClaims = [],
         unverifiedClaims = [],
+        citations = [],
         conflicts = [],
         retrievalMode = "entry_projection",
         snapshotAt,
@@ -14119,7 +14135,9 @@ const defaultHandler = {
             created_at: match.createdAt,
             updated: false,
           })),
+          answer: null,
           insight: null,
+          citations: [],
         });
       }
 
@@ -14135,9 +14153,11 @@ const defaultHandler = {
         matches,
         directEvidence = matches.filter((match) => !match.association),
         relatedContext = matches.filter((match) => Boolean(match.association)),
+        answer,
         insight,
         verifiedClaims = [],
         unverifiedClaims = [],
+        citations = [],
         conflicts = [],
         retrievalMode = "entry_projection",
         snapshotAt,
@@ -14162,6 +14182,8 @@ const defaultHandler = {
           ok: true,
           results: [],
           message: "Nothing found matching that query.",
+          answer: null,
+          citations: [],
           degraded_mode: Boolean(degraded),
           degraded_reason: degradedReason ?? null,
         });
@@ -14215,7 +14237,9 @@ const defaultHandler = {
           association: match.association,
         })),
         conflicts,
+        answer: answer || null,
         insight: insight || null,
+        citations,
         verified_claims: verifiedClaims,
         unverified_claims: unverifiedClaims,
       });

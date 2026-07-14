@@ -21,7 +21,11 @@ function aiMock(response: string) {
 }
 
 function structuredClaim(text: string, refs = ["C1"], kind: "fact" | "conflict" = "fact") {
-  return JSON.stringify({ answer: "", claims: [{ text, refs, kind }] });
+  const citations = refs.map((ref) => `[${ref}]`).join("");
+  return JSON.stringify({
+    answer: refs.length ? `Based on the verified memory, ${text} ${citations}` : "",
+    claims: [{ text, refs, kind }],
+  });
 }
 
 function verifiedEvidence(id: string, content: string) {
@@ -85,7 +89,7 @@ describe("synthesizeInsight()", () => {
       relatedContext: [],
     }, env);
 
-    expect(result.answer).toBe("The project port is 8787 [C2]");
+    expect(result.answer).toBe("Based on the verified memory, The project port is 8787 [C2]");
     expect(env.AI.run).toHaveBeenCalled();
   });
 
@@ -136,8 +140,7 @@ describe("synthesizeInsight()", () => {
       conflictEnv,
       [conflict]
     );
-    expect(disclosed.answer).toContain("The project uses SQLite");
-    expect(disclosed.answer).toContain("The project uses Postgres");
+    expect(disclosed.answer).toBe("Based on the verified memory, Conflict [C1][C2]");
 
     const factEnv = makeTestEnv(undefined, {
       AI: aiMock(structuredClaim("The project uses Postgres", ["C2"])),
@@ -187,7 +190,7 @@ describe("synthesizeInsight()", () => {
       [verifiedEvidence("1", "We chose JWT with 1hr expiry")],
       env
     );
-    expect(result).toBe("We chose JWT with 1hr expiry [C1]");
+    expect(result).toBe("Based on the verified memory, We chose JWT with 1hr expiry [C1]");
   });
 
   it("returns empty string when LLM throws — does not propagate error", async () => {
@@ -207,7 +210,7 @@ describe("synthesizeInsight()", () => {
   it("trims whitespace from LLM response", async () => {
     const env = makeTestEnv(undefined, { AI: aiMock(`  ${structuredClaim("content")}  `) });
     const result = await synthesizeInsight("content", [verifiedEvidence("1", "content")], env);
-    expect(result).toBe("content [C1]");
+    expect(result).toBe("Based on the verified memory, content [C1]");
   });
 
   it("includes the query in the prompt sent to LLM", async () => {
@@ -324,7 +327,7 @@ describe("synthesizeInsight()", () => {
       env
     );
 
-    expect(result).toBe("The project uses SQLite [C1]");
+    expect(result).toBe("Based on the verified memory, The project uses SQLite [C1]");
     const [, { messages }] = (env.AI.run as ReturnType<typeof vi.fn>).mock.calls[0];
     const prompt = messages[0].content as string;
     expect(prompt).toContain("[E1] evidence_id=entry-direct");
