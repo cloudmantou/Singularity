@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1536" height="1024" viewBox="0 0 1536 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Singularity technical architecture</title>
+  <desc id="desc">Clients pass through authentication and APIs into an evidence-first memory layer backed by Cloudflare or self-hosted storage, with verified recall and observability.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#07111f"/><stop offset="1" stop-color="#11142b"/></linearGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#f7d08a"/><stop offset="1" stop-color="#c58b3d"/></linearGradient>
+    <filter id="shadow"><feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#000" flood-opacity=".35"/></filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0 0l12 6-12 6z" fill="#7dd3fc"/></marker>
+    <style>
+      .title{font-family:Arial,sans-serif;font-weight:700;font-size:42px;fill:#fff}.sub{font-family:Arial,sans-serif;font-weight:400;font-size:20px;fill:#a9bbd0}.section{font-family:Arial,sans-serif;font-weight:700;font-size:18px;letter-spacing:1px;fill:#e9c47d}.label{font-family:Arial,sans-serif;font-weight:700;font-size:23px;fill:#f8fafc}.small{font-family:Arial,sans-serif;font-weight:400;font-size:17px;fill:#b8c7d9}.arrowtext{font-family:Arial,sans-serif;font-weight:700;font-size:42px;fill:#7dd3fc}.box{fill:#111f33;stroke:#314b69;stroke-width:2}.goldbox{fill:#241d1a;stroke:#d4a85f;stroke-width:2}.cyanbox{fill:#0d2330;stroke:#4db7d6;stroke-width:2}.line{fill:none;stroke:#7dd3fc;stroke-width:4;marker-end:url(#arrow)}
+    </style>
+  </defs>
+  <rect width="1536" height="1024" rx="48" fill="url(#bg)"/>
+  <circle cx="1310" cy="128" r="260" fill="#31265c" opacity=".18"/><circle cx="180" cy="860" r="300" fill="#0e7490" opacity=".12"/>
+  <text x="96" y="96" class="title">Singularity architecture</text>
+  <text x="96" y="132" class="sub">One evidence contract, multiple clients and deployment runtimes</text>
+
+  <text x="96" y="206" class="section">CLIENTS</text>
+  <g filter="url(#shadow)">
+    <rect x="96" y="232" width="250" height="94" rx="20" class="box"/><text x="221" y="274" text-anchor="middle" class="label">Web app</text><text x="221" y="302" text-anchor="middle" class="small">Recall · Remember · Recent</text>
+    <rect x="96" y="350" width="250" height="94" rx="20" class="box"/><text x="221" y="392" text-anchor="middle" class="label">AI agents</text><text x="221" y="420" text-anchor="middle" class="small">ChatGPT · Codex · MCP</text>
+    <rect x="96" y="468" width="250" height="94" rx="20" class="box"/><text x="221" y="510" text-anchor="middle" class="label">Obsidian</text><text x="221" y="538" text-anchor="middle" class="small">Bidirectional evidence sync</text>
+  </g>
+
+  <text x="432" y="206" class="section">SECURITY + API</text>
+  <g filter="url(#shadow)">
+    <rect x="432" y="250" width="270" height="118" rx="22" class="cyanbox"/><text x="567" y="296" text-anchor="middle" class="label">Authentication</text><text x="567" y="327" text-anchor="middle" class="small">Bearer token</text><text x="567" y="351" text-anchor="middle" class="small">OAuth 2.0 + PKCE</text>
+    <rect x="432" y="418" width="270" height="118" rx="22" class="cyanbox"/><text x="567" y="464" text-anchor="middle" class="label">Unified API</text><text x="567" y="495" text-anchor="middle" class="small">MCP tools + REST</text><text x="567" y="519" text-anchor="middle" class="small">Shared fetch handler</text>
+  </g>
+
+  <text x="788" y="206" class="section">EVIDENCE MEMORY</text>
+  <g filter="url(#shadow)">
+    <rect x="788" y="232" width="288" height="92" rx="20" class="goldbox"/><text x="932" y="272" text-anchor="middle" class="label">Observation</text><text x="932" y="299" text-anchor="middle" class="small">Raw content + provenance</text>
+    <rect x="788" y="354" width="288" height="92" rx="20" class="goldbox"/><text x="932" y="394" text-anchor="middle" class="label">Atomic extraction</text><text x="932" y="421" text-anchor="middle" class="small">Facts · kind · time · entities</text>
+    <rect x="788" y="476" width="288" height="92" rx="20" class="goldbox"/><text x="932" y="516" text-anchor="middle" class="label">Versioned Claims</text><text x="932" y="543" text-anchor="middle" class="small">Active · historical · contested</text>
+    <rect x="788" y="598" width="288" height="92" rx="20" class="goldbox"/><text x="932" y="638" text-anchor="middle" class="label">Knowledge graph</text><text x="932" y="665" text-anchor="middle" class="small">Entity · relation · temporal fact</text>
+  </g>
+
+  <text x="1162" y="206" class="section">RUNTIMES</text>
+  <g filter="url(#shadow)">
+    <rect x="1162" y="250" width="278" height="142" rx="22" class="box"/><text x="1301" y="296" text-anchor="middle" class="label">Cloudflare</text><text x="1301" y="329" text-anchor="middle" class="small">Workers · D1 · Vectorize</text><text x="1301" y="354" text-anchor="middle" class="small">KV · Workers AI</text>
+    <rect x="1162" y="430" width="278" height="142" rx="22" class="box"/><text x="1301" y="476" text-anchor="middle" class="label">Self-hosted</text><text x="1301" y="509" text-anchor="middle" class="small">Fastify · SQLite · sqlite-vec</text><text x="1301" y="534" text-anchor="middle" class="small">Local KV · configurable models</text>
+  </g>
+
+  <path d="M346 397H408" class="line"/><path d="M702 477H764" class="line"/><path d="M1076 400H1138" class="line"/>
+  <path d="M932 324V340" class="line"/><path d="M932 446V462" class="line"/><path d="M932 568V584" class="line"/>
+  <text x="370" y="412" class="arrowtext">→</text><text x="720" y="492" class="arrowtext">→</text><text x="1095" y="415" class="arrowtext">→</text>
+  <text x="918" y="348" class="arrowtext">↓</text><text x="918" y="470" class="arrowtext">↓</text><text x="918" y="592" class="arrowtext">↓</text>
+
+  <rect x="96" y="764" width="1344" height="154" rx="28" fill="#0b1b29" stroke="#31516d" stroke-width="2"/>
+  <text x="134" y="811" class="section">VERIFIED RECALL + OPERATIONS</text>
+  <text x="134" y="858" class="label">Hybrid retrieval → RRF → active Claim ledger → structured synthesis → server validation → citations</text>
+  <text x="134" y="891" class="small">Observatory: memory health · repair queues · vector runtime · HTTP/model/memory traces · quality review</text>
+</svg>

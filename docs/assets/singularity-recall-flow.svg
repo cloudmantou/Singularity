@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1536" height="1024" viewBox="0 0 1536 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Singularity verified recall flow</title>
+  <desc id="desc">A question moves through hybrid retrieval, reciprocal rank fusion, active Claim checks, structured synthesis, server validation, and a cited answer.</desc>
+  <defs>
+    <linearGradient id="bg2" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#07111f"/><stop offset="1" stop-color="#17132a"/></linearGradient>
+    <filter id="shadow2"><feDropShadow dx="0" dy="12" stdDeviation="15" flood-color="#000" flood-opacity=".35"/></filter>
+    <marker id="arrow2" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0 0l12 6-12 6z" fill="#e7bd72"/></marker>
+    <style>
+      .title{font-family:Arial,sans-serif;font-weight:700;font-size:42px;fill:#fff}.sub{font-family:Arial,sans-serif;font-weight:400;font-size:20px;fill:#a9bbd0}.step{font-family:Arial,sans-serif;font-weight:700;font-size:18px;letter-spacing:2px;fill:#e9c47d}.label{font-family:Arial,sans-serif;font-weight:700;font-size:24px;fill:#f8fafc}.small{font-family:Arial,sans-serif;font-weight:400;font-size:17px;fill:#b8c7d9}.arrowtext{font-family:Arial,sans-serif;font-weight:700;font-size:42px;fill:#e7bd72}.box{fill:#111f33;stroke:#31516d;stroke-width:2}.gold{fill:#281f18;stroke:#d2a24f;stroke-width:2}.cyan{fill:#0c2531;stroke:#43b9d5;stroke-width:2}.line{fill:none;stroke:#e7bd72;stroke-width:4;marker-end:url(#arrow2)}
+    </style>
+  </defs>
+  <rect width="1536" height="1024" rx="48" fill="url(#bg2)"/>
+  <circle cx="1390" cy="150" r="280" fill="#4c1d95" opacity=".12"/><circle cx="100" cy="930" r="300" fill="#0e7490" opacity=".12"/>
+  <text x="96" y="96" class="title">From a question to a defensible answer</text>
+  <text x="96" y="132" class="sub">Retrieval proposes candidates. Claims decide what the answer may say.</text>
+
+  <g filter="url(#shadow2)">
+    <rect x="86" y="220" width="278" height="142" rx="24" class="gold"/>
+    <text x="118" y="254" class="step">01 · ASK</text><text x="225" y="300" text-anchor="middle" class="label">Natural-language query</text><text x="225" y="332" text-anchor="middle" class="small">intent · tags · time window</text>
+
+    <rect x="460" y="180" width="326" height="222" rx="24" class="box"/>
+    <text x="492" y="214" class="step">02 · RETRIEVE</text><text x="623" y="258" text-anchor="middle" class="label">Independent signals</text><text x="515" y="302" class="small">● dense vectors</text><text x="515" y="333" class="small">● keyword + lexical</text><text x="515" y="364" class="small">● entity + relation + time</text>
+
+    <rect x="884" y="220" width="278" height="142" rx="24" class="cyan"/>
+    <text x="916" y="254" class="step">03 · FUSE</text><text x="1023" y="300" text-anchor="middle" class="label">RRF + reranking</text><text x="1023" y="332" text-anchor="middle" class="small">recency · importance · confidence</text>
+
+    <rect x="1258" y="220" width="192" height="142" rx="24" class="gold"/>
+    <text x="1290" y="254" class="step">04 · FILTER</text><text x="1354" y="300" text-anchor="middle" class="label">Claim ledger</text><text x="1354" y="332" text-anchor="middle" class="small">active + answerable</text>
+  </g>
+
+  <path d="M364 291H436" class="line"/><path d="M786 291H860" class="line"/><path d="M1162 291H1234" class="line"/>
+  <text x="393" y="306" class="arrowtext">→</text><text x="816" y="306" class="arrowtext">→</text><text x="1191" y="306" class="arrowtext">→</text>
+
+  <g filter="url(#shadow2)">
+    <rect x="170" y="554" width="326" height="170" rx="24" class="box"/>
+    <text x="202" y="590" class="step">07 · PRESENT</text><text x="333" y="637" text-anchor="middle" class="label">Answer + citations</text><text x="333" y="672" text-anchor="middle" class="small">sources · conflicts · why recalled</text>
+
+    <rect x="605" y="522" width="326" height="234" rx="24" class="cyan"/>
+    <text x="637" y="558" class="step">06 · VALIDATE</text><text x="768" y="604" text-anchor="middle" class="label">Server trust gate</text><text x="660" y="646" class="small">✓ known refs</text><text x="660" y="677" class="small">✓ no conflict leakage</text><text x="660" y="708" class="small">✓ language + entailment</text>
+
+    <rect x="1040" y="554" width="326" height="170" rx="24" class="gold"/>
+    <text x="1072" y="590" class="step">05 · SYNTHESIZE</text><text x="1203" y="637" text-anchor="middle" class="label">Structured paragraphs</text><text x="1203" y="672" text-anchor="middle" class="small">{ text, refs, kind }</text>
+  </g>
+
+  <path d="M1354 362V478H1203V530" class="line"/><path d="M1040 639H955" class="line"/><path d="M605 639H520" class="line"/>
+  <text x="1339" y="450" class="arrowtext">↓</text><text x="980" y="654" class="arrowtext">←</text><text x="545" y="654" class="arrowtext">←</text>
+
+  <rect x="170" y="840" width="1196" height="86" rx="24" fill="#171d2b" stroke="#5a506e" stroke-width="2"/>
+  <text x="768" y="877" text-anchor="middle" class="label">Fail closed: unsupported prose is removed, repaired, or replaced with insufficient evidence</text>
+  <text x="768" y="906" text-anchor="middle" class="small">Association context helps navigation but never becomes factual support</text>
+</svg>
