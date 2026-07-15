@@ -153,6 +153,12 @@ The server rejects or repairs output when it contains:
 
 Citations are rendered after validation. The model does not get to invent the final citation mapping.
 
+### Answer latency and verified caching
+
+Recall reports retrieval, generation, repair, entailment-verification, total latency, model-call count, verifier usage, and cache-hit state as separate fields. A successful answer may be cached briefly, but only after Claim and citation validation completes. The cache key binds the authenticated principal and Vault, normalized question, retrieval policy, related-context snapshot, active Claim content and versions, conflict IDs, answerability policy, and generator/verifier model policy. Failed, partial, or unverified answers are never cached.
+
+The cache is an optimization, not a knowledge source. A Claim version or conflict change produces a new key, and cache hits still emit the same ordered draft/final stream contract as a generated answer.
+
 ## Data and trust boundaries
 
 | Boundary | Source of truth | What must not cross the boundary |
@@ -171,6 +177,7 @@ Citations are rendered after validation. The model does not get to invent the fi
 - Worker entry point and scheduled maintenance
 - D1 for relational state and audit records
 - Vectorize for entry and Claim embeddings
+- Vectorize metadata-isolated entity ANN candidates, optionally in a dedicated namespace
 - KV for OAuth state
 - Workers AI or an OpenAI-compatible provider
 - Static assets served by Workers Assets
@@ -179,11 +186,13 @@ Citations are rendered after validation. The model does not get to invent the fi
 
 - Fastify front door around the same Worker fetch handler
 - SQLite adapters for D1 and KV behavior
-- sqlite-vec plus lexical search for vector retrieval
+- sqlite-vec plus lexical search for entry, Claim, and entity retrieval
 - persistent database volume
 - reverse proxy for public HTTPS
 
 The shared fetch handler keeps protocol and memory behavior consistent; adapters isolate platform-specific storage.
+
+Entity resolution always checks canonical names, aliases, and stable external IDs before ANN search. ANN results only create review candidates; they never silently merge identities. Entity merges synchronize the durable entity graph and the regenerable ANN projection, while stale sqlite-vec rows are removed before Top-K selection.
 
 ## Security and privacy posture
 
@@ -194,6 +203,8 @@ Current code includes:
 - a redirect allowlist, route-specific rate limits, bounded request bodies, and path traversal checks;
 - masked settings responses and telemetry redaction before persistence;
 - backup-integrity and audit-chain verification before restore.
+
+Self-host request budgets separately limit model calls, maintenance, imports, and MCP traffic. The trusted owner credential receives an IP-plus-fingerprint bucket; unknown or invalid credentials share the IP-only bucket so rotating bogus tokens cannot bypass limits. Raw credentials are never stored in limiter keys. The production Docker profile runs as a non-root user with a read-only root filesystem, dropped capabilities, bounded resources, and an explicit health check.
 
 Public documentation, demo media, and judge testing must use synthetic data. Never submit real personal-memory traces. Private testing instructions may contain only scoped access to an isolated synthetic deployment—never the owner's long-lived token.
 
@@ -206,6 +217,8 @@ The Observatory is part of the product, not a debugging afterthought. It exposes
 - system and vector-runtime health;
 - HTTP, model, and memory-event traces;
 - quality-review queues for duplicates, entity merges, and conflicts.
+
+The web Knowledge Review screen is the action surface for those queues. It keeps factual conflicts, entity identity proposals, and similar-memory decisions separate, requires explicit outcomes, and records accepted decisions through the existing compliance audit path.
 
 That visibility matters because a memory system can return HTTP 200 while its extraction, vector, or answer-synthesis layer is degraded.
 

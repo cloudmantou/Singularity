@@ -3480,6 +3480,21 @@ export class D1Mock {
         if (
           s.includes("SELECT id, name, name_normalized, entity_type, aliases_json") &&
           s.includes("FROM sb_entities") &&
+          s.includes("id > ?") &&
+          s.includes("ORDER BY id")
+        ) {
+          const lastId = String(args[0] ?? "");
+          const limit = Number(args[1] ?? 250);
+          return {
+            results: [...db.entities]
+              .filter((entity: any) => String(entity.id) > lastId)
+              .sort((a: any, b: any) => String(a.id).localeCompare(String(b.id)))
+              .slice(0, limit),
+          };
+        }
+        if (
+          s.includes("SELECT id, name, name_normalized, entity_type, aliases_json") &&
+          s.includes("FROM sb_entities") &&
           s.includes("ORDER BY mention_count DESC")
         ) {
           const limit = Number(args[0] ?? 1000);

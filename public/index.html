@@ -17,6 +17,7 @@
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@2.44.0/tabler-icons.min.css" />
     <link rel="manifest" href="/manifest.json" />
     <link rel="stylesheet" href="/singularity-background.css" />
+    <link rel="stylesheet" href="/knowledge-review.css" />
     <style>
       /* ============================================================
        Singularity — AI Memory Engine
@@ -3324,6 +3325,7 @@
         </div>
         <nav class="sb-nav">
           <button class="sb-tab" id="sb-tab-observatory" onclick="switchTab('observatory')"><i class="ti ti-chart-histogram"></i><span data-i18n="nav.observatory">观测台</span></button>
+          <button class="sb-tab" id="sb-tab-review" onclick="switchTab('review')"><i class="ti ti-shield-check"></i><span data-i18n="nav.review">审核</span></button>
           <button class="sb-tab active" id="sb-tab-recall" onclick="switchTab('recall')"><i class="ti ti-search"></i><span data-i18n="nav.recall">回忆</span></button>
           <button class="sb-tab" id="sb-tab-recent" onclick="switchTab('recent')"><i class="ti ti-clock"></i><span data-i18n="nav.recent">近期</span></button>
           <button class="sb-tab" id="sb-tab-remember" onclick="switchTab('remember')"><i class="ti ti-plus"></i><span data-i18n="nav.remember">记住</span></button>
@@ -3479,6 +3481,26 @@
             </div>
           </div>
 
+          <div class="screen" id="screen-review">
+            <div class="review-shell">
+              <header class="review-head">
+                <div>
+                  <div class="review-kicker" data-i18n="review.kicker">Knowledge Review</div>
+                  <h1 data-i18n="review.title">知识审核</h1>
+                  <p data-i18n="review.subtitle">裁决冲突、实体身份和相似记忆。所有决定都会进入审计链。</p>
+                </div>
+                <button class="review-refresh" type="button" data-review-refresh data-i18n-title="review.refresh" title="刷新"><i class="ti ti-refresh"></i></button>
+              </header>
+              <div class="review-tabs" role="tablist">
+                <button class="review-tab active" type="button" data-review-tab="conflicts"><span data-i18n="review.conflicts">事实冲突</span><span data-review-count>0</span></button>
+                <button class="review-tab" type="button" data-review-tab="entities"><span data-i18n="review.entities">实体合并</span><span data-review-count>0</span></button>
+                <button class="review-tab" type="button" data-review-tab="memories"><span data-i18n="review.memories">相似记忆</span><span data-review-count>0</span></button>
+              </div>
+              <div class="review-status" data-review-status aria-live="polite"><span data-review-total>0</span></div>
+              <div class="review-list" data-review-list></div>
+            </div>
+          </div>
+
           <div class="screen active" id="screen-recall">
             <div id="recall-messages">
               <div class="recall-hero" id="recall-welcome">
@@ -3574,6 +3596,7 @@
 
         <div id="navbar">
           <button class="nav-tab" id="tab-observatory" onclick="switchTab('observatory')"><i class="ti ti-chart-histogram"></i><span data-i18n="nav.observatory">观测台</span></button>
+          <button class="nav-tab" id="tab-review" onclick="switchTab('review')"><i class="ti ti-shield-check"></i><span data-i18n="nav.review">审核</span></button>
           <button class="nav-tab active" id="tab-recall" onclick="switchTab('recall')"><i class="ti ti-search"></i><span data-i18n="nav.recall">回忆</span></button>
           <button class="nav-tab" id="tab-recent" onclick="switchTab('recent')"><i class="ti ti-clock"></i><span data-i18n="nav.recent">近期</span></button>
           <button class="nav-tab" id="tab-remember" onclick="switchTab('remember')"><i class="ti ti-plus"></i><span data-i18n="nav.remember">记住</span></button>
@@ -3829,6 +3852,7 @@
     </aside>
 
     <script src="utils.js"></script>
+    <script src="knowledge-review.js"></script>
     <script>
       // Re-apply dynamic labels when language changes (status, open lists)
       window.addEventListener('sb:langchange', () => {
@@ -3837,6 +3861,9 @@
           if (typeof loadTags === 'function') loadTags()
           if (currentTab === 'recent' && typeof renderRecent === 'function' && allEntries) {
             renderRecent(allEntries)
+          }
+          if (currentTab === 'review' && typeof knowledgeReview !== 'undefined') {
+            knowledgeReview.render()
           }
         } catch (_) {}
       })
@@ -4004,12 +4031,22 @@
         const sbTab = document.getElementById('sb-tab-' + tab)
         if (sbTab) sbTab.classList.add('active')
         if (tab === 'recent') loadRecent()
+        if (tab === 'review') knowledgeReview.load()
         if (tab === 'observatory') {
           obsRefresh()
         } else {
           obsStopAuto()
         }
       }
+
+      const knowledgeReview = SingularityKnowledgeReview.createKnowledgeReviewController({
+        root: document.getElementById('screen-review'),
+        t,
+        api: SingularityKnowledgeReview.createKnowledgeReviewApi({
+          getBaseUrl: () => WORKER_URL,
+          getToken: () => AUTH_TOKEN,
+        }),
+      })
 
       /* ---------- Observatory (embedded right panel) ---------- */
       let _obsTimer = null

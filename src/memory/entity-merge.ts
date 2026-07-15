@@ -1,4 +1,5 @@
 import { ensureEntityDataModel, ensureEntityResolutionDataModel } from "./entities";
+import type { EntityEmbeddingIndex } from "./entity-embedding-index";
 import { distinctFactEvidenceCountSql } from "./fact-evidence";
 import { prepareComplianceAuditEvent } from "./quality";
 
@@ -253,7 +254,10 @@ function guardedAuditStatement(
 }
 
 export class D1EntityMergeExecutor {
-  constructor(private readonly db: D1Database) {}
+  constructor(
+    private readonly db: D1Database,
+    private readonly entityEmbeddingIndex?: EntityEmbeddingIndex
+  ) {}
 
   async resolve(input: EntityMergeInput): Promise<EntityMergeResult> {
     const candidateId = boundedText(input.candidateId, 256);
@@ -584,12 +588,48 @@ export class D1EntityMergeExecutor {
     if (Number(results[finalStatementIndex]?.meta?.changes ?? 0) !== 1) {
       throw new EntityMergeCandidateUnavailableError(lock.candidateId);
     }
+    await this.syncEmbeddingProjection(source.id, target.id);
     return {
       candidateId: lock.candidateId,
       sourceEntityId: source.id,
       targetEntityId: target.id,
       state: "merged",
     };
+  }
+
+  private async syncEmbeddingProjection(
+    sourceEntityId: string,
+    targetEntityId: string
+  ): Promise<void> {
+    if (!this.entityEmbeddingIndex) return;
+    try {
+      await this.entityEmbeddingIndex.delete(sourceEntityId);
+      const embeddings = await this.db.prepare(
+        `SELECT embedding_fingerprint, embedding_json, updated_at
+         FROM sb_entity_embeddings WHERE entity_id = ?`
+      ).bind(targetEntityId).all<{
+        embedding_fingerprint: string;
+        embedding_json: string;
+        updated_at: number;
+      }>();
+      for (const row of embeddings.results ?? []) {
+        let vector: number[] = [];
+        try { vector = JSON.parse(row.embedding_json); } catch { vector = []; }
+        if (!Array.isArray(vector) || !vector.length || !vector.every(Number.isFinite)) continue;
+        await this.entityEmbeddingIndex.upsert({
+          entityId: targetEntityId,
+          vector,
+          fingerprint: row.embedding_fingerprint,
+          updatedAt: row.updated_at,
+        });
+      }
+    } catch (error) {
+      console.error("Entity embedding projection sync failed after merge", {
+        sourceEntityId,
+        targetEntityId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   private async loadActiveEntity(entityId: string): Promise<EntityRow | null> {

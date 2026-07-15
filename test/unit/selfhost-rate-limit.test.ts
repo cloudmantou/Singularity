@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { createFixedWindowRateLimiter } from "../../src/selfhost/rate-limit";
+import {
+  classifyExpensiveRoute,
+  createFixedWindowRateLimiter,
+  createRateLimitIdentity,
+} from "../../src/selfhost/rate-limit";
 
 describe("fixed-window rate limiter", () => {
   it("allows the configured number of attempts and then returns retry timing", () => {
@@ -20,5 +24,39 @@ describe("fixed-window rate limiter", () => {
     expect(limiter.consume("client-a", 500).allowed).toBe(false);
     expect(limiter.consume("client-b", 500).allowed).toBe(true);
     expect(limiter.consume("client-a", 1_000).allowed).toBe(true);
+  });
+
+  it("classifies model, maintenance, import, and MCP endpoints", () => {
+    expect(classifyExpensiveRoute("GET", "/recall")).toBe("model");
+    expect(classifyExpensiveRoute("POST", "/settings/models/test")).toBe("model");
+    expect(classifyExpensiveRoute("POST", "/vectorize-pending")).toBe("maintenance");
+    expect(classifyExpensiveRoute("POST", "/import")).toBe("import");
+    expect(classifyExpensiveRoute("POST", "/mcp")).toBe("mcp");
+    expect(classifyExpensiveRoute("GET", "/tags")).toBeNull();
+  });
+
+  it("only isolates the trusted owner credential and groups unknown credentials by IP", () => {
+    const trustedAuthorization = "Bearer private-token";
+    const key = createRateLimitIdentity(
+      "127.0.0.1",
+      trustedAuthorization,
+      trustedAuthorization
+    );
+    expect(key).not.toContain("private-token");
+    expect(key).toBe(createRateLimitIdentity(
+      "127.0.0.1",
+      trustedAuthorization,
+      trustedAuthorization
+    ));
+    expect(key).not.toBe(createRateLimitIdentity("127.0.0.1"));
+    expect(createRateLimitIdentity(
+      "127.0.0.1",
+      "Bearer attacker-token-a",
+      trustedAuthorization
+    )).toBe(createRateLimitIdentity(
+      "127.0.0.1",
+      "Bearer attacker-token-b",
+      trustedAuthorization
+    ));
   });
 });

@@ -9,6 +9,14 @@ const observatoryHtml = readFileSync(
 );
 
 describe("web memory mutation API contract", () => {
+  it("loads Knowledge Review as an external, authenticated frontend module", () => {
+    expect(html).toContain('<link rel="stylesheet" href="/knowledge-review.css" />');
+    expect(html).toContain('<script src="knowledge-review.js"></script>');
+    expect(html).toContain('id="screen-review"');
+    expect(html).toContain("switchTab('review')");
+    expect(html).toContain("knowledgeReview.load()");
+  });
+
   it("scopes cached connection credentials to the page origin", () => {
     expect(html).toContain("resolveStoredConnection(localStorage, origin)");
     expect(html).toContain(

@@ -11,7 +11,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
+import Fastify, { LogController, type FastifyReply, type FastifyRequest } from "fastify";
 import dotenv from "dotenv";
 import worker, { initializeDatabase } from "./index";
 import {
@@ -27,7 +27,12 @@ import {
 import { getEffectiveModelSettings } from "./settings/store";
 import { isDevLocalProvider } from "./settings/model-settings";
 import { flushTelemetry } from "./telemetry";
-import { createFixedWindowRateLimiter } from "./selfhost/rate-limit";
+import {
+  classifyExpensiveRoute,
+  createFixedWindowRateLimiter,
+  createRateLimitIdentity,
+  type ExpensiveRouteClass,
+} from "./selfhost/rate-limit";
 import {
   isKnownWorkerRoute,
   resolvePublicAssetPath,
@@ -57,6 +62,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || "8787", 10);
 const HOST = process.env.HOST || "0.0.0.0";
 const PUBLIC_DIR = path.join(__dirname, "..", "public");
+
+function positiveEnvInt(name: string, fallback: number): number {
+  const value = Number(process.env[name] ?? fallback);
+  return Number.isFinite(value) && value > 0 ? Math.trunc(value) : fallback;
+}
 
 const MIME: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -117,7 +127,7 @@ async function main() {
 
   const app = Fastify({
     logger: true,
-    disableRequestLogging: true,
+    logController: new LogController({ disableRequestLogging: true }),
     // Keep the control plane narrow by default. Import and MCP receive explicit
     // route-level limits below.
     bodyLimit: 256 * 1024,
@@ -145,6 +155,24 @@ async function main() {
     limit: 120,
     windowMs: 60_000,
   });
+  const expensiveLimiters: Record<ExpensiveRouteClass, ReturnType<typeof createFixedWindowRateLimiter>> = {
+    model: createFixedWindowRateLimiter({
+      limit: positiveEnvInt("MODEL_REQUESTS_PER_MINUTE", 30),
+      windowMs: 60_000,
+    }),
+    maintenance: createFixedWindowRateLimiter({
+      limit: positiveEnvInt("MAINTENANCE_REQUESTS_PER_MINUTE", 12),
+      windowMs: 60_000,
+    }),
+    import: createFixedWindowRateLimiter({
+      limit: positiveEnvInt("IMPORT_REQUESTS_PER_HOUR", 4),
+      windowMs: 60 * 60_000,
+    }),
+    mcp: createFixedWindowRateLimiter({
+      limit: positiveEnvInt("MCP_REQUESTS_PER_MINUTE", 240),
+      windowMs: 60_000,
+    }),
+  };
   let rejectedUnknownRoutes = 0;
 
   function oauthRateLimitPreHandler(
@@ -208,6 +236,29 @@ async function main() {
       done(null, body);
     }
   );
+
+  app.addHook("preHandler", async (req, reply) => {
+    const pathname = req.url.split("?")[0] || "/";
+    const routeClass = classifyExpensiveRoute(req.method, pathname);
+    if (!routeClass) return;
+    const authorization = Array.isArray(req.headers.authorization)
+      ? req.headers.authorization[0]
+      : req.headers.authorization;
+    const trustedAuthorization = env.AUTH_TOKEN ? `Bearer ${env.AUTH_TOKEN}` : undefined;
+    const identity = createRateLimitIdentity(
+      req.ip || "unknown",
+      authorization,
+      trustedAuthorization
+    );
+    const result = expensiveLimiters[routeClass].consume(identity);
+    reply.header("X-RateLimit-Remaining", String(result.remaining));
+    if (result.allowed) return;
+    return reply
+      .code(429)
+      .header("Retry-After", String(result.retryAfterSeconds))
+      .header("Cache-Control", "no-store")
+      .send({ ok: false, error: "Too many expensive requests. Try again later." });
+  });
   app.addContentTypeParser(
     "application/json",
     { parseAs: "string" },

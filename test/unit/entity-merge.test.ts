@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   D1EntityMergeExecutor,
   EntityMergeCandidateUnavailableError,
@@ -134,7 +134,12 @@ describe("Entity Merge Executor", () => {
        VALUES ('fs-source-ai', 'relation-source', 'memory-3', 'obs-ai', 2)`
     ).run();
 
-    const result = await new D1EntityMergeExecutor(db).resolve({
+    const entityIndex = {
+      search: vi.fn(),
+      upsert: vi.fn().mockResolvedValue(undefined),
+      delete: vi.fn().mockResolvedValue(undefined),
+    };
+    const result = await new D1EntityMergeExecutor(db, entityIndex).resolve({
       candidateId: "merge-candidate",
       decision: "accept",
       actorType: "user",
@@ -149,6 +154,12 @@ describe("Entity Merge Executor", () => {
       targetEntityId: "entity-target",
       state: "merged",
     });
+    expect(entityIndex.delete).toHaveBeenCalledWith("entity-source");
+    expect(entityIndex.upsert).toHaveBeenCalledTimes(2);
+    expect(entityIndex.upsert).toHaveBeenCalledWith(expect.objectContaining({
+      entityId: "entity-target",
+      fingerprint: "fp-source",
+    }));
     expect(raw.prepare(
       `SELECT lifecycle_state, merged_into_entity_id, merged_at, mention_count
        FROM sb_entities WHERE id = 'entity-source'`

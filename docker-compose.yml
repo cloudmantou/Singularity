@@ -13,6 +13,29 @@ services:
       # Production self-hosting must fail closed; use ANSWERABILITY_MODE=shadow
       # explicitly only for evaluation/data-collection environments.
       ANSWERABILITY_MODE: ${ANSWERABILITY_MODE:-enforce}
+      VERIFIED_ANSWER_CACHE_TTL_MS: ${VERIFIED_ANSWER_CACHE_TTL_MS:-30000}
+      VERIFIED_ANSWER_CACHE_MAX_ENTRIES: ${VERIFIED_ANSWER_CACHE_MAX_ENTRIES:-256}
+      MODEL_REQUESTS_PER_MINUTE: ${MODEL_REQUESTS_PER_MINUTE:-30}
+      MAINTENANCE_REQUESTS_PER_MINUTE: ${MAINTENANCE_REQUESTS_PER_MINUTE:-12}
+      MCP_REQUESTS_PER_MINUTE: ${MCP_REQUESTS_PER_MINUTE:-240}
+      IMPORT_REQUESTS_PER_HOUR: ${IMPORT_REQUESTS_PER_HOUR:-4}
     volumes:
       - ./data:/app/data
     restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    cpus: 2.0
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3

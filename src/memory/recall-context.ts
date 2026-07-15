@@ -97,6 +97,16 @@ export interface VerifiedInsightResult {
   citations?: InsightCitation[];
   answerabilityWarnings?: AnswerabilityWarning[];
   answerabilityMode?: AnswerabilityMode;
+  performance?: {
+    cacheHit: boolean;
+    retrievalMs: number;
+    generationMs: number;
+    repairMs: number;
+    verificationMs: number;
+    totalMs: number;
+    modelCalls: number;
+    verifierModelUsed: boolean;
+  };
 }
 
 export function normalizeInsightContext<TClaim>(

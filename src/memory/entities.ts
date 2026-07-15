@@ -10,6 +10,7 @@ import {
   ENTITY_RESOLUTION_SCHEMA_STATEMENTS,
   type EntityExternalId,
 } from "./entity-resolution";
+import type { EntityEmbeddingIndex } from "./entity-embedding-index";
 import {
   FACT_RESOLUTION_SCHEMA_STATEMENTS,
 } from "./fact-resolution";
@@ -405,13 +406,14 @@ export async function attachEntitiesToMemory(
       embeddings: Map<string, number[]>;
       fingerprint: string;
     } | null>;
+    entityEmbeddingIndex?: EntityEmbeddingIndex;
     createdAt: number;
   }
 ): Promise<{ entityIds: string[]; relationIds: string[] }> {
   await ensureEntityResolutionDataModel(db);
   const entityIds: string[] = [];
   const byNormalized = new Map<string, string>();
-  const entityResolver = new D1EntityResolver(db);
+  const entityResolver = new D1EntityResolver(db, input.entityEmbeddingIndex);
   const names = [...new Set(input.entities.map((draft) => draft.name.trim()).filter(Boolean))];
   const embeddingBatch = input.resolveEntityEmbeddings
     ? await input.resolveEntityEmbeddings(names).catch(() => null)

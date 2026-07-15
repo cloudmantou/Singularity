@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 export interface FixedWindowRateLimiterOptions {
   limit: number;
   windowMs: number;
@@ -61,4 +63,43 @@ export function createFixedWindowRateLimiter(options: FixedWindowRateLimiterOpti
       };
     },
   };
+}
+
+export type ExpensiveRouteClass = "model" | "maintenance" | "import" | "mcp";
+
+const MODEL_ROUTES = new Set(["GET /recall", "POST /settings/models/test"]);
+const MAINTENANCE_ROUTES = new Set([
+  "POST /classify-pending",
+  "POST /extract-pending",
+  "POST /maintenance/claim-vectors/backfill",
+  "POST /maintenance/claim-vectors/retry-failed",
+  "POST /maintenance/mutations/reconcile",
+  "POST /maintenance/vector-index/backfill",
+  "POST /settings/models/reindex",
+  "POST /vectorize-pending",
+]);
+
+export function classifyExpensiveRoute(
+  method: string,
+  pathname: string
+): ExpensiveRouteClass | null {
+  const key = `${method.toUpperCase()} ${pathname}`;
+  if (pathname === "/mcp") return "mcp";
+  if (key === "POST /import") return "import";
+  if (MODEL_ROUTES.has(key)) return "model";
+  if (MAINTENANCE_ROUTES.has(key)) return "maintenance";
+  return null;
+}
+
+export function createRateLimitIdentity(
+  ip: string,
+  authorization?: string,
+  trustedAuthorization?: string
+): string {
+  const auth = String(authorization ?? "").trim();
+  const trusted = String(trustedAuthorization ?? "").trim();
+  const fingerprint = auth && trusted && auth === trusted
+    ? createHash("sha256").update(auth).digest("hex").slice(0, 24)
+    : "anonymous";
+  return `${ip || "unknown"}:${fingerprint}`;
 }

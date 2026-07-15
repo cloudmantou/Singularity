@@ -187,6 +187,21 @@ describe("SqliteVectorizeIndex", () => {
     expect(matches.map((match) => match.id)).toEqual(["keep-a", "keep-b"]);
   });
 
+  it("supports Vectorize $nin source filters used to isolate entry, claim, and entity vectors", async () => {
+    await vec.insert([
+      { id: "entry", values: [0.8, 0.2], metadata: { source: "api" } },
+      { id: "claim", values: [1, 0], metadata: { source: "singularity-claim" } },
+      { id: "entity", values: [0.99, 0.01], metadata: { source: "singularity-entity" } },
+    ]);
+
+    const { matches } = await vec.query([1, 0], {
+      topK: 5,
+      filter: { source: { $nin: ["singularity-claim", "singularity-entity"] } },
+    } as any);
+
+    expect(matches.map((match) => match.id)).toEqual(["entry"]);
+  });
+
   it("uses sqlite-vec KNN for embedding_fingerprint filters before JSON fallback", async () => {
     await vec.insert([
       { id: "active-a", values: [1, 0], metadata: { parentId: "active", embedding_fingerprint: "ep2_active" } },

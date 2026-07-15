@@ -9,6 +9,7 @@ import type { Env } from "../index";
 import { SqliteD1Database } from "./sqlite-d1";
 import { SqliteKVNamespace } from "./sqlite-kv";
 import { SqliteVectorizeIndex } from "./sqlite-vectorize";
+import { SqliteEntityEmbeddingIndex } from "./sqlite-entity-index";
 import { formatUnknownReason } from "./process-errors";
 
 export interface SelfhostOptions {
@@ -46,6 +47,7 @@ export function createSelfhostEnv(options: SelfhostOptions = {}): {
   const raw = openSqlite(databasePath);
   const d1 = new SqliteD1Database(raw);
   const vectorize = new SqliteVectorizeIndex(raw);
+  const entityEmbeddingIndex = new SqliteEntityEmbeddingIndex(raw);
   const kv = new SqliteKVNamespace(raw);
 
   // Stub Workers AI — createLLM/createEmbedding use OpenAI-compatible APIs when configured.
@@ -60,6 +62,7 @@ export function createSelfhostEnv(options: SelfhostOptions = {}): {
   const env: Env = {
     DB: d1 as unknown as D1Database,
     VECTORIZE: vectorize as unknown as VectorizeIndex,
+    ENTITY_EMBEDDING_INDEX: entityEmbeddingIndex,
     OAUTH_KV: kv as unknown as KVNamespace,
     AI: aiStub,
     AUTH_TOKEN: authToken.trim(),
@@ -88,6 +91,12 @@ export function createSelfhostEnv(options: SelfhostOptions = {}): {
     EMBEDDING_PROVIDER: process.env.EMBEDDING_PROVIDER,
     EMBEDDING_DIM: process.env.EMBEDDING_DIM,
     ANSWERABILITY_MODE: process.env.ANSWERABILITY_MODE,
+    VERIFIED_ANSWER_CACHE_TTL_MS: process.env.VERIFIED_ANSWER_CACHE_TTL_MS,
+    VERIFIED_ANSWER_CACHE_MAX_ENTRIES: process.env.VERIFIED_ANSWER_CACHE_MAX_ENTRIES,
+    VERIFIER_LLM_BASE_URL: process.env.VERIFIER_LLM_BASE_URL,
+    VERIFIER_LLM_API_KEY: process.env.VERIFIER_LLM_API_KEY,
+    VERIFIER_LLM_MODEL: process.env.VERIFIER_LLM_MODEL,
+    VERIFIER_LLM_EXTRA_BODY: process.env.VERIFIER_LLM_EXTRA_BODY,
   };
 
   return { env, db: raw, databasePath };

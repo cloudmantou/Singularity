@@ -1103,6 +1103,21 @@ export class SqliteVectorizeIndex {
     ) {
       clauses.push(`COALESCE(json_extract(${metadataExpression}, '$.source'), '') <> ?`);
       params.push((filter.source as Record<string, unknown>).$ne);
+    } else if (
+      filter.source &&
+      typeof filter.source === "object" &&
+      !Array.isArray(filter.source) &&
+      Array.isArray((filter.source as Record<string, unknown>).$nin)
+    ) {
+      const excluded = ((filter.source as Record<string, unknown>).$nin as unknown[])
+        .filter((value): value is string => typeof value === "string")
+        .slice(0, 20);
+      if (excluded.length) {
+        clauses.push(
+          `COALESCE(json_extract(${metadataExpression}, '$.source'), '') NOT IN (${excluded.map(() => "?").join(", ")})`
+        );
+        params.push(...excluded);
+      }
     }
     if (typeof filter.embedding_fingerprint === "string") {
       clauses.push(`json_extract(${metadataExpression}, '$.embedding_fingerprint') = ?`);

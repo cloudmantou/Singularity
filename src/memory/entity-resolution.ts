@@ -46,6 +46,7 @@ export interface EntityResolutionDecision {
 
 export interface EntityResolutionOptions {
   queryEmbedding?: number[] | null;
+  semanticCandidates?: Array<{ entityId: string; score: number }>;
   semanticReviewThreshold?: number;
   lexicalReviewThreshold?: number;
 }
@@ -304,7 +305,15 @@ export function decideEntityResolution(
   }
 
   const semanticThreshold = options.semanticReviewThreshold ?? 0.88;
-  const semantic = options.queryEmbedding
+  const indexedSemantic = (options.semanticCandidates ?? [])
+    .filter((item) => compatible.some((candidate) => candidate.id === item.entityId))
+    .map((item) => ({ ...item, matchedBy: "semantic" as const }));
+  const semantic = indexedSemantic.length > 0
+    ? indexedSemantic
+        .filter((candidate) => candidate.score >= semanticThreshold)
+        .sort((left, right) => right.score - left.score || left.entityId.localeCompare(right.entityId))
+        .slice(0, 10)
+    : options.queryEmbedding
     ? compatible
         .filter((candidate) => candidate.embedding != null)
         .map((candidate) => ({
@@ -411,7 +420,10 @@ export class D1EntityResolver implements EntityResolver {
   >();
   private schemaReady: Promise<void> | null = null;
 
-  constructor(private readonly db: D1Database) {}
+  constructor(
+    private readonly db: D1Database,
+    private readonly embeddingIndex: EntityEmbeddingIndex = new D1EntityEmbeddingIndex(db)
+  ) {}
 
   async resolve(
     draft: EntityResolutionDraft,
@@ -427,12 +439,22 @@ export class D1EntityResolver implements EntityResolver {
       rows.map((item) => item.candidate)
     );
     if (decision.action === "create") {
-      rows = await this.loadCandidates(context.embeddingFingerprint ?? null);
-      decision = decideEntityResolution(
-        { ...draft, name, entityType },
-        rows.map((item) => item.candidate),
-        { queryEmbedding: context.embedding ?? null }
-      );
+      const semanticMatches = await this.searchSemanticCandidates(context);
+      if (semanticMatches.length > 0) {
+        rows = await this.loadCandidatesByIds(semanticMatches.map((item) => item.entityId));
+        decision = decideEntityResolution(
+          { ...draft, name, entityType },
+          rows.map((item) => item.candidate),
+          { semanticCandidates: semanticMatches }
+        );
+      }
+      if (decision.action === "create") {
+        rows = await this.loadCandidates(null);
+        decision = decideEntityResolution(
+          { ...draft, name, entityType },
+          rows.map((item) => item.candidate)
+        );
+      }
     }
 
     const existing = decision.action === "use_existing"
@@ -472,6 +494,7 @@ export class D1EntityResolver implements EntityResolver {
       context
     );
     await this.persistEmbedding(entityId, context);
+    await this.indexEmbedding(entityId, context);
     if (decision.action === "review") {
       await this.persistMergeCandidates(entityId, decision, context);
     }
@@ -513,29 +536,24 @@ export class D1EntityResolver implements EntityResolver {
     const cacheKey = fingerprint ?? "";
     const cached = this.candidateCache.get(cacheKey);
     if (cached) return cached;
-    const { results } = await this.db.prepare(
-      `SELECT id, name, name_normalized, entity_type, aliases_json,
-              metadata_json, mention_count
-       FROM sb_entities
-       WHERE lifecycle_state = 'active'
-       ORDER BY mention_count DESC, updated_at DESC
-       LIMIT 1000`
-    ).all<EntityRow>();
-    const embeddingByEntity = new Map<string, number[]>();
-    if (fingerprint) {
-      const embeddings = await this.db.prepare(
-        `SELECT entity_id, embedding_json
-         FROM sb_entity_embeddings
-         WHERE embedding_fingerprint = ?
-         ORDER BY updated_at DESC
-         LIMIT 1000`
-      ).bind(fingerprint).all<{ entity_id: string; embedding_json: string }>();
-      for (const row of embeddings.results ?? []) {
-        const vector = parseStringArray(row.embedding_json).map(Number).filter(Number.isFinite);
-        if (vector.length > 0) embeddingByEntity.set(row.entity_id, vector);
-      }
+    const allRows: EntityRow[] = [];
+    let lastId = "";
+    const pageSize = 250;
+    while (true) {
+      const { results } = await this.db.prepare(
+        `SELECT id, name, name_normalized, entity_type, aliases_json,
+                metadata_json, mention_count
+         FROM sb_entities
+         WHERE lifecycle_state = 'active' AND id > ?
+         ORDER BY id
+         LIMIT ?`
+      ).bind(lastId, pageSize).all<EntityRow>();
+      const page = results ?? [];
+      allRows.push(...page);
+      if (page.length < pageSize) break;
+      lastId = page[page.length - 1].id;
     }
-    const loaded = (results ?? []).map((row) => ({
+    const loaded = allRows.map((row) => ({
       row,
       candidate: {
         id: row.id,
@@ -544,12 +562,53 @@ export class D1EntityResolver implements EntityResolver {
         entityType: row.entity_type,
         aliases: parseStringArray(row.aliases_json),
         externalIds: parseExternalIds(row.metadata_json),
-        embedding: embeddingByEntity.get(row.id) ?? null,
+        embedding: null,
         mentionCount: Number(row.mention_count ?? 0),
       },
     }));
     this.candidateCache.set(cacheKey, loaded);
     return loaded;
+  }
+
+  private async searchSemanticCandidates(
+    context: EntityResolverContext
+  ): Promise<EntityEmbeddingMatch[]> {
+    const vector = context.embedding?.map(Number).filter(Number.isFinite) ?? [];
+    const fingerprint = context.embeddingFingerprint?.trim() ?? "";
+    if (!vector.length || !fingerprint) return [];
+    try {
+      return await this.embeddingIndex.search({ vector, fingerprint, topK: 20 });
+    } catch (error) {
+      console.error("Entity ANN lookup failed; continuing with lexical resolution:", error);
+      return [];
+    }
+  }
+
+  private async loadCandidatesByIds(
+    entityIds: string[]
+  ): Promise<Array<{ row: EntityRow; candidate: EntityResolutionCandidate }>> {
+    const unique = [...new Set(entityIds.map((id) => id.trim()).filter(Boolean))].slice(0, 50);
+    if (!unique.length) return [];
+    const placeholders = unique.map(() => "?").join(", ");
+    const { results } = await this.db.prepare(
+      `SELECT id, name, name_normalized, entity_type, aliases_json,
+              metadata_json, mention_count
+       FROM sb_entities
+       WHERE lifecycle_state = 'active' AND id IN (${placeholders})`
+    ).bind(...unique).all<EntityRow>();
+    return (results ?? []).map((row) => ({
+      row,
+      candidate: {
+        id: row.id,
+        name: row.name,
+        nameNormalized: normalize(row.name),
+        entityType: row.entity_type,
+        aliases: parseStringArray(row.aliases_json),
+        externalIds: parseExternalIds(row.metadata_json),
+        embedding: null,
+        mentionCount: Number(row.mention_count ?? 0),
+      },
+    }));
   }
 
   private updateCandidateCache(
@@ -742,6 +801,22 @@ export class D1EntityResolver implements EntityResolver {
     ).bind(entityId, fingerprint, JSON.stringify(embedding), embedding.length, context.now).run();
   }
 
+  private async indexEmbedding(entityId: string, context: EntityResolverContext): Promise<void> {
+    const vector = context.embedding?.map(Number).filter(Number.isFinite) ?? [];
+    const fingerprint = context.embeddingFingerprint?.trim();
+    if (!fingerprint || vector.length === 0) return;
+    try {
+      await this.embeddingIndex.upsert({
+        entityId,
+        vector,
+        fingerprint,
+        updatedAt: context.now,
+      });
+    } catch (error) {
+      console.error("Entity ANN indexing failed; durable embedding remains available:", error);
+    }
+  }
+
   private async persistMergeCandidates(
     sourceEntityId: string,
     decision: EntityResolutionDecision,
@@ -763,3 +838,8 @@ export class D1EntityResolver implements EntityResolver {
     }
   }
 }
+import {
+  D1EntityEmbeddingIndex,
+  type EntityEmbeddingIndex,
+  type EntityEmbeddingMatch,
+} from "./entity-embedding-index";

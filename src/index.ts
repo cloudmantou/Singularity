@@ -9,7 +9,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpHandler } from "agents/mcp";
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { z } from "zod";
-import { createEmbedding, createEmbeddingFromResolved, createLLM, type EmbeddingProvider } from "./providers";
+import {
+  createEmbedding,
+  createEmbeddingFromResolved,
+  createLLM,
+  type EmbeddingProvider,
+  type LLMProvider,
+  type ProviderEnv,
+} from "./providers";
 import { collectCfSseText } from "./providers/cf-sse";
 import {
   applyModelSettingsPatch,
@@ -155,6 +162,10 @@ import {
 } from "./memory/recall-context";
 import { rankClaimAnswerability } from "./memory/query-answerability";
 import {
+  buildVerifiedAnswerCacheKey,
+  getVerifiedAnswerCache,
+} from "./memory/verified-answer-cache";
+import {
   prepareMemoryRevision,
   type MemoryRevisionEvent,
 } from "./memory/revisions";
@@ -193,6 +204,12 @@ import {
   normalizeEntityName,
 } from "./memory/entities";
 import {
+  D1EntityEmbeddingIndex,
+  ENTITY_VECTOR_SOURCE,
+  VectorizeEntityEmbeddingIndex,
+  type EntityEmbeddingIndex,
+} from "./memory/entity-embedding-index";
+import {
   buildParentVersionMetadataSnapshot,
   prepareParentUnitInsert,
   prepareParentVersionActivation,
@@ -203,9 +220,6 @@ import {
 } from "./memory/evidence-contract";
 import { runMigrations, MIGRATIONS } from "./migrations";
 import {
-  CONFLICT_CASE_STATES,
-  CONFLICT_RESOLUTIONS,
-  MERGE_CANDIDATE_STATES,
   ensureConflictClaimSchema,
   prepareComplianceAuditEvent,
   prepareConflictCase,
@@ -225,7 +239,6 @@ import {
 } from "./memory/resolution-coordinator";
 import {
   D1EntityMergeExecutor,
-  ENTITY_MERGE_CANDIDATE_STATES,
   EntityMergeCandidateUnavailableError,
   EntityMergeEndpointUnavailableError,
   type EntityMergeCandidateState,
@@ -263,12 +276,20 @@ import {
   readClassificationQueueSnapshot,
   readExtractionQueueSnapshot,
 } from "./operations/queue-health";
+import {
+  handleQualityRoute,
+  type QualityRouteServices,
+} from "./routes/quality";
 
 export { CURRENT_CLASSIFICATION_VERSION } from "./operations/queue-health";
 
 export interface Env {
   DB: D1Database;
   VECTORIZE: VectorizeIndex;
+  /** Optional dedicated Cloudflare Vectorize namespace for entity ANN candidates. */
+  ENTITY_VECTORIZE?: VectorizeIndex;
+  /** Self-host injection point; not a Worker binding. */
+  ENTITY_EMBEDDING_INDEX?: EntityEmbeddingIndex;
   /**
    * Workers AI binding — used when external LLM/embedding env vars are not set.
    * Self-host provides a stub when only OpenAI-compatible APIs are configured.
@@ -308,6 +329,29 @@ export interface Env {
   EMBEDDING_DIM?: string;
   /** Claim answerability policy: shadow, warn, or enforce. */
   ANSWERABILITY_MODE?: string;
+  /** Optional verified-answer cache. Disabled when unset or zero. */
+  VERIFIED_ANSWER_CACHE_TTL_MS?: string;
+  VERIFIED_ANSWER_CACHE_MAX_ENTRIES?: string;
+  /** Optional independent OpenAI-compatible verifier. Falls back to the answer model. */
+  VERIFIER_LLM_BASE_URL?: string;
+  VERIFIER_LLM_API_KEY?: string;
+  VERIFIER_LLM_MODEL?: string;
+  VERIFIER_LLM_EXTRA_BODY?: string;
+}
+
+const entityEmbeddingIndexes = new WeakMap<object, EntityEmbeddingIndex>();
+
+function entityEmbeddingIndexForEnv(env: Env): EntityEmbeddingIndex {
+  if (env.ENTITY_EMBEDDING_INDEX) return env.ENTITY_EMBEDDING_INDEX;
+  const key = (env.ENTITY_VECTORIZE ?? env.DB) as unknown as object;
+  const cached = entityEmbeddingIndexes.get(key);
+  if (cached) return cached;
+  const vectorIndex = env.ENTITY_VECTORIZE ?? (env.SELFHOST === "1" ? null : env.VECTORIZE);
+  const index = vectorIndex
+    ? new VectorizeEntityEmbeddingIndex(vectorIndex)
+    : new D1EntityEmbeddingIndex(env.DB);
+  entityEmbeddingIndexes.set(key, index);
+  return index;
 }
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
@@ -676,6 +720,11 @@ function auditActorFromPrincipal(principal: AuthPrincipal): Pick<
     tokenId: principal.tokenId,
     vaultId: principal.vaultId,
   };
+}
+
+function recallCacheScope(principal: AuthPrincipal, vaultId: string | null): string {
+  if (principal.owner) return `owner:vault:${vaultId ?? "global"}`;
+  return `token:${principal.tokenId ?? "unknown"}:vault:${principal.vaultId ?? "unknown"}`;
 }
 
 async function safeRecordComplianceAuditEvent(
@@ -3890,7 +3939,7 @@ async function queryActiveVectors(
     returnMetadata: "all" as const,
     filter: {
       embedding_fingerprint: fingerprint,
-      source: { $ne: CLAIM_VECTOR_SOURCE },
+      source: { $nin: [CLAIM_VECTOR_SOURCE, ENTITY_VECTOR_SOURCE] },
     },
   };
   try {
@@ -7012,13 +7061,13 @@ function enforceInsightAnswerLanguage(
 }
 
 async function verifySynthesizedInsightEntailment(
-  llm: Awaited<ReturnType<typeof createLLM>>,
+  llm: LLMProvider,
   answer: string,
   claims: readonly CitableInsightClaim[],
   signal?: AbortSignal
-): Promise<Set<string>> {
+): Promise<{ supportedIds: Set<string>; modelCalled: boolean }> {
   const paragraphs = parseRenderedInsightParagraphs(answer);
-  if (!paragraphs.length) return new Set();
+  if (!paragraphs.length) return { supportedIds: new Set(), modelCalled: false };
   const claimsByRef = new Map(claims.map((claim) => [claim.ref.toUpperCase(), claim]));
   const deterministicIds = new Set<string>();
   const unresolved = paragraphs.filter((paragraph) => {
@@ -7031,7 +7080,7 @@ async function verifySynthesizedInsightEntailment(
     if (supported) deterministicIds.add(paragraph.id);
     return !supported;
   });
-  if (!unresolved.length) return deterministicIds;
+  if (!unresolved.length) return { supportedIds: deterministicIds, modelCalled: false };
 
   const verifierData = unresolved.map((paragraph) => ({
     id: paragraph.id,
@@ -7059,22 +7108,98 @@ ${JSON.stringify(verifierData)}`;
       response,
       unresolved.map((paragraph) => paragraph.id)
     );
-    if (!verdicts) return deterministicIds;
-    return new Set([
-      ...deterministicIds,
-      ...[...verdicts.entries()]
-        .filter(([, supported]) => supported)
-        .map(([id]) => id),
-    ]);
+    if (!verdicts) return { supportedIds: deterministicIds, modelCalled: true };
+    return {
+      supportedIds: new Set([
+        ...deterministicIds,
+        ...[...verdicts.entries()]
+          .filter(([, supported]) => supported)
+          .map(([id]) => id),
+      ]),
+      modelCalled: true,
+    };
   } catch (error) {
     console.error("synthesizeInsight entailment verification failed (non-fatal):", error);
-    return deterministicIds;
+    return { supportedIds: deterministicIds, modelCalled: true };
   }
+}
+
+type SynthesisPerformance = NonNullable<VerifiedInsightResult["performance"]>;
+
+function boundedEnvInteger(raw: string | undefined, fallback: number, max: number): number {
+  const parsed = Number.parseInt(raw ?? "", 10);
+  return Number.isFinite(parsed) ? Math.min(max, Math.max(0, parsed)) : fallback;
+}
+
+interface SynthesisRuntimeConfig {
+  modelSignature: string;
+  verifierEnv: ProviderEnv | null;
+}
+
+async function resolveSynthesisRuntimeConfig(env: Env): Promise<SynthesisRuntimeConfig> {
+  let generator = {
+    provider: env.LLM_BASE_URL ? "openai-compatible" : "workers-ai",
+    baseURL: env.LLM_BASE_URL ?? "",
+    apiKey: env.LLM_API_KEY ?? "",
+    model: env.LLM_MODEL ?? "",
+  };
+  try {
+    const { effective } = await getEffectiveModelSettings(env);
+    generator = {
+      provider: effective.llm.provider,
+      baseURL: effective.llm.baseURL,
+      apiKey: effective.llm.apiKey,
+      model: effective.llm.model,
+    };
+  } catch {
+    // Provider construction will surface configuration errors later. Cache keys
+    // can safely fall back to the process env without exposing API keys.
+  }
+
+  const verifierRequested = Boolean(
+    env.VERIFIER_LLM_BASE_URL || env.VERIFIER_LLM_API_KEY || env.VERIFIER_LLM_MODEL
+  );
+  const verifierBaseURL = env.VERIFIER_LLM_BASE_URL || generator.baseURL;
+  const verifierApiKey = env.VERIFIER_LLM_API_KEY || generator.apiKey;
+  const verifierModel = env.VERIFIER_LLM_MODEL || generator.model;
+  const verifierEnv = verifierRequested && verifierBaseURL && verifierApiKey
+    ? {
+        AI: env.AI,
+        SELFHOST: env.SELFHOST,
+        LLM_BASE_URL: verifierBaseURL,
+        LLM_API_KEY: verifierApiKey,
+        LLM_MODEL: verifierModel,
+        LLM_EXTRA_BODY: env.VERIFIER_LLM_EXTRA_BODY,
+      }
+    : null;
+  const [generatorPolicyHash, verifierPolicyHash] = await Promise.all([
+    contentFingerprint(env.LLM_EXTRA_BODY ?? ""),
+    contentFingerprint(env.VERIFIER_LLM_EXTRA_BODY ?? ""),
+  ]);
+  return {
+    modelSignature: JSON.stringify({
+      generator: {
+        provider: generator.provider,
+        baseURL: generator.baseURL.replace(/\/+$/, "").toLowerCase(),
+        model: generator.model,
+        policyHash: generatorPolicyHash,
+      },
+      verifier: verifierEnv ? {
+        baseURL: verifierBaseURL.replace(/\/+$/, "").toLowerCase(),
+        model: verifierModel,
+        policyHash: verifierPolicyHash,
+      } : null,
+    }),
+    verifierEnv,
+  };
 }
 
 interface InsightSynthesisOptions {
   asOf?: number;
   activitySummary?: boolean;
+  retrievalMs?: number;
+  cacheScope?: string;
+  retrievalPolicy?: string;
   onGenerationStart?: () => void;
   onDraftDelta?: (delta: string) => void;
   onDraftComplete?: () => void;
@@ -7101,16 +7226,43 @@ export async function synthesizeVerifiedInsight(
   conflicts: RecallConflictContext[] = [],
   options: InsightSynthesisOptions = {}
 ): Promise<VerifiedInsightResult> {
+  const synthesisStartedAt = Date.now();
+  let generationMs = 0;
+  let repairMs = 0;
+  let verificationMs = 0;
+  let modelCalls = 0;
+  let verifierModelUsed = false;
+  const finish = (
+    result: Omit<VerifiedInsightResult, "performance">,
+    cacheHit = false
+  ): VerifiedInsightResult => {
+    const performance: SynthesisPerformance = {
+      cacheHit,
+      retrievalMs: Math.max(0, options.retrievalMs ?? 0),
+      generationMs,
+      repairMs,
+      verificationMs,
+      totalMs: Math.max(0, Date.now() - synthesisStartedAt) + Math.max(0, options.retrievalMs ?? 0),
+      modelCalls,
+      verifierModelUsed,
+    };
+    logMemoryEvent("recall", "verified_answer_performance", {
+      ...performance,
+      activity_summary: Boolean(options.activitySummary),
+      answer_available: Boolean(result.answer && result.answer !== INSUFFICIENT_VERIFIED_EVIDENCE),
+    }, "system");
+    return { ...result, performance };
+  };
   const context = normalizeInsightContext(contextInput);
   if (!context.directEvidence.length && !context.relatedContext.length) {
-    return { answer: "", verifiedClaims: [], unverifiedClaims: [] };
+    return finish({ answer: "", verifiedClaims: [], unverifiedClaims: [] });
   }
   if (!context.directEvidence.length) {
-    return {
+    return finish({
       answer: INSUFFICIENT_VERIFIED_EVIDENCE,
       verifiedClaims: [],
       unverifiedClaims: [],
-    };
+    });
   }
 
   const citableClaims = buildCitableInsightClaims(
@@ -7124,21 +7276,66 @@ export async function synthesizeVerifiedInsight(
     env.SELFHOST === "1" ? "shadow" : "enforce"
   );
   if (!citableClaims.length) {
-    return {
+    return finish({
       answer: INSUFFICIENT_VERIFIED_EVIDENCE,
       verifiedClaims: [],
       unverifiedClaims: [],
-    };
+    });
   }
   const promptClaims = options.activitySummary
     ? citableClaims.filter((claim) => isSafeInsightFactClaim(claim, answerabilityMode))
     : citableClaims;
   if (!promptClaims.length) {
-    return {
+    return finish({
       answer: INSUFFICIENT_VERIFIED_EVIDENCE,
       verifiedClaims: [],
       unverifiedClaims: [],
-    };
+    });
+  }
+  const runtimeConfig = await resolveSynthesisRuntimeConfig(env);
+  const cacheTtlMs = boundedEnvInteger(env.VERIFIED_ANSWER_CACHE_TTL_MS, 0, 60 * 60_000);
+  const cacheMaxEntries = boundedEnvInteger(env.VERIFIED_ANSWER_CACHE_MAX_ENTRIES, 128, 2_000) || 128;
+  const cacheKey = cacheTtlMs > 0
+    ? await buildVerifiedAnswerCacheKey({
+        query,
+        activitySummary: Boolean(options.activitySummary),
+        answerabilityMode,
+        modelSignature: runtimeConfig.modelSignature,
+        cacheScope: options.cacheScope ?? "process:default",
+        retrievalPolicy: options.retrievalPolicy ?? JSON.stringify({
+          asOf: options.asOf ?? null,
+          activitySummary: Boolean(options.activitySummary),
+        }),
+        relatedContext: context.relatedContext.map((row) => ({
+          id: row.id,
+          content: row.content,
+          associationType: row.associationType,
+          hop: row.hop,
+        })),
+        claims: citableClaims.map((claim) => ({
+          id: claim.claimId,
+          statement: claim.statement,
+          status: claim.status,
+          versionId: claim.versionId ?? null,
+          conflictIds: claim.conflictIds,
+        })),
+      })
+    : null;
+  const answerCache = cacheKey
+    ? getVerifiedAnswerCache<Omit<VerifiedInsightResult, "performance">>({
+        ttlMs: cacheTtlMs,
+        maxEntries: cacheMaxEntries,
+      })
+    : null;
+  const cached = cacheKey && answerCache ? answerCache.get(cacheKey) : null;
+  if (cached) {
+    options.onGenerationStart?.();
+    const verifiedDraft = parseRenderedInsightParagraphs(cached.answer)
+      .map((paragraph) => paragraph.text)
+      .join("\n\n");
+    if (verifiedDraft) options.onDraftDelta?.(verifiedDraft);
+    options.onDraftComplete?.();
+    return finish(cached, true);
   }
   const memoriesList = context.directEvidence
     .map((r, i) => {
@@ -7226,9 +7423,11 @@ Rules:
 
   let insight = "";
   let llm: Awaited<ReturnType<typeof createLLM>>;
+  const generationStartedAt = Date.now();
   try {
     llm = await createLLM(env);
     options.onGenerationStart?.();
+    modelCalls += 1;
     if (options.onDraftDelta) {
       const stream = await llm.chatAsCfSse(
         [{ role: "user", content: prompt }],
@@ -7243,9 +7442,11 @@ Rules:
       );
     }
   } catch (e) {
+    generationMs = Math.max(0, Date.now() - generationStartedAt);
     console.error("synthesizeInsight LLM call failed (non-fatal):", e);
-    return { answer: "", verifiedClaims: [], unverifiedClaims: [] };
+    return finish({ answer: "", verifiedClaims: [], unverifiedClaims: [] });
   }
+  generationMs = Math.max(0, Date.now() - generationStartedAt);
 
   let revalidatedClaims = citableClaims;
   if (options.asOf !== undefined && citableClaims.some((claim) => claim.claimId)) {
@@ -7308,6 +7509,7 @@ Rules:
     safeRepairClaims.length > 0 &&
     validated.unverifiedClaims.every((claim) => repairableReasons.has(claim.reason));
   if (shouldRepair) {
+    const repairStartedAt = Date.now();
     const repairReasons = [...new Set(validated.unverifiedClaims.map((claim) => claim.reason))];
     const allowedClaims = safeRepairClaims.map((claim) =>
       `[${claim.ref}] statement=${claim.statement}`
@@ -7336,6 +7538,7 @@ ${allowedClaims}`;
       allowed_claims: safeRepairClaims.length,
     }, "system");
     try {
+      modelCalls += 1;
       const repairedInsight = await llm.chat(
         [{ role: "user", content: repairPrompt }],
         { max_tokens: INSIGHT_MAX_TOKENS, jsonMode: true, signal: options.signal }
@@ -7352,6 +7555,8 @@ ${allowedClaims}`;
       }
     } catch (error) {
       console.error("synthesizeInsight repair call failed (non-fatal):", error);
+    } finally {
+      repairMs = Math.max(0, Date.now() - repairStartedAt);
     }
   }
   if (
@@ -7361,12 +7566,27 @@ ${allowedClaims}`;
     validated.answer !== INSUFFICIENT_VERIFIED_EVIDENCE
   ) {
     const paragraphs = parseRenderedInsightParagraphs(validated.answer);
-    const supportedParagraphIds = await verifySynthesizedInsightEntailment(
-      llm,
+    let verifier = llm;
+    if (runtimeConfig.verifierEnv) {
+      try {
+        verifier = await createLLM(runtimeConfig.verifierEnv);
+      } catch (error) {
+        console.error("Independent verifier configuration failed; using answer model:", error);
+      }
+    }
+    const verificationStartedAt = Date.now();
+    const verification = await verifySynthesizedInsightEntailment(
+      verifier,
       validated.answer,
       revalidatedClaims,
       options.signal
     );
+    verificationMs = Math.max(0, Date.now() - verificationStartedAt);
+    if (verification.modelCalled) {
+      modelCalls += 1;
+      verifierModelUsed = verifier !== llm;
+    }
+    const supportedParagraphIds = verification.supportedIds;
     const supportedParagraphs = paragraphs.filter((paragraph) =>
       supportedParagraphIds.has(paragraph.id)
     );
@@ -7445,7 +7665,17 @@ ${allowedClaims}`;
       .join("\n\n");
     if (verifiedDraft) options.onDraftDelta(verifiedDraft);
   }
-  return validated;
+  if (
+    cacheKey &&
+    answerCache &&
+    validated.answer &&
+    validated.answer !== INSUFFICIENT_VERIFIED_EVIDENCE &&
+    validated.verifiedClaims.length > 0 &&
+    validated.unverifiedClaims.length === 0
+  ) {
+    answerCache.set(cacheKey, validated);
+  }
+  return finish(validated);
 }
 
 export async function synthesizeRecentActivityAnswer(
@@ -7453,7 +7683,16 @@ export async function synthesizeRecentActivityAnswer(
   matches: readonly RecallMatch[],
   plan: Pick<RecallRequestPlan, "before">,
   env: Env,
-  options: Pick<InsightSynthesisOptions, "onGenerationStart" | "onDraftDelta" | "onDraftComplete" | "signal"> = {}
+  options: Pick<
+    InsightSynthesisOptions,
+    | "onGenerationStart"
+    | "onDraftDelta"
+    | "onDraftComplete"
+    | "signal"
+    | "retrievalMs"
+    | "cacheScope"
+    | "retrievalPolicy"
+  > = {}
 ): Promise<VerifiedInsightResult> {
   if (!matches.length) return { answer: "", verifiedClaims: [], unverifiedClaims: [] };
   const asOf = plan.before ?? Date.now();
@@ -7854,6 +8093,7 @@ export interface RecallSearchResult {
   verifiedClaims?: VerifiedInsightResult["verifiedClaims"];
   unverifiedClaims?: VerifiedInsightResult["unverifiedClaims"];
   citations?: VerifiedInsightResult["citations"];
+  answerPerformance?: VerifiedInsightResult["performance"];
   conflicts?: RecallConflictContext[];
   degraded?: boolean;
   degradedReason?: string;
@@ -7862,6 +8102,8 @@ export interface RecallSearchResult {
 interface RecallRuntimeOptions {
   recordUsage?: boolean;
   allowClaimVectorBackfill?: boolean;
+  cacheScope?: string;
+  retrievalPolicy?: string;
   onInsightGenerationStart?: () => void;
   onInsightDraftDelta?: (delta: string) => void;
   onInsightDraftComplete?: () => void;
@@ -9217,6 +9459,7 @@ async function recallHistoricalClaims(
   vaultFilter: string | null,
   runtimeOptions: RecallRuntimeOptions
 ): Promise<RecallSearchResult> {
+  const retrievalStartedAt = Date.now();
   const tokens = tokenizeQuery(params.query);
   const graphSignals = await buildGraphRecallSignals(
     params.query,
@@ -9444,6 +9687,9 @@ async function recallHistoricalClaims(
       conflictContext.conflicts,
       {
         asOf: params.before,
+        retrievalMs: Math.max(0, Date.now() - retrievalStartedAt),
+        cacheScope: runtimeOptions.cacheScope,
+        retrievalPolicy: runtimeOptions.retrievalPolicy,
         onGenerationStart: runtimeOptions.onInsightGenerationStart,
         onDraftDelta: runtimeOptions.onInsightDraftDelta,
         onDraftComplete: runtimeOptions.onInsightDraftComplete,
@@ -9451,6 +9697,7 @@ async function recallHistoricalClaims(
       }
     )
     : { answer: "", verifiedClaims: [], unverifiedClaims: [] };
+  const answerPerformance = synthesized.performance;
   if (runtimeOptions.recordUsage !== false) {
     ctx.waitUntil(Promise.all(matches.map((match) =>
       env.DB.prepare(`UPDATE entries SET recall_count = recall_count + 1 WHERE id = ?`)
@@ -9466,6 +9713,7 @@ async function recallHistoricalClaims(
     verifiedClaims: synthesized.verifiedClaims,
     unverifiedClaims: synthesized.unverifiedClaims,
     citations: synthesized.citations ?? [],
+    answerPerformance,
     conflicts: conflictContext.conflicts,
     retrievalMode: "claim_snapshot",
     snapshotAt: params.before,
@@ -9490,10 +9738,13 @@ export async function recallEntries(
   vaultFilter: string | null = null,
   runtimeOptions: RecallRuntimeOptions = {}
 ): Promise<RecallSearchResult> {
+  const retrievalStartedAt = Date.now();
   const { query, topK } = params;
   const associationHops = Math.max(0, Math.min(2, Math.trunc(params.hops ?? 0)));
   const associationDirection = params.associationDirection ?? "outgoing";
   let { tag, after, before, kind } = params;
+  const explicitAfter = after !== undefined;
+  const explicitBefore = before !== undefined;
   if (tag && !isD1SafeTag(tag)) return { matches: [], answer: "", insight: "" };
   const now = Date.now();
 
@@ -9506,6 +9757,17 @@ export async function recallEntries(
   }
 
   if (before !== undefined && before < now) {
+    const retrievalPolicy = runtimeOptions.retrievalPolicy ?? JSON.stringify({
+      mode: "historical",
+      topK,
+      tag: tag ?? null,
+      after: explicitAfter || after === undefined ? after ?? null : Math.floor(after / 300_000),
+      before: explicitBefore ? before : Math.floor(before / 300_000),
+      inferredTimeBucketMs: explicitAfter && explicitBefore ? null : 300_000,
+      kind: kind ?? null,
+      hops: associationHops,
+      associationDirection,
+    });
     return recallHistoricalClaims({
       query: embedQuery,
       topK,
@@ -9513,7 +9775,7 @@ export async function recallEntries(
       after,
       before,
       kind,
-    }, env, ctx, vaultFilter, runtimeOptions);
+    }, env, ctx, vaultFilter, { ...runtimeOptions, retrievalPolicy });
   }
 
   const tokens = tokenizeQuery(embedQuery);
@@ -10068,12 +10330,26 @@ export async function recallEntries(
         relatedContext: relatedInsightRows,
       }, env, conflictContext.conflicts, {
         asOf: recallAsOf,
+        retrievalMs: Math.max(0, Date.now() - retrievalStartedAt),
+        cacheScope: runtimeOptions.cacheScope,
+        retrievalPolicy: runtimeOptions.retrievalPolicy ?? JSON.stringify({
+          mode: "semantic",
+          topK,
+          tag: tag ?? null,
+          after: explicitAfter || after === undefined ? after ?? null : Math.floor(after / 300_000),
+          before: explicitBefore || before === undefined ? before ?? null : Math.floor(before / 300_000),
+          inferredTimeBucketMs: explicitAfter && explicitBefore ? null : 300_000,
+          kind: kind ?? null,
+          hops: associationHops,
+          associationDirection,
+        }),
         onGenerationStart: runtimeOptions.onInsightGenerationStart,
         onDraftDelta: runtimeOptions.onInsightDraftDelta,
         onDraftComplete: runtimeOptions.onInsightDraftComplete,
         signal: runtimeOptions.signal,
       })
     : { answer: "", verifiedClaims: [], unverifiedClaims: [] };
+  const answerPerformance = synthesized.performance;
 
   return {
     matches,
@@ -10084,6 +10360,7 @@ export async function recallEntries(
     verifiedClaims: synthesized.verifiedClaims,
     unverifiedClaims: synthesized.unverifiedClaims,
     citations: synthesized.citations ?? [],
+    answerPerformance,
     conflicts: conflictContext.conflicts,
     retrievalMode: "entry_projection",
     snapshotAt: recallAsOf,
@@ -10577,27 +10854,6 @@ function boundedQualityLimit(value: unknown, fallback = 50): number {
   return Number.isFinite(raw) ? Math.max(1, Math.min(Math.trunc(raw), 100)) : fallback;
 }
 
-function parseQualityState<T extends string>(
-  value: unknown,
-  allowed: readonly T[]
-): T | null {
-  if (typeof value !== "string" || !value.trim()) return null;
-  return (allowed as readonly string[]).includes(value.trim())
-    ? value.trim() as T
-    : null;
-}
-
-function parseReviewId(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-const EntityMergeReviewSchema = z.object({
-  id: z.string().trim().min(1).max(256),
-  decision: z.enum(["accept", "reject"]),
-  reviewedBy: z.string().trim().min(1).max(256).optional(),
-  reason: z.string().max(1000).optional(),
-}).strict();
-
 async function listMemoryMergeCandidates(
   env: Env,
   input: { state: MergeCandidateState | null; limit: number }
@@ -10811,6 +11067,56 @@ async function resolveConflictCase(
     actorType: actor.actorType,
     actorId: actor.actorId,
   });
+}
+
+function createQualityRouteServices(env: Env): QualityRouteServices<AuthPrincipal> {
+  return {
+    authenticate: (request) => requireAuth(request, env),
+    listEntityCandidates: (input) => listEntityMergeCandidates(env, {
+      state: input.state as EntityMergeCandidateState | null,
+      limit: input.limit,
+    }),
+    resolveEntityCandidate: async (input) => {
+      const actor = auditActorFromPrincipal(input.principal);
+      const reviewedBy = input.reviewedBy ?? actor.actorId ?? "owner";
+      const result = await new D1EntityMergeExecutor(
+        env.DB,
+        entityEmbeddingIndexForEnv(env)
+      ).resolve({
+        candidateId: input.id,
+        decision: input.decision,
+        actorType: actor.actorType,
+        actorId: actor.actorId ?? "owner",
+        reviewedBy,
+        tokenId: actor.tokenId,
+        vaultId: actor.vaultId,
+        reason: input.reason ?? null,
+      });
+      return { ...result, reviewedBy };
+    },
+    listMemoryCandidates: (input) => listMemoryMergeCandidates(env, input),
+    resolveMemoryCandidate: (input) => resolveMemoryMergeCandidate(env, input),
+    listConflictCases: (input) => listConflictCases(env, input),
+    resolveConflictCase: (input) => resolveConflictCase(env, input),
+    mapError: (error) => {
+      if (error instanceof EntityMergeCandidateUnavailableError) {
+        return json({ ok: false, error: "entity_merge_candidate_unavailable", message: error.message }, 409);
+      }
+      if (error instanceof EntityMergeEndpointUnavailableError) {
+        return json({ ok: false, error: "entity_merge_endpoint_unavailable", message: error.message }, 409);
+      }
+      if (error instanceof ConflictClaimsUnavailableError) {
+        return json({ ok: false, error: "conflict_claims_unavailable", message: error.message }, 409);
+      }
+      if (error instanceof ManualResolutionOutcomeRequiredError) {
+        return json({ ok: false, error: "manual_resolution_requires_outcome", message: error.message }, 400);
+      }
+      if (error instanceof ClaimRelationMismatchError) {
+        return json({ ok: false, error: "claim_relation_mismatch", message: error.message }, 409);
+      }
+      return null;
+    },
+  };
 }
 
 async function listAuditEvents(
@@ -11822,6 +12128,7 @@ async function dualWriteAtomicMemory(
         scopeId: input.atomic.scopeId ?? null,
         polarity: input.atomic.polarity ?? "positive",
         modality: input.atomic.modality ?? "asserted",
+        entityEmbeddingIndex: entityEmbeddingIndexForEnv(env),
         resolveEntityEmbeddings: async (names) => {
           entityEmbeddingSnapshot ??= loadActiveEmbeddingSnapshot(env);
           const snapshot = await entityEmbeddingSnapshot;
@@ -12677,7 +12984,11 @@ export async function applyStatus(id: string, status: MemoryStatus, env: Env): P
 
 // ─── MCP Server ───────────────────────────────────────────────────────────────
 
-function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
+function buildMcpServer(
+  env: Env,
+  ctx: ExecutionContext,
+  cacheScope = "mcp:unscoped"
+): McpServer {
   const server = new McpServer({ name: "singularity", version: "0.1.0" });
 
   // ── remember ────────────────────────────────────────────────────────────
@@ -12916,7 +13227,7 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
         kind: kind as MemoryKind | undefined,
         hops,
         associationDirection: associationDirection as AssociationDirection,
-      }, env, ctx);
+      }, env, ctx, null, { cacheScope });
 
       if (!matches.length) {
         const degradedText = degraded ? ` (${degradedReason ?? "degraded"})` : "";
@@ -13201,7 +13512,9 @@ const apiHandler = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     return withRequestTelemetry(request, env, ctx, async () => {
       await ensureDatabase(env);
-      const server = buildMcpServer(env, ctx);
+      const authorization = request.headers.get("Authorization") ?? "mcp-authenticated";
+      const cacheScope = `mcp:${await contentFingerprint(authorization)}`;
+      const server = buildMcpServer(env, ctx, cacheScope);
       const isToolsList = await isMcpToolsListRequest(request);
       // Prefer a complete JSON-RPC response for POST requests. This is still
       // MCP Streamable HTTP, but avoids reverse proxies buffering or dropping
@@ -13262,7 +13575,7 @@ async function detailedHealth(env: Env) {
               await env.VECTORIZE.query(probe, {
                 topK: 1,
                 returnMetadata: "none",
-                filter: { source: { $ne: CLAIM_VECTOR_SOURCE } },
+                filter: { source: { $nin: [CLAIM_VECTOR_SOURCE, ENTITY_VECTOR_SOURCE] } },
               });
             }
           );
@@ -13418,6 +13731,7 @@ async function executeRecallHttpRequest(
   env: Env,
   ctx: ExecutionContext,
   vaultId: string | null,
+  cacheScope: string,
   hooks: RecallStreamHooks = {}
 ): Promise<Record<string, unknown>> {
   const requestPlan = planRecallRequest(input.query);
@@ -13427,7 +13741,9 @@ async function executeRecallHttpRequest(
       after: input.after ?? requestPlan.after,
       before: input.before ?? requestPlan.before,
     };
+    const retrievalStartedAt = Date.now();
     const matches = await listRecentActivity(activityPlan, input.tag, env, vaultId);
+    const retrievalMs = Math.max(0, Date.now() - retrievalStartedAt);
     if (!matches.length) {
       return {
         ok: true,
@@ -13452,9 +13768,25 @@ async function executeRecallHttpRequest(
         onDraftDelta: hooks.onDraftDelta,
         onDraftComplete: hooks.onDraftComplete,
         signal: hooks.signal,
+        retrievalMs,
+        cacheScope,
+        retrievalPolicy: JSON.stringify({
+          mode: "recent_activity",
+          tag: input.tag ?? null,
+          after: input.after ?? (
+            activityPlan.after === undefined ? null : Math.floor(activityPlan.after / 300_000)
+          ),
+          before: input.before ?? (
+            activityPlan.before === undefined ? null : Math.floor(activityPlan.before / 300_000)
+          ),
+          inferredTimeBucketMs: input.after !== undefined && input.before !== undefined
+            ? null
+            : 300_000,
+        }),
       }
     );
     const activityAnswer = presentableRecallAnswer(activityInsight.answer);
+    const activityPerformance = activityInsight.performance;
     const activitySources = matches.map((match) => ({
       id: match.id,
       content: match.content,
@@ -13476,6 +13808,7 @@ async function executeRecallHttpRequest(
       citations: activityInsight.citations ?? [],
       verified_claims: activityInsight.verifiedClaims,
       unverified_claims: activityInsight.unverifiedClaims,
+      answer_performance: activityPerformance ?? null,
       sources: activitySources,
     };
   }
@@ -13488,6 +13821,7 @@ async function executeRecallHttpRequest(
     verifiedClaims = [],
     unverifiedClaims = [],
     citations = [],
+    answerPerformance,
     conflicts = [],
     retrievalMode = "entry_projection",
     snapshotAt,
@@ -13505,6 +13839,7 @@ async function executeRecallHttpRequest(
   }, env, ctx, vaultId, {
     recordUsage: false,
     allowClaimVectorBackfill: false,
+    cacheScope,
     onInsightDraftDelta: hooks.onDraftDelta,
     onInsightGenerationStart: hooks.onGenerationStart,
     onInsightDraftComplete: hooks.onDraftComplete,
@@ -13588,6 +13923,7 @@ async function executeRecallHttpRequest(
     sources: responseSources,
     verified_claims: verifiedClaims,
     unverified_claims: unverifiedClaims,
+    answer_performance: answerPerformance ?? null,
   };
 }
 
@@ -14822,7 +15158,14 @@ const defaultHandler = {
         associationDirection,
       };
       const execute = (hooks: RecallStreamHooks = {}) =>
-        executeRecallHttpRequest(recallInput, env, ctx, vaultId, hooks);
+        executeRecallHttpRequest(
+          recallInput,
+          env,
+          ctx,
+          vaultId,
+          recallCacheScope(auth.principal, vaultId),
+          hooks
+        );
       const acceptsSse = (request.headers.get("accept") ?? "")
         .split(",")
         .some((value) => value.trim().toLowerCase().startsWith("text/event-stream"));
@@ -14971,161 +15314,12 @@ const defaultHandler = {
       return json({ ok: true, id, relations });
     }
 
-    // GET /quality/entity-merge-candidates — entity identity review queue
-    if (url.pathname === "/quality/entity-merge-candidates" && request.method === "GET") {
-      const auth = requireAuth(request, env);
-      if (!auth.ok) return auth.response;
-      const state = parseQualityState(url.searchParams.get("state"), ENTITY_MERGE_CANDIDATE_STATES);
-      if (url.searchParams.has("state") && !state) {
-        return json({
-          ok: false,
-          error: `state must be one of: ${ENTITY_MERGE_CANDIDATE_STATES.join(", ")}`,
-        }, 400);
-      }
-      const limit = boundedQualityLimit(url.searchParams.get("limit"));
-      const candidates = await listEntityMergeCandidates(env, { state, limit });
-      return json({ ok: true, count: candidates.length, candidates });
-    }
-
-    // POST /quality/entity-merge-candidates/resolve — execute or reject an entity merge
-    if (url.pathname === "/quality/entity-merge-candidates/resolve" && request.method === "POST") {
-      const auth = requireAuth(request, env);
-      if (!auth.ok) return auth.response;
-      let rawBody: unknown;
-      try { rawBody = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
-      const parsed = EntityMergeReviewSchema.safeParse(rawBody);
-      if (!parsed.success) {
-        return json({ ok: false, error: "invalid_entity_merge_review" }, 400);
-      }
-      const { id, decision, reviewedBy: requestedReviewer, reason } = parsed.data;
-      const principalActor = auditActorFromPrincipal(auth.principal);
-      const reviewedBy = requestedReviewer ?? principalActor.actorId ?? "owner";
-      try {
-        const result = await new D1EntityMergeExecutor(env.DB).resolve({
-          candidateId: id,
-          decision,
-          actorType: principalActor.actorType,
-          actorId: principalActor.actorId ?? "owner",
-          reviewedBy,
-          tokenId: principalActor.tokenId,
-          vaultId: principalActor.vaultId,
-          reason: reason ?? null,
-        });
-        return json({ ok: true, ...result, reviewedBy });
-      } catch (error) {
-        if (error instanceof EntityMergeCandidateUnavailableError) {
-          return json({ ok: false, error: "entity_merge_candidate_unavailable", message: error.message }, 409);
-        }
-        if (error instanceof EntityMergeEndpointUnavailableError) {
-          return json({ ok: false, error: "entity_merge_endpoint_unavailable", message: error.message }, 409);
-        }
-        throw error;
-      }
-    }
-
-    // GET /quality/merge-candidates — human review queue for high-similarity memories
-    if (url.pathname === "/quality/merge-candidates" && request.method === "GET") {
-      const auth = requireAuth(request, env);
-      if (!auth.ok) return auth.response;
-      const state = parseQualityState(url.searchParams.get("state"), MERGE_CANDIDATE_STATES);
-      if (url.searchParams.has("state") && !state) {
-        return json({ ok: false, error: `state must be one of: ${MERGE_CANDIDATE_STATES.join(", ")}` }, 400);
-      }
-      const limit = boundedQualityLimit(url.searchParams.get("limit"));
-      const candidates = await listMemoryMergeCandidates(env, { state, limit });
-      return json({ ok: true, count: candidates.length, candidates });
-    }
-
-    // POST /quality/merge-candidates/resolve — mark a merge candidate reviewed
-    if (url.pathname === "/quality/merge-candidates/resolve" && request.method === "POST") {
-      const auth = requireAuth(request, env);
-      if (!auth.ok) return auth.response;
-      let body: { id?: string; state?: string; reviewedBy?: string };
-      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
-      const id = parseReviewId(body.id);
-      if (!id) return json({ ok: false, error: "id is required" }, 400);
-      const state = parseQualityState(body.state, MERGE_CANDIDATE_STATES);
-      if (!state || state === "pending") {
-        return json({ ok: false, error: "state must be accepted, rejected, or resolved" }, 400);
-      }
-      const reviewedBy = parseReviewId(body.reviewedBy) ?? "owner";
-      const ok = await resolveMemoryMergeCandidate(env, {
-        id,
-        state,
-        reviewedBy,
-        principal: auth.principal,
-      });
-      if (!ok) return json({ ok: false, error: `No merge candidate found with ID: ${id}` }, 404);
-      return json({ ok: true, id, state, reviewedBy });
-    }
-
-    // GET /quality/conflict-cases — human review queue for contradictory memories
-    if (url.pathname === "/quality/conflict-cases" && request.method === "GET") {
-      const auth = requireAuth(request, env);
-      if (!auth.ok) return auth.response;
-      const state = parseQualityState(url.searchParams.get("state"), CONFLICT_CASE_STATES);
-      if (url.searchParams.has("state") && !state) {
-        return json({ ok: false, error: `state must be one of: ${CONFLICT_CASE_STATES.join(", ")}` }, 400);
-      }
-      const limit = boundedQualityLimit(url.searchParams.get("limit"));
-      const conflicts = await listConflictCases(env, { state, limit });
-      return json({ ok: true, count: conflicts.length, conflicts });
-    }
-
-    // POST /quality/conflict-cases/resolve — record a human conflict decision
-    if (url.pathname === "/quality/conflict-cases/resolve" && request.method === "POST") {
-      const auth = requireAuth(request, env);
-      if (!auth.ok) return auth.response;
-      let body: { id?: string; state?: string; resolution?: string; resolvedBy?: string };
-      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
-      const id = parseReviewId(body.id);
-      if (!id) return json({ ok: false, error: "id is required" }, 400);
-      const state = parseQualityState(body.state, CONFLICT_CASE_STATES);
-      if (!state || state === "pending") {
-        return json({ ok: false, error: "state must be resolved or dismissed" }, 400);
-      }
-      const resolution = parseQualityState(body.resolution, CONFLICT_RESOLUTIONS);
-      if (!resolution) {
-        return json({ ok: false, error: `resolution must be one of: ${CONFLICT_RESOLUTIONS.join(", ")}` }, 400);
-      }
-      if (
-        (state === "dismissed" && resolution !== "dismissed") ||
-        (state === "resolved" && resolution === "dismissed")
-      ) {
-        return json({ ok: false, error: "dismissed state requires dismissed resolution, and resolved state cannot use it" }, 400);
-      }
-      if (resolution === "manual") {
-        return json({
-          ok: false,
-          error: "manual_resolution_requires_outcome",
-          message: "manual resolution cannot close a conflict without explicit final Claim and Fact outcomes",
-        }, 400);
-      }
-      const resolvedBy = parseReviewId(body.resolvedBy) ?? "owner";
-      let ok: boolean;
-      try {
-        ok = await resolveConflictCase(env, {
-          id,
-          state,
-          resolution,
-          resolvedBy,
-          principal: auth.principal,
-        });
-      } catch (error) {
-        if (error instanceof ConflictClaimsUnavailableError) {
-          return json({ ok: false, error: "conflict_claims_unavailable", message: error.message }, 409);
-        }
-        if (error instanceof ManualResolutionOutcomeRequiredError) {
-          return json({ ok: false, error: "manual_resolution_requires_outcome", message: error.message }, 400);
-        }
-        if (error instanceof ClaimRelationMismatchError) {
-          return json({ ok: false, error: "claim_relation_mismatch", message: error.message }, 409);
-        }
-        throw error;
-      }
-      if (!ok) return json({ ok: false, error: `No conflict case found with ID: ${id}` }, 404);
-      return json({ ok: true, id, state, resolution, resolvedBy });
-    }
+    const qualityResponse = await handleQualityRoute(
+      request,
+      url,
+      createQualityRouteServices(env)
+    );
+    if (qualityResponse) return qualityResponse;
 
     // GET /audit/events — compliance audit trail (hash-chained, content hashes only)
     if (url.pathname === "/audit/events" && request.method === "GET") {

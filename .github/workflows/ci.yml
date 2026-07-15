@@ -22,8 +22,35 @@ jobs:
       - run: npm ci --legacy-peer-deps
       - run: npm run typecheck
       - run: npm run test:coverage
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+      - name: Build Obsidian integration
+        working-directory: integrations/obsidian-plugin
+        run: |
+          npm ci
+          npm run build
       - name: Build self-host Docker image
         run: docker build -t second-brain-ci .
+      - name: Smoke self-host Docker runtime
+        run: |
+          docker run -d --name second-brain-smoke \
+            -p 127.0.0.1:18787:8787 \
+            -e AUTH_TOKEN=ci-smoke-token-not-for-production \
+            -e ALLOW_DEV_EMBEDDING=true \
+            -e EMBEDDING_PROVIDER=local-hash-dev \
+            -e ANSWERABILITY_MODE=enforce \
+            second-brain-ci
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18787/health >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs second-brain-smoke
+          exit 1
+      - name: Stop Docker smoke container
+        if: always()
+        run: docker rm -f second-brain-smoke || true
       - name: Post coverage comment on PR
         if: github.event_name == 'pull_request'
         uses: davelosert/vitest-coverage-report-action@v2

@@ -87,6 +87,19 @@ describe("decideEntityResolution", () => {
     expect(result.candidates[0].score).toBeGreaterThan(0.98);
   });
 
+  it("accepts pre-ranked ANN candidates without loading stored vectors into JavaScript", () => {
+    const result = decideEntityResolution(
+      { name: "馒头助手 App", entityType: "product" },
+      [candidate({ aliases: [], externalIds: [], embedding: null })],
+      { semanticCandidates: [{ entityId: "entity-1", score: 0.97 }] }
+    );
+
+    expect(result).toMatchObject({ action: "review", matchedBy: "semantic" });
+    expect(result.candidates).toEqual([
+      { entityId: "entity-1", score: 0.97, matchedBy: "semantic" },
+    ]);
+  });
+
   it("does not suggest type-incompatible semantic candidates", () => {
     const result = decideEntityResolution(
       { name: "Java", entityType: "product" },

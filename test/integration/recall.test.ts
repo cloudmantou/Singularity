@@ -485,7 +485,7 @@ describe("GET /recall", () => {
     const [, options] = queryMock.mock.calls[0];
     expect(options.filter).toEqual({
       embedding_fingerprint: expect.any(String),
-      source: { $ne: "singularity-claim" },
+      source: { $nin: ["singularity-claim", "singularity-entity"] },
     });
   });
 
@@ -1012,7 +1012,7 @@ describe("GET /recall", () => {
     expect(queryMock).toHaveBeenCalledTimes(1);
     expect(queryMock.mock.calls[0][1].filter).toEqual({
       embedding_fingerprint: expect.any(String),
-      source: { $ne: "singularity-claim" },
+      source: { $nin: ["singularity-claim", "singularity-entity"] },
     });
   });
 

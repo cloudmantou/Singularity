@@ -6,6 +6,7 @@ import {
   type Env,
 } from "../../src/index";
 import { makeTestEnv } from "../helpers/make-env";
+import { resetVerifiedAnswerCache } from "../../src/memory/verified-answer-cache";
 
 function makeSseStream(response: string) {
   return new ReadableStream({
@@ -54,6 +55,130 @@ function verifiedEvidence(id: string, content: string) {
 }
 
 describe("synthesizeInsight()", () => {
+  it("caches only the final verified answer and reports synthesis stages", async () => {
+    resetVerifiedAnswerCache();
+    const env = makeTestEnv(undefined, {
+      VERIFIED_ANSWER_CACHE_TTL_MS: "60000",
+      AI: aiMock(structuredClaim("The project uses SQLite")),
+    });
+    const context = {
+      directEvidence: [verifiedEvidence("entry-cache", "The project uses SQLite")],
+      relatedContext: [],
+    };
+
+    const first = await synthesizeVerifiedInsight("Which database is used?", context, env);
+    const cacheEvents: string[] = [];
+    const second = await synthesizeVerifiedInsight("Which database is used?", context, env, [], {
+      onGenerationStart: () => cacheEvents.push("start"),
+      onDraftDelta: (delta) => cacheEvents.push(`delta:${delta}`),
+      onDraftComplete: () => cacheEvents.push("complete"),
+    });
+
+    expect(first.performance).toMatchObject({ cacheHit: false, modelCalls: 1 });
+    expect(first.performance?.totalMs).toBeGreaterThanOrEqual(0);
+    expect(second.answer).toBe(first.answer);
+    expect(second.performance).toMatchObject({ cacheHit: true, modelCalls: 0 });
+    expect(cacheEvents).toEqual([
+      "start",
+      expect.stringMatching(/^delta:/),
+      "complete",
+    ]);
+    expect(env.AI.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("partitions cached answers by requester, related context, and model policy", async () => {
+    resetVerifiedAnswerCache();
+    const ai = aiSequenceMock(
+      structuredClaim("The project uses SQLite"),
+      structuredClaim("The project uses SQLite"),
+      structuredClaim("The project uses SQLite"),
+      structuredClaim("The project uses SQLite")
+    );
+    const baseEnv = makeTestEnv(undefined, {
+      VERIFIED_ANSWER_CACHE_TTL_MS: "60000",
+      LLM_EXTRA_BODY: JSON.stringify({ reasoning: { effort: "low" } }),
+      AI: ai,
+    });
+    const context = {
+      directEvidence: [verifiedEvidence("entry-partition", "The project uses SQLite")],
+      relatedContext: [],
+    };
+
+    await synthesizeVerifiedInsight("Which database is used?", context, baseEnv, [], {
+      cacheScope: "owner",
+      retrievalPolicy: "semantic:hops=0",
+    });
+    await synthesizeVerifiedInsight("Which database is used?", context, baseEnv, [], {
+      cacheScope: "token:client-a",
+      retrievalPolicy: "semantic:hops=0",
+    });
+    await synthesizeVerifiedInsight("Which database is used?", {
+      ...context,
+      relatedContext: [{
+        id: "related-1",
+        content: "Related project context",
+        associationType: "related_to",
+        hop: 1,
+      }],
+    }, baseEnv, [], {
+      cacheScope: "owner",
+      retrievalPolicy: "semantic:hops=0",
+    });
+    await synthesizeVerifiedInsight("Which database is used?", context, {
+      ...baseEnv,
+      LLM_EXTRA_BODY: JSON.stringify({ reasoning: { effort: "high" } }),
+    }, [], {
+      cacheScope: "owner",
+      retrievalPolicy: "semantic:hops=0",
+    });
+
+    expect(ai.run).toHaveBeenCalledTimes(4);
+  });
+
+  it("uses a separately configured verifier without weakening answer validation", async () => {
+    resetVerifiedAnswerCache();
+    const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input, init) => {
+      const url = String(input);
+      requests.push({ url, body: JSON.parse(String(init?.body ?? "{}")) });
+      const content = url.includes("verifier.example")
+        ? JSON.stringify({ paragraphs: [{ id: "P1", supported: true }] })
+        : JSON.stringify({
+            answer: [{ text: "The project uses a SQLite database.", refs: ["C1"], kind: "fact" }],
+          });
+      return {
+        ok: true,
+        json: async () => ({ choices: [{ message: { content } }] }),
+      };
+    }));
+    const env = {
+      ...makeTestEnv(),
+      SELFHOST: "1",
+      LLM_BASE_URL: "https://generator.example/v1",
+      LLM_API_KEY: "generator-key",
+      LLM_MODEL: "generator-model",
+      VERIFIER_LLM_BASE_URL: "https://verifier.example/v1",
+      VERIFIER_LLM_API_KEY: "verifier-key",
+      VERIFIER_LLM_MODEL: "verifier-model",
+    } as Env;
+
+    try {
+      const result = await synthesizeVerifiedInsight("Which database is used?", {
+        directEvidence: [verifiedEvidence("entry-verifier", "The project uses SQLite")],
+        relatedContext: [],
+      }, env);
+
+      expect(result.answer).toContain("SQLite database");
+      expect(requests.map((request) => request.url)).toEqual([
+        "https://generator.example/v1/chat/completions",
+        "https://verifier.example/v1/chat/completions",
+      ]);
+      expect(result.performance).toMatchObject({ modelCalls: 2, verifierModelUsed: true });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("requests provider JSON mode for verified answer synthesis", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
@@ -223,7 +348,7 @@ describe("synthesizeInsight()", () => {
         hop: 1,
       }],
     }, env);
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       answer: "Retrieved direct evidence is insufficient for a verified answer.",
       verifiedClaims: [],
       unverifiedClaims: [],
