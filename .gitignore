@@ -4,8 +4,15 @@ node_modules/
 coverage/
 .wrangler/
 .claude/
-.dev.vars
-.env
+.dev.vars*
+!.dev.vars.example
+.env*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
 data/
 *.db
 *.db-shm

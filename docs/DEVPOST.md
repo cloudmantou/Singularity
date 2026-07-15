@@ -18,7 +18,7 @@ Singularity is a self-hosted, evidence-first memory engine for ChatGPT, Codex, o
 - **Preserve the evidence:** raw Observations remain linked to extracted atomic Claims.
 - **Let memory evolve:** updates create versions, while conflicts and historical facts remain explicit.
 - **Recall with more than vectors:** dense, keyword, lexical, entity, relation, and temporal signals are fused and reranked.
-- **Answer with proof:** the model selects Claim references; the server validates answerability, conflicts, language, entailment, and citations before showing an answer.
+- **Answer with proof:** the model selects Claim references; the server validates conflicts, language, entailment, and citations before showing an answer. Query-answerability can run in shadow, warning, or strict enforcement mode.
 - **Run it your way:** Cloudflare Workers/D1/Vectorize/KV or Node.js/Fastify/SQLite/sqlite-vec.
 - **See when it degrades:** Observatory exposes health queues, vector state, traces, and model calls.
 
@@ -36,7 +36,7 @@ Recall keeps retrieval and factual support separate:
 ```text
 Question → intent/time parsing → dense + lexical + graph retrieval
          → reciprocal-rank fusion → bounded reranking
-         → active, answerable Claim ledger → LLM synthesis
+         → active, scored Claim ledger → LLM synthesis
          → server validation → answer + citations + why-recalled signals
 ```
 
@@ -71,7 +71,9 @@ During Build Week, Codex and GPT-5.6 helped us:
 4. review the changes adversarially for fail-open behavior, secret leakage, unsafe retries, and current-versus-historical confusion;
 5. verify tests, coverage, typechecking, dependency audit, local runtime behavior, and live browser traces as separate proof layers.
 
-Codex accelerated investigation and implementation. The human decisions shaped the product: preserve raw evidence, make associations navigation-only, fail closed on unsupported factual answers, and prefer an incremental architecture over a rewrite.
+The timestamped Git history records the implementation delta. The private Devpost evidence must separately identify the `/feedback` Session ID from the thread where most core functionality was built; this documentation-only work is not a substitute for that implementation record.
+
+Codex accelerated investigation and implementation. The human decisions shaped the product: preserve raw evidence, make associations navigation-only, expose strict query-answerability as an explicit deployment choice, and prefer an incremental architecture over a rewrite.
 
 ## Challenges
 
@@ -93,7 +95,7 @@ Cloudflare provides D1, Vectorize, KV, and Workers AI. The self-host runtime map
 
 ### Privacy changes the demo strategy
 
-A real memory system contains private work. The public demo and media use a synthetic database; credentials belong in private testing instructions, never in screenshots or the repository.
+A real memory system contains private work. Public media and judge testing must use a separate synthetic database. We will never share the owner's token or submit real memory traces; private instructions may contain only a scoped, revocable credential for the isolated judge deployment.
 
 ## What we learned
 
@@ -109,7 +111,7 @@ A real memory system contains private work. The public demo and media use a synt
 - One memory layer shared by MCP, OAuth-enabled clients, REST, web, and Obsidian.
 - Evidence-linked atomic Claims with current and historical versions.
 - Hybrid vector, lexical, graph, and temporal recall.
-- Fail-closed answer validation with server-rendered citations.
+- Structural answer validation with server-rendered citations, plus configurable strict query-answerability enforcement.
 - Cloudflare and self-hosted runtimes backed by the same behavior.
 - Operational dashboards, repair queues, backup integrity, and audit-chain verification.
 - An 80% coverage gate across unit, integration, UI-contract, and self-host MCP E2E suites.
@@ -123,7 +125,7 @@ A real memory system contains private work. The public demo and media use a synt
 
 ## Try it
 
-- Demo: [agent.mtzs.cloud](https://agent.mtzs.cloud)
+- Hosted app (sign-in required; owner instance is not the judge sandbox): [agent.mtzs.cloud](https://agent.mtzs.cloud)
 - Source: [github.com/cloudmantou/Singularity](https://github.com/cloudmantou/Singularity)
 
 ## Tags
@@ -132,6 +134,9 @@ A real memory system contains private work. The public demo and media use a synt
 
 ## Remaining private submission fields
 
+- Devpost track/category selection (choose the category that best matches the final demo)
 - Public YouTube demo URL (required, under three minutes, with audio)
-- Demo Bearer token or test account for judges
+- Scoped credential for a separate, resettable synthetic judge deployment
 - Codex `/feedback` Session ID for the thread where the majority of core functionality was built
+
+**Never paste those values into this tracked file.** Enter them only in the appropriate Devpost fields.

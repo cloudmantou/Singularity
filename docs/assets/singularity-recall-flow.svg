@@ -25,7 +25,7 @@
     <text x="916" y="254" class="step">03 · FUSE</text><text x="1023" y="300" text-anchor="middle" class="label">RRF + reranking</text><text x="1023" y="332" text-anchor="middle" class="small">recency · importance · confidence</text>
 
     <rect x="1258" y="220" width="192" height="142" rx="24" class="gold"/>
-    <text x="1290" y="254" class="step">04 · FILTER</text><text x="1354" y="300" text-anchor="middle" class="label">Claim ledger</text><text x="1354" y="332" text-anchor="middle" class="small">active + answerable</text>
+    <text x="1290" y="254" class="step">04 · FILTER</text><text x="1354" y="300" text-anchor="middle" class="label">Claim ledger</text><text x="1354" y="332" text-anchor="middle" class="small">active + scored</text>
   </g>
 
   <path d="M364 291H436" class="line"/><path d="M786 291H860" class="line"/><path d="M1162 291H1234" class="line"/>

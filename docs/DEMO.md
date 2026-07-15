@@ -5,6 +5,7 @@ This is a privacy-safe script for the required public Devpost video. Target **90
 ## Before recording
 
 - Use a separate demo database. Do not record the owner's real memory corpus, traces, filesystem paths, API keys, tokens, or client identifiers.
+- Never share the owner instance's long-lived token. Judge access must use a dedicated, revocable credential for an isolated synthetic deployment.
 - Configure OpenAI in **Settings → Models & API** if the submission will say the running demo uses OpenAI.
 - Prepare one synthetic project, `Aurora Launch`, with a decision, deadline, owner, and changed plan.
 - Keep the browser at 100% zoom and close notification overlays.

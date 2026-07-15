@@ -6,7 +6,7 @@
 
 Singularity turns conversations, decisions, project updates, and notes into a memory layer that ChatGPT, Codex, other MCP clients, the web app, and Obsidian can share. It preserves original evidence, extracts traceable atomic claims, tracks how facts change, and generates answers whose citations are validated by the server.
 
-[Live demo](https://agent.mtzs.cloud) · [Architecture](docs/ARCHITECTURE.md) · [90-second demo plan](docs/DEMO.md) · [Devpost story](docs/DEVPOST.md)
+[Hosted app (sign-in required)](https://agent.mtzs.cloud) · [Architecture](docs/ARCHITECTURE.md) · [2-minute demo plan](docs/DEMO.md) · [Devpost story](docs/DEVPOST.md)
 
 ## Why this exists
 
@@ -26,7 +26,7 @@ The important boundary is between *finding something related* and *proving what 
 - **Evidence-first capture.** Original observations remain available while the extraction pipeline creates atomic, source-linked claims.
 - **Memory that can change safely.** Append, update, status, revision, conflict, and forget flows preserve lineage and activate one current parent version.
 - **Hybrid recall.** Dense vectors, lexical matches, keywords, entities, relationships, and time signals are fused before reranking.
-- **Claim-validated answers.** The model selects from a server-built Claim ledger; the server validates references, conflicts, answerability, language, and paragraph support before rendering citations.
+- **Claim-validated answers.** The model selects from a server-built Claim ledger; the server validates references, conflicts, language, and paragraph support before rendering citations. Query-answerability can run in `shadow`, `warn`, or `enforce` mode; self-host defaults to `shadow` unless configured otherwise.
 - **Graph-assisted retrieval.** Entity and temporal facts influence recall. Associations expand navigation context but are not allowed to masquerade as factual evidence.
 - **Two deployment targets.** Run on Cloudflare Workers with D1, Vectorize, KV, and Workers AI, or self-host with Node.js, Fastify, SQLite, and sqlite-vec.
 - **Operational visibility.** Observatory shows memory health, extraction and classification queues, vector state, request traces, and model calls.
@@ -50,7 +50,7 @@ flowchart LR
     V --> A["Answer + citations + why recalled"]
 ```
 
-For candidate document \(d\), dense, keyword, and self-host lexical ranks are combined with Reciprocal Rank Fusion:
+For candidate document $d$, dense, keyword, and self-host lexical ranks are combined with Reciprocal Rank Fusion:
 
 $$
 S_{\mathrm{RRF}}(d)=
@@ -117,7 +117,7 @@ The Build Week extension added or hardened:
 
 ### How Codex and GPT-5.6 contributed
 
-Codex and GPT-5.6 were used as an implementation, review, and verification partner throughout the extension:
+Codex and GPT-5.6 were used as an implementation, review, and verification partner throughout the extension. The dated commit range below records the code delta; the Devpost submission must separately include the `/feedback` Session ID from the thread that produced most of the core functionality.
 
 1. **Evidence mapping.** Codex traced capture, mutation, vector, graph, and recall paths before proposing changes.
 2. **Test-first failure reproduction.** Regression tests were written for stale generations, missing provenance, unsupported answer text, invalid citations, conflict leakage, and restore-chain corruption before the corresponding fixes.
@@ -125,7 +125,7 @@ Codex and GPT-5.6 were used as an implementation, review, and verification partn
 4. **Adversarial review.** Separate review passes looked for fail-open behavior, secret leakage, retry amplification, historical-version confusion, and source/packaged/runtime mismatches.
 5. **Real-system verification.** The final judgment remained evidence-based: typecheck, tests, coverage, audit, local runtime checks, and live browser traces were checked separately.
 
-The human decisions were equally important: preserve raw evidence, make associations navigation-only, fail closed on unsupported factual answers, keep self-host data ownership explicit, and prefer incremental compatibility over replacing the existing architecture.
+The human decisions were equally important: preserve raw evidence, make associations navigation-only, make strict query-answerability enforcement an explicit deployment choice, keep self-host data ownership explicit, and prefer incremental compatibility over replacing the existing architecture.
 
 ## Quick start
 
@@ -194,7 +194,7 @@ npm audit
 
 Coverage gates are set to 80% for statements, lines, and functions. Tests are organized as unit, integration, UI-contract, and self-hosted MCP end-to-end suites.
 
-For judges: the hosted instance is linked above. Access credentials and the required Codex `/feedback` session ID belong in the private Devpost testing instructions, not in this public repository.
+For judges: the hosted link above is the owner's private instance, not a public sandbox. **Never share its owner token.** Testing access must use a separate, resettable deployment with synthetic data and a dedicated revocable credential. Put only that scoped access detail and the required Codex `/feedback` session ID in Devpost's private testing instructions.
 
 ## Project origin
 

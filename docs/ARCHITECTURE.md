@@ -94,7 +94,7 @@ sequenceDiagram
     R->>DB: Dense, keyword, lexical, entity, relation, temporal retrieval
     DB-->>R: Candidate parents and Claims
     R->>R: RRF, rerank, active-version filter
-    R->>L: Question + answerable Claim ledger
+    R->>L: Question + scored Claim ledger
     L-->>V: Structured paragraphs {text, refs, kind}
     V->>V: Validate refs, conflicts, language, answerability, entailment
     V-->>API: Supported paragraphs + server-rendered citations
@@ -103,7 +103,7 @@ sequenceDiagram
 
 ### Retrieval fusion
 
-Let \(r_i(d)\) be the rank of document \(d\) in retrieval channel \(i\). Singularity uses Reciprocal Rank Fusion instead of trying to compare raw cosine and keyword scores directly:
+Let $r_i(d)$ be the rank of document $d$ in retrieval channel $i$. Singularity uses Reciprocal Rank Fusion instead of trying to compare raw cosine and keyword scores directly:
 
 $$
 S_{\mathrm{RRF}}(d)=
@@ -112,7 +112,7 @@ S_{\mathrm{RRF}}(d)=
 \sum_{r\in R_{\mathrm{lexical}}}\frac{1}{k+r(d)}
 $$
 
-Keyword weight \(w_d\) reflects the number of distinct query tokens matched. Entity, relation, and temporal signals add bounded boosts and can introduce a graph-only candidate when permitted.
+Keyword weight $w_d$ reflects the number of distinct query tokens matched. Entity, relation, and temporal signals add bounded boosts and can introduce a graph-only candidate when permitted.
 
 ### Reranking
 
@@ -137,13 +137,15 @@ $$
 
 ### Answer validation
 
-Retrieval results do not go straight into prose. The server builds a Claim ledger with immutable references such as `C1`, their verification state, conflicts, provenance, version, and query answerability. The model returns structured paragraphs that reference those Claims.
+Retrieval results do not go straight into prose. The server builds a Claim ledger with immutable references such as `C1`, their verification state, conflicts, provenance, version, and query-answerability score. The model returns structured paragraphs that reference those Claims.
 
-The server then rejects or repairs output when it contains:
+`ANSWERABILITY_MODE` controls how the query-answerability score affects output. `shadow` records warnings, `warn` exposes warnings, and `enforce` rejects paragraphs backed by a Claim that is not answerable for the query. Self-host deployments default to `shadow`; Cloudflare deployments default to `enforce` when the variable is unset. The checks below are therefore structural validations in every mode, with query-answerability rejection added only in `enforce` mode.
+
+The server rejects or repairs output when it contains:
 
 - missing or unknown Claim references;
 - a factual paragraph backed only by a conflict or navigation association;
-- a Claim that is active but not answerable for this query;
+- a Claim that is active but not answerable for this query when `ANSWERABILITY_MODE=enforce`;
 - unresolved conflict leakage;
 - language mismatch;
 - text not entailed by the cited Claims;
@@ -185,12 +187,15 @@ The shared fetch handler keeps protocol and memory behavior consistent; adapters
 
 ## Security and privacy posture
 
-- High-entropy owner token; no credentials in connector URLs.
-- OAuth 2.0 discovery and PKCE for supported remote MCP clients.
-- Redirect allowlist, route-specific rate limits, bounded request bodies, and path traversal protection.
-- Secrets masked in settings responses and telemetry redaction before persistence.
-- Backup integrity and audit-chain verification before restore.
-- Public documentation and demo media must use synthetic data. Real personal memory traces belong only in private testing instructions.
+Current code includes:
+
+- high-entropy owner-token configuration and connector URLs that do not carry credentials;
+- OAuth 2.0 discovery and PKCE for supported remote MCP clients;
+- a redirect allowlist, route-specific rate limits, bounded request bodies, and path traversal checks;
+- masked settings responses and telemetry redaction before persistence;
+- backup-integrity and audit-chain verification before restore.
+
+Public documentation, demo media, and judge testing must use synthetic data. Never submit real personal-memory traces. Private testing instructions may contain only scoped access to an isolated synthetic deployment—never the owner's long-lived token.
 
 ## Operational model
 
