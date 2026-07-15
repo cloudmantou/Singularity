@@ -305,6 +305,7 @@ CREATE TABLE IF NOT EXISTS sb_ai_review_jobs (
   mode TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'queued',
   requested_by TEXT NOT NULL,
+  review_policy_version TEXT NOT NULL DEFAULT 'knowledge-review-v1',
   input_snapshot_hash TEXT NOT NULL,
   input_snapshot_json TEXT NOT NULL,
   run_id TEXT,
@@ -323,7 +324,7 @@ CREATE INDEX IF NOT EXISTS idx_ai_review_jobs_object
 CREATE INDEX IF NOT EXISTS idx_ai_review_jobs_status
   ON sb_ai_review_jobs(status, created_at ASC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_review_jobs_active_identity
-  ON sb_ai_review_jobs(object_type, object_id, mode, input_snapshot_hash)
+  ON sb_ai_review_jobs(object_type, object_id, mode, input_snapshot_hash, review_policy_version)
   WHERE status IN ('queued', 'processing', 'completed', 'applying', 'applied');
 
 CREATE TABLE IF NOT EXISTS sb_ai_review_runs (
@@ -336,6 +337,9 @@ CREATE TABLE IF NOT EXISTS sb_ai_review_runs (
   reason TEXT NOT NULL,
   evidence_refs_json TEXT NOT NULL DEFAULT '[]',
   confidence_json TEXT NOT NULL DEFAULT '{}',
+  reviewability TEXT NOT NULL DEFAULT 'insufficient',
+  missing_context_json TEXT NOT NULL DEFAULT '[]',
+  key_differences_json TEXT NOT NULL DEFAULT '[]',
   abstained INTEGER NOT NULL DEFAULT 0,
   requires_human INTEGER NOT NULL DEFAULT 1,
   auto_apply_eligible INTEGER NOT NULL DEFAULT 0,
@@ -347,6 +351,7 @@ CREATE TABLE IF NOT EXISTS sb_ai_review_runs (
   created_at INTEGER NOT NULL,
   CHECK (object_type IN ('conflict_case', 'entity_merge_candidate', 'memory_merge_candidate')),
   CHECK (mode IN ('shadow', 'suggest', 'auto_low_risk')),
+  CHECK (reviewability IN ('sufficient', 'partial', 'insufficient')),
   CHECK (abstained IN (0, 1)),
   CHECK (requires_human IN (0, 1)),
   CHECK (auto_apply_eligible IN (0, 1))

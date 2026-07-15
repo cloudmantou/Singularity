@@ -27,6 +27,14 @@ describe("Knowledge Review UI module", () => {
   });
 
   it("attaches the latest immutable AI review to its matching queue item", () => {
+    const missingContext = ["scope_context"];
+    const keyDifferences = [{
+      dimension: "scope",
+      status: "missing",
+      summary: "The scopes are not identified.",
+      evidenceRefs: ["OLD", "NEW"],
+    }];
+    const sourceChannels = ["obsidian"];
     const payload = normalizeReviewQueues({
       conflicts: { conflicts: [{ id: "conflict-1" }] },
       entities: { candidates: [{ id: "entity-1" }] },
@@ -36,14 +44,33 @@ describe("Knowledge Review UI module", () => {
         objectType: "conflict_case",
         objectId: "conflict-1",
         status: "completed",
-        run: { id: "run-1", decision: "use_new", requiresHuman: true },
+        context: { evidence: [{ ref: "OLD", sourceChannels, scopeIds: ["production"] }] },
+        run: {
+          id: "run-1",
+          decision: "uncertain",
+          reviewability: "partial",
+          missingContext,
+          keyDifferences,
+          requiresHuman: true,
+        },
       }] },
     });
 
     expect(payload.conflicts[0].aiReview).toMatchObject({
       id: "job-1",
-      run: { id: "run-1", decision: "use_new" },
+      run: {
+        id: "run-1",
+        decision: "uncertain",
+        reviewability: "partial",
+        missingContext: ["scope_context"],
+      },
     });
+    expect(payload.conflicts[0].aiReview.run.missingContext).not.toBe(missingContext);
+    expect(payload.conflicts[0].aiReview.run.keyDifferences).not.toBe(keyDifferences);
+    expect(payload.conflicts[0].aiReview.run.keyDifferences[0].evidenceRefs)
+      .not.toBe(keyDifferences[0].evidenceRefs);
+    expect(payload.conflicts[0].aiReview.context.evidence[0].sourceChannels)
+      .not.toBe(sourceChannels);
     expect(payload.entities[0].aiReview).toBeNull();
   });
 

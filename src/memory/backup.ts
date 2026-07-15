@@ -12,12 +12,18 @@ import {
 } from "./quality";
 import { ensureAssociationDataModel } from "./associations";
 import { MEMORY_MUTATION_SCHEMA_STATEMENTS } from "./mutations";
-import { ensureAIReviewDataModel } from "./ai-review";
+import {
+  AI_REVIEW_DIFFERENCE_DIMENSIONS,
+  AI_REVIEW_DIFFERENCE_STATUSES,
+  AI_REVIEW_MISSING_CONTEXT_REASONS,
+  AI_REVIEWABILITY_LEVELS,
+  ensureAIReviewDataModel,
+} from "./ai-review";
 
-export const MEMORY_BACKUP_SCHEMA_VERSION = 16;
+export const MEMORY_BACKUP_SCHEMA_VERSION = 17;
 export const MEMORY_MUTATION_BACKUP_MODE = "audit_only" as const;
 const MEMORY_BACKUP_FORMAT = "singularity-memory-backup";
-const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
 const MEMORY_BACKUP_FEATURES = [
   "atomic-memory",
   "temporal-facts",
@@ -41,6 +47,7 @@ const MEMORY_BACKUP_FEATURES = [
   "entry-mutation-journal",
   "entry-mutation-journal-audit-only",
   "ai-assisted-quality-review",
+  "context-aware-ai-review",
 ] as const;
 
 export const AUDIT_IMPORT_MODES = ["replace_empty", "append_verified"] as const;
@@ -100,7 +107,7 @@ export interface BackupIntegrityReport {
 
 export interface MemoryBackup {
   backupFormat: typeof MEMORY_BACKUP_FORMAT;
-  schemaVersion: 16;
+  schemaVersion: 17;
   features: Array<(typeof MEMORY_BACKUP_FEATURES)[number]>;
   exportedAt: string;
   source: string;
@@ -141,7 +148,7 @@ export interface MemoryBackup {
 }
 
 export interface MemoryBackupImportResult extends ImportResult {
-  schemaVersion: 16;
+  schemaVersion: 17;
   memoryMutationBackupMode: typeof MEMORY_MUTATION_BACKUP_MODE;
   graph: Record<GraphArrayKey, TableImportStats>;
   integrity: BackupIntegrityReport;
@@ -546,12 +553,13 @@ export async function exportMemoryBackup(
                 FROM sb_conflict_cases
                 ORDER BY created_at DESC, id DESC`),
     allRows(db, `SELECT id, object_type, object_id, mode, status, requested_by,
-                       input_snapshot_hash, input_snapshot_json, run_id, error_code,
+                       review_policy_version, input_snapshot_hash, input_snapshot_json, run_id, error_code,
                        created_at, started_at, completed_at
                 FROM sb_ai_review_jobs
                 ORDER BY created_at DESC, id DESC`),
     allRows(db, `SELECT id, job_id, object_type, object_id, mode, decision, reason,
-                       evidence_refs_json, confidence_json, abstained, requires_human,
+                       evidence_refs_json, confidence_json, reviewability,
+                       missing_context_json, key_differences_json, abstained, requires_human,
                        auto_apply_eligible, reviewer_provider, reviewer_model,
                        prompt_version, input_snapshot_hash, input_snapshot_json, created_at
                 FROM sb_ai_review_runs
@@ -927,7 +935,7 @@ function rowsFor(body: Record<string, unknown>, key: GraphArrayKey): BackupRow[]
   return arrayFrom(body[key]);
 }
 
-function verifyAIReviewBackupRows(body: Record<string, unknown>): void {
+function verifyAIReviewBackupRows(body: Record<string, unknown>, schemaVersion: number): void {
   const jobs = rowsFor(body, "aiReviewJobs");
   const runs = rowsFor(body, "aiReviewRuns");
   const applications = rowsFor(body, "aiReviewApplications");
@@ -936,6 +944,17 @@ function verifyAIReviewBackupRows(body: Record<string, unknown>): void {
   const applicationsByRunId = new Map(
     applications.map((row) => [requiredText(row, "run_id"), row])
   );
+  const requiredArray = (row: BackupRow, key: string): unknown[] => {
+    const raw = row[key];
+    let parsed: unknown;
+    try {
+      parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    } catch {
+      throw new Error(`AI review run ${key} must be valid JSON`);
+    }
+    if (!Array.isArray(parsed)) throw new Error(`AI review run ${key} must be an array`);
+    return parsed;
+  };
 
   for (const run of runs) {
     const job = jobsById.get(requiredText(run, "job_id"));
@@ -943,6 +962,50 @@ function verifyAIReviewBackupRows(body: Record<string, unknown>): void {
     const linkedRunId = textOrNull(job, "run_id");
     if (linkedRunId !== requiredText(run, "id")) {
       throw new Error("AI review job and run linkage does not match");
+    }
+    if (schemaVersion >= 17) {
+      const reviewability = requiredText(run, "reviewability");
+      if (!(AI_REVIEWABILITY_LEVELS as readonly string[]).includes(reviewability)) {
+        throw new Error("AI review run has an invalid reviewability state");
+      }
+      const abstained = intOrDefault(run, "abstained", 0) === 1;
+      const decision = requiredText(run, "decision");
+      const evidenceRefs = requiredArray(run, "evidence_refs_json");
+      const missingContext = requiredArray(run, "missing_context_json");
+      const keyDifferences = requiredArray(run, "key_differences_json");
+      if (evidenceRefs.some((value) => typeof value !== "string" || !value.trim())) {
+        throw new Error("AI review run has an invalid evidence reference");
+      }
+      const evidenceRefSet = new Set(evidenceRefs as string[]);
+      if (missingContext.some((value) =>
+        typeof value !== "string" ||
+        !(AI_REVIEW_MISSING_CONTEXT_REASONS as readonly string[]).includes(value))) {
+        throw new Error("AI review run has an invalid missing context reason");
+      }
+      if (keyDifferences.some((value) => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) return true;
+        const difference = value as Record<string, unknown>;
+        return typeof difference.dimension !== "string" ||
+          !(AI_REVIEW_DIFFERENCE_DIMENSIONS as readonly string[]).includes(difference.dimension) ||
+          typeof difference.status !== "string" ||
+          !(AI_REVIEW_DIFFERENCE_STATUSES as readonly string[]).includes(difference.status) ||
+          typeof difference.summary !== "string" || !difference.summary.trim() ||
+          !Array.isArray(difference.evidenceRefs) ||
+          difference.evidenceRefs.some((ref) =>
+            typeof ref !== "string" || !evidenceRefSet.has(ref));
+      })) {
+        throw new Error("AI review run has an invalid key difference");
+      }
+      if (reviewability !== "sufficient" && (!abstained || decision !== "uncertain" || missingContext.length === 0)) {
+        throw new Error("Incomplete AI review context must abstain with a reason");
+      }
+      if (reviewability === "sufficient" && missingContext.length > 0) {
+        throw new Error("Sufficient AI review context cannot list missing context");
+      }
+      if (!abstained && decision !== "uncertain" &&
+          (evidenceRefs.length === 0 || keyDifferences.length === 0)) {
+        throw new Error("Applyable AI review runs require evidence references and key differences");
+      }
     }
   }
   for (const application of applications) {
@@ -981,7 +1044,7 @@ async function importMemoryBackupUnlocked(
     );
   }
   const mode: ImportMode = options.mode === "overwrite" ? "overwrite" : "skip";
-  verifyAIReviewBackupRows(body);
+  verifyAIReviewBackupRows(body, rawSchemaVersion);
   const auditImportPlan = await prepareAuditImport(
     db,
     rowsFor(body, "auditEvents"),
@@ -1581,10 +1644,10 @@ async function importMemoryBackupUnlocked(
       : rawStatus === "applying" ? "completed" : rawStatus;
     return db.prepare(
       `INSERT OR IGNORE INTO sb_ai_review_jobs (
-         id, object_type, object_id, mode, status, requested_by,
+         id, object_type, object_id, mode, status, requested_by, review_policy_version,
          input_snapshot_hash, input_snapshot_json, run_id, error_code,
          created_at, started_at, completed_at, lease_owner, lease_expires_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`
     ).bind(
       requiredText(row, "id"),
       requiredText(row, "object_type"),
@@ -1592,6 +1655,7 @@ async function importMemoryBackupUnlocked(
       textOrDefault(row, "mode", "shadow"),
       status,
       textOrDefault(row, "requested_by", "backup_restore"),
+      textOrDefault(row, "review_policy_version", "knowledge-review-v1"),
       requiredText(row, "input_snapshot_hash"),
       jsonText(row, "input_snapshot_json", "{}"),
       textOrNull(row, "run_id"),
@@ -1606,10 +1670,11 @@ async function importMemoryBackupUnlocked(
     db.prepare(
       `INSERT OR IGNORE INTO sb_ai_review_runs (
          id, job_id, object_type, object_id, mode, decision, reason,
-         evidence_refs_json, confidence_json, abstained, requires_human,
+         evidence_refs_json, confidence_json, reviewability,
+         missing_context_json, key_differences_json, abstained, requires_human,
          auto_apply_eligible, reviewer_provider, reviewer_model, prompt_version,
          input_snapshot_hash, input_snapshot_json, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       requiredText(row, "id"),
       requiredText(row, "job_id"),
@@ -1620,6 +1685,17 @@ async function importMemoryBackupUnlocked(
       textOrDefault(row, "reason", "Restored AI review recommendation"),
       jsonText(row, "evidence_refs_json", "[]"),
       jsonText(row, "confidence_json", "{}"),
+      textOrDefault(
+        row,
+        "reviewability",
+        intOrDefault(row, "abstained", 0) === 1 ? "insufficient" : "sufficient"
+      ),
+      jsonText(
+        row,
+        "missing_context_json",
+        intOrDefault(row, "abstained", 0) === 1 ? '["complete_statement"]' : "[]"
+      ),
+      jsonText(row, "key_differences_json", "[]"),
       intOrDefault(row, "abstained", 0),
       intOrDefault(row, "requires_human", 1),
       intOrDefault(row, "auto_apply_eligible", 0),

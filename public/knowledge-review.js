@@ -13,6 +13,32 @@
           ? review.run.evidenceRefs.map(String)
           : [],
         confidence: review.run.confidence ? { ...review.run.confidence } : null,
+        missingContext: Array.isArray(review.run.missingContext)
+          ? review.run.missingContext.map(String)
+          : [],
+        keyDifferences: Array.isArray(review.run.keyDifferences)
+          ? review.run.keyDifferences.map((difference) => ({
+            ...difference,
+            evidenceRefs: Array.isArray(difference.evidenceRefs)
+              ? difference.evidenceRefs.map(String)
+              : [],
+          }))
+          : [],
+      } : null,
+      context: review.context && Array.isArray(review.context.evidence) ? {
+        evidence: review.context.evidence.map((item) => ({
+          ...item,
+          scopeIds: Array.isArray(item.scopeIds) ? item.scopeIds.map(String) : [],
+          vaultIds: Array.isArray(item.vaultIds) ? item.vaultIds.map(String) : [],
+          sourceChannels: Array.isArray(item.sourceChannels) ? item.sourceChannels.map(String) : [],
+          authorTypes: Array.isArray(item.authorTypes) ? item.authorTypes.map(String) : [],
+          claimStatuses: Array.isArray(item.claimStatuses) ? item.claimStatuses.map(String) : [],
+          parentStates: Array.isArray(item.parentStates) ? item.parentStates.map(String) : [],
+          sourceTimestamps: Array.isArray(item.sourceTimestamps) ? [...item.sourceTimestamps] : [],
+          observedAt: Array.isArray(item.observedAt) ? [...item.observedAt] : [],
+          validFrom: Array.isArray(item.validFrom) ? [...item.validFrom] : [],
+          validTo: Array.isArray(item.validTo) ? [...item.validTo] : [],
+        })),
       } : null,
       application: review.application ? { ...review.application } : null,
     };
@@ -212,6 +238,46 @@
     }
     if (metadata.childElementCount) head.appendChild(metadata);
     panel.appendChild(head);
+    const contextItems = review?.context?.evidence;
+    if (Array.isArray(contextItems) && contextItems.length) {
+      const context = el("section", "review-ai-context");
+      context.appendChild(el("h4", "", t("review.ai.context")));
+      contextItems.forEach((contextItem) => {
+        const row = el("div", "review-ai-context-row");
+        row.appendChild(el("strong", "", contextItem.ref));
+        const chips = el("div", "review-ai-context-chips");
+        const addValues = (labelKey, values) => {
+          if (!Array.isArray(values)) return;
+          values.slice(0, 4).forEach((value) => {
+            chips.appendChild(el("span", "review-ai-context-chip", `${t(labelKey)}: ${value}`));
+          });
+        };
+        addValues("review.ai.context.scope", contextItem.scopeIds);
+        addValues("review.ai.context.vault", contextItem.vaultIds);
+        addValues("review.ai.context.source", contextItem.sourceChannels);
+        addValues("review.ai.context.author", contextItem.authorTypes);
+        addValues("review.ai.context.claimStatus", contextItem.claimStatuses);
+        addValues("review.ai.context.parentStatus", contextItem.parentStates);
+        const timestamp = [
+          ...(Array.isArray(contextItem.validFrom) ? contextItem.validFrom : []),
+          ...(Array.isArray(contextItem.observedAt) ? contextItem.observedAt : []),
+          ...(Array.isArray(contextItem.sourceTimestamps) ? contextItem.sourceTimestamps : []),
+        ].find((value) => Number.isFinite(Number(value)));
+        if (timestamp != null) {
+          chips.appendChild(el(
+            "span",
+            "review-ai-context-chip",
+            `${t("review.ai.context.time")}: ${new Date(Number(timestamp)).toLocaleDateString()}`
+          ));
+        }
+        if (!chips.childElementCount) {
+          chips.appendChild(el("span", "review-ai-context-empty", t("review.ai.context.none")));
+        }
+        row.appendChild(chips);
+        context.appendChild(row);
+      });
+      panel.appendChild(context);
+    }
     if (!review || review.status === "failed") {
       if (review && review.errorCode) panel.appendChild(el("p", "review-ai-error", review.errorCode));
       panel.appendChild(createAction(
@@ -233,6 +299,13 @@
       article.appendChild(panel);
       return;
     }
+    article.dataset.reviewability = run.reviewability || "insufficient";
+    const reviewability = el(
+      "div",
+      `review-ai-reviewability ${run.reviewability || "insufficient"}`,
+      t(`review.ai.reviewability.${run.reviewability || "insufficient"}`)
+    );
+    panel.appendChild(reviewability);
     const decision = el("div", "review-ai-decision");
     decision.appendChild(el("strong", "", t(`review.ai.decision.${run.decision}`)));
     if (run.confidence && Number.isFinite(Number(run.confidence.decision))) {
@@ -240,12 +313,45 @@
     }
     panel.appendChild(decision);
     panel.appendChild(el("p", "review-ai-reason", run.reason));
+    if (Array.isArray(run.keyDifferences) && run.keyDifferences.length) {
+      const differences = el("section", "review-ai-differences");
+      differences.appendChild(el("h4", "", t("review.ai.keyDifferences")));
+      const list = el("ul", "");
+      run.keyDifferences.forEach((difference) => {
+        const item = el("li", "");
+        item.appendChild(el(
+          "strong",
+          "",
+          `${t(`review.ai.dimension.${difference.dimension}`)} (${t(`review.ai.differenceStatus.${difference.status}`)}): `
+        ));
+        item.appendChild(document.createTextNode(String(difference.summary || "")));
+        if (Array.isArray(difference.evidenceRefs) && difference.evidenceRefs.length) {
+          item.appendChild(el("span", "review-ai-difference-refs", ` ${difference.evidenceRefs.join(", ")}`));
+        }
+        list.appendChild(item);
+      });
+      differences.appendChild(list);
+      panel.appendChild(differences);
+    }
+    if (Array.isArray(run.missingContext) && run.missingContext.length) {
+      const missing = el("section", "review-ai-missing");
+      missing.appendChild(el("h4", "", t("review.ai.missingContext")));
+      const chips = el("div", "review-ai-missing-list");
+      run.missingContext.forEach((reason) => {
+        chips.appendChild(el("span", "review-ai-missing-chip", t(`review.ai.missing.${reason}`)));
+      });
+      missing.appendChild(chips);
+      panel.appendChild(missing);
+    }
     if (Array.isArray(run.evidenceRefs) && run.evidenceRefs.length) {
       panel.appendChild(el("div", "review-ai-refs", `${t("review.ai.evidence")}: ${run.evidenceRefs.join(", ")}`));
     }
     if (review.application || review.status === "applied") {
       panel.appendChild(el("div", "review-ai-applied", t("review.ai.applied")));
-    } else if (run.mode !== "shadow" && !run.abstain && run.decision !== "uncertain") {
+    } else if (
+      run.mode !== "shadow" && run.reviewability === "sufficient" &&
+      !run.abstain && run.decision !== "uncertain"
+    ) {
       const apply = createAction(t("review.ai.apply"), "ai:apply", true);
       apply.dataset.reviewRunId = run.id;
       panel.appendChild(apply);

@@ -60,8 +60,16 @@ describe("full memory backup import/export", () => {
           mode: "suggest",
           decision: "duplicate",
           reason: "invalid fixture",
-          evidence_refs_json: "[]",
+          evidence_refs_json: '["SOURCE","TARGET"]',
           confidence_json: "{}",
+          reviewability: "sufficient",
+          missing_context_json: "[]",
+          key_differences_json: JSON.stringify([{
+            dimension: "content",
+            status: "same",
+            summary: "The normalized content is identical.",
+            evidenceRefs: ["SOURCE", "TARGET"],
+          }]),
           reviewer_provider: "test",
           reviewer_model: "reviewer",
           prompt_version: "v1",
@@ -77,6 +85,138 @@ describe("full memory backup import/export", () => {
         invalid as unknown as Record<string, unknown>,
         { atomic: true }
       )).rejects.toThrow(/applied AI review.*receipt/i);
+      expect(target.db.prepare(`SELECT COUNT(*) AS count FROM entries`).get())
+        .toEqual({ count: 0 });
+    } finally {
+      source.db.close();
+      target.db.close();
+    }
+  });
+
+  it("rejects a v17 AI review that makes a decision from incomplete context before import", async () => {
+    const source = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    const target = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(source.env);
+      await initializeDatabase(target.env);
+      const backup = await exportMemoryBackup(source.env.DB, { source: "test" });
+      const now = Date.now();
+      const manifest = JSON.stringify({
+        objectType: "memory_merge_candidate",
+        objectId: "candidate-forced",
+        state: "pending",
+        evidence: [],
+        policyInput: {},
+      });
+      const invalid = {
+        ...backup,
+        aiReviewJobs: [{
+          id: "job-forced",
+          object_type: "memory_merge_candidate",
+          object_id: "candidate-forced",
+          mode: "suggest",
+          status: "completed",
+          requested_by: "owner",
+          input_snapshot_hash: "snapshot-hash",
+          input_snapshot_json: manifest,
+          run_id: "run-forced",
+          created_at: now,
+        }],
+        aiReviewRuns: [{
+          id: "run-forced",
+          job_id: "job-forced",
+          object_type: "memory_merge_candidate",
+          object_id: "candidate-forced",
+          mode: "suggest",
+          decision: "duplicate",
+          reason: "forced decision",
+          evidence_refs_json: "[]",
+          confidence_json: "{}",
+          reviewability: "partial",
+          missing_context_json: '["scope_context"]',
+          key_differences_json: "[]",
+          abstained: 0,
+          reviewer_provider: "test",
+          reviewer_model: "reviewer",
+          prompt_version: "knowledge-review-v2",
+          input_snapshot_hash: "snapshot-hash",
+          input_snapshot_json: manifest,
+          created_at: now,
+        }],
+        aiReviewApplications: [],
+      };
+
+      await expect(importMemoryBackup(
+        target.env.DB,
+        invalid as unknown as Record<string, unknown>,
+        { atomic: true }
+      )).rejects.toThrow(/incomplete AI review context/i);
+      expect(target.db.prepare(`SELECT COUNT(*) AS count FROM entries`).get())
+        .toEqual({ count: 0 });
+    } finally {
+      source.db.close();
+      target.db.close();
+    }
+  });
+
+  it("rejects a v17 applyable AI review without evidence-bound differences before import", async () => {
+    const source = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    const target = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(source.env);
+      await initializeDatabase(target.env);
+      const backup = await exportMemoryBackup(source.env.DB, { source: "test" });
+      const now = Date.now();
+      const manifest = JSON.stringify({
+        objectType: "memory_merge_candidate",
+        objectId: "candidate-unbound",
+        state: "pending",
+        evidence: [],
+        policyInput: {},
+      });
+      const invalid = {
+        ...backup,
+        aiReviewJobs: [{
+          id: "job-unbound",
+          object_type: "memory_merge_candidate",
+          object_id: "candidate-unbound",
+          mode: "suggest",
+          status: "completed",
+          requested_by: "owner",
+          input_snapshot_hash: "snapshot-hash",
+          input_snapshot_json: manifest,
+          run_id: "run-unbound",
+          created_at: now,
+        }],
+        aiReviewRuns: [{
+          id: "run-unbound",
+          job_id: "job-unbound",
+          object_type: "memory_merge_candidate",
+          object_id: "candidate-unbound",
+          mode: "suggest",
+          decision: "duplicate",
+          reason: "unbound decision",
+          evidence_refs_json: "[]",
+          confidence_json: "{}",
+          reviewability: "sufficient",
+          missing_context_json: "[]",
+          key_differences_json: "[]",
+          abstained: 0,
+          reviewer_provider: "test",
+          reviewer_model: "reviewer",
+          prompt_version: "knowledge-review-v3",
+          input_snapshot_hash: "snapshot-hash",
+          input_snapshot_json: manifest,
+          created_at: now,
+        }],
+        aiReviewApplications: [],
+      };
+
+      await expect(importMemoryBackup(
+        target.env.DB,
+        invalid as unknown as Record<string, unknown>,
+        { atomic: true }
+      )).rejects.toThrow(/evidence references and key differences/i);
       expect(target.db.prepare(`SELECT COUNT(*) AS count FROM entries`).get())
         .toEqual({ count: 0 });
     } finally {
@@ -110,13 +250,16 @@ describe("full memory backup import/export", () => {
       source.db.prepare(
         `INSERT INTO sb_ai_review_runs (
            id, job_id, object_type, object_id, mode, decision, reason,
-           evidence_refs_json, confidence_json, abstained, requires_human,
+           evidence_refs_json, confidence_json, reviewability,
+           missing_context_json, key_differences_json, abstained, requires_human,
            auto_apply_eligible, reviewer_provider, reviewer_model, prompt_version,
            input_snapshot_hash, input_snapshot_json, created_at
          ) VALUES ('run-1', 'job-1', 'memory_merge_candidate', 'candidate-1', 'suggest',
                    'duplicate', 'Exact evidence match', '["SOURCE"]',
-                   '{"decision":1,"evidence":1}', 0, 1, 0, 'test', 'reviewer-v1',
-                   'knowledge-review-v1', 'snapshot-hash', ?, ?)`
+                   '{"decision":1,"evidence":1}', 'sufficient', '[]',
+                   '[{"dimension":"content","status":"same","summary":"No material difference","evidenceRefs":["SOURCE"]}]',
+                   0, 1, 0, 'test', 'reviewer-v1',
+                   'knowledge-review-v2', 'snapshot-hash', ?, ?)`
       ).run(manifest, now);
       source.db.prepare(
         `INSERT INTO sb_ai_review_applications (
@@ -127,13 +270,17 @@ describe("full memory backup import/export", () => {
       ).run(now);
 
       const backup = await exportMemoryBackup(source.env.DB, { source: "test" });
-      expect(backup.schemaVersion).toBe(16);
+      expect(backup.schemaVersion).toBe(17);
       expect(backup.totals).toMatchObject({
         aiReviewJobs: 1,
         aiReviewRuns: 1,
         aiReviewApplications: 1,
       });
       expect(JSON.stringify(backup.aiReviewRuns)).not.toContain("private source text");
+      expect(backup.aiReviewRuns[0]).toMatchObject({
+        reviewability: "sufficient",
+        missing_context_json: "[]",
+      });
 
       const imported = await importMemoryBackup(
         target.env.DB,
@@ -149,6 +296,9 @@ describe("full memory backup import/export", () => {
       expect(target.db.prepare(
         `SELECT decision, application_mode FROM sb_ai_review_applications WHERE id = 'application-1'`
       ).get()).toEqual({ decision: "duplicate", application_mode: "human" });
+      expect(target.db.prepare(
+        `SELECT reviewability, missing_context_json FROM sb_ai_review_runs WHERE id = 'run-1'`
+      ).get()).toEqual({ reviewability: "sufficient", missing_context_json: "[]" });
     } finally {
       source.db.close();
       target.db.close();
@@ -641,7 +791,7 @@ describe("full memory backup import/export", () => {
     const backup = await exportResponse.json() as any;
 
     expect(backup.backupFormat).toBe("singularity-memory-backup");
-    expect(backup.schemaVersion).toBe(16);
+    expect(backup.schemaVersion).toBe(17);
     expect(backup.features).toEqual(
       expect.arrayContaining([
         "atomic-memory",
@@ -784,7 +934,7 @@ describe("full memory backup import/export", () => {
     );
     expect(importResponse.status).toBe(200);
     const imported = await importResponse.json() as any;
-    expect(imported.schemaVersion).toBe(16);
+    expect(imported.schemaVersion).toBe(17);
     expect(imported.inserted).toBe(2);
     expect(imported.graph.scopes.imported).toBe(1);
     expect(imported.graph.parentUnits.imported).toBe(2);
@@ -899,7 +1049,7 @@ describe("full memory backup import/export", () => {
     );
     expect(legacyImportResponse.status).toBe(200);
     const legacyImported = await legacyImportResponse.json() as any;
-    expect(legacyImported.schemaVersion).toBe(16);
+    expect(legacyImported.schemaVersion).toBe(17);
     expect(legacyImported.graph.factSources.total).toBe(0);
     expect(legacyImported.graph.parentVersionClaims.total).toBe(1);
 
@@ -918,14 +1068,14 @@ describe("full memory backup import/export", () => {
     const futureImportResponse = await worker.fetch(
       auth("/import", {
         method: "POST",
-        body: JSON.stringify({ ...backup, schemaVersion: 17 }),
+        body: JSON.stringify({ ...backup, schemaVersion: 18 }),
       }),
       legacyRestored.env,
       createExecutionContext()
     );
     expect(futureImportResponse.status).toBe(400);
     const futureImported = await futureImportResponse.json() as any;
-    expect(futureImported.error).toMatch(/schemaVersion 17/);
+    expect(futureImported.error).toMatch(/schemaVersion 18/);
 
     db.close();
     restored.db.close();

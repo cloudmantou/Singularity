@@ -11140,6 +11140,12 @@ function publicAIReviewJob(job: AIReviewJobRecord): Record<string, unknown> {
     evidenceRefs: [...job.run.evidenceRefs],
     confidence: { ...job.run.confidence },
     abstain: job.run.abstain,
+    reviewability: job.run.reviewability,
+    missingContext: [...job.run.missingContext],
+    keyDifferences: job.run.keyDifferences.map((difference) => ({
+      ...difference,
+      evidenceRefs: [...difference.evidenceRefs],
+    })),
     requiresHuman: job.run.requiresHuman,
     autoApplyEligible: job.run.autoApplyEligible,
     reviewerProvider: job.run.reviewerProvider,
@@ -11153,11 +11159,27 @@ function publicAIReviewJob(job: AIReviewJobRecord): Record<string, unknown> {
     objectId: job.objectId,
     mode: job.mode,
     status: job.status,
+    reviewPolicyVersion: job.reviewPolicyVersion,
     runId: job.runId,
     errorCode: job.errorCode,
     createdAt: job.createdAt,
     startedAt: job.startedAt,
     completedAt: job.completedAt,
+    context: {
+      evidence: job.inputManifest.evidence.map((item) => ({
+        ref: item.ref,
+        scopeIds: [...(item.scopeIds ?? [])],
+        vaultIds: [...(item.vaultIds ?? [])],
+        sourceChannels: [...(item.sourceChannels ?? [])],
+        authorTypes: [...(item.authorTypes ?? [])],
+        claimStatuses: [...(item.claimStatuses ?? [])],
+        parentStates: [...(item.parentStates ?? [])],
+        sourceTimestamps: [...(item.sourceTimestamps ?? [])],
+        observedAt: [...(item.observedAt ?? [])],
+        validFrom: [...(item.validFrom ?? [])],
+        validTo: [...(item.validTo ?? [])],
+      })),
+    },
     run,
     application: job.application ? { ...job.application } : null,
   };
@@ -11182,7 +11204,7 @@ async function createAIReviewModel(env: Env) {
       return llm.chat([
         { role: "system", content: messages.system },
         { role: "user", content: messages.user },
-      ], { max_tokens: 700, jsonMode: true });
+      ], { max_tokens: 1_200, jsonMode: true });
     },
   };
 }

@@ -174,6 +174,63 @@
   gap: 10px;
 }
 
+.review-ai-reviewability {
+  margin-top: 10px;
+  padding-left: 9px;
+  border-left: 3px solid var(--success, #39734f);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.review-ai-reviewability.partial {
+  border-left-color: #b37a24;
+}
+
+.review-ai-reviewability.insufficient {
+  border-left-color: var(--danger);
+}
+
+.review-ai-context {
+  margin-top: 10px;
+  padding-block: 8px;
+  border-block: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+}
+
+.review-ai-context h4 {
+  margin: 0 0 7px;
+  color: var(--text-primary);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.review-ai-context-row {
+  display: grid;
+  grid-template-columns: minmax(48px, auto) 1fr;
+  align-items: start;
+  gap: 8px;
+  margin-top: 6px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.review-ai-context-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.review-ai-context-chip {
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg-card);
+}
+
+.review-ai-context-empty {
+  color: var(--text-tertiary);
+}
+
 .review-ai-meta {
   display: flex;
   align-items: center;
@@ -223,6 +280,47 @@
 
 .review-ai-reason,
 .review-ai-pending { color: var(--text-secondary); }
+
+.review-ai-differences,
+.review-ai-missing {
+  margin-top: 11px;
+}
+
+.review-ai-differences h4,
+.review-ai-missing h4 {
+  margin: 0 0 6px;
+  color: var(--text-primary);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.review-ai-differences ul {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.review-ai-difference-refs {
+  color: var(--text-tertiary);
+  font-size: 10px;
+}
+
+.review-ai-missing-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.review-ai-missing-chip {
+  padding: 3px 7px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  background: var(--bg-card);
+  font-size: 11px;
+}
 
 .review-ai-refs,
 .review-ai-shadow,

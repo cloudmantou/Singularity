@@ -70,6 +70,14 @@ function insertMemoryReviewCandidate(
      ) VALUES (?, ?, ?, 1, 'duplicate', 'pending', ?)`
   ).run(input.id, sourceId, targetId, now);
   if (input.exactContext) {
+    const observationId = `${input.id}-observation`;
+    const evidenceRootId = `${input.id}-evidence-root`;
+    db.prepare(
+      `INSERT INTO sb_observations (
+         id, content, source, source_channel, source_identity, author_type,
+         source_timestamp, revision, root_evidence_id, created_at
+       ) VALUES (?, 'Exact duplicate', 'api', 'api', ?, 'user', ?, 1, ?, ?)`
+    ).run(observationId, `${input.id}/exact-repeat`, now, evidenceRootId, now);
     db.prepare(
       `INSERT INTO sb_parent_versions (
          version_id, parent_id, version_number, vault_snapshot, state, created_at, updated_at
@@ -88,6 +96,16 @@ function insertMemoryReviewCandidate(
     ).run(
       `${input.id}-source-claim`, sourceId, `${input.id}-source-v1`, now, now,
       `${input.id}-target-claim`, targetId, `${input.id}-target-v1`, now, now
+    );
+    db.prepare(
+      `INSERT INTO sb_memory_sources (
+         id, memory_id, observation_id, relation, evidence_score,
+         derivation_confidence, evidence_root_id, created_at
+       ) VALUES (?, ?, ?, 'supports', 1, 1, ?, ?),
+                (?, ?, ?, 'supports', 1, 1, ?, ?)`
+    ).run(
+      `${input.id}-source-proof`, `${input.id}-source-claim`, observationId, evidenceRootId, now,
+      `${input.id}-target-proof`, `${input.id}-target-claim`, observationId, evidenceRootId, now
     );
   }
 }
@@ -151,6 +169,14 @@ describe("memory quality review queues", () => {
           evidenceRefs: ["SOURCE", "TARGET"],
           confidence: { decision: 0.96, evidence: 0.9 },
           abstain: false,
+          reviewability: "sufficient",
+          missingContext: [],
+          keyDifferences: [{
+            dimension: "content",
+            status: "same",
+            summary: "No material content difference was found.",
+            evidenceRefs: ["SOURCE", "TARGET"],
+          }],
         }),
       });
       expect(db.prepare(
@@ -177,6 +203,31 @@ describe("memory quality review queues", () => {
         ai_review_run_id: run.id,
         ai_review_decision: "duplicate",
       });
+      const listed = await worker.fetch(
+        auth("/quality/ai-review?objectType=memory_merge_candidate&limit=10"),
+        env,
+        testCtx()
+      );
+      expect(listed.status).toBe(200);
+      expect((await listed.json() as any).reviews[0].run).toMatchObject({
+        reviewability: "sufficient",
+        missingContext: [],
+        keyDifferences: [{
+          dimension: "content",
+          status: "same",
+          evidenceRefs: ["SOURCE", "TARGET"],
+        }],
+      });
+      expect((await (await worker.fetch(
+        auth("/quality/ai-review?objectType=memory_merge_candidate&limit=10"),
+        env,
+        testCtx()
+      )).json() as any).reviews[0].context).toMatchObject({
+        evidence: [
+          expect.objectContaining({ ref: "SOURCE" }),
+          expect.objectContaining({ ref: "TARGET" }),
+        ],
+      });
     } finally {
       db.close();
     }
@@ -202,6 +253,14 @@ describe("memory quality review queues", () => {
           evidenceRefs: ["SOURCE", "TARGET"],
           confidence: { decision: 0.9, evidence: 0.9 },
           abstain: false,
+          reviewability: "sufficient",
+          missingContext: [],
+          keyDifferences: [{
+            dimension: "content",
+            status: "same",
+            summary: "No material content difference was found.",
+            evidenceRefs: ["SOURCE", "TARGET"],
+          }],
         }),
       });
 
@@ -241,6 +300,14 @@ describe("memory quality review queues", () => {
           evidenceRefs: ["SOURCE", "TARGET"],
           confidence: { decision: 0.9, evidence: 0.9 },
           abstain: false,
+          reviewability: "sufficient",
+          missingContext: [],
+          keyDifferences: [{
+            dimension: "content",
+            status: "same",
+            summary: "No material content difference was found.",
+            evidenceRefs: ["SOURCE", "TARGET"],
+          }],
         }),
       });
       db.exec(
@@ -335,6 +402,14 @@ describe("memory quality review queues", () => {
           evidenceRefs: ["SOURCE", "TARGET"],
           confidence: { decision: 0.88, evidence: 0.75 },
           abstain: false,
+          reviewability: "sufficient",
+          missingContext: [],
+          keyDifferences: [{
+            dimension: "identity",
+            status: "different",
+            summary: "The entity names identify different projects.",
+            evidenceRefs: ["SOURCE", "TARGET"],
+          }],
         }),
       })).run;
       expect((await worker.fetch(auth("/quality/ai-review/apply", {
@@ -378,6 +453,14 @@ describe("memory quality review queues", () => {
           evidenceRefs: ["OLD", "NEW"],
           confidence: { decision: 0.91, evidence: 0.9 },
           abstain: false,
+          reviewability: "sufficient",
+          missingContext: [],
+          keyDifferences: [{
+            dimension: "time",
+            status: "different",
+            summary: "The incoming evidence is newer.",
+            evidenceRefs: ["OLD", "NEW"],
+          }],
         }),
       })).run;
       expect((await worker.fetch(auth("/quality/ai-review/apply", {
