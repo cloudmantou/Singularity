@@ -17,6 +17,7 @@ export interface EntityMergeInput {
   vaultId?: string | null;
   reason?: string | null;
   reviewedAt?: number;
+  finalizationStatements?: D1PreparedStatement[];
 }
 
 export interface EntityMergeResult {
@@ -287,7 +288,8 @@ export class D1EntityMergeExecutor {
         actorId,
         reason,
         input.tokenId ?? null,
-        input.vaultId ?? null
+        input.vaultId ?? null,
+        input.finalizationStatements ?? []
       );
     }
     if (input.decision !== "accept") throw new Error("Unsupported entity merge decision");
@@ -311,7 +313,8 @@ export class D1EntityMergeExecutor {
       actorId,
       reason,
       input.tokenId ?? null,
-      input.vaultId ?? null
+      input.vaultId ?? null,
+      input.finalizationStatements ?? []
     );
   }
 
@@ -330,7 +333,8 @@ export class D1EntityMergeExecutor {
     auditActorId: string,
     reason: string | null,
     tokenId: string | null,
-    vaultId: string | null
+    vaultId: string | null,
+    finalizationStatements: D1PreparedStatement[]
   ): Promise<EntityMergeResult> {
     const audit = await prepareComplianceAuditEvent(this.db, {
       occurredAt: lock.reviewedAt,
@@ -350,6 +354,7 @@ export class D1EntityMergeExecutor {
          WHERE id = ? AND state = 'pending'`
       ).bind(lock.reviewedBy, lock.reviewedAt, lock.reviewedAt, lock.candidateId),
       guardedAuditStatement(this.db, audit, lock, "rejected"),
+      ...finalizationStatements,
     ]);
     if (Number(results[0]?.meta?.changes ?? 0) !== 1) {
       throw new EntityMergeCandidateUnavailableError(lock.candidateId);
@@ -369,7 +374,8 @@ export class D1EntityMergeExecutor {
     auditActorId: string,
     reason: string | null,
     tokenId: string | null,
-    vaultId: string | null
+    vaultId: string | null,
+    finalizationStatements: D1PreparedStatement[]
   ): Promise<EntityMergeResult> {
     if (candidate.source_entity_id === candidate.target_entity_id) {
       throw new EntityMergeEndpointUnavailableError();
@@ -583,8 +589,15 @@ export class D1EntityMergeExecutor {
       },
     });
     statements.push(guardedAuditStatement(this.db, audit, lock, "merged"));
+    statements.push(...finalizationStatements);
 
-    const results = await this.db.batch(statements);
+    let results: D1Result<unknown>[];
+    try {
+      results = await this.db.batch(statements);
+    } catch (error) {
+      if (candidate.state === "pending") await this.releaseAcceptedLock(lock);
+      throw error;
+    }
     if (Number(results[finalStatementIndex]?.meta?.changes ?? 0) !== 1) {
       throw new EntityMergeCandidateUnavailableError(lock.candidateId);
     }

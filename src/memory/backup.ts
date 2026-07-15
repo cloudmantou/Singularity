@@ -12,11 +12,12 @@ import {
 } from "./quality";
 import { ensureAssociationDataModel } from "./associations";
 import { MEMORY_MUTATION_SCHEMA_STATEMENTS } from "./mutations";
+import { ensureAIReviewDataModel } from "./ai-review";
 
-export const MEMORY_BACKUP_SCHEMA_VERSION = 15;
+export const MEMORY_BACKUP_SCHEMA_VERSION = 16;
 export const MEMORY_MUTATION_BACKUP_MODE = "audit_only" as const;
 const MEMORY_BACKUP_FORMAT = "singularity-memory-backup";
-const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
 const MEMORY_BACKUP_FEATURES = [
   "atomic-memory",
   "temporal-facts",
@@ -39,6 +40,7 @@ const MEMORY_BACKUP_FEATURES = [
   "association-validity-windows",
   "entry-mutation-journal",
   "entry-mutation-journal-audit-only",
+  "ai-assisted-quality-review",
 ] as const;
 
 export const AUDIT_IMPORT_MODES = ["replace_empty", "append_verified"] as const;
@@ -75,6 +77,9 @@ const GRAPH_ARRAY_KEYS = [
   "revisions",
   "mergeCandidates",
   "conflictCases",
+  "aiReviewJobs",
+  "aiReviewRuns",
+  "aiReviewApplications",
   "auditEvents",
 ] as const;
 
@@ -95,7 +100,7 @@ export interface BackupIntegrityReport {
 
 export interface MemoryBackup {
   backupFormat: typeof MEMORY_BACKUP_FORMAT;
-  schemaVersion: 15;
+  schemaVersion: 16;
   features: Array<(typeof MEMORY_BACKUP_FEATURES)[number]>;
   exportedAt: string;
   source: string;
@@ -129,11 +134,14 @@ export interface MemoryBackup {
   revisions: BackupRow[];
   mergeCandidates: BackupRow[];
   conflictCases: BackupRow[];
+  aiReviewJobs: BackupRow[];
+  aiReviewRuns: BackupRow[];
+  aiReviewApplications: BackupRow[];
   auditEvents: BackupRow[];
 }
 
 export interface MemoryBackupImportResult extends ImportResult {
-  schemaVersion: 15;
+  schemaVersion: 16;
   memoryMutationBackupMode: typeof MEMORY_MUTATION_BACKUP_MODE;
   graph: Record<GraphArrayKey, TableImportStats>;
   integrity: BackupIntegrityReport;
@@ -338,7 +346,22 @@ export async function inspectMemoryBackupIntegrity(db: D1Database): Promise<Back
         WHERE c.old_claim_id IS NOT NULL AND m.id IS NULL) as conflict_cases_missing_old_claim,
        (SELECT COUNT(*) FROM sb_conflict_cases c
         LEFT JOIN sb_memories m ON m.id = c.new_claim_id
-        WHERE c.new_claim_id IS NOT NULL AND m.id IS NULL) as conflict_cases_missing_new_claim`
+        WHERE c.new_claim_id IS NOT NULL AND m.id IS NULL) as conflict_cases_missing_new_claim,
+       (SELECT COUNT(*) FROM sb_ai_review_runs r
+        LEFT JOIN sb_ai_review_jobs j ON j.id = r.job_id
+        WHERE j.id IS NULL) as ai_review_runs_missing_job,
+       (SELECT COUNT(*) FROM sb_ai_review_jobs j
+        LEFT JOIN sb_ai_review_runs r ON r.id = j.run_id
+        WHERE j.run_id IS NOT NULL AND r.id IS NULL) as ai_review_jobs_missing_run,
+       (SELECT COUNT(*) FROM sb_ai_review_applications a
+        LEFT JOIN sb_ai_review_runs r ON r.id = a.run_id
+        WHERE r.id IS NULL) as ai_review_applications_missing_run,
+       (SELECT COUNT(*) FROM sb_ai_review_jobs j
+        WHERE j.status = 'applied'
+          AND NOT EXISTS (
+            SELECT 1 FROM sb_ai_review_applications a
+            WHERE a.run_id = j.run_id
+          )) as ai_review_applied_jobs_missing_receipt`
   );
   const issues: Record<string, number> = {};
   for (const [key, value] of Object.entries(row ?? {})) {
@@ -357,6 +380,7 @@ export async function exportMemoryBackup(
   await ensureEntityResolutionDataModel(db);
   await ensureConflictClaimSchema(db);
   await ensureAssociationDataModel(db);
+  await ensureAIReviewDataModel(db);
   for (const statement of MEMORY_MUTATION_SCHEMA_STATEMENTS) await db.exec(statement);
   const [
     scopes,
@@ -386,6 +410,9 @@ export async function exportMemoryBackup(
     revisions,
     mergeCandidates,
     conflictCases,
+    aiReviewJobs,
+    aiReviewRuns,
+    aiReviewApplications,
     auditEvents,
   ] = await Promise.all([
     allRows(db, `SELECT scope_id, parent_scope_id, canonical_name, aliases_json,
@@ -518,6 +545,21 @@ export async function exportMemoryBackup(
                        resolved_at, created_at
                 FROM sb_conflict_cases
                 ORDER BY created_at DESC, id DESC`),
+    allRows(db, `SELECT id, object_type, object_id, mode, status, requested_by,
+                       input_snapshot_hash, input_snapshot_json, run_id, error_code,
+                       created_at, started_at, completed_at
+                FROM sb_ai_review_jobs
+                ORDER BY created_at DESC, id DESC`),
+    allRows(db, `SELECT id, job_id, object_type, object_id, mode, decision, reason,
+                       evidence_refs_json, confidence_json, abstained, requires_human,
+                       auto_apply_eligible, reviewer_provider, reviewer_model,
+                       prompt_version, input_snapshot_hash, input_snapshot_json, created_at
+                FROM sb_ai_review_runs
+                ORDER BY created_at DESC, id DESC`),
+    allRows(db, `SELECT id, run_id, object_type, object_id, decision, applied_by,
+                       application_mode, created_at
+                FROM sb_ai_review_applications
+                ORDER BY created_at DESC, id DESC`),
     allRows(db, `SELECT id, occurred_at, trace_id, actor_type, actor_id,
                        token_id, action, object_type, object_id, vault_id,
                        before_hash, after_hash, success, error_code,
@@ -561,6 +603,9 @@ export async function exportMemoryBackup(
       revisions: countRows(revisions),
       mergeCandidates: countRows(mergeCandidates),
       conflictCases: countRows(conflictCases),
+      aiReviewJobs: countRows(aiReviewJobs),
+      aiReviewRuns: countRows(aiReviewRuns),
+      aiReviewApplications: countRows(aiReviewApplications),
       auditEvents: countRows(auditEvents),
     },
     integrity: await inspectMemoryBackupIntegrity(db),
@@ -591,6 +636,9 @@ export async function exportMemoryBackup(
     revisions,
     mergeCandidates,
     conflictCases,
+    aiReviewJobs,
+    aiReviewRuns,
+    aiReviewApplications,
     auditEvents,
   };
 }
@@ -879,6 +927,45 @@ function rowsFor(body: Record<string, unknown>, key: GraphArrayKey): BackupRow[]
   return arrayFrom(body[key]);
 }
 
+function verifyAIReviewBackupRows(body: Record<string, unknown>): void {
+  const jobs = rowsFor(body, "aiReviewJobs");
+  const runs = rowsFor(body, "aiReviewRuns");
+  const applications = rowsFor(body, "aiReviewApplications");
+  const jobsById = new Map(jobs.map((row) => [requiredText(row, "id"), row]));
+  const runsById = new Map(runs.map((row) => [requiredText(row, "id"), row]));
+  const applicationsByRunId = new Map(
+    applications.map((row) => [requiredText(row, "run_id"), row])
+  );
+
+  for (const run of runs) {
+    const job = jobsById.get(requiredText(run, "job_id"));
+    if (!job) throw new Error("AI review run references a missing job");
+    const linkedRunId = textOrNull(job, "run_id");
+    if (linkedRunId !== requiredText(run, "id")) {
+      throw new Error("AI review job and run linkage does not match");
+    }
+  }
+  for (const application of applications) {
+    const runId = requiredText(application, "run_id");
+    const run = runsById.get(runId);
+    if (!run) throw new Error("AI review application references a missing run");
+    if (
+      requiredText(application, "object_type") !== requiredText(run, "object_type") ||
+      requiredText(application, "object_id") !== requiredText(run, "object_id") ||
+      requiredText(application, "decision") !== requiredText(run, "decision")
+    ) {
+      throw new Error("AI review application does not match its immutable run");
+    }
+  }
+  for (const job of jobs) {
+    if (textOrDefault(job, "status", "failed") !== "applied") continue;
+    const runId = textOrNull(job, "run_id");
+    if (!runId || !runsById.has(runId) || !applicationsByRunId.has(runId)) {
+      throw new Error("Applied AI review is missing its immutable application receipt");
+    }
+  }
+}
+
 async function importMemoryBackupUnlocked(
   db: D1Database,
   body: Record<string, unknown>,
@@ -894,6 +981,7 @@ async function importMemoryBackupUnlocked(
     );
   }
   const mode: ImportMode = options.mode === "overwrite" ? "overwrite" : "skip";
+  verifyAIReviewBackupRows(body);
   const auditImportPlan = await prepareAuditImport(
     db,
     rowsFor(body, "auditEvents"),
@@ -1486,6 +1574,82 @@ async function importMemoryBackupUnlocked(
     )
   );
 
+  graph.aiReviewJobs = await importTable(db, rowsFor(body, "aiReviewJobs"), (row) => {
+    const rawStatus = textOrDefault(row, "status", "failed");
+    const status = rawStatus === "processing"
+      ? "queued"
+      : rawStatus === "applying" ? "completed" : rawStatus;
+    return db.prepare(
+      `INSERT OR IGNORE INTO sb_ai_review_jobs (
+         id, object_type, object_id, mode, status, requested_by,
+         input_snapshot_hash, input_snapshot_json, run_id, error_code,
+         created_at, started_at, completed_at, lease_owner, lease_expires_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`
+    ).bind(
+      requiredText(row, "id"),
+      requiredText(row, "object_type"),
+      requiredText(row, "object_id"),
+      textOrDefault(row, "mode", "shadow"),
+      status,
+      textOrDefault(row, "requested_by", "backup_restore"),
+      requiredText(row, "input_snapshot_hash"),
+      jsonText(row, "input_snapshot_json", "{}"),
+      textOrNull(row, "run_id"),
+      textOrNull(row, "error_code"),
+      intOrDefault(row, "created_at", Date.now()),
+      numberOrNull(row, "started_at"),
+      numberOrNull(row, "completed_at")
+    );
+  });
+
+  graph.aiReviewRuns = await importTable(db, rowsFor(body, "aiReviewRuns"), (row) =>
+    db.prepare(
+      `INSERT OR IGNORE INTO sb_ai_review_runs (
+         id, job_id, object_type, object_id, mode, decision, reason,
+         evidence_refs_json, confidence_json, abstained, requires_human,
+         auto_apply_eligible, reviewer_provider, reviewer_model, prompt_version,
+         input_snapshot_hash, input_snapshot_json, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "id"),
+      requiredText(row, "job_id"),
+      requiredText(row, "object_type"),
+      requiredText(row, "object_id"),
+      textOrDefault(row, "mode", "shadow"),
+      requiredText(row, "decision"),
+      textOrDefault(row, "reason", "Restored AI review recommendation"),
+      jsonText(row, "evidence_refs_json", "[]"),
+      jsonText(row, "confidence_json", "{}"),
+      intOrDefault(row, "abstained", 0),
+      intOrDefault(row, "requires_human", 1),
+      intOrDefault(row, "auto_apply_eligible", 0),
+      textOrDefault(row, "reviewer_provider", "unknown"),
+      textOrDefault(row, "reviewer_model", "unknown"),
+      textOrDefault(row, "prompt_version", "unknown"),
+      requiredText(row, "input_snapshot_hash"),
+      jsonText(row, "input_snapshot_json", "{}"),
+      intOrDefault(row, "created_at", Date.now())
+    )
+  );
+
+  graph.aiReviewApplications = await importTable(db, rowsFor(body, "aiReviewApplications"), (row) =>
+    db.prepare(
+      `INSERT OR IGNORE INTO sb_ai_review_applications (
+         id, run_id, object_type, object_id, decision, applied_by,
+         application_mode, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "id"),
+      requiredText(row, "run_id"),
+      requiredText(row, "object_type"),
+      requiredText(row, "object_id"),
+      requiredText(row, "decision"),
+      textOrDefault(row, "applied_by", "backup_restore"),
+      textOrDefault(row, "application_mode", "human"),
+      intOrDefault(row, "created_at", Date.now())
+    )
+  );
+
   graph.auditEvents = await importAuditEvents(db, auditImportPlan, (row) =>
     db.prepare(
       `INSERT INTO sb_audit_events (
@@ -1539,6 +1703,7 @@ export async function importMemoryBackup(
   await ensureEntityResolutionDataModel(db);
   await ensureConflictClaimSchema(db);
   await ensureAssociationDataModel(db);
+  await ensureAIReviewDataModel(db);
   for (const statement of MEMORY_MUTATION_SCHEMA_STATEMENTS) await db.exec(statement);
 
   const ownerId = crypto.randomUUID();

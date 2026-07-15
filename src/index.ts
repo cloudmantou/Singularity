@@ -166,6 +166,25 @@ import {
   getVerifiedAnswerCache,
 } from "./memory/verified-answer-cache";
 import {
+  AI_REVIEW_OBJECT_TYPES,
+  AIReviewInvalidResponseError,
+  AIReviewJobUnavailableError,
+  AIReviewObjectUnavailableError,
+  claimAIReviewApplication,
+  enqueueAIReviewJob,
+  getAIReviewRun,
+  hashAIReviewSnapshot,
+  listAIReviewJobs,
+  loadAIReviewSnapshot,
+  processAIReviewJob,
+  prepareAIReviewApplicationStatements,
+  releaseAIReviewApplication,
+  type AIReviewJobRecord,
+  type AIReviewMode,
+  type AIReviewObjectType,
+  type AIReviewRunRecord,
+} from "./memory/ai-review";
+import {
   prepareMemoryRevision,
   type MemoryRevisionEvent,
 } from "./memory/revisions";
@@ -337,6 +356,7 @@ export interface Env {
   VERIFIER_LLM_API_KEY?: string;
   VERIFIER_LLM_MODEL?: string;
   VERIFIER_LLM_EXTRA_BODY?: string;
+  /** Knowledge Review model mode: shadow, suggest, or deterministic auto_low_risk. */
 }
 
 const entityEmbeddingIndexes = new WeakMap<object, EntityEmbeddingIndex>();
@@ -10907,27 +10927,62 @@ async function resolveMemoryMergeCandidate(
     id: string;
     state: MergeCandidateState;
     reviewedBy: string;
-    principal: AuthPrincipal;
+    principal?: AuthPrincipal;
+    auditActor?: Pick<
+      ComplianceAuditEventInput,
+      "actorType" | "actorId" | "tokenId" | "vaultId"
+    >;
+    reviewedAt?: number;
+    aiReview?: { runId: string; decision: string; applicationMode: "human" | "deterministic_auto" };
+    finalizationStatements?: D1PreparedStatement[];
   }
 ): Promise<boolean> {
-  const now = Date.now();
+  const now = input.reviewedAt ?? Date.now();
+  const actor = input.auditActor ?? (input.principal
+    ? auditActorFromPrincipal(input.principal)
+    : { actorType: "system", actorId: "system", tokenId: null, vaultId: null });
   const auditEvent = await prepareComplianceAuditEvent(env.DB, {
-    ...auditActorFromPrincipal(input.principal),
+    ...actor,
     action: "quality.merge_candidate.resolve",
     objectType: "memory_merge_candidate",
     objectId: input.id,
     metadata: {
       state: input.state,
       reviewed_by: input.reviewedBy,
+      ...(input.aiReview ? {
+        ai_review_run_id: input.aiReview.runId,
+        ai_review_decision: input.aiReview.decision,
+        ai_review_application_mode: input.aiReview.applicationMode,
+      } : {}),
     },
   });
+  const record = auditEvent.record;
+  const guardedAudit = env.DB.prepare(
+    `INSERT INTO sb_audit_events (
+       id, occurred_at, trace_id, actor_type, actor_id, token_id,
+       action, object_type, object_id, vault_id, before_hash, after_hash,
+       success, error_code, metadata_json, previous_event_hash, event_hash
+     )
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+     WHERE EXISTS (
+       SELECT 1 FROM sb_memory_merge_candidates
+       WHERE id = ? AND state = ? AND reviewed_by = ? AND reviewed_at = ?
+     )`
+  ).bind(
+    record.id, record.occurred_at, record.trace_id, record.actor_type, record.actor_id,
+    record.token_id, record.action, record.object_type, record.object_id, record.vault_id,
+    record.before_hash, record.after_hash, record.success, record.error_code,
+    record.metadata_json, record.previous_event_hash, record.event_hash,
+    input.id, input.state, input.reviewedBy, now
+  );
   const results = await env.DB.batch([
     env.DB.prepare(
       `UPDATE sb_memory_merge_candidates
        SET state = ?, reviewed_by = ?, reviewed_at = ?
-       WHERE id = ?`
+       WHERE id = ? AND state = 'pending'`
     ).bind(input.state, input.reviewedBy, now, input.id),
-    auditEvent.statement,
+    guardedAudit,
+    ...(input.finalizationStatements ?? []),
   ]);
   return Number(results[0]?.meta?.changes ?? 0) > 0;
 }
@@ -11054,9 +11109,12 @@ async function resolveConflictCase(
     resolution: ConflictResolution;
     resolvedBy: string;
     principal: AuthPrincipal;
+    resolvedAt?: number;
+    finalizationStatements?: D1PreparedStatement[];
+    aiReview?: { runId: string; decision: string; applicationMode: "human" | "deterministic_auto" };
   }
 ): Promise<boolean> {
-  const now = Date.now();
+  const now = input.resolvedAt ?? Date.now();
   const actor = auditActorFromPrincipal(input.principal);
   return await new D1ResolutionCoordinator(env.DB).applyConflictResolution({
     conflictId: input.id,
@@ -11066,10 +11124,256 @@ async function resolveConflictCase(
     effectiveAt: now,
     actorType: actor.actorType,
     actorId: actor.actorId,
+    finalizationStatements: input.finalizationStatements,
+    aiReview: input.aiReview,
   });
 }
 
-function createQualityRouteServices(env: Env): QualityRouteServices<AuthPrincipal> {
+function publicAIReviewJob(job: AIReviewJobRecord): Record<string, unknown> {
+  const run = job.run ? {
+    id: job.run.id,
+    objectType: job.run.objectType,
+    objectId: job.run.objectId,
+    mode: job.run.mode,
+    decision: job.run.decision,
+    reason: job.run.reason,
+    evidenceRefs: [...job.run.evidenceRefs],
+    confidence: { ...job.run.confidence },
+    abstain: job.run.abstain,
+    requiresHuman: job.run.requiresHuman,
+    autoApplyEligible: job.run.autoApplyEligible,
+    reviewerProvider: job.run.reviewerProvider,
+    reviewerModel: job.run.reviewerModel,
+    promptVersion: job.run.promptVersion,
+    createdAt: job.run.createdAt,
+  } : null;
+  return {
+    id: job.id,
+    objectType: job.objectType,
+    objectId: job.objectId,
+    mode: job.mode,
+    status: job.status,
+    runId: job.runId,
+    errorCode: job.errorCode,
+    createdAt: job.createdAt,
+    startedAt: job.startedAt,
+    completedAt: job.completedAt,
+    run,
+    application: job.application ? { ...job.application } : null,
+  };
+}
+
+async function createAIReviewModel(env: Env) {
+  let provider = env.LLM_BASE_URL ? "openai-compatible" : "workers-ai";
+  let model = env.LLM_MODEL ?? "default";
+  try {
+    const { effective } = await getEffectiveModelSettings(env);
+    provider = effective.llm.provider;
+    model = effective.llm.model;
+  } catch {
+    // createLLM reports the actionable provider error when processing starts.
+  }
+  let llm: LLMProvider | null = null;
+  return {
+    provider,
+    model,
+    complete: async (messages: { system: string; user: string }) => {
+      llm ??= await createLLM(env);
+      return llm.chat([
+        { role: "system", content: messages.system },
+        { role: "user", content: messages.user },
+      ], { max_tokens: 700, jsonMode: true });
+    },
+  };
+}
+
+async function pendingAIReviewTargets(
+  db: D1Database,
+  objectType: AIReviewObjectType | null,
+  limit: number
+): Promise<Array<{ objectType: AIReviewObjectType; objectId: string }>> {
+  const boundedLimit = Math.max(1, Math.min(10, Math.trunc(limit)));
+  const clauses: Record<AIReviewObjectType, string> = {
+    conflict_case:
+      `SELECT 'conflict_case' AS object_type, id AS object_id, created_at
+       FROM sb_conflict_cases WHERE state = 'pending'`,
+    entity_merge_candidate:
+      `SELECT 'entity_merge_candidate' AS object_type, id AS object_id, created_at
+       FROM sb_entity_merge_candidates WHERE state = 'pending'`,
+    memory_merge_candidate:
+      `SELECT 'memory_merge_candidate' AS object_type, id AS object_id, created_at
+       FROM sb_memory_merge_candidates WHERE state = 'pending'`,
+  };
+  const selected = objectType ? [objectType] : [...AI_REVIEW_OBJECT_TYPES];
+  const sql = `${selected.map((type) => clauses[type]).join(" UNION ALL ")}
+    ORDER BY created_at DESC, object_id DESC LIMIT ?`;
+  const rows = await db.prepare(sql).bind(boundedLimit).all<{
+    object_type: AIReviewObjectType;
+    object_id: string;
+  }>();
+  return (rows.results ?? []).map((row) => ({
+    objectType: row.object_type,
+    objectId: row.object_id,
+  }));
+}
+
+async function applyAIReviewRecommendation(
+  env: Env,
+  runId: string,
+  input: {
+    principal?: AuthPrincipal;
+    deterministicAuto?: boolean;
+  }
+): Promise<Record<string, unknown>> {
+  const run = await getAIReviewRun(env.DB, runId);
+  if (!run) throw new AIReviewJobUnavailableError(runId);
+  if (input.deterministicAuto && (!run.autoApplyEligible || run.requiresHuman)) {
+    throw new AIReviewJobUnavailableError(runId);
+  }
+  if (!input.deterministicAuto && !input.principal) {
+    throw new AIReviewJobUnavailableError(runId);
+  }
+  const currentSnapshot = await loadAIReviewSnapshot(env.DB, run.objectType, run.objectId);
+  if (await hashAIReviewSnapshot(currentSnapshot) !== run.inputSnapshotHash) {
+    throw new AIReviewObjectUnavailableError(run.objectType, run.objectId);
+  }
+  const claimed = await claimAIReviewApplication(env.DB, runId);
+  const actor = input.principal ? auditActorFromPrincipal(input.principal) : {
+    actorType: "system",
+    actorId: "ai-review-rules",
+    tokenId: null,
+    vaultId: null,
+  };
+  const appliedBy = input.deterministicAuto
+    ? "system:deterministic"
+    : actor.actorId ?? "owner";
+  const applicationMode = input.deterministicAuto ? "deterministic_auto" : "human";
+  const reviewedAt = Date.now();
+  try {
+    let applied = false;
+    if (run.objectType === "conflict_case") {
+      const resolution = run.decision as ConflictResolution;
+      const state: ConflictCaseState = resolution === "dismissed" ? "dismissed" : "resolved";
+      const resolvedBy = `ai-review:${appliedBy}`;
+      const finalizationStatements = prepareAIReviewApplicationStatements(env.DB, {
+        jobId: claimed.job.id,
+        run,
+        appliedBy,
+        applicationMode,
+        leaseOwner: claimed.job.leaseOwner!,
+        guard: {
+          objectType: "conflict_case",
+          objectId: run.objectId,
+          state,
+          resolution,
+          resolvedBy,
+          resolvedAt: reviewedAt,
+        },
+      });
+      applied = await resolveConflictCase(env, {
+        id: run.objectId,
+        state,
+        resolution,
+        resolvedBy,
+        principal: input.principal!,
+        resolvedAt: reviewedAt,
+        finalizationStatements,
+        aiReview: { runId: run.id, decision: run.decision, applicationMode },
+      });
+    } else if (run.objectType === "entity_merge_candidate") {
+      const reviewedBy = `ai-review:${appliedBy}`;
+      const entityState = run.decision === "merge" ? "merged" : "rejected";
+      const finalizationStatements = prepareAIReviewApplicationStatements(env.DB, {
+        jobId: claimed.job.id,
+        run,
+        appliedBy,
+        applicationMode,
+        leaseOwner: claimed.job.leaseOwner!,
+        guard: {
+          objectType: "entity_merge_candidate",
+          objectId: run.objectId,
+          state: entityState,
+          reviewedBy,
+          reviewedAt,
+        },
+      });
+      const result = await new D1EntityMergeExecutor(
+        env.DB,
+        entityEmbeddingIndexForEnv(env)
+      ).resolve({
+        candidateId: run.objectId,
+        decision: run.decision === "merge" ? "accept" : "reject",
+        actorType: actor.actorType,
+        actorId: actor.actorId ?? appliedBy,
+        reviewedBy,
+        reviewedAt,
+        tokenId: actor.tokenId,
+        vaultId: actor.vaultId,
+        reason: run.reason,
+        finalizationStatements,
+      });
+      applied = Boolean(result.candidateId);
+    } else {
+      const state: MergeCandidateState = run.decision === "keep_both" ? "rejected" : "accepted";
+      const reviewedBy = `ai-review:${appliedBy}`;
+      const finalizationStatements = prepareAIReviewApplicationStatements(env.DB, {
+        jobId: claimed.job.id,
+        run,
+        appliedBy,
+        applicationMode,
+        leaseOwner: claimed.job.leaseOwner!,
+        guard: {
+          objectType: "memory_merge_candidate",
+          objectId: run.objectId,
+          state,
+          reviewedBy,
+          reviewedAt,
+        },
+      });
+      applied = await resolveMemoryMergeCandidate(env, {
+        id: run.objectId,
+        state,
+        reviewedBy,
+        reviewedAt,
+        principal: input.principal,
+        auditActor: actor,
+        aiReview: { runId: run.id, decision: run.decision, applicationMode },
+        finalizationStatements,
+      });
+    }
+    if (!applied) throw new AIReviewObjectUnavailableError(run.objectType, run.objectId);
+    return {
+      runId: run.id,
+      objectType: run.objectType,
+      objectId: run.objectId,
+      decision: run.decision,
+      status: "applied",
+      appliedBy,
+    };
+  } catch (error) {
+    await releaseAIReviewApplication(env.DB, claimed.job.id, claimed.job.leaseOwner!);
+    throw error;
+  }
+}
+
+async function processAIReviewInBackground(env: Env, jobId: string): Promise<void> {
+  try {
+    const result = await processAIReviewJob(env.DB, jobId, await createAIReviewModel(env));
+    if (result.run.autoApplyEligible && result.run.mode === "auto_low_risk") {
+      await applyAIReviewRecommendation(env, result.run.id, { deterministicAuto: true });
+    }
+  } catch (error) {
+    console.error("AI Knowledge Review job failed", {
+      jobId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function createQualityRouteServices(
+  env: Env,
+  ctx: ExecutionContext
+): QualityRouteServices<AuthPrincipal> {
   return {
     authenticate: (request) => requireAuth(request, env),
     listEntityCandidates: (input) => listEntityMergeCandidates(env, {
@@ -11098,7 +11402,45 @@ function createQualityRouteServices(env: Env): QualityRouteServices<AuthPrincipa
     resolveMemoryCandidate: (input) => resolveMemoryMergeCandidate(env, input),
     listConflictCases: (input) => listConflictCases(env, input),
     resolveConflictCase: (input) => resolveConflictCase(env, input),
+    listAIReviews: async (input) => (
+      await listAIReviewJobs(env.DB, input)
+    ).map(publicAIReviewJob),
+    requestAIReview: async (input) => {
+      const actor = auditActorFromPrincipal(input.principal);
+      const job = await enqueueAIReviewJob(env.DB, {
+        objectType: input.objectType,
+        objectId: input.objectId,
+        mode: input.mode,
+        requestedBy: actor.actorId ?? "owner",
+      });
+      if (job.status === "queued") ctx.waitUntil(processAIReviewInBackground(env, job.id));
+      return publicAIReviewJob(job);
+    },
+    requestAIReviewBatch: async (input) => {
+      const actor = auditActorFromPrincipal(input.principal);
+      const targets = await pendingAIReviewTargets(env.DB, input.objectType, input.limit);
+      const jobs: Record<string, unknown>[] = [];
+      for (const target of targets) {
+        const job = await enqueueAIReviewJob(env.DB, {
+          ...target,
+          mode: input.mode,
+          requestedBy: actor.actorId ?? "owner",
+        });
+        jobs.push(publicAIReviewJob(job));
+        if (job.status === "queued") ctx.waitUntil(processAIReviewInBackground(env, job.id));
+      }
+      return { count: jobs.length, jobs };
+    },
+    applyAIReview: (input) => applyAIReviewRecommendation(env, input.runId, {
+      principal: input.principal,
+    }),
     mapError: (error) => {
+      if (error instanceof AIReviewInvalidResponseError) {
+        return json({ ok: false, error: error.message }, 422);
+      }
+      if (error instanceof AIReviewObjectUnavailableError || error instanceof AIReviewJobUnavailableError) {
+        return json({ ok: false, error: "ai_review_unavailable", message: error.message }, 409);
+      }
       if (error instanceof EntityMergeCandidateUnavailableError) {
         return json({ ok: false, error: "entity_merge_candidate_unavailable", message: error.message }, 409);
       }
@@ -15317,7 +15659,7 @@ const defaultHandler = {
     const qualityResponse = await handleQualityRoute(
       request,
       url,
-      createQualityRouteServices(env)
+      createQualityRouteServices(env, ctx)
     );
     if (qualityResponse) return qualityResponse;
 

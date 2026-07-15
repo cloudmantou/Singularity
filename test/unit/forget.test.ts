@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ensureEntityResolutionDataModel } from "../../src/memory/entities";
+import { ensureAIReviewDataModel } from "../../src/memory/ai-review";
 import { FACT_RESOLUTION_SCHEMA_STATEMENTS } from "../../src/memory/fact-resolution";
 import { forgetMemoryGraph } from "../../src/memory/forget";
 import { MEMORY_QUALITY_SCHEMA_STATEMENTS } from "../../src/memory/quality";
@@ -30,6 +31,7 @@ describe("forgetMemoryGraph Fact evidence repair", () => {
         pending_rebuild_id TEXT
       );
     `);
+    await ensureAIReviewDataModel(db);
   });
 
   afterEach(() => raw.close());
@@ -138,5 +140,60 @@ describe("forgetMemoryGraph Fact evidence repair", () => {
       .toEqual({ id: "entry-malformed" });
     expect(raw.prepare(`SELECT id FROM sb_memories WHERE id = 'claim-malformed'`).get())
       .toEqual({ id: "claim-malformed" });
+  });
+
+  it("purges AI review manifests when forgetting their reviewed memory object", async () => {
+    raw.prepare(
+      `INSERT INTO entries (id, content, tags, source, created_at, vector_ids)
+       VALUES ('review-source', 'private source', '[]', 'api', 1, '[]'),
+              ('review-target', 'private target', '[]', 'api', 1, '[]')`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_memory_merge_candidates (
+         id, source_memory_id, target_memory_id, similarity,
+         suggested_action, state, created_at
+       ) VALUES ('review-candidate', 'review-source', 'review-target', 1,
+                 'duplicate', 'pending', 1)`
+    ).run();
+    const manifest = JSON.stringify({
+      objectType: "memory_merge_candidate",
+      objectId: "review-candidate",
+      evidence: [{ ref: "SOURCE", memoryId: "review-source" }],
+    });
+    raw.prepare(
+      `INSERT INTO sb_ai_review_jobs (
+         id, object_type, object_id, mode, status, requested_by,
+         input_snapshot_hash, input_snapshot_json, run_id, created_at
+       ) VALUES ('review-job', 'memory_merge_candidate', 'review-candidate',
+                 'suggest', 'applied', 'owner', 'snapshot-hash', ?, 'review-run', 1)`
+    ).run(manifest);
+    raw.prepare(
+      `INSERT INTO sb_ai_review_runs (
+         id, job_id, object_type, object_id, mode, decision, reason,
+         evidence_refs_json, confidence_json, reviewer_provider, reviewer_model,
+         prompt_version, input_snapshot_hash, input_snapshot_json, created_at
+       ) VALUES ('review-run', 'review-job', 'memory_merge_candidate', 'review-candidate',
+                 'suggest', 'duplicate', 'same content', '["SOURCE"]', '{}',
+                 'test', 'reviewer', 'v1', 'snapshot-hash', ?, 1)`
+    ).run(manifest);
+    raw.prepare(
+      `INSERT INTO sb_ai_review_applications (
+         id, run_id, object_type, object_id, decision, applied_by,
+         application_mode, created_at
+       ) VALUES ('review-application', 'review-run', 'memory_merge_candidate',
+                 'review-candidate', 'duplicate', 'owner', 'human', 1)`
+    ).run();
+
+    await expect(forgetMemoryGraph(
+      "review-source",
+      db,
+      { deleteByIds: vi.fn().mockResolvedValue(undefined) } as unknown as VectorizeIndex
+    )).resolves.toMatchObject({ status: "deleted" });
+    expect(raw.prepare(`SELECT COUNT(*) AS count FROM sb_ai_review_jobs`).get())
+      .toEqual({ count: 0 });
+    expect(raw.prepare(`SELECT COUNT(*) AS count FROM sb_ai_review_runs`).get())
+      .toEqual({ count: 0 });
+    expect(raw.prepare(`SELECT COUNT(*) AS count FROM sb_ai_review_applications`).get())
+      .toEqual({ count: 0 });
   });
 });

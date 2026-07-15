@@ -11,6 +11,10 @@ describe("self-host request routing", () => {
   it("rejects scanner paths before Worker forwarding", () => {
     expect(isKnownWorkerRoute("GET", "/recall")).toBe(true);
     expect(isKnownWorkerRoute("POST", "/integrations/obsidian/push")).toBe(true);
+    expect(isKnownWorkerRoute("GET", "/quality/ai-review")).toBe(true);
+    expect(isKnownWorkerRoute("POST", "/quality/ai-review")).toBe(true);
+    expect(isKnownWorkerRoute("POST", "/quality/ai-review/batch")).toBe(true);
+    expect(isKnownWorkerRoute("POST", "/quality/ai-review/apply")).toBe(true);
     expect(isKnownWorkerRoute("GET", "/digest")).toBe(false);
     expect(isKnownWorkerRoute("GET", "/digest/preview")).toBe(true);
     expect(isKnownWorkerRoute("POST", "/digest")).toBe(true);

@@ -67,7 +67,12 @@ export function createFixedWindowRateLimiter(options: FixedWindowRateLimiterOpti
 
 export type ExpensiveRouteClass = "model" | "maintenance" | "import" | "mcp";
 
-const MODEL_ROUTES = new Set(["GET /recall", "POST /settings/models/test"]);
+const MODEL_ROUTES = new Set([
+  "GET /recall",
+  "POST /quality/ai-review",
+  "POST /quality/ai-review/batch",
+  "POST /settings/models/test",
+]);
 const MAINTENANCE_ROUTES = new Set([
   "POST /classify-pending",
   "POST /extract-pending",

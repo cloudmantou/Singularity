@@ -220,6 +220,8 @@ The Observatory is part of the product, not a debugging afterthought. It exposes
 
 The web Knowledge Review screen is the action surface for those queues. It keeps factual conflicts, entity identity proposals, and similar-memory decisions separate, requires explicit outcomes, and records accepted decisions through the existing compliance audit path.
 
+AI review is an evidence-bound recommendation layer over those existing queues, never a fact-writing path. `shadow` records evaluations without an apply action; `suggest` always requires the authenticated owner to apply a recommendation; `auto_low_risk` is limited to exact-hash memory duplicates with identical, explicit Scope and Vault sets. Conflicts and entity identity decisions remain human-gated. Jobs are leased and recoverable, model runs and application receipts are immutable, and application receipts commit in the same database batch as the underlying domain decision. Persisted manifests contain evidence hashes and internal references rather than raw memory text, so normal deletion does not leave a second immutable copy of the source content.
+
 That visibility matters because a memory system can return HTTP 200 while its extraction, vector, or answer-synthesis layer is degraded.
 
 ## Key source locations

@@ -1,6 +1,12 @@
 import { z } from "zod";
 import { ENTITY_MERGE_CANDIDATE_STATES } from "../memory/entity-merge";
 import {
+  AI_REVIEW_MODES,
+  AI_REVIEW_OBJECT_TYPES,
+  type AIReviewMode,
+  type AIReviewObjectType,
+} from "../memory/ai-review";
+import {
   CONFLICT_CASE_STATES,
   CONFLICT_RESOLUTIONS,
   MERGE_CANDIDATE_STATES,
@@ -38,6 +44,27 @@ export interface QualityRouteServices<Principal> {
     resolvedBy: string;
     principal: Principal;
   }): Promise<boolean>;
+  listAIReviews(input: {
+    objectType: AIReviewObjectType | null;
+    objectId: string | null;
+    limit: number;
+  }): Promise<unknown[]>;
+  requestAIReview(input: {
+    objectType: AIReviewObjectType;
+    objectId: string;
+    mode: AIReviewMode;
+    principal: Principal;
+  }): Promise<Record<string, unknown>>;
+  requestAIReviewBatch(input: {
+    objectType: AIReviewObjectType | null;
+    limit: number;
+    mode: AIReviewMode;
+    principal: Principal;
+  }): Promise<Record<string, unknown>>;
+  applyAIReview(input: {
+    runId: string;
+    principal: Principal;
+  }): Promise<Record<string, unknown>>;
   mapError?(error: unknown): Response | null;
 }
 
@@ -59,6 +86,22 @@ const ConflictReviewSchema = z.object({
   state: z.enum(["resolved", "dismissed"]),
   resolution: z.enum(CONFLICT_RESOLUTIONS),
   resolvedBy: z.string().trim().min(1).max(256).optional(),
+}).strict();
+
+const AIReviewRequestSchema = z.object({
+  objectType: z.enum(AI_REVIEW_OBJECT_TYPES),
+  objectId: z.string().trim().min(1).max(256),
+  mode: z.enum(AI_REVIEW_MODES).default("suggest"),
+}).strict();
+
+const AIReviewBatchSchema = z.object({
+  objectType: z.enum(AI_REVIEW_OBJECT_TYPES).optional(),
+  limit: z.number().int().min(1).max(10).default(5),
+  mode: z.enum(AI_REVIEW_MODES).default("suggest"),
+}).strict();
+
+const AIReviewApplySchema = z.object({
+  runId: z.string().trim().min(1).max(256),
 }).strict();
 
 function json(data: unknown, status = 200): Response {
@@ -182,6 +225,54 @@ async function conflictRoute<Principal>(
   }
 }
 
+async function aiReviewRoute<Principal>(
+  request: Request,
+  url: URL,
+  principal: Principal,
+  services: QualityRouteServices<Principal>
+): Promise<Response> {
+  try {
+    if (url.pathname === "/quality/ai-review" && request.method === "GET") {
+    const objectType = parseState(url.searchParams.get("objectType"), AI_REVIEW_OBJECT_TYPES);
+    if (url.searchParams.has("objectType") && !objectType) {
+      return json({ ok: false, error: "invalid_ai_review_object_type" }, 400);
+    }
+    const objectId = url.searchParams.get("objectId")?.trim() || null;
+    const reviews = await services.listAIReviews({
+      objectType,
+      objectId,
+      limit: boundedLimit(url.searchParams.get("limit")),
+    });
+    return json({ ok: true, count: reviews.length, reviews });
+  }
+    if (url.pathname === "/quality/ai-review" && request.method === "POST") {
+    const parsed = AIReviewRequestSchema.safeParse(await readJson(request));
+    if (!parsed.success) return json({ ok: false, error: "invalid_ai_review_request" }, 400);
+    const job = await services.requestAIReview({ ...parsed.data, principal });
+    return json({ ok: true, ...job }, 202);
+  }
+    if (url.pathname === "/quality/ai-review/batch") {
+    const parsed = AIReviewBatchSchema.safeParse(await readJson(request));
+    if (!parsed.success) return json({ ok: false, error: "invalid_ai_review_batch" }, 400);
+    const result = await services.requestAIReviewBatch({
+      objectType: parsed.data.objectType ?? null,
+      limit: parsed.data.limit,
+      mode: parsed.data.mode,
+      principal,
+    });
+    return json({ ok: true, ...result }, 202);
+  }
+    const parsed = AIReviewApplySchema.safeParse(await readJson(request));
+    if (!parsed.success) return json({ ok: false, error: "invalid_ai_review_application" }, 400);
+    const result = await services.applyAIReview({ ...parsed.data, principal });
+    return json({ ok: true, ...result });
+  } catch (error) {
+    const response = mappedError(error, services);
+    if (response) return response;
+    throw error;
+  }
+}
+
 export async function handleQualityRoute<Principal>(
   request: Request,
   url: URL,
@@ -194,12 +285,27 @@ export async function handleQualityRoute<Principal>(
     "/quality/merge-candidates/resolve",
     "/quality/conflict-cases",
     "/quality/conflict-cases/resolve",
+    "/quality/ai-review",
+    "/quality/ai-review/batch",
+    "/quality/ai-review/apply",
   ]);
   if (!routes.has(url.pathname)) return null;
-  const expectedMethod = url.pathname.endsWith("/resolve") ? "POST" : "GET";
-  if (request.method !== expectedMethod) return json({ ok: false, error: "method_not_allowed" }, 405);
+  const expectedMethod = url.pathname === "/quality/ai-review"
+    ? null
+    : url.pathname.endsWith("/resolve") || url.pathname.endsWith("/batch") || url.pathname.endsWith("/apply")
+      ? "POST"
+      : "GET";
+  if (url.pathname === "/quality/ai-review" && !["GET", "POST"].includes(request.method)) {
+    return json({ ok: false, error: "method_not_allowed" }, 405);
+  }
+  if (expectedMethod && request.method !== expectedMethod) {
+    return json({ ok: false, error: "method_not_allowed" }, 405);
+  }
   const auth = services.authenticate(request);
   if (!auth.ok) return auth.response;
+  if (url.pathname.startsWith("/quality/ai-review")) {
+    return aiReviewRoute(request, url, auth.principal, services);
+  }
   if (url.pathname.startsWith("/quality/entity-merge-candidates")) {
     return entityRoute(request, url, auth.principal, services);
   }

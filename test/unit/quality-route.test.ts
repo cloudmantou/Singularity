@@ -10,6 +10,10 @@ function services() {
     resolveMemoryCandidate: vi.fn(async () => true),
     listConflictCases: vi.fn(async () => []),
     resolveConflictCase: vi.fn(async () => true),
+    listAIReviews: vi.fn(async () => []),
+    requestAIReview: vi.fn(async () => ({ id: "ai-job-1", status: "queued" })),
+    requestAIReviewBatch: vi.fn(async () => ({ jobs: [{ id: "ai-job-1" }] })),
+    applyAIReview: vi.fn(async () => ({ runId: "ai-run-1", status: "applied" })),
     mapError: vi.fn(() => null),
   };
 }
@@ -86,5 +90,46 @@ describe("quality route module", () => {
     );
     expect(response?.status).toBe(400);
     expect(deps.resolveConflictCase).not.toHaveBeenCalled();
+  });
+
+  it("queues AI review without resolving the underlying candidate", async () => {
+    const deps = services();
+    const response = await handleQualityRoute(
+      new Request("https://memory.example/quality/ai-review", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          objectType: "conflict_case",
+          objectId: "conflict-1",
+          mode: "suggest",
+        }),
+      }),
+      new URL("https://memory.example/quality/ai-review"),
+      deps
+    );
+
+    expect(response?.status).toBe(202);
+    expect(deps.requestAIReview).toHaveBeenCalledWith(expect.objectContaining({
+      objectType: "conflict_case",
+      objectId: "conflict-1",
+      mode: "suggest",
+      principal: { id: "owner" },
+    }));
+    expect(deps.resolveConflictCase).not.toHaveBeenCalled();
+  });
+
+  it("validates AI review applications by immutable run id", async () => {
+    const deps = services();
+    const invalid = await handleQualityRoute(
+      new Request("https://memory.example/quality/ai-review/apply", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ runId: "" }),
+      }),
+      new URL("https://memory.example/quality/ai-review/apply"),
+      deps
+    );
+    expect(invalid?.status).toBe(400);
+    expect(deps.applyAIReview).not.toHaveBeenCalled();
   });
 });

@@ -25,6 +25,8 @@ export interface ConflictResolutionInput {
   effectiveAt: number;
   actorType: string;
   actorId?: string | null;
+  finalizationStatements?: D1PreparedStatement[];
+  aiReview?: { runId: string; decision: string; applicationMode: "human" | "deterministic_auto" };
 }
 
 interface ConflictRow {
@@ -397,6 +399,11 @@ export class D1ResolutionCoordinator implements ResolutionCoordinator {
         resolved_by: input.resolvedBy,
         old_claim_id: oldClaimId,
         new_claim_id: newClaimId,
+        ...(input.aiReview ? {
+          ai_review_run_id: input.aiReview.runId,
+          ai_review_decision: input.aiReview.decision,
+          ai_review_application_mode: input.aiReview.applicationMode,
+        } : {}),
       },
     });
     statements.push(
@@ -417,8 +424,10 @@ export class D1ResolutionCoordinator implements ResolutionCoordinator {
         input.conflictId
       )
     );
+    const conflictUpdateIndex = statements.length - 1;
+    statements.push(...(input.finalizationStatements ?? []));
     const results = await this.db.batch(statements);
-    return Number(results.at(-1)?.meta?.changes ?? 0) > 0;
+    return Number(results[conflictUpdateIndex]?.meta?.changes ?? 0) > 0;
   }
 
   private prepareGuardedMemoryRelation(

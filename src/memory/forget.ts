@@ -1,6 +1,10 @@
 import { prepareMemoryRevision } from "./revisions";
 import { ensureAssociationDataModel } from "./associations";
 import { distinctFactEvidenceCountSql } from "./fact-evidence";
+import {
+  ensureAIReviewDataModel,
+  prepareOrphanAIReviewPurgeStatements,
+} from "./ai-review";
 
 const DERIVED_RELATION_TYPES = ["digest_of", "derived_from"] as const;
 const QUERY_BATCH_SIZE = 100;
@@ -569,6 +573,7 @@ function prepareDatabaseErase(
     ...atomicMemoryStatements,
     ...observationStatements,
     ...eraseStatements,
+    ...prepareOrphanAIReviewPurgeStatements(db),
   ];
 }
 
@@ -580,6 +585,7 @@ export async function forgetMemoryGraph(
 ): Promise<ForgetMemoryResult> {
   const memoryId = id.trim();
   if (!memoryId) return { status: "not_found" };
+  await ensureAIReviewDataModel(db);
   const root = await loadTrackedEntry(db, memoryId);
   if (!root) return { status: "not_found" };
   try {

@@ -2,7 +2,7 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="Singularity" />
@@ -3489,15 +3489,26 @@
                   <h1 data-i18n="review.title">知识审核</h1>
                   <p data-i18n="review.subtitle">裁决冲突、实体身份和相似记忆。所有决定都会进入审计链。</p>
                 </div>
-                <button class="review-refresh" type="button" data-review-refresh data-i18n-title="review.refresh" title="刷新"><i class="ti ti-refresh"></i></button>
+                <div class="review-head-actions">
+                  <label class="review-mode">
+                    <span data-i18n="review.ai.modeLabel">AI 模式</span>
+                    <select data-review-ai-mode data-i18n-title="review.ai.modeLabel" title="AI 模式">
+                      <option value="shadow" data-i18n="review.ai.mode.shadow">影子评估</option>
+                      <option value="suggest" data-i18n="review.ai.mode.suggest" selected>仅建议</option>
+                      <option value="auto_low_risk" data-i18n="review.ai.mode.auto_low_risk">低风险自动</option>
+                    </select>
+                  </label>
+                  <button class="review-ai-batch" type="button" data-review-ai-batch><i class="ti ti-sparkles"></i><span data-i18n="review.ai.batch">批量建议</span></button>
+                  <button class="review-refresh" type="button" data-review-refresh data-i18n-title="review.refresh" data-i18n-aria="review.refresh" title="刷新" aria-label="刷新"><i class="ti ti-refresh"></i></button>
+                </div>
               </header>
-              <div class="review-tabs" role="tablist">
-                <button class="review-tab active" type="button" data-review-tab="conflicts"><span data-i18n="review.conflicts">事实冲突</span><span data-review-count>0</span></button>
-                <button class="review-tab" type="button" data-review-tab="entities"><span data-i18n="review.entities">实体合并</span><span data-review-count>0</span></button>
-                <button class="review-tab" type="button" data-review-tab="memories"><span data-i18n="review.memories">相似记忆</span><span data-review-count>0</span></button>
+              <div class="review-tabs" role="tablist" data-i18n-aria="review.queues" aria-label="审核队列">
+                <button id="review-tab-conflicts" class="review-tab active" type="button" role="tab" aria-selected="true" aria-controls="review-panel" tabindex="0" data-review-tab="conflicts"><span data-i18n="review.conflicts">事实冲突</span><span data-review-count>0</span></button>
+                <button id="review-tab-entities" class="review-tab" type="button" role="tab" aria-selected="false" aria-controls="review-panel" tabindex="-1" data-review-tab="entities"><span data-i18n="review.entities">实体合并</span><span data-review-count>0</span></button>
+                <button id="review-tab-memories" class="review-tab" type="button" role="tab" aria-selected="false" aria-controls="review-panel" tabindex="-1" data-review-tab="memories"><span data-i18n="review.memories">相似记忆</span><span data-review-count>0</span></button>
               </div>
               <div class="review-status" data-review-status aria-live="polite"><span data-review-total>0</span></div>
-              <div class="review-list" data-review-list></div>
+              <div id="review-panel" class="review-list" role="tabpanel" aria-labelledby="review-tab-conflicts" tabindex="0" data-review-list></div>
             </div>
           </div>
 

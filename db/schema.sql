@@ -298,6 +298,120 @@ CREATE INDEX IF NOT EXISTS idx_conflict_cases_old_claim
 CREATE INDEX IF NOT EXISTS idx_conflict_cases_new_claim
   ON sb_conflict_cases(new_claim_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS sb_ai_review_jobs (
+  id TEXT PRIMARY KEY,
+  object_type TEXT NOT NULL,
+  object_id TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',
+  requested_by TEXT NOT NULL,
+  input_snapshot_hash TEXT NOT NULL,
+  input_snapshot_json TEXT NOT NULL,
+  run_id TEXT,
+  error_code TEXT,
+  created_at INTEGER NOT NULL,
+  started_at INTEGER,
+  completed_at INTEGER,
+  lease_owner TEXT,
+  lease_expires_at INTEGER,
+  CHECK (object_type IN ('conflict_case', 'entity_merge_candidate', 'memory_merge_candidate')),
+  CHECK (mode IN ('shadow', 'suggest', 'auto_low_risk')),
+  CHECK (status IN ('queued', 'processing', 'completed', 'failed', 'applying', 'applied'))
+);
+CREATE INDEX IF NOT EXISTS idx_ai_review_jobs_object
+  ON sb_ai_review_jobs(object_type, object_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_review_jobs_status
+  ON sb_ai_review_jobs(status, created_at ASC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_review_jobs_active_identity
+  ON sb_ai_review_jobs(object_type, object_id, mode, input_snapshot_hash)
+  WHERE status IN ('queued', 'processing', 'completed', 'applying', 'applied');
+
+CREATE TABLE IF NOT EXISTS sb_ai_review_runs (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL UNIQUE,
+  object_type TEXT NOT NULL,
+  object_id TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+  confidence_json TEXT NOT NULL DEFAULT '{}',
+  abstained INTEGER NOT NULL DEFAULT 0,
+  requires_human INTEGER NOT NULL DEFAULT 1,
+  auto_apply_eligible INTEGER NOT NULL DEFAULT 0,
+  reviewer_provider TEXT NOT NULL,
+  reviewer_model TEXT NOT NULL,
+  prompt_version TEXT NOT NULL,
+  input_snapshot_hash TEXT NOT NULL,
+  input_snapshot_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  CHECK (object_type IN ('conflict_case', 'entity_merge_candidate', 'memory_merge_candidate')),
+  CHECK (mode IN ('shadow', 'suggest', 'auto_low_risk')),
+  CHECK (abstained IN (0, 1)),
+  CHECK (requires_human IN (0, 1)),
+  CHECK (auto_apply_eligible IN (0, 1))
+);
+CREATE INDEX IF NOT EXISTS idx_ai_review_runs_object
+  ON sb_ai_review_runs(object_type, object_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS sb_ai_review_applications (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL UNIQUE,
+  object_type TEXT NOT NULL,
+  object_id TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  applied_by TEXT NOT NULL,
+  application_mode TEXT NOT NULL,
+  lease_owner TEXT,
+  created_at INTEGER NOT NULL,
+  CHECK (application_mode IN ('human', 'deterministic_auto'))
+);
+CREATE INDEX IF NOT EXISTS idx_ai_review_applications_object
+  ON sb_ai_review_applications(object_type, object_id, created_at DESC);
+CREATE TRIGGER IF NOT EXISTS trg_ai_review_runs_immutable_update
+  BEFORE UPDATE ON sb_ai_review_runs
+  BEGIN SELECT RAISE(ABORT, 'ai_review_runs_immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_ai_review_runs_guarded_delete
+  BEFORE DELETE ON sb_ai_review_runs
+  WHEN (
+    (OLD.object_type = 'conflict_case' AND EXISTS (SELECT 1 FROM sb_conflict_cases WHERE id = OLD.object_id)) OR
+    (OLD.object_type = 'entity_merge_candidate' AND EXISTS (SELECT 1 FROM sb_entity_merge_candidates WHERE id = OLD.object_id)) OR
+    (OLD.object_type = 'memory_merge_candidate' AND EXISTS (SELECT 1 FROM sb_memory_merge_candidates WHERE id = OLD.object_id))
+  )
+  BEGIN SELECT RAISE(ABORT, 'ai_review_runs_immutable'); END;
+DROP TRIGGER IF EXISTS trg_ai_review_runs_immutable_delete;
+CREATE TRIGGER IF NOT EXISTS trg_ai_review_applications_immutable_update
+  BEFORE UPDATE ON sb_ai_review_applications
+  BEGIN SELECT RAISE(ABORT, 'ai_review_applications_immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_ai_review_applications_guarded_delete
+  BEFORE DELETE ON sb_ai_review_applications
+  WHEN (
+    (OLD.object_type = 'conflict_case' AND EXISTS (SELECT 1 FROM sb_conflict_cases WHERE id = OLD.object_id)) OR
+    (OLD.object_type = 'entity_merge_candidate' AND EXISTS (SELECT 1 FROM sb_entity_merge_candidates WHERE id = OLD.object_id)) OR
+    (OLD.object_type = 'memory_merge_candidate' AND EXISTS (SELECT 1 FROM sb_memory_merge_candidates WHERE id = OLD.object_id))
+  )
+  BEGIN SELECT RAISE(ABORT, 'ai_review_applications_immutable'); END;
+DROP TRIGGER IF EXISTS trg_ai_review_applications_immutable_delete;
+CREATE TRIGGER IF NOT EXISTS trg_ai_review_application_valid_lease
+  BEFORE INSERT ON sb_ai_review_applications
+  WHEN NEW.lease_owner IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM sb_ai_review_jobs job
+      WHERE job.run_id = NEW.run_id
+        AND job.status = 'applying'
+        AND job.lease_owner = NEW.lease_owner
+        AND COALESCE(job.lease_expires_at, 0) > NEW.created_at
+    )
+  BEGIN SELECT RAISE(ABORT, 'ai_review_application_lease_invalid'); END;
+CREATE TRIGGER IF NOT EXISTS trg_ai_review_jobs_applied_requires_receipt
+  BEFORE UPDATE OF status ON sb_ai_review_jobs
+  WHEN NEW.status = 'applied'
+    AND NOT EXISTS (
+      SELECT 1 FROM sb_ai_review_applications receipt
+      WHERE receipt.run_id = NEW.run_id
+    )
+  BEGIN SELECT RAISE(ABORT, 'ai_review_application_receipt_required'); END;
+
 CREATE TABLE IF NOT EXISTS sb_audit_events (
   id TEXT PRIMARY KEY,
   occurred_at INTEGER NOT NULL,

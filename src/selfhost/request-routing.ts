@@ -12,7 +12,7 @@ const GET_ROUTES = new Set([
   "/integrations/obsidian/aggregates", "/integrations/obsidian/pull",
   "/integrations/obsidian/rules", "/integrations/obsidian/status", "/integrations/providers",
   "/list", "/maintenance/claim-vectors/status", "/maintenance/mutations/status", "/maintenance/vector-index/status", "/quality/conflict-cases",
-  "/quality/entity-merge-candidates", "/quality/merge-candidates", "/recall", "/relations",
+  "/quality/ai-review", "/quality/entity-merge-candidates", "/quality/merge-candidates", "/recall", "/relations",
   "/settings/models", "/settings/oauth/clients", "/settings/telemetry", "/stats", "/tags",
 ]);
 
@@ -24,6 +24,7 @@ const POST_ROUTES = new Set([
   "/integrations/obsidian/resolve-conflict", "/integrations/obsidian/rules",
   "/integrations/obsidian/tokens", "/link", "/maintenance/claim-vectors/backfill",
   "/maintenance/claim-vectors/retry-failed", "/maintenance/mutations/reconcile", "/maintenance/vector-index/backfill",
+  "/quality/ai-review", "/quality/ai-review/apply", "/quality/ai-review/batch",
   "/quality/conflict-cases/resolve", "/quality/entity-merge-candidates/resolve",
   "/quality/merge-candidates/resolve", "/settings/models/reindex",
   "/settings/models/reindex/cancel", "/settings/models/test", "/status", "/unlink", "/update",

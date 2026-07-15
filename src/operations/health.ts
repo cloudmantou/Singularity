@@ -63,6 +63,14 @@ export interface HealthMatrix {
     entityMerge: number;
     factReview: number;
     degradedParents: number;
+    aiReview: {
+      queued: number;
+      processingLive: number;
+      processingExpired: number;
+      applyingLive: number;
+      applyingExpired: number;
+      failed: number;
+    };
     mutations: {
       preparing: number;
       entryCommitted: number;
@@ -147,6 +155,12 @@ export async function collectHealthMatrix(input: HealthMatrixInput): Promise<Hea
     degradedParents,
     mutationHealth,
     auditChain,
+    aiReviewQueued,
+    aiReviewProcessingLive,
+    aiReviewProcessingExpired,
+    aiReviewApplyingLive,
+    aiReviewApplyingExpired,
+    aiReviewFailed,
   ] = await Promise.all([
     readExtractionQueueSnapshot(input.db),
     readClassificationQueueSnapshot(input.db),
@@ -177,6 +191,32 @@ export async function collectHealthMatrix(input: HealthMatrixInput): Promise<Hea
       checked: 0,
       error: safeError(error),
     })),
+    countQuery(input.db, `SELECT COUNT(*) AS count FROM sb_ai_review_jobs WHERE status = 'queued'`),
+    countQuery(
+      input.db,
+      `SELECT COUNT(*) AS count FROM sb_ai_review_jobs
+       WHERE status = 'processing' AND COALESCE(lease_expires_at, 0) > ?`,
+      Date.now()
+    ),
+    countQuery(
+      input.db,
+      `SELECT COUNT(*) AS count FROM sb_ai_review_jobs
+       WHERE status = 'processing' AND COALESCE(lease_expires_at, 0) <= ?`,
+      Date.now()
+    ),
+    countQuery(
+      input.db,
+      `SELECT COUNT(*) AS count FROM sb_ai_review_jobs
+       WHERE status = 'applying' AND COALESCE(lease_expires_at, 0) > ?`,
+      Date.now()
+    ),
+    countQuery(
+      input.db,
+      `SELECT COUNT(*) AS count FROM sb_ai_review_jobs
+       WHERE status = 'applying' AND COALESCE(lease_expires_at, 0) <= ?`,
+      Date.now()
+    ),
+    countQuery(input.db, `SELECT COUNT(*) AS count FROM sb_ai_review_jobs WHERE status = 'failed'`),
   ]);
 
   const graphReviewPending = conflicts + entityMerge + factReview;
@@ -201,6 +241,9 @@ export async function collectHealthMatrix(input: HealthMatrixInput): Promise<Hea
       : mutationHealth.retryable_failed > 0 || mutationHealth.stale_incomplete > 0
         ? "degraded"
         : "healthy",
+    aiReviewProcessingExpired + aiReviewApplyingExpired + aiReviewFailed > 0
+      ? "degraded"
+      : "healthy",
     ...providers.map((provider) => provider.status),
   ];
   const status: HealthStatus = componentStatuses.includes("unhealthy")
@@ -245,6 +288,14 @@ export async function collectHealthMatrix(input: HealthMatrixInput): Promise<Hea
       entityMerge,
       factReview,
       degradedParents,
+      aiReview: {
+        queued: aiReviewQueued,
+        processingLive: aiReviewProcessingLive,
+        processingExpired: aiReviewProcessingExpired,
+        applyingLive: aiReviewApplyingLive,
+        applyingExpired: aiReviewApplyingExpired,
+        failed: aiReviewFailed,
+      },
       mutations: {
         preparing: mutationHealth.preparing,
         entryCommitted: mutationHealth.entry_committed,

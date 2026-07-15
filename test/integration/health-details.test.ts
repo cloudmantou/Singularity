@@ -49,6 +49,14 @@ describe("Operations health API", () => {
       const body = await details.json() as any;
       expect(body.ok).toBe(true);
       expect(body.components.database.status).toBe("healthy");
+      expect(body.queues.aiReview).toEqual({
+        queued: 0,
+        processingLive: 0,
+        processingExpired: 0,
+        applyingLive: 0,
+        applyingExpired: 0,
+        failed: 0,
+      });
       expect(body.components.providers).toEqual(expect.arrayContaining([
         expect.objectContaining({ id: "obsidian" }),
       ]));

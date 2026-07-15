@@ -29,6 +29,9 @@ describe("fixed-window rate limiter", () => {
   it("classifies model, maintenance, import, and MCP endpoints", () => {
     expect(classifyExpensiveRoute("GET", "/recall")).toBe("model");
     expect(classifyExpensiveRoute("POST", "/settings/models/test")).toBe("model");
+    expect(classifyExpensiveRoute("POST", "/quality/ai-review")).toBe("model");
+    expect(classifyExpensiveRoute("POST", "/quality/ai-review/batch")).toBe("model");
+    expect(classifyExpensiveRoute("POST", "/quality/ai-review/apply")).toBeNull();
     expect(classifyExpensiveRoute("POST", "/vectorize-pending")).toBe("maintenance");
     expect(classifyExpensiveRoute("POST", "/import")).toBe("import");
     expect(classifyExpensiveRoute("POST", "/mcp")).toBe("mcp");

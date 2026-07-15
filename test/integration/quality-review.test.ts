@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker, { initializeDatabase } from "../../src/index";
+import {
+  ensureAIReviewDataModel,
+  enqueueAIReviewJob,
+  processAIReviewJob,
+} from "../../src/memory/ai-review";
 import { createSelfhostEnv } from "../../src/selfhost/env";
 import { resetSettingsCache } from "../../src/settings/store";
 
@@ -30,6 +35,63 @@ function testCtx(): ExecutionContext {
   } as unknown as ExecutionContext;
 }
 
+function collectingCtx(): { ctx: ExecutionContext; drain: () => Promise<void> } {
+  const pending: Promise<unknown>[] = [];
+  return {
+    ctx: {
+      waitUntil(promise: Promise<unknown>) {
+        pending.push(promise);
+      },
+      passThroughOnException() {
+        /* no-op */
+      },
+      props: {},
+    } as unknown as ExecutionContext,
+    drain: async () => { await Promise.all(pending); },
+  };
+}
+
+function insertMemoryReviewCandidate(
+  db: ReturnType<typeof createSelfhostEnv>["db"],
+  input: { id: string; exactContext?: boolean }
+) {
+  const now = Date.now();
+  const sourceId = `${input.id}-source`;
+  const targetId = `${input.id}-target`;
+  db.prepare(
+    `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, content_hash)
+     VALUES (?, 'Exact duplicate', '[]', 'api', ?, '[]', 'same-hash'),
+            (?, 'Exact duplicate', '[]', 'api', ?, '[]', 'same-hash')`
+  ).run(sourceId, now, targetId, now);
+  db.prepare(
+    `INSERT INTO sb_memory_merge_candidates (
+       id, source_memory_id, target_memory_id, similarity,
+       suggested_action, state, created_at
+     ) VALUES (?, ?, ?, 1, 'duplicate', 'pending', ?)`
+  ).run(input.id, sourceId, targetId, now);
+  if (input.exactContext) {
+    db.prepare(
+      `INSERT INTO sb_parent_versions (
+         version_id, parent_id, version_number, vault_snapshot, state, created_at, updated_at
+       ) VALUES (?, ?, 1, 'work-vault', 'active', ?, ?),
+                (?, ?, 1, 'work-vault', 'active', ?, ?)`
+    ).run(
+      `${input.id}-source-v1`, `${input.id}-source-parent`, now, now,
+      `${input.id}-target-v1`, `${input.id}-target-parent`, now, now
+    );
+    db.prepare(
+      `INSERT INTO sb_memories (
+         id, content, entry_id, parent_version_id, scope_id, content_hash,
+         observed_at, entities_json, created_at
+       ) VALUES (?, 'Exact duplicate', ?, ?, 'project/singularity', 'same-hash', ?, '[]', ?),
+                (?, 'Exact duplicate', ?, ?, 'project/singularity', 'same-hash', ?, '[]', ?)`
+    ).run(
+      `${input.id}-source-claim`, sourceId, `${input.id}-source-v1`, now, now,
+      `${input.id}-target-claim`, targetId, `${input.id}-target-v1`, now, now
+    );
+  }
+}
+
 describe("memory quality review queues", () => {
   beforeEach(() => {
     resetSettingsCache();
@@ -42,21 +104,293 @@ describe("memory quality review queues", () => {
     resetSettingsCache();
   });
 
-  it("creates quality/audit tables through initialization", async () => {
+  it("creates quality/audit tables and lazily initializes the AI review ledger", async () => {
     const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
     try {
       await initializeDatabase(env);
+      await ensureAIReviewDataModel(env.DB);
       const rows = db.prepare(
         `SELECT name FROM sqlite_master
          WHERE type = 'table'
-           AND name IN ('sb_memory_merge_candidates', 'sb_conflict_cases', 'sb_audit_events')
+           AND name IN (
+             'sb_memory_merge_candidates', 'sb_conflict_cases', 'sb_audit_events',
+             'sb_ai_review_jobs', 'sb_ai_review_runs', 'sb_ai_review_applications'
+           )
          ORDER BY name`
       ).all() as Array<{ name: string }>;
       expect(rows.map(row => row.name)).toEqual([
+        "sb_ai_review_applications",
+        "sb_ai_review_jobs",
+        "sb_ai_review_runs",
         "sb_audit_events",
         "sb_conflict_cases",
         "sb_memory_merge_candidates",
       ]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("keeps suggestions pending until a human applies the immutable AI run", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      insertMemoryReviewCandidate(db, { id: "ai-suggest" });
+      const job = await enqueueAIReviewJob(env.DB, {
+        objectType: "memory_merge_candidate",
+        objectId: "ai-suggest",
+        mode: "suggest",
+        requestedBy: "owner",
+      });
+      const { run } = await processAIReviewJob(env.DB, job.id, {
+        provider: "test",
+        model: "reviewer-v1",
+        complete: async () => JSON.stringify({
+          decision: "duplicate",
+          reason: "Both evidence references contain the same statement.",
+          evidenceRefs: ["SOURCE", "TARGET"],
+          confidence: { decision: 0.96, evidence: 0.9 },
+          abstain: false,
+        }),
+      });
+      expect(db.prepare(
+        `SELECT state FROM sb_memory_merge_candidates WHERE id = 'ai-suggest'`
+      ).get()).toEqual({ state: "pending" });
+
+      const response = await worker.fetch(auth("/quality/ai-review/apply", {
+        method: "POST",
+        body: JSON.stringify({ runId: run.id }),
+      }), env, testCtx());
+
+      expect(response.status).toBe(200);
+      expect(db.prepare(
+        `SELECT state, reviewed_by FROM sb_memory_merge_candidates WHERE id = 'ai-suggest'`
+      ).get()).toEqual({ state: "accepted", reviewed_by: "ai-review:owner" });
+      expect(db.prepare(
+        `SELECT decision, application_mode FROM sb_ai_review_applications WHERE run_id = ?`
+      ).get(run.id)).toEqual({ decision: "duplicate", application_mode: "human" });
+      const audit = db.prepare(
+        `SELECT metadata_json FROM sb_audit_events
+         WHERE action = 'quality.merge_candidate.resolve' AND object_id = 'ai-suggest'`
+      ).get() as { metadata_json: string };
+      expect(JSON.parse(audit.metadata_json)).toMatchObject({
+        ai_review_run_id: run.id,
+        ai_review_decision: "duplicate",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("never applies shadow reviews", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      insertMemoryReviewCandidate(db, { id: "ai-shadow" });
+      const job = await enqueueAIReviewJob(env.DB, {
+        objectType: "memory_merge_candidate",
+        objectId: "ai-shadow",
+        mode: "shadow",
+        requestedBy: "owner",
+      });
+      const { run } = await processAIReviewJob(env.DB, job.id, {
+        provider: "test",
+        model: "reviewer-v1",
+        complete: async () => JSON.stringify({
+          decision: "duplicate",
+          reason: "Shadow evaluation only.",
+          evidenceRefs: ["SOURCE", "TARGET"],
+          confidence: { decision: 0.9, evidence: 0.9 },
+          abstain: false,
+        }),
+      });
+
+      const response = await worker.fetch(auth("/quality/ai-review/apply", {
+        method: "POST",
+        body: JSON.stringify({ runId: run.id }),
+      }), env, testCtx());
+
+      expect(response.status).toBe(409);
+      expect(db.prepare(
+        `SELECT state FROM sb_memory_merge_candidates WHERE id = 'ai-shadow'`
+      ).get()).toEqual({ state: "pending" });
+      expect(db.prepare(`SELECT COUNT(*) AS count FROM sb_ai_review_applications`).get())
+        .toEqual({ count: 0 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("atomically rolls back the domain decision when its AI receipt cannot be written", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      insertMemoryReviewCandidate(db, { id: "ai-atomic" });
+      const job = await enqueueAIReviewJob(env.DB, {
+        objectType: "memory_merge_candidate",
+        objectId: "ai-atomic",
+        mode: "suggest",
+        requestedBy: "owner",
+      });
+      const { run } = await processAIReviewJob(env.DB, job.id, {
+        provider: "test",
+        model: "reviewer-v1",
+        complete: async () => JSON.stringify({
+          decision: "duplicate",
+          reason: "Exact duplicate suggestion.",
+          evidenceRefs: ["SOURCE", "TARGET"],
+          confidence: { decision: 0.9, evidence: 0.9 },
+          abstain: false,
+        }),
+      });
+      db.exec(
+        `CREATE TRIGGER reject_ai_receipt BEFORE INSERT ON sb_ai_review_applications
+         BEGIN SELECT RAISE(ABORT, 'injected_receipt_failure'); END`
+      );
+
+      await expect(worker.fetch(auth("/quality/ai-review/apply", {
+        method: "POST",
+        body: JSON.stringify({ runId: run.id }),
+      }), env, testCtx())).rejects.toThrow("injected_receipt_failure");
+      expect(db.prepare(
+        `SELECT state, reviewed_by, reviewed_at FROM sb_memory_merge_candidates WHERE id = 'ai-atomic'`
+      ).get()).toEqual({ state: "pending", reviewed_by: null, reviewed_at: null });
+      expect(db.prepare(
+        `SELECT status FROM sb_ai_review_jobs WHERE id = ?`
+      ).get(job.id)).toEqual({ status: "completed" });
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count FROM sb_audit_events
+         WHERE action = 'quality.merge_candidate.resolve' AND object_id = 'ai-atomic'`
+      ).get()).toEqual({ count: 0 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("auto-applies only exact duplicates with matching explicit scope and vault", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      insertMemoryReviewCandidate(db, { id: "ai-auto", exactContext: true });
+      const background = collectingCtx();
+
+      const response = await worker.fetch(auth("/quality/ai-review", {
+        method: "POST",
+        body: JSON.stringify({
+          objectType: "memory_merge_candidate",
+          objectId: "ai-auto",
+          mode: "auto_low_risk",
+        }),
+      }), env, background.ctx);
+      await background.drain();
+
+      expect(response.status).toBe(202);
+      expect(db.prepare(
+        `SELECT state, reviewed_by FROM sb_memory_merge_candidates WHERE id = 'ai-auto'`
+      ).get()).toEqual({ state: "accepted", reviewed_by: "ai-review:system:deterministic" });
+      expect(db.prepare(
+        `SELECT decision, application_mode FROM sb_ai_review_applications`
+      ).get()).toEqual({ decision: "duplicate", application_mode: "deterministic_auto" });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("applies approved AI conflict and entity recommendations through their domain coordinators", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      const now = Date.now();
+      await worker.fetch(
+        auth("/quality/entity-merge-candidates?state=pending"),
+        env,
+        testCtx()
+      );
+      db.prepare(
+        `INSERT INTO sb_entities (
+           id, name, name_normalized, entity_type, aliases_json, metadata_json,
+           mention_count, lifecycle_state, created_at, updated_at
+         ) VALUES ('entity-source', 'Project Alpha', 'project alpha', 'project', '[]', '{}', 1, 'active', ?, ?),
+                  ('entity-target', 'Project Beta', 'project beta', 'project', '[]', '{}', 1, 'active', ?, ?)`
+      ).run(now, now, now, now);
+      db.prepare(
+        `INSERT INTO sb_entity_merge_candidates (
+           id, source_entity_id, target_entity_id, matched_by, score,
+           reason_json, state, created_at, updated_at
+         ) VALUES ('ai-entity', 'entity-source', 'entity-target', 'semantic', 0.84,
+                   '["review_required"]', 'pending', ?, ?)`
+      ).run(now, now);
+      const entityJob = await enqueueAIReviewJob(env.DB, {
+        objectType: "entity_merge_candidate",
+        objectId: "ai-entity",
+        mode: "suggest",
+        requestedBy: "owner",
+      });
+      const entityRun = (await processAIReviewJob(env.DB, entityJob.id, {
+        provider: "test",
+        model: "reviewer-v1",
+        complete: async () => JSON.stringify({
+          decision: "keep_separate",
+          reason: "The evidence does not establish identity.",
+          evidenceRefs: ["SOURCE", "TARGET"],
+          confidence: { decision: 0.88, evidence: 0.75 },
+          abstain: false,
+        }),
+      })).run;
+      expect((await worker.fetch(auth("/quality/ai-review/apply", {
+        method: "POST",
+        body: JSON.stringify({ runId: entityRun.id }),
+      }), env, testCtx())).status).toBe(200);
+      expect(db.prepare(
+        `SELECT state, reviewed_by FROM sb_entity_merge_candidates WHERE id = 'ai-entity'`
+      ).get()).toEqual({ state: "rejected", reviewed_by: "ai-review:owner" });
+
+      db.prepare(
+        `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, content_hash)
+         VALUES ('old-entry-ai', 'Service uses SQLite', '[]', 'api', ?, '[]', 'old-hash'),
+                ('new-entry-ai', 'Service uses Postgres', '[]', 'api', ?, '[]', 'new-hash')`
+      ).run(now - 1, now);
+      db.prepare(
+        `INSERT INTO sb_memories (
+           id, content, entry_id, content_hash, observed_at, entities_json, created_at
+         ) VALUES ('old-claim-ai', 'Service uses SQLite', 'old-entry-ai', 'old-hash', ?, '[]', ?),
+                  ('new-claim-ai', 'Service uses Postgres', 'new-entry-ai', 'new-hash', ?, '[]', ?)`
+      ).run(now - 1, now - 1, now, now);
+      db.prepare(
+        `INSERT INTO sb_conflict_cases (
+           id, old_memory_id, new_memory_id, old_claim_id, new_claim_id,
+           conflict_type, reason, confidence, state, created_at
+         ) VALUES ('ai-conflict', 'old-entry-ai', 'new-entry-ai', 'old-claim-ai', 'new-claim-ai',
+                   'contradiction', 'different database', 0.9, 'pending', ?)`
+      ).run(now);
+      const conflictJob = await enqueueAIReviewJob(env.DB, {
+        objectType: "conflict_case",
+        objectId: "ai-conflict",
+        mode: "suggest",
+        requestedBy: "owner",
+      });
+      const conflictRun = (await processAIReviewJob(env.DB, conflictJob.id, {
+        provider: "test",
+        model: "reviewer-v1",
+        complete: async () => JSON.stringify({
+          decision: "use_new",
+          reason: "The incoming evidence is newer.",
+          evidenceRefs: ["OLD", "NEW"],
+          confidence: { decision: 0.91, evidence: 0.9 },
+          abstain: false,
+        }),
+      })).run;
+      expect((await worker.fetch(auth("/quality/ai-review/apply", {
+        method: "POST",
+        body: JSON.stringify({ runId: conflictRun.id }),
+      }), env, testCtx())).status).toBe(200);
+      expect(db.prepare(
+        `SELECT state, resolution, resolved_by FROM sb_conflict_cases WHERE id = 'ai-conflict'`
+      ).get()).toEqual({ state: "resolved", resolution: "use_new", resolved_by: "ai-review:owner" });
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count FROM sb_ai_review_applications
+         WHERE run_id IN (?, ?)`
+      ).get(entityRun.id, conflictRun.id)).toEqual({ count: 2 });
     } finally {
       db.close();
     }
