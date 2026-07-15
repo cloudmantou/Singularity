@@ -214,6 +214,13 @@ function answerHasNonClaimReference(answer: string): boolean {
   return /\[\s*[ER]\d+(?:\s*,\s*[ER]\d+)*\s*\]/i.test(answer);
 }
 
+function removeModelClaimMarkers(text: string, refs: readonly string[]): string {
+  const allowed = new Set(refs.map((ref) => ref.toUpperCase()));
+  return text.replace(/[（(]\s*(C\d+)\s*[)）]/gi, (marker, ref: string) =>
+    allowed.has(ref.toUpperCase()) ? "" : marker
+  );
+}
+
 function renderStructuredAnswer(
   value: unknown,
   unverifiedClaims: UnverifiedInsightClaim[]
@@ -236,14 +243,14 @@ function renderStructuredAnswer(
       continue;
     }
     const record = paragraph as Record<string, unknown>;
-    const text = typeof record.text === "string"
-      ? normalizeClaimText(record.text).slice(0, 4_000)
-      : "";
     const rawRefs = Array.isArray(record.refs) ? record.refs : [];
     const refs = [...new Set(rawRefs
       .filter((ref): ref is string => typeof ref === "string")
       .map((ref) => ref.trim().toUpperCase())
       .filter(Boolean))];
+    const text = typeof record.text === "string"
+      ? removeModelClaimMarkers(normalizeClaimText(record.text), refs).slice(0, 4_000)
+      : "";
     if (!text || rawRefs.some((ref) => typeof ref !== "string")) {
       unverifiedClaims.push({ text, refs, reason: "invalid_structured_response" });
       continue;

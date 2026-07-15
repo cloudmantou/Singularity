@@ -10,13 +10,58 @@ import { logModelCall } from "../telemetry/queue";
 export const DEFAULT_WORKERS_LLM_MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct";
 export const DEFAULT_WORKERS_EMBEDDING_MODEL = "@cf/baai/bge-small-en-v1.5";
 
-async function readCfSseText(stream: ReadableStream): Promise<string> {
+function abortError(): DOMException {
+  return new DOMException("The operation was aborted", "AbortError");
+}
+
+async function awaitWithAbort<T>(
+  promise: Promise<T>,
+  signal?: AbortSignal,
+  onAbortedResolve?: (value: T) => void | Promise<void>
+): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) throw abortError();
+  return new Promise<T>((resolve, reject) => {
+    let aborted = false;
+    const onAbort = () => {
+      aborted = true;
+      reject(abortError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        if (aborted || signal.aborted) {
+          void onAbortedResolve?.(value);
+          reject(abortError());
+          return;
+        }
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      }
+    );
+  });
+}
+
+async function readCfSseText(stream: ReadableStream, signal?: AbortSignal): Promise<string> {
+  if (signal?.aborted) {
+    await stream.cancel(signal.reason).catch(() => undefined);
+    throw abortError();
+  }
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let text = "";
   let carry = "";
+  const cancelReader = () => {
+    void reader.cancel(signal?.reason).catch(() => undefined);
+  };
+  signal?.addEventListener("abort", cancelReader, { once: true });
   try {
     while (true) {
+      if (signal?.aborted) throw abortError();
       const { done, value } = await reader.read();
       if (done) break;
       carry += decoder.decode(value, { stream: true });
@@ -42,7 +87,9 @@ async function readCfSseText(stream: ReadableStream): Promise<string> {
         /* ignore */
       }
     }
+    if (signal?.aborted) throw abortError();
   } finally {
+    signal?.removeEventListener("abort", cancelReader);
     reader.releaseLock();
   }
   return text;
@@ -77,6 +124,7 @@ export class WorkersAILLM implements LLMProvider {
   ) {}
 
   async chat(messages: ChatMessage[], options: ChatOptions = {}): Promise<string> {
+    if (options.signal?.aborted) throw new DOMException("Aborted", "AbortError");
     const started = Date.now();
     const input = messages.map((message) => message.content).join("\n");
     const payload: Record<string, unknown> = {
@@ -88,9 +136,15 @@ export class WorkersAILLM implements LLMProvider {
     if (options.stream === true) payload.stream = true;
 
     try {
-      const result = (await this.ai.run(this.model as any, payload as any)) as unknown;
+      const result = await awaitWithAbort(
+        this.ai.run(this.model as any, payload as any) as Promise<unknown>,
+        options.signal,
+        (value) => isReadableStream(value)
+          ? value.cancel(options.signal?.reason)
+          : undefined
+      );
       const content = isReadableStream(result)
-        ? await readCfSseText(result)
+        ? await readCfSseText(result, options.signal)
         : extractWorkersText(result);
       logModelCall({
         call_type: "chat",
@@ -117,18 +171,35 @@ export class WorkersAILLM implements LLMProvider {
   }
 
   async chatAsCfSse(messages: ChatMessage[], options: ChatOptions = {}): Promise<ReadableStream> {
+    if (options.signal?.aborted) throw new DOMException("Aborted", "AbortError");
     const started = Date.now();
     const input = messages.map((message) => message.content).join("\n");
     try {
-      const stream = (await this.ai.run(this.model as any, {
-        messages,
-        max_tokens: options.max_tokens,
-        temperature: options.temperature,
-        stream: true,
-      } as any)) as ReadableStream;
+      const stream = await awaitWithAbort(
+        this.ai.run(this.model as any, {
+          messages,
+          max_tokens: options.max_tokens,
+          temperature: options.temperature,
+          stream: true,
+        } as any) as Promise<ReadableStream>,
+        options.signal,
+        (value) => isReadableStream(value)
+          ? value.cancel(options.signal?.reason)
+          : undefined
+      );
       if (!isReadableStream(stream)) throw new Error("Workers AI chat stream missing");
+      if (options.signal?.aborted) {
+        await stream.cancel(options.signal.reason).catch(() => undefined);
+        throw abortError();
+      }
       const reader = stream.getReader();
       let settled = false;
+      const cancelUpstream = (reason?: unknown) => reader.cancel(reason).catch(() => undefined);
+      const onAbort = () => {
+        void cancelUpstream(options.signal?.reason);
+      };
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+      const cleanup = () => options.signal?.removeEventListener("abort", onAbort);
       const record = (status: "success" | "error", error?: unknown) => {
         if (settled) return;
         settled = true;
@@ -147,19 +218,23 @@ export class WorkersAILLM implements LLMProvider {
           try {
             const next = await reader.read();
             if (next.done) {
-              record("success");
+              cleanup();
+              if (options.signal?.aborted) record("error", abortError());
+              else record("success");
               controller.close();
             } else {
               controller.enqueue(next.value);
             }
           } catch (error) {
+            cleanup();
             record("error", error);
             controller.error(error);
           }
         },
         async cancel(reason) {
+          cleanup();
           record("error", reason);
-          await reader.cancel(reason);
+          await cancelUpstream(reason);
         },
       });
     } catch (error) {

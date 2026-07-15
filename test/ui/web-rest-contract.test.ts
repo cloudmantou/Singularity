@@ -57,6 +57,28 @@ describe("web memory mutation API contract", () => {
     expect(html).toContain("formatRecallSignal(scoreDetails.temporal)");
   });
 
+  it("streams a temporary plain-text draft and formats only the verified final answer", () => {
+    expect(html).toContain("Accept: 'text/event-stream'");
+    expect(html).toContain("consumeRecallSseResponse(recallRes");
+    expect(html).toContain("createRecallDraftAnimator({");
+    expect(html).toContain("draftAnimator.push(delta)");
+    expect(html).toContain("await draftAnimator.finish()");
+    expect(html).toContain("draftEl.textContent = text");
+    expect(html).toContain("finalAnswerEl.innerHTML = renderAnswerMarkdown(verifiedAnswer)");
+    expect(html).toContain("finalAnswerEl.classList.remove('is-streaming')");
+    expect(html.indexOf("consumeRecallSseResponse(recallRes")).toBeLessThan(
+      html.indexOf("const sourcesToggle = document.createElement('div')")
+    );
+  });
+
+  it("cancels stale recall streams when another query starts or the conversation is cleared", () => {
+    expect(html).toContain("if (activeRecallController) activeRecallController.abort()");
+    expect(html).toContain("if (activeRecallAnimation) activeRecallAnimation.cancel()");
+    expect(html).toContain("signal: recallController.signal");
+    expect(html).toContain("requestId !== activeRecallRequestId");
+    expect(html).toMatch(/function clearRecall\(\)[\s\S]*?activeRecallController\.abort\(\)/);
+  });
+
   it("surfaces vector runtime state in the observatory system view", () => {
     expect(html).toContain('id="obs-vector-runtime-section"');
     expect(html).toContain('id="obs-vector-runtime-grid"');

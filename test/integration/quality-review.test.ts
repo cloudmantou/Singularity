@@ -27,7 +27,7 @@ function testCtx(): ExecutionContext {
       /* no-op */
     },
     props: {},
-  } as ExecutionContext;
+  } as unknown as ExecutionContext;
 }
 
 describe("memory quality review queues", () => {

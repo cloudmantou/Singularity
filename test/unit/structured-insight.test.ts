@@ -42,6 +42,18 @@ describe("validateStructuredInsightResponse", () => {
     expect(result.unverifiedClaims).toEqual([]);
   });
 
+  it("removes model-written parenthetical Claim markers before adding server citations", () => {
+    const result = validateStructuredInsightResponse(JSON.stringify({
+      answer: [{
+        text: "根据已验证记忆，项目当前使用 SQLite（C1）。",
+        refs: ["C1"],
+      }],
+    }), [sqliteClaim]);
+
+    expect(result.answer).toBe("根据已验证记忆，项目当前使用 SQLite。 [C1]");
+    expect(result.unverifiedClaims).toEqual([]);
+  });
+
   it("derives the verified Claim ledger from paragraph refs when the model omits claims", () => {
     const secondClaim: CitableInsightClaim = {
       ...sqliteClaim,

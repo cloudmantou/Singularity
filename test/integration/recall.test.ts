@@ -39,6 +39,18 @@ function makeMatch(id: string, score: number, overrides: Record<string, any> = {
   };
 }
 
+function parseSseData(raw: string): any[] {
+  return raw.split(/\r?\n\r?\n/).flatMap((event) => {
+    const data = event.split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n")
+      .trim();
+    if (!data || data === "[DONE]") return [];
+    return [JSON.parse(data)];
+  });
+}
+
 // The AI mock embeds every query as 384 dims of 0.1 (make-env.ts) —
 // SIMILAR_VEC scores cosine 1.0 against it, DISSIMILAR_VEC scores ~0.
 const SIMILAR_VEC = new Array(384).fill(0.1);
@@ -236,6 +248,178 @@ describe("GET /recall", () => {
       expect.objectContaining({ ref: "C2", evidenceId: "recent-mtzs" }),
     ]));
     expect(data.sources).toHaveLength(2);
+  });
+
+  it("streams only verified answer text before one final recall payload", async () => {
+    const now = Date.now();
+    db.entries.push({
+      id: "recent-stream",
+      content: "Singularity 正在增加流式 Recall。",
+      tags: '["work","project/singularity"]',
+      source: "codex",
+      created_at: now - 60_000,
+      vector_ids: "[]",
+    });
+    seedActiveClaimsForEntries(db, ["recent-stream"]);
+    const structured = JSON.stringify({
+      answer: [{
+        text: "你正在为 Singularity 增加流式 Recall。",
+        refs: ["C1"],
+        kind: "fact",
+      }],
+    });
+    env = makeTestEnv(db, { AI: makeContradictionAI(structured) });
+    const request = new Request(
+      `http://localhost/recall?query=${encodeURIComponent("我在忙什么？")}`,
+      {
+        headers: {
+          Authorization: "Bearer test-token",
+          Accept: "text/event-stream",
+        },
+      }
+    );
+
+    const res = await worker.fetch(request, env, ctx);
+    const raw = await res.text();
+    const events = parseSseData(raw);
+    const draftIndex = events.findIndex((event) => event.type === "draft_delta");
+    const finalIndex = events.findIndex((event) => event.type === "final");
+    const verificationIndex = events.findIndex(
+      (event) => event.type === "status" && event.phase === "verification"
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    expect(events[0]).toEqual({ type: "status", phase: "retrieval" });
+    expect(events.some((event) =>
+      event.type === "status" && event.phase === "generation"
+    )).toBe(true);
+    expect(draftIndex).toBeGreaterThan(0);
+    expect(verificationIndex).toBeLessThan(draftIndex);
+    expect(finalIndex).toBeGreaterThan(draftIndex);
+    expect(events[draftIndex].delta).toContain("流式 Recall");
+    expect(events[draftIndex].delta).not.toContain('"answer"');
+    expect(events[draftIndex].delta).not.toContain("C1");
+    expect(events[finalIndex].data).toMatchObject({
+      ok: true,
+      mode: "recent_activity",
+      answer: "你正在为 Singularity 增加流式 Recall。 [C1]",
+    });
+    expect(events[finalIndex].data.sources).toEqual([
+      expect.objectContaining({ id: "recent-stream" }),
+    ]);
+    expect(raw.trimEnd().endsWith("data: [DONE]")).toBe(true);
+  });
+
+  it("does not expose answer text until model generation and verification complete", async () => {
+    const now = Date.now();
+    db.entries.push({
+      id: "recent-gated-stream",
+      content: "Singularity 正在验证真正的增量输出。",
+      tags: '["work","project/singularity"]',
+      source: "codex",
+      created_at: now - 60_000,
+      vector_ids: "[]",
+    });
+    seedActiveClaimsForEntries(db, ["recent-gated-stream"]);
+
+    let releaseGeneration: (() => void) | undefined;
+    const aiRun = vi.fn().mockImplementation(async (_model: string, options?: Record<string, any>) => {
+      const prompt = String(options?.messages?.[0]?.content ?? "");
+      if (prompt.includes("strict evidence entailment verifier")) {
+        return new ReadableStream({
+          start(controller) {
+            const verdict = JSON.stringify({ paragraphs: [{ id: "P1", supported: true }] });
+            controller.enqueue(new TextEncoder().encode(
+              `data: {"response":${JSON.stringify(verdict)}}\n\ndata: [DONE]\n\n`
+            ));
+            controller.close();
+          },
+        });
+      }
+      return new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(
+            'data: {"response":"{\\"answer\\":[{\\"text\\":\\"第一段"}\n\n'
+          ));
+          releaseGeneration = () => {
+            controller.enqueue(new TextEncoder().encode(
+              'data: {"response":"继续\\",\\"refs\\":[\\"C1\\"],\\"kind\\":\\"fact\\"}]}"}\n\n' +
+              'data: [DONE]\n\n'
+            ));
+            controller.close();
+          };
+        },
+      });
+    });
+    env = makeTestEnv(db, { AI: { run: aiRun } as unknown as Ai });
+    const res = await worker.fetch(new Request(
+      `http://localhost/recall?query=${encodeURIComponent("我在忙什么？")}`,
+      {
+        headers: {
+          Authorization: "Bearer test-token",
+          Accept: "text/event-stream",
+        },
+      }
+    ), env, ctx);
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    const firstChunk = await reader.read();
+    expect(firstChunk.done).toBe(false);
+    const beforeRelease = decoder.decode(firstChunk.value, { stream: true });
+    expect(beforeRelease).not.toContain('"type":"draft_delta"');
+    expect(beforeRelease).not.toContain('"type":"final"');
+    await vi.waitFor(() => expect(releaseGeneration).toBeTypeOf("function"));
+    releaseGeneration!();
+
+    let remainder = "";
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      remainder += decoder.decode(chunk.value, { stream: true });
+    }
+    remainder += decoder.decode();
+    const allEvents = parseSseData(beforeRelease + remainder);
+    expect(allEvents.find((event) => event.type === "final")?.data.answer)
+      .toBe("第一段继续 [C1]");
+  });
+
+  it("never streams an unsupported answer draft", async () => {
+    const now = Date.now();
+    db.entries.push({
+      id: "recent-invalid-draft",
+      content: "Singularity 正在实现安全流式回答。",
+      tags: '["work"]',
+      source: "codex",
+      created_at: now - 60_000,
+      vector_ids: "[]",
+    });
+    seedActiveClaimsForEntries(db, ["recent-invalid-draft"]);
+    env = makeTestEnv(db, {
+      AI: makeContradictionAI(JSON.stringify({
+        answer: [{ text: "这是一条没有证据的草稿。", refs: ["C999"], kind: "fact" }],
+      })),
+    });
+
+    const res = await worker.fetch(new Request(
+      `http://localhost/recall?query=${encodeURIComponent("我在忙什么？")}`,
+      {
+        headers: {
+          Authorization: "Bearer test-token",
+          Accept: "text/event-stream",
+        },
+      }
+    ), env, ctx);
+    const events = parseSseData(await res.text());
+    const drafts = events.filter((event) => event.type === "draft_delta");
+    const final = events.find((event) => event.type === "final")?.data;
+
+    expect(drafts).toEqual([]);
+    expect(final.answer).toBeNull();
+    expect(final.citations).toEqual([]);
+    expect(final.sources).toEqual([
+      expect.objectContaining({ id: "recent-invalid-draft" }),
+    ]);
   });
 
   it("does not expose raw recent activity when answer synthesis fails", async () => {

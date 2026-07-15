@@ -190,6 +190,251 @@ function createCfSseParser(handlers) {
   };
 }
 
+/* Incremental parser for Recall SSE events. The server emits answer text only
+ * after verification; the final payload remains authoritative metadata. */
+function createRecallSseParser(handlers) {
+  const callbacks = handlers || {};
+  let buffer = '';
+  let completed = false;
+  let failed = false;
+
+  function invoke(name, value) {
+    const handler = callbacks[name];
+    if (typeof handler === 'function') handler(value);
+  }
+
+  function fail(error) {
+    if (failed) return;
+    failed = true;
+    invoke('onError', error instanceof Error ? error : new Error('Recall stream failed'));
+  }
+
+  function consumeEvent(eventText) {
+    const data = eventText
+      .split(/\r?\n/)
+      .filter(line => line.startsWith('data:'))
+      .map(line => line.slice(5).trimStart())
+      .join('\n')
+      .trim();
+    if (!data) return;
+    if (failed) return;
+    if (completed) {
+      fail(new Error('Recall stream produced an event after DONE'));
+      return;
+    }
+    if (data === '[DONE]') {
+      if (!completed) invoke('onDone');
+      completed = true;
+      return;
+    }
+    try {
+      const event = JSON.parse(data);
+      if (!event || typeof event !== 'object') throw new Error('Invalid Recall SSE event');
+      if (event.type === 'status' && typeof event.phase === 'string') {
+        invoke('onStatus', event.phase);
+      } else if (event.type === 'draft_delta' && typeof event.delta === 'string') {
+        invoke('onDraftDelta', event.delta);
+      } else if (event.type === 'final' && event.data && typeof event.data === 'object') {
+        invoke('onFinal', event.data);
+      } else if (event.type === 'error') {
+        fail(new Error(
+          typeof event.message === 'string' && event.message
+            ? event.message
+            : 'Recall stream failed'
+        ));
+      }
+    } catch (error) {
+      fail(error);
+    }
+  }
+
+  function drain(allowRemainder) {
+    let match;
+    while ((match = buffer.match(/\r?\n\r?\n/))) {
+      const end = match.index;
+      consumeEvent(buffer.slice(0, end));
+      buffer = buffer.slice(end + match[0].length);
+    }
+    if (allowRemainder && buffer.trim()) {
+      consumeEvent(buffer);
+      buffer = '';
+    }
+  }
+
+  return {
+    push(text) {
+      if (!text) return;
+      if (failed) return;
+      if (completed) {
+        if (text.trim()) fail(new Error('Recall stream produced data after DONE'));
+        return;
+      }
+      buffer += text;
+      drain(false);
+    },
+    finish() {
+      drain(true);
+    },
+  };
+}
+
+async function consumeRecallSseResponse(response, handlers) {
+  if (!response || !response.ok) {
+    throw new Error(`Recall failed (HTTP ${response ? response.status : 0})`);
+  }
+  if (!response.body || typeof response.body.getReader !== 'function') {
+    throw new Error('Recall stream body is unavailable');
+  }
+
+  const callbacks = handlers || {};
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let finalData = null;
+  let finalCount = 0;
+  let done = false;
+  let protocolError = null;
+  const parser = createRecallSseParser({
+    onStatus(phase) {
+      if (finalCount === 0 && typeof callbacks.onStatus === 'function') {
+        callbacks.onStatus(phase);
+      }
+    },
+    onDraftDelta(delta) {
+      if (finalCount === 0 && typeof callbacks.onDraftDelta === 'function') {
+        callbacks.onDraftDelta(delta);
+      }
+    },
+    onFinal(data) {
+      finalCount += 1;
+      if (finalCount > 1) {
+        protocolError = new Error('Recall stream produced multiple final responses');
+        return;
+      }
+      finalData = data;
+    },
+    onError(error) {
+      protocolError = error instanceof Error ? error : new Error('Recall stream failed');
+    },
+    onDone() {
+      done = true;
+    },
+  });
+
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      parser.push(decoder.decode(next.value, { stream: true }));
+      if (protocolError) {
+        await reader.cancel(protocolError).catch(() => undefined);
+        throw protocolError;
+      }
+    }
+    parser.push(decoder.decode());
+    parser.finish();
+    if (protocolError) throw protocolError;
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (protocolError) throw protocolError;
+  if (!done) throw new Error('Recall stream ended before DONE');
+  if (finalCount !== 1 || !finalData) {
+    throw new Error('Recall stream ended without a final response');
+  }
+  if (typeof callbacks.onFinal === 'function') callbacks.onFinal(finalData);
+  return finalData;
+}
+
+/* Reveal verified Recall prose independently of network chunk sizes. The final
+ * payload applies citations and formatting after the queue has drained. */
+function createRecallDraftAnimator(options) {
+  const settings = options || {};
+  const intervalMs = Number.isFinite(settings.intervalMs)
+    ? Math.max(1, settings.intervalMs)
+    : 14;
+  const onText = typeof settings.onText === 'function'
+    ? settings.onText
+    : () => {};
+  let rawText = '';
+  let queuedText = '';
+  let visibleText = '';
+  let pending = [];
+  let timer = null;
+  let completed = false;
+  let cancelled = false;
+  let drainWaiters = [];
+
+  function sanitizeDraft(value, complete) {
+    const withoutCitations = value.replace(/\s*\[\s*C\d+\s*\]/gi, '');
+    return complete
+      ? withoutCitations
+      : withoutCitations.replace(/\s*\[\s*C?\d*$/i, '');
+  }
+
+  function resolveDrainWaiters() {
+    if (pending.length || timer) return;
+    const waiters = drainWaiters;
+    drainWaiters = [];
+    waiters.forEach(resolve => resolve());
+  }
+
+  function scheduleTick() {
+    if (cancelled || timer || !pending.length) {
+      resolveDrainWaiters();
+      return;
+    }
+    timer = setTimeout(() => {
+      timer = null;
+      if (cancelled) {
+        resolveDrainWaiters();
+        return;
+      }
+      const character = pending.shift();
+      if (character != null) {
+        visibleText += character;
+        onText(visibleText, character);
+      }
+      scheduleTick();
+    }, intervalMs);
+  }
+
+  function enqueueSanitized(complete) {
+    const nextText = sanitizeDraft(rawText, complete);
+    if (!nextText.startsWith(queuedText)) return;
+    const suffix = nextText.slice(queuedText.length);
+    queuedText = nextText;
+    if (suffix) pending.push(...Array.from(suffix));
+    scheduleTick();
+  }
+
+  return {
+    push(chunk) {
+      if (cancelled || completed || !chunk) return;
+      rawText += chunk;
+      enqueueSanitized(false);
+    },
+    finish() {
+      if (cancelled) return Promise.resolve();
+      if (!completed) {
+        completed = true;
+        enqueueSanitized(true);
+      }
+      if (!pending.length && !timer) return Promise.resolve();
+      return new Promise(resolve => {
+        drainWaiters.push(resolve);
+      });
+    },
+    cancel() {
+      cancelled = true;
+      pending = [];
+      if (timer) clearTimeout(timer);
+      timer = null;
+      resolveDrainWaiters();
+    },
+  };
+}
+
 /* Parse a state-changing REST response and enforce its { ok: true } contract.
  * The response body is never reflected on malformed/non-JSON failures because
  * upstream HTML can contain private diagnostics.
@@ -248,6 +493,9 @@ if (typeof module !== 'undefined' && module.exports) {
     parseRecallResult,
     normalizeEntry,
     createCfSseParser,
+    createRecallSseParser,
+    createRecallDraftAnimator,
+    consumeRecallSseResponse,
     parseApiJsonResponse,
     normalizeSafeTag,
     importEntriesInBatches,

@@ -118,6 +118,18 @@ interface OpenAIChatPayload {
     completion_tokens?: number;
     total_tokens?: number;
   };
+  error?: {
+    message?: string;
+    code?: string | number;
+  } | string;
+}
+
+function providerStreamError(payload: OpenAIChatPayload): Error | null {
+  if (!payload.error) return null;
+  const message = typeof payload.error === "string"
+    ? payload.error
+    : payload.error.message || `Provider stream error${payload.error.code ? ` (${payload.error.code})` : ""}`;
+  return new Error(message);
 }
 
 function extractChatContent(payload: OpenAIChatPayload): string | null {
@@ -136,11 +148,11 @@ function openAiSseToCfSseStream(
   let carry = "";
   let output = "";
   let usage: OpenAIChatPayload["usage"];
-  let doneSent = false;
+  let providerDone = false;
 
   const emitDone = (controller: TransformStreamDefaultController<Uint8Array>) => {
-    if (doneSent) return;
-    doneSent = true;
+    if (providerDone) return;
+    providerDone = true;
     controller.enqueue(encoder.encode("data: [DONE]\n\n"));
   };
 
@@ -152,12 +164,15 @@ function openAiSseToCfSseStream(
     if (!line.startsWith("data:")) return;
     const data = line.slice(5).trimStart();
     if (!data) return;
+    if (providerDone) throw new Error("Provider stream produced an event after DONE");
     if (data === "[DONE]") {
       emitDone(controller);
       return;
     }
 
     const payload = JSON.parse(data) as OpenAIChatPayload;
+    const streamError = providerStreamError(payload);
+    if (streamError) throw streamError;
     if (payload.usage) usage = payload.usage;
     const content = extractChatContent(payload);
     if (!content) return;
@@ -183,7 +198,7 @@ function openAiSseToCfSseStream(
       try {
         carry += decoder.decode();
         if (carry) processLine(carry, controller);
-        emitDone(controller);
+        if (!providerDone) throw new Error("Provider stream ended before DONE");
         record("success", output, usage);
       } catch (error) {
         record("error", output, usage, error);
@@ -234,6 +249,7 @@ export class OpenAICompatibleLLM implements LLMProvider {
       const send = (requestBody: Record<string, unknown>) =>
         fetch(`${this.baseURL}/chat/completions`, {
           method: "POST",
+          signal: options.signal,
           headers: {
             "Content-Type": "application/json",
             Authorization: `Bearer ${this.apiKey}`,
@@ -298,10 +314,11 @@ export class OpenAICompatibleLLM implements LLMProvider {
   async chatAsCfSse(messages: ChatMessage[], options: ChatOptions = {}): Promise<ReadableStream> {
     const started = Date.now();
     const inputPreview = messages.map((message) => message.content).join("\n").slice(0, 2000);
+    const miniMax = isMiniMaxChatProvider(this.baseURL, this.model);
     const body: Record<string, unknown> = {
       model: this.model,
       messages,
-      temperature: options.temperature ?? 0.2,
+      temperature: options.temperature ?? (miniMax ? 1 : 0.2),
       max_tokens: options.max_tokens,
       stream: true,
       ...(this.defaultExtraBody ?? {}),
@@ -337,18 +354,34 @@ export class OpenAICompatibleLLM implements LLMProvider {
     };
 
     try {
-      const response = await fetch(`${this.baseURL}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "text/event-stream, application/json",
-          Authorization: `Bearer ${this.apiKey}`,
-        },
-        body: JSON.stringify(body),
-      });
+      const send = (requestBody: Record<string, unknown>) =>
+        fetch(`${this.baseURL}/chat/completions`, {
+          method: "POST",
+          signal: options.signal,
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "text/event-stream, application/json",
+            Authorization: `Bearer ${this.apiKey}`,
+          },
+          body: JSON.stringify(requestBody),
+        });
+      const initial = miniMax
+        ? await sendMiniMaxWithRetry(send, body)
+        : { response: await send(body), errorBody: null };
+      let response = initial.response;
+      let consumedErrorBody = initial.errorBody;
+
+      if (!response.ok && body.response_format) {
+        consumedErrorBody ??= await response.text().catch(() => "");
+        if (isUnsupportedJsonFormatError(response.status, consumedErrorBody)) {
+          const { response_format: _responseFormat, ...fallbackBody } = body;
+          response = await send(fallbackBody);
+          consumedErrorBody = null;
+        }
+      }
 
       if (!response.ok) {
-        const errBody = await response.text().catch(() => "");
+        const errBody = consumedErrorBody ?? await response.text().catch(() => "");
         throw new Error(enrichLlmHttpError(response.status, errBody, this.baseURL));
       }
 

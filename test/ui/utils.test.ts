@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
 const {
   parseRecallResult,
@@ -6,6 +6,9 @@ const {
   escAttr,
   toDateStr,
   createCfSseParser,
+  createRecallSseParser,
+  createRecallDraftAnimator,
+  consumeRecallSseResponse,
   parseApiJsonResponse,
   importEntriesInBatches,
 } = require("../../public/utils.js");
@@ -142,6 +145,200 @@ describe("createCfSseParser", () => {
     parser.finish();
 
     expect(deltas.join("")).toBe("最近在开发");
+  });
+});
+
+describe("createRecallSseParser", () => {
+  it("preserves event order across split chunks and exposes only the final payload as final", () => {
+    const events: string[] = [];
+    let finalPayload: unknown = null;
+    const parser = createRecallSseParser({
+      onStatus: (phase: string) => events.push(`status:${phase}`),
+      onDraftDelta: (delta: string) => events.push(`draft:${delta}`),
+      onFinal: (data: unknown) => {
+        events.push("final");
+        finalPayload = data;
+      },
+      onDone: () => events.push("done"),
+    });
+
+    parser.push('data: {"type":"status","phase":"retr');
+    parser.push('ieval"}\n\ndata: {"type":"draft_delta","delta":"你');
+    parser.push('好"}\n\ndata: {"type":"final","data":{"ok":true,"answer":"你好 [C1]"}}\n\n');
+    parser.push('data: [DONE]\n\n');
+    parser.finish();
+
+    expect(events).toEqual([
+      "status:retrieval",
+      "draft:你好",
+      "final",
+      "done",
+    ]);
+    expect(finalPayload).toEqual({ ok: true, answer: "你好 [C1]" });
+  });
+
+  it("reports malformed events without manufacturing a final payload", () => {
+    const errors: unknown[] = [];
+    const finals: unknown[] = [];
+    const parser = createRecallSseParser({
+      onError: (error: unknown) => errors.push(error),
+      onFinal: (data: unknown) => finals.push(data),
+    });
+
+    parser.push('data: {not-json}\n\n');
+    parser.finish();
+
+    expect(errors).toHaveLength(1);
+    expect(finals).toEqual([]);
+  });
+});
+
+describe("consumeRecallSseResponse", () => {
+  it("streams draft callbacks but resolves only the single completed final payload", async () => {
+    const encoder = new TextEncoder();
+    const response = new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(
+          'data: {"type":"draft_delta","delta":"草稿"}\n\n'
+        ));
+        controller.enqueue(encoder.encode(
+          'data: {"type":"final","data":{"ok":true,"answer":"最终答案"}}\n\n'
+        ));
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+      },
+    }), {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    });
+    const drafts: string[] = [];
+    const finals: unknown[] = [];
+
+    const result = await consumeRecallSseResponse(response, {
+      onDraftDelta: (delta: string) => drafts.push(delta),
+      onFinal: (data: unknown) => finals.push(data),
+    });
+
+    expect(drafts).toEqual(["草稿"]);
+    expect(finals).toEqual([{ ok: true, answer: "最终答案" }]);
+    expect(result).toEqual({ ok: true, answer: "最终答案" });
+  });
+
+  it("rejects a completed stream that never produced a final payload", async () => {
+    const response = new Response(
+      'data: {"type":"draft_delta","delta":"未经验证"}\n\ndata: [DONE]\n\n',
+      { status: 200, headers: { "Content-Type": "text/event-stream" } }
+    );
+
+    await expect(consumeRecallSseResponse(response)).rejects.toThrow(
+      "Recall stream ended without a final response"
+    );
+  });
+
+  it("rejects duplicate final events", async () => {
+    const response = new Response(
+      'data: {"type":"final","data":{"ok":true,"answer":"A"}}\n\n' +
+      'data: {"type":"final","data":{"ok":true,"answer":"B"}}\n\n' +
+      'data: [DONE]\n\n',
+      { status: 200, headers: { "Content-Type": "text/event-stream" } }
+    );
+
+    await expect(consumeRecallSseResponse(response)).rejects.toThrow(
+      "Recall stream produced multiple final responses"
+    );
+  });
+
+  it("rejects events delivered after DONE in the same network chunk", async () => {
+    const response = new Response(
+      'data: {"type":"final","data":{"ok":true}}\n\n' +
+      'data: [DONE]\n\n' +
+      'data: {"type":"draft_delta","delta":"late"}\n\n',
+      { status: 200, headers: { "Content-Type": "text/event-stream" } }
+    );
+
+    await expect(consumeRecallSseResponse(response)).rejects.toThrow("after DONE");
+  });
+
+  it("cancels the response stream immediately after the first protocol error", async () => {
+    const cancel = vi.fn();
+    const drafts: string[] = [];
+    const response = new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(
+          'data: {"type":"error","message":"invalid stream"}\n\n' +
+          'data: {"type":"draft_delta","delta":"must not render"}\n\n'
+        ));
+      },
+      cancel,
+    }), { status: 200 });
+
+    await expect(consumeRecallSseResponse(response, {
+      onDraftDelta: (delta: string) => drafts.push(delta),
+    })).rejects.toThrow("invalid stream");
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(drafts).toEqual([]);
+  });
+});
+
+describe("createRecallDraftAnimator", () => {
+  it("reveals streamed text one character per animation tick", async () => {
+    vi.useFakeTimers();
+    const updates: string[] = [];
+    const animator = createRecallDraftAnimator({
+      intervalMs: 12,
+      onText: (text: string) => updates.push(text),
+    });
+
+    animator.push("你好呀");
+    expect(updates).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(12);
+    expect(updates).toEqual(["你"]);
+    await vi.advanceTimersByTimeAsync(12);
+    expect(updates).toEqual(["你", "你好"]);
+
+    const finished = animator.finish();
+    await vi.runAllTimersAsync();
+    await finished;
+    expect(updates.at(-1)).toBe("你好呀");
+    vi.useRealTimers();
+  });
+
+  it("holds split citation markers out of the temporary draft", async () => {
+    vi.useFakeTimers();
+    let visible = "";
+    const animator = createRecallDraftAnimator({
+      intervalMs: 10,
+      onText: (text: string) => { visible = text; },
+    });
+
+    animator.push("进度 [");
+    await vi.runAllTimersAsync();
+    expect(visible).toBe("进度");
+
+    animator.push("C12] 已完成");
+    const finished = animator.finish();
+    await vi.runAllTimersAsync();
+    await finished;
+    expect(visible).toBe("进度 已完成");
+    vi.useRealTimers();
+  });
+
+  it("cancels queued characters without writing more text", async () => {
+    vi.useFakeTimers();
+    const updates: string[] = [];
+    const animator = createRecallDraftAnimator({
+      intervalMs: 10,
+      onText: (text: string) => updates.push(text),
+    });
+
+    animator.push("不会全部显示");
+    await vi.advanceTimersByTimeAsync(10);
+    animator.cancel();
+    await vi.runAllTimersAsync();
+
+    expect(updates).toEqual(["不"]);
+    vi.useRealTimers();
   });
 });
 

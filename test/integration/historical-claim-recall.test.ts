@@ -10,7 +10,7 @@ function ctx(): ExecutionContext {
     waitUntil() {},
     passThroughOnException() {},
     props: {},
-  } as ExecutionContext;
+  } as unknown as ExecutionContext;
 }
 
 describe("historical Claim recall", () => {

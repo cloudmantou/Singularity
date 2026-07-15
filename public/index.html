@@ -743,12 +743,36 @@
       }
 
       .ex-a {
-        font-family: var(--font-serif);
-        font-size: 19px;
-        line-height: 1.58;
-        letter-spacing: -0.004em;
+        max-width: 64ch;
+        font-family: var(--font-sans);
+        font-size: 16.5px;
+        line-height: 1.72;
+        letter-spacing: 0;
         color: var(--text-primary);
+        overflow-wrap: anywhere;
         animation: bubble-in 0.36s var(--ease) both;
+      }
+
+      .ex-a.is-streaming {
+        white-space: pre-wrap;
+        color: var(--text-secondary);
+      }
+
+      .ex-a.is-streaming::after {
+        content: '';
+        display: inline-block;
+        width: 0.42em;
+        height: 1em;
+        margin-left: 0.18em;
+        vertical-align: -0.12em;
+        background: var(--accent);
+        animation: recall-caret 0.9s steps(1, end) infinite;
+      }
+
+      @keyframes recall-caret {
+        50% {
+          opacity: 0;
+        }
       }
 
       .ex-a strong {
@@ -3828,6 +3852,9 @@
         selectedTimeRange = ''
       let currentCount = 0
       let vectorizeGraceMs = 300000
+      let activeRecallController = null
+      let activeRecallAnimation = null
+      let activeRecallRequestId = 0
 
       function init() {
         applyTheme()
@@ -4660,6 +4687,11 @@
         const input = document.getElementById('recall-input')
         const query = input.value.trim()
         if (!query) return
+        if (activeRecallController) activeRecallController.abort()
+        if (activeRecallAnimation) activeRecallAnimation.cancel()
+        const requestId = ++activeRecallRequestId
+        const recallController = new AbortController()
+        activeRecallController = recallController
         const msgs = document.getElementById('recall-messages')
         const welcome = document.getElementById('recall-welcome')
         if (welcome) welcome.remove()
@@ -4668,14 +4700,56 @@
         autoResize(input)
         const loadingEl = appendLoading(msgs)
         let answerBubble = null
+        let answerEl = null
+        const ensureAnswerBubble = () => {
+          if (answerBubble) return answerEl
+          answerBubble = document.createElement('div')
+          answerBubble.className = 'ex-a-row'
+          answerEl = document.createElement('div')
+          answerEl.className = 'ex-a'
+          answerBubble.appendChild(answerEl)
+          msgs.appendChild(answerBubble)
+          return answerEl
+        }
+        const draftAnimator = createRecallDraftAnimator({
+          intervalMs: 14,
+          onText(text) {
+            if (requestId !== activeRecallRequestId) return
+            loadingEl.remove()
+            const draftEl = ensureAnswerBubble()
+            draftEl.classList.add('is-streaming')
+            draftEl.textContent = text
+            msgs.scrollTop = msgs.scrollHeight
+          },
+        })
+        activeRecallAnimation = draftAnimator
         msgs.scrollTop = msgs.scrollHeight
         try {
           // Use the REST endpoint for structured results — parsing the MCP tool's
           // formatted text miscounts sources when memory content contains list items
           const params = new URLSearchParams({ query, topK: '5' })
           if (selectedTag) params.set('tag', selectedTag)
-          const recallRes = await fetch(`${WORKER_URL}/recall?${params}`, { headers: { Authorization: `Bearer ${AUTH_TOKEN}` } })
-          const data = await recallRes.json()
+          const recallRes = await fetch(`${WORKER_URL}/recall?${params}`, {
+            headers: {
+              Authorization: `Bearer ${AUTH_TOKEN}`,
+              Accept: 'text/event-stream',
+            },
+            signal: recallController.signal,
+          })
+          const contentType = recallRes.headers.get('content-type') || ''
+          let data
+          if (contentType.includes('text/event-stream')) {
+            data = await consumeRecallSseResponse(recallRes, {
+                onDraftDelta(delta) {
+                  if (requestId !== activeRecallRequestId || !delta) return
+                  draftAnimator.push(delta)
+                },
+              })
+            await draftAnimator.finish()
+          } else {
+            data = await recallRes.json()
+          }
+          if (requestId !== activeRecallRequestId) return
           // Server/auth errors must not render as "no results" — let the catch handle them
           if (!recallRes.ok || !data.ok) throw new Error(data.error || 'recall failed')
           loadingEl.remove()
@@ -4687,6 +4761,7 @@
             )
           }
           if (!data.results || !data.results.length) {
+            if (answerBubble) answerBubble.remove()
             appendBrainBubble(msgs, t('recall.empty'), 'recall-sys')
           } else {
             const recentActivity = data.mode === 'recent_activity'
@@ -4705,16 +4780,10 @@
               graphFacts: m.graph_facts || [],
               timeBasis: m.time_basis || null,
             }))
-            answerBubble = document.createElement('div')
-            answerBubble.className = 'ex-a-row'
-            const answerEl = document.createElement('div')
-            answerEl.className = 'ex-a'
-            answerEl.textContent = '…'
-            answerBubble.appendChild(answerEl)
-            msgs.appendChild(answerBubble)
-
+            const finalAnswerEl = ensureAnswerBubble()
             const verifiedAnswer = String(data.answer || t('recall.answerUnavailable'))
-            answerEl.innerHTML = renderAnswerMarkdown(verifiedAnswer)
+            finalAnswerEl.classList.remove('is-streaming')
+            finalAnswerEl.innerHTML = renderAnswerMarkdown(verifiedAnswer)
 
             // 2. Sources toggle
             const citationIds = new Set((Array.isArray(data.citations) ? data.citations : [])
@@ -4738,10 +4807,16 @@
             document.getElementById('recall-clear-btn').style.display = 'flex'
           }
         } catch (error) {
+          draftAnimator.cancel()
           loadingEl.remove()
           if (answerBubble) answerBubble.remove()
+          if (error && error.name === 'AbortError') return
+          if (requestId !== activeRecallRequestId) return
           console.error('recall chat failed:', error)
           appendBrainBubble(msgs, t('recall.error'), 'recall-sys')
+        } finally {
+          if (requestId === activeRecallRequestId) activeRecallController = null
+          if (activeRecallAnimation === draftAnimator) activeRecallAnimation = null
         }
         msgs.scrollTop = msgs.scrollHeight
       }
@@ -6307,6 +6382,11 @@ ${metaLine}
         document.getElementById('remember-clear-btn').style.display = 'none'
       }
       function clearRecall() {
+        if (activeRecallController) activeRecallController.abort()
+        if (activeRecallAnimation) activeRecallAnimation.cancel()
+        activeRecallController = null
+        activeRecallAnimation = null
+        activeRecallRequestId += 1
         const msgs = document.getElementById('recall-messages')
         msgs.innerHTML = `<div class="recall-hero" id="recall-welcome"><div class="eyebrow">Recall</div><div class="hero-line">Ask me anything you've stored away &mdash; I'll find it and answer in your own words.</div></div>`
         document.getElementById('recall-clear-btn').style.display = 'none'

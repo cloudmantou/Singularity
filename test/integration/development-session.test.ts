@@ -19,7 +19,7 @@ function ctx(): ExecutionContext {
     waitUntil() {},
     passThroughOnException() {},
     props: {},
-  } as ExecutionContext;
+  } as unknown as ExecutionContext;
 }
 
 function collectingCtx() {
@@ -28,7 +28,7 @@ function collectingCtx() {
     waitUntil(promise: Promise<unknown>) { tasks.push(promise); },
     passThroughOnException() {},
     props: {},
-  } as ExecutionContext;
+  } as unknown as ExecutionContext;
   return {
     context,
     async drain() {

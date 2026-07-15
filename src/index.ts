@@ -10,6 +10,7 @@ import { createMcpHandler } from "agents/mcp";
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { z } from "zod";
 import { createEmbedding, createEmbeddingFromResolved, createLLM, type EmbeddingProvider } from "./providers";
+import { collectCfSseText } from "./providers/cf-sse";
 import {
   applyModelSettingsPatch,
   activeEmbeddingOf,
@@ -7013,7 +7014,8 @@ function enforceInsightAnswerLanguage(
 async function verifySynthesizedInsightEntailment(
   llm: Awaited<ReturnType<typeof createLLM>>,
   answer: string,
-  claims: readonly CitableInsightClaim[]
+  claims: readonly CitableInsightClaim[],
+  signal?: AbortSignal
 ): Promise<Set<string>> {
   const paragraphs = parseRenderedInsightParagraphs(answer);
   if (!paragraphs.length) return new Set();
@@ -7051,7 +7053,7 @@ ${JSON.stringify(verifierData)}`;
   try {
     const response = await llm.chat(
       [{ role: "user", content: verificationPrompt }],
-      { max_tokens: INSIGHT_VERIFICATION_MAX_TOKENS, jsonMode: true }
+      { max_tokens: INSIGHT_VERIFICATION_MAX_TOKENS, jsonMode: true, signal }
     );
     const verdicts = parseInsightEntailmentVerdicts(
       response,
@@ -7070,12 +7072,21 @@ ${JSON.stringify(verifierData)}`;
   }
 }
 
+interface InsightSynthesisOptions {
+  asOf?: number;
+  activitySummary?: boolean;
+  onGenerationStart?: () => void;
+  onDraftDelta?: (delta: string) => void;
+  onDraftComplete?: () => void;
+  signal?: AbortSignal;
+}
+
 export async function resolveVerifiedRecallInsight(
   query: string,
   contextInput: InsightContextPackage<RecallClaimContext>,
   env: Env,
   conflicts: RecallConflictContext[] = [],
-  options: { asOf?: number } = {}
+  options: InsightSynthesisOptions = {}
 ): Promise<VerifiedInsightResult> {
   const context = normalizeInsightContext(contextInput);
   return synthesizeVerifiedInsight(query, context, env, conflicts, options);
@@ -7088,7 +7099,7 @@ export async function synthesizeVerifiedInsight(
     | InsightEvidenceRow<RecallClaimContext>[],
   env: Env,
   conflicts: RecallConflictContext[] = [],
-  options: { asOf?: number; activitySummary?: boolean } = {}
+  options: InsightSynthesisOptions = {}
 ): Promise<VerifiedInsightResult> {
   const context = normalizeInsightContext(contextInput);
   if (!context.directEvidence.length && !context.relatedContext.length) {
@@ -7217,10 +7228,20 @@ Rules:
   let llm: Awaited<ReturnType<typeof createLLM>>;
   try {
     llm = await createLLM(env);
-    insight = await llm.chat(
-      [{ role: "user", content: prompt }],
-      { max_tokens: INSIGHT_MAX_TOKENS, jsonMode: true }
-    );
+    options.onGenerationStart?.();
+    if (options.onDraftDelta) {
+      const stream = await llm.chatAsCfSse(
+        [{ role: "user", content: prompt }],
+        { max_tokens: INSIGHT_MAX_TOKENS, jsonMode: true, signal: options.signal }
+      );
+      insight = await collectCfSseText(stream, { signal: options.signal });
+      options.onDraftComplete?.();
+    } else {
+      insight = await llm.chat(
+        [{ role: "user", content: prompt }],
+        { max_tokens: INSIGHT_MAX_TOKENS, jsonMode: true, signal: options.signal }
+      );
+    }
   } catch (e) {
     console.error("synthesizeInsight LLM call failed (non-fatal):", e);
     return { answer: "", verifiedClaims: [], unverifiedClaims: [] };
@@ -7317,7 +7338,7 @@ ${allowedClaims}`;
     try {
       const repairedInsight = await llm.chat(
         [{ role: "user", content: repairPrompt }],
-        { max_tokens: INSIGHT_MAX_TOKENS, jsonMode: true }
+        { max_tokens: INSIGHT_MAX_TOKENS, jsonMode: true, signal: options.signal }
       );
       if (repairedInsight.trim()) {
         validated = enforceInsightAnswerLanguage(
@@ -7343,7 +7364,8 @@ ${allowedClaims}`;
     const supportedParagraphIds = await verifySynthesizedInsightEntailment(
       llm,
       validated.answer,
-      revalidatedClaims
+      revalidatedClaims,
+      options.signal
     );
     const supportedParagraphs = paragraphs.filter((paragraph) =>
       supportedParagraphIds.has(paragraph.id)
@@ -7412,6 +7434,17 @@ ${allowedClaims}`;
       unverified_reason_counts: unverifiedReasonCounts,
     }, "system");
   }
+  if (
+    options.onDraftDelta &&
+    validated.answer &&
+    validated.answer !== INSUFFICIENT_VERIFIED_EVIDENCE &&
+    validated.unverifiedClaims.length === 0
+  ) {
+    const verifiedDraft = parseRenderedInsightParagraphs(validated.answer)
+      .map((paragraph) => paragraph.text)
+      .join("\n\n");
+    if (verifiedDraft) options.onDraftDelta(verifiedDraft);
+  }
   return validated;
 }
 
@@ -7419,7 +7452,8 @@ export async function synthesizeRecentActivityAnswer(
   query: string,
   matches: readonly RecallMatch[],
   plan: Pick<RecallRequestPlan, "before">,
-  env: Env
+  env: Env,
+  options: Pick<InsightSynthesisOptions, "onGenerationStart" | "onDraftDelta" | "onDraftComplete" | "signal"> = {}
 ): Promise<VerifiedInsightResult> {
   if (!matches.length) return { answer: "", verifiedClaims: [], unverifiedClaims: [] };
   const asOf = plan.before ?? Date.now();
@@ -7445,7 +7479,7 @@ export async function synthesizeRecentActivityAnswer(
     { directEvidence, relatedContext: [] },
     env,
     conflictContext.conflicts,
-    { asOf, activitySummary: true }
+    { asOf, activitySummary: true, ...options }
   );
 }
 
@@ -7823,6 +7857,15 @@ export interface RecallSearchResult {
   conflicts?: RecallConflictContext[];
   degraded?: boolean;
   degradedReason?: string;
+}
+
+interface RecallRuntimeOptions {
+  recordUsage?: boolean;
+  allowClaimVectorBackfill?: boolean;
+  onInsightGenerationStart?: () => void;
+  onInsightDraftDelta?: (delta: string) => void;
+  onInsightDraftComplete?: () => void;
+  signal?: AbortSignal;
 }
 
 function presentableRecallAnswer(value: string | null | undefined): string | null {
@@ -9172,7 +9215,7 @@ async function recallHistoricalClaims(
   env: Env,
   ctx: ExecutionContext,
   vaultFilter: string | null,
-  runtimeOptions: { recordUsage?: boolean; allowClaimVectorBackfill?: boolean }
+  runtimeOptions: RecallRuntimeOptions
 ): Promise<RecallSearchResult> {
   const tokens = tokenizeQuery(params.query);
   const graphSignals = await buildGraphRecallSignals(
@@ -9399,7 +9442,13 @@ async function recallHistoricalClaims(
       { directEvidence: insightRows, relatedContext: [] },
       env,
       conflictContext.conflicts,
-      { asOf: params.before }
+      {
+        asOf: params.before,
+        onGenerationStart: runtimeOptions.onInsightGenerationStart,
+        onDraftDelta: runtimeOptions.onInsightDraftDelta,
+        onDraftComplete: runtimeOptions.onInsightDraftComplete,
+        signal: runtimeOptions.signal,
+      }
     )
     : { answer: "", verifiedClaims: [], unverifiedClaims: [] };
   if (runtimeOptions.recordUsage !== false) {
@@ -9439,7 +9488,7 @@ export async function recallEntries(
   env: Env,
   ctx: ExecutionContext,
   vaultFilter: string | null = null,
-  runtimeOptions: { recordUsage?: boolean; allowClaimVectorBackfill?: boolean } = {}
+  runtimeOptions: RecallRuntimeOptions = {}
 ): Promise<RecallSearchResult> {
   const { query, topK } = params;
   const associationHops = Math.max(0, Math.min(2, Math.trunc(params.hops ?? 0)));
@@ -10017,7 +10066,13 @@ export async function recallEntries(
     ? await resolveVerifiedRecallInsight(embedQuery, {
         directEvidence: directInsightRows,
         relatedContext: relatedInsightRows,
-      }, env, conflictContext.conflicts, { asOf: recallAsOf })
+      }, env, conflictContext.conflicts, {
+        asOf: recallAsOf,
+        onGenerationStart: runtimeOptions.onInsightGenerationStart,
+        onDraftDelta: runtimeOptions.onInsightDraftDelta,
+        onDraftComplete: runtimeOptions.onInsightDraftComplete,
+        signal: runtimeOptions.signal,
+      })
     : { answer: "", verifiedClaims: [], unverifiedClaims: [] };
 
   return {
@@ -13302,6 +13357,269 @@ async function withRequestTelemetry(
   );
 }
 
+interface RecallHttpInput {
+  query: string;
+  tag?: string;
+  after?: number;
+  before?: number;
+  kind?: MemoryKind;
+  topK: number;
+  hops: number;
+  associationDirection: AssociationDirection;
+}
+
+interface RecallStreamHooks {
+  onGenerationStart?: () => void;
+  onDraftDelta?: (delta: string) => void;
+  onDraftComplete?: () => void;
+  signal?: AbortSignal;
+}
+
+async function executeRecallHttpRequest(
+  input: RecallHttpInput,
+  env: Env,
+  ctx: ExecutionContext,
+  vaultId: string | null,
+  hooks: RecallStreamHooks = {}
+): Promise<Record<string, unknown>> {
+  const requestPlan = planRecallRequest(input.query);
+  if (requestPlan.mode === "recent_activity") {
+    const activityPlan: RecallRequestPlan = {
+      ...requestPlan,
+      after: input.after ?? requestPlan.after,
+      before: input.before ?? requestPlan.before,
+    };
+    const matches = await listRecentActivity(activityPlan, input.tag, env, vaultId);
+    if (!matches.length) {
+      return {
+        ok: true,
+        mode: activityPlan.mode,
+        window: { after: activityPlan.after, before: activityPlan.before },
+        results: [],
+        answer: null,
+        insight: null,
+        citations: [],
+        sources: [],
+        message: "No recent activity found in that time window.",
+      };
+    }
+
+    const activityInsight = await synthesizeRecentActivityAnswer(
+      input.query,
+      matches,
+      activityPlan,
+      env,
+      {
+        onGenerationStart: hooks.onGenerationStart,
+        onDraftDelta: hooks.onDraftDelta,
+        onDraftComplete: hooks.onDraftComplete,
+        signal: hooks.signal,
+      }
+    );
+    const activityAnswer = presentableRecallAnswer(activityInsight.answer);
+    const activitySources = matches.map((match) => ({
+      id: match.id,
+      content: match.content,
+      tags: match.tags,
+      source: match.source,
+      created_at: match.createdAt,
+    }));
+    return {
+      ok: true,
+      mode: activityPlan.mode,
+      window: { after: activityPlan.after, before: activityPlan.before },
+      results: activitySources.map((source) => ({
+        ...source,
+        score: null,
+        updated: false,
+      })),
+      answer: activityAnswer,
+      insight: activityAnswer,
+      citations: activityInsight.citations ?? [],
+      verified_claims: activityInsight.verifiedClaims,
+      unverified_claims: activityInsight.unverifiedClaims,
+      sources: activitySources,
+    };
+  }
+
+  const {
+    matches,
+    directEvidence = matches.filter((match) => !match.association),
+    relatedContext = matches.filter((match) => Boolean(match.association)),
+    answer,
+    verifiedClaims = [],
+    unverifiedClaims = [],
+    citations = [],
+    conflicts = [],
+    retrievalMode = "entry_projection",
+    snapshotAt,
+    degraded,
+    degradedReason,
+  } = await recallEntries({
+    query: input.query,
+    topK: input.topK,
+    tag: input.tag,
+    after: input.after,
+    before: input.before,
+    kind: input.kind,
+    hops: input.hops,
+    associationDirection: input.associationDirection,
+  }, env, ctx, vaultId, {
+    recordUsage: false,
+    allowClaimVectorBackfill: false,
+    onInsightDraftDelta: hooks.onDraftDelta,
+    onInsightGenerationStart: hooks.onGenerationStart,
+    onInsightDraftComplete: hooks.onDraftComplete,
+    signal: hooks.signal,
+  });
+
+  if (!matches.length) {
+    return {
+      ok: true,
+      results: [],
+      message: "Nothing found matching that query.",
+      answer: null,
+      insight: null,
+      citations: [],
+      sources: [],
+      degraded_mode: Boolean(degraded),
+      degraded_reason: degradedReason ?? null,
+    };
+  }
+
+  const responseAnswer = presentableRecallAnswer(answer);
+  const responseSources = directEvidence.map((match) => ({
+    id: match.id,
+    content: match.content,
+    tags: match.tags,
+    source: match.source,
+    created_at: match.createdAt,
+  }));
+  return {
+    ok: true,
+    mode: "semantic",
+    retrieval_mode: retrievalMode,
+    snapshot_at: snapshotAt ?? null,
+    degraded_mode: Boolean(degraded),
+    degraded_reason: degradedReason ?? null,
+    results: matches.map((match) => ({
+      id: match.id,
+      claim_id: match.claimId ?? null,
+      parent_version_id: match.parentVersionId ?? null,
+      snapshot_at: match.snapshotAt ?? null,
+      content: match.content,
+      score: parseFloat((match.score * 100).toFixed(1)),
+      relevance: formatRelevanceLabel(match.score),
+      tags: match.tags,
+      source: match.source,
+      created_at: match.createdAt,
+      updated: match.isUpdate,
+      score_details: match.scoreDetails,
+      matched_entities: match.matchedEntities ?? [],
+      graph_facts: match.graphFacts ?? [],
+      time_basis: match.timeBasis ?? null,
+      claims: match.claims ?? [],
+      association: match.association ?? null,
+    })),
+    directEvidence: directEvidence.map((match, index) => ({
+      ref: `E${index + 1}`,
+      id: match.id,
+      content: match.content,
+      versionId: match.parentVersionId ?? null,
+      claims: match.claims ?? [],
+    })),
+    claim_context: buildCitableInsightClaims({
+      directEvidence: directEvidence.map((match) => ({
+        id: match.id,
+        content: match.content,
+        versionId: match.parentVersionId ?? null,
+        claims: match.claims,
+      })),
+      relatedContext: [],
+    }, conflicts, input.query),
+    relatedContext: relatedContext.map((match, index) => ({
+      ref: `R${index + 1}`,
+      id: match.id,
+      content: match.content,
+      association: match.association,
+    })),
+    conflicts,
+    answer: responseAnswer,
+    insight: responseAnswer,
+    citations,
+    sources: responseSources,
+    verified_claims: verifiedClaims,
+    unverified_claims: unverifiedClaims,
+  };
+}
+
+function createRecallSseResponse(
+  requestSignal: AbortSignal,
+  run: (hooks: RecallStreamHooks) => Promise<Record<string, unknown>>
+): Response {
+  const encoder = new TextEncoder();
+  const abortController = new AbortController();
+  let settled = false;
+  let generationStarted = false;
+
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const emit = (event: Record<string, unknown>) => {
+        if (settled || abortController.signal.aborted) return;
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+      };
+      const close = () => {
+        if (settled) return;
+        settled = true;
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      };
+      const relayAbort = () => abortController.abort(requestSignal.reason);
+      requestSignal.addEventListener("abort", relayAbort, { once: true });
+      emit({ type: "status", phase: "retrieval" });
+
+      void run({
+        signal: abortController.signal,
+        onGenerationStart() {
+          if (generationStarted) return;
+          generationStarted = true;
+          emit({ type: "status", phase: "generation" });
+        },
+        onDraftDelta(delta) {
+          emit({ type: "draft_delta", delta });
+        },
+        onDraftComplete() {
+          emit({ type: "status", phase: "verification" });
+        },
+      }).then((data) => {
+        if (abortController.signal.aborted) return;
+        emit({ type: "final", data });
+        close();
+      }).catch((error) => {
+        if (abortController.signal.aborted) return;
+        console.error("Recall stream failed:", error);
+        emit({ type: "error", code: "recall_failed", message: "Recall failed" });
+        close();
+      }).finally(() => {
+        requestSignal.removeEventListener("abort", relayAbort);
+      });
+    },
+    cancel(reason) {
+      settled = true;
+      abortController.abort(reason);
+    },
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      "X-Accel-Buffering": "no",
+    },
+  });
+}
+
 const defaultHandler = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     if (request.method === "OPTIONS") {
@@ -14448,62 +14766,6 @@ const defaultHandler = {
       const kindParam = url.searchParams.get("kind")?.trim();
       const kind = kindParam && (KIND_VALUES as readonly string[]).includes(kindParam) ? kindParam as MemoryKind : undefined;
 
-      const requestPlan = planRecallRequest(query);
-      if (requestPlan.mode === "recent_activity") {
-        const activityPlan: RecallRequestPlan = {
-          ...requestPlan,
-          after: after ?? requestPlan.after,
-          before: before ?? requestPlan.before,
-        };
-        const matches = await listRecentActivity(activityPlan, tag, env, vaultId);
-
-        if (!matches.length) {
-          return json({
-            ok: true,
-            mode: activityPlan.mode,
-            window: { after: activityPlan.after, before: activityPlan.before },
-            results: [],
-            answer: null,
-            insight: null,
-            citations: [],
-            sources: [],
-            message: "No recent activity found in that time window.",
-          });
-        }
-
-        const activityInsight = await synthesizeRecentActivityAnswer(
-          query,
-          matches,
-          activityPlan,
-          env
-        );
-        const activityAnswer = presentableRecallAnswer(activityInsight.answer);
-        const activitySources = matches.map((match) => ({
-          id: match.id,
-          content: match.content,
-          tags: match.tags,
-          source: match.source,
-          created_at: match.createdAt,
-        }));
-
-        return json({
-          ok: true,
-          mode: activityPlan.mode,
-          window: { after: activityPlan.after, before: activityPlan.before },
-          results: activitySources.map((source) => ({
-            ...source,
-            score: null,
-            updated: false,
-          })),
-          answer: activityAnswer,
-          insight: activityAnswer,
-          citations: activityInsight.citations ?? [],
-          verified_claims: activityInsight.verifiedClaims,
-          unverified_claims: activityInsight.unverifiedClaims,
-          sources: activitySources,
-        });
-      }
-
       const topK = Math.min(Math.max(parseInt(url.searchParams.get("topK") ?? "5", 10), 1), 20);
       const hops = Math.min(Math.max(parseInt(url.searchParams.get("hops") ?? "0", 10), 0), 2);
       const directionParam = url.searchParams.get("associationDirection") ?? "outgoing";
@@ -14511,22 +14773,7 @@ const defaultHandler = {
         return json({ ok: false, error: "invalid_association_direction" }, 400);
       }
       const associationDirection = directionParam as AssociationDirection;
-
-      const {
-        matches,
-        directEvidence = matches.filter((match) => !match.association),
-        relatedContext = matches.filter((match) => Boolean(match.association)),
-        answer,
-        insight,
-        verifiedClaims = [],
-        unverifiedClaims = [],
-        citations = [],
-        conflicts = [],
-        retrievalMode = "entry_projection",
-        snapshotAt,
-        degraded,
-        degradedReason,
-      } = await recallEntries({
+      const recallInput: RecallHttpInput = {
         query,
         topK,
         tag,
@@ -14535,91 +14782,15 @@ const defaultHandler = {
         kind,
         hops,
         associationDirection,
-      }, env, ctx, vaultId, {
-        recordUsage: false,
-        allowClaimVectorBackfill: false,
-      });
-
-      if (!matches.length) {
-        return json({
-          ok: true,
-          results: [],
-          message: "Nothing found matching that query.",
-          answer: null,
-          insight: null,
-          citations: [],
-          sources: [],
-          degraded_mode: Boolean(degraded),
-          degraded_reason: degradedReason ?? null,
-        });
-      }
-
-      const responseAnswer = presentableRecallAnswer(answer);
-      const responseSources = directEvidence.map((match) => ({
-        id: match.id,
-        content: match.content,
-        tags: match.tags,
-        source: match.source,
-        created_at: match.createdAt,
-      }));
-
-      return json({
-        ok: true,
-        mode: "semantic",
-        retrieval_mode: retrievalMode,
-        snapshot_at: snapshotAt ?? null,
-        degraded_mode: Boolean(degraded),
-        degraded_reason: degradedReason ?? null,
-        results: matches.map(m => ({
-          id: m.id,
-          claim_id: m.claimId ?? null,
-          parent_version_id: m.parentVersionId ?? null,
-          snapshot_at: m.snapshotAt ?? null,
-          content: m.content,
-          // Relative rank score 0–100 (top=100). Not probability or cosine accuracy.
-          score: parseFloat((m.score * 100).toFixed(1)),
-          relevance: formatRelevanceLabel(m.score),
-          tags: m.tags,
-          source: m.source,
-          created_at: m.createdAt,
-          updated: m.isUpdate,
-          score_details: m.scoreDetails,
-          matched_entities: m.matchedEntities ?? [],
-          graph_facts: m.graphFacts ?? [],
-          time_basis: m.timeBasis ?? null,
-          claims: m.claims ?? [],
-          association: m.association ?? null,
-        })),
-        directEvidence: directEvidence.map((match, index) => ({
-          ref: `E${index + 1}`,
-          id: match.id,
-          content: match.content,
-          versionId: match.parentVersionId ?? null,
-          claims: match.claims ?? [],
-        })),
-        claim_context: buildCitableInsightClaims({
-          directEvidence: directEvidence.map((match) => ({
-            id: match.id,
-            content: match.content,
-            versionId: match.parentVersionId ?? null,
-            claims: match.claims,
-          })),
-          relatedContext: [],
-        }, conflicts, query),
-        relatedContext: relatedContext.map((match, index) => ({
-          ref: `R${index + 1}`,
-          id: match.id,
-          content: match.content,
-          association: match.association,
-        })),
-        conflicts,
-        answer: responseAnswer,
-        insight: responseAnswer,
-        citations,
-        sources: responseSources,
-        verified_claims: verifiedClaims,
-        unverified_claims: unverifiedClaims,
-      });
+      };
+      const execute = (hooks: RecallStreamHooks = {}) =>
+        executeRecallHttpRequest(recallInput, env, ctx, vaultId, hooks);
+      const acceptsSse = (request.headers.get("accept") ?? "")
+        .split(",")
+        .some((value) => value.trim().toLowerCase().startsWith("text/event-stream"));
+      return acceptsSse
+        ? createRecallSseResponse(request.signal, execute)
+        : json(await execute());
     }
 
     // POST /link — explicit, non-authoritative Parent association.

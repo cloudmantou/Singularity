@@ -7,7 +7,7 @@ import { getEffectiveModelSettings } from "../../src/settings/store";
 import { resetSettingsCache } from "../../src/settings/store";
 
 function context(): ExecutionContext {
-  return { waitUntil() {}, passThroughOnException() {}, props: {} } as ExecutionContext;
+  return { waitUntil() {}, passThroughOnException() {}, props: {} } as unknown as ExecutionContext;
 }
 
 function appendRequest(key: string) {

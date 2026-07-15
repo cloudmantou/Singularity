@@ -12,6 +12,8 @@ export interface ChatMessage {
 export interface ChatOptions {
   temperature?: number;
   max_tokens?: number;
+  /** Abort an in-flight provider request when the downstream client disconnects. */
+  signal?: AbortSignal;
   /** When true, Workers AI uses SSE; OpenAI-compatible may still buffer. */
   stream?: boolean;
   /** Prefer JSON-only responses when the provider supports it. */

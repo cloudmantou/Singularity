@@ -275,6 +275,148 @@ describe("OpenAICompatibleLLM", () => {
     const body = JSON.parse(fetchMock.mock.calls[0][1].body);
     expect(body.stream).toBe(true);
   });
+
+  it("retries bounded MiniMax 529 failures before opening a chat stream", async () => {
+    const upstream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(
+          'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+        ));
+        controller.close();
+      },
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response("peak load", { status: 529 }))
+      .mockResolvedValueOnce(new Response(upstream, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const llm = new OpenAICompatibleLLM({
+      baseURL: "https://api.minimaxi.com/v1",
+      apiKey: "test-key",
+      model: "MiniMax-M3",
+    });
+
+    const stream = await llm.chatAsCfSse(
+      [{ role: "user", content: "stream" }],
+      { jsonMode: true }
+    );
+    await expect(new Response(stream).text()).resolves.toContain('"response":"ok"');
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const firstBody = JSON.parse(String(fetchMock.mock.calls[0][1].body));
+    expect(firstBody.stream).toBe(true);
+    expect(firstBody.temperature).toBe(1);
+    expect(firstBody.response_format).toBeUndefined();
+  });
+
+  it("retries a rejected streaming json_object request without response_format", async () => {
+    const upstream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(
+          'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+        ));
+        controller.close();
+      },
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response("unsupported response_format", { status: 400 }))
+      .mockResolvedValueOnce(new Response(upstream, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const llm = new OpenAICompatibleLLM({
+      baseURL: "https://gateway.example/v1",
+      apiKey: "test-key",
+      model: "custom-model",
+    });
+
+    const stream = await llm.chatAsCfSse(
+      [{ role: "user", content: "Return JSON" }],
+      { jsonMode: true }
+    );
+    await expect(new Response(stream).text()).resolves.toContain('"response":"ok"');
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const firstBody = JSON.parse(String(fetchMock.mock.calls[0][1].body));
+    const secondBody = JSON.parse(String(fetchMock.mock.calls[1][1].body));
+    expect(firstBody.response_format).toEqual({ type: "json_object" });
+    expect(secondBody.response_format).toBeUndefined();
+  });
+
+  it("rejects OpenAI-compatible errors delivered inside a successful stream", async () => {
+    const upstream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(
+          'data: {"error":{"message":"quota exhausted"}}\n\n'
+        ));
+        controller.close();
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(upstream, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    })));
+    const llm = new OpenAICompatibleLLM({
+      baseURL: "https://gateway.example/v1",
+      apiKey: "test-key",
+      model: "custom-model",
+    });
+
+    const stream = await llm.chatAsCfSse([{ role: "user", content: "stream" }]);
+
+    await expect(new Response(stream).text()).rejects.toThrow("quota exhausted");
+  });
+
+  it("rejects OpenAI-compatible streams that end before DONE", async () => {
+    const upstream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(
+          'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+        ));
+        controller.close();
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(upstream, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    })));
+    const llm = new OpenAICompatibleLLM({
+      baseURL: "https://gateway.example/v1",
+      apiKey: "test-key",
+      model: "custom-model",
+    });
+
+    const stream = await llm.chatAsCfSse([{ role: "user", content: "stream" }]);
+
+    await expect(new Response(stream).text()).rejects.toThrow("before DONE");
+  });
+
+  it("rejects OpenAI-compatible events after DONE", async () => {
+    const upstream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(
+          'data: [DONE]\n\ndata: {"choices":[{"delta":{"content":"late"}}]}\n\n'
+        ));
+        controller.close();
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(upstream, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    })));
+    const llm = new OpenAICompatibleLLM({
+      baseURL: "https://gateway.example/v1",
+      apiKey: "test-key",
+      model: "custom-model",
+    });
+
+    const stream = await llm.chatAsCfSse([{ role: "user", content: "stream" }]);
+
+    await expect(new Response(stream).text()).rejects.toThrow("after DONE");
+  });
 });
 
 describe("WorkersAILLM", () => {
@@ -289,6 +431,64 @@ describe("WorkersAILLM", () => {
     );
     // stream must stay undefined for non-stream chat (derivePattern contract)
     expect(run.mock.calls[0][1].stream).toBeUndefined();
+  });
+
+  it("cancels an active Workers AI stream when the caller aborts", async () => {
+    let upstreamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const cancel = vi.fn();
+    const upstream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        upstreamController = controller;
+      },
+      cancel,
+    });
+    const llm = new WorkersAILLM({
+      run: vi.fn().mockResolvedValue(upstream),
+    } as unknown as Ai);
+    const abortController = new AbortController();
+    const stream = await llm.chatAsCfSse(
+      [{ role: "user", content: "stream" }],
+      { signal: abortController.signal }
+    );
+    const reader = stream.getReader();
+    const pendingRead = reader.read();
+
+    try {
+      abortController.abort("replaced");
+      await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+      await expect(pendingRead).resolves.toMatchObject({ done: true });
+    } finally {
+      if (!cancel.mock.calls.length) upstreamController?.close();
+      reader.releaseLock();
+    }
+  });
+
+  it("aborts buffered Workers AI verification reads", async () => {
+    let upstreamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const cancel = vi.fn();
+    const upstream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        upstreamController = controller;
+      },
+      cancel,
+    });
+    const llm = new WorkersAILLM({
+      run: vi.fn().mockResolvedValue(upstream),
+    } as unknown as Ai);
+    const abortController = new AbortController();
+    const chat = llm.chat(
+      [{ role: "user", content: "verify" }],
+      { signal: abortController.signal }
+    );
+
+    try {
+      await Promise.resolve();
+      abortController.abort("replaced");
+      await expect(chat).rejects.toMatchObject({ name: "AbortError" });
+      await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+    } finally {
+      if (!cancel.mock.calls.length) upstreamController?.close();
+    }
   });
 });
 
