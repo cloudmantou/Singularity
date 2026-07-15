@@ -62,6 +62,39 @@ describe("memory quality review queues", () => {
     }
   });
 
+  it("removes legacy conflict cases whose entries no longer exist", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      db.prepare(
+        `INSERT INTO sb_conflict_cases (
+           id, old_memory_id, new_memory_id, old_claim_id, new_claim_id,
+           conflict_type, state, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        "orphan-conflict",
+        "missing-old-entry",
+        "missing-new-entry",
+        null,
+        null,
+        "contradiction",
+        "pending",
+        Date.now()
+      );
+      db.prepare(
+        `DELETE FROM sb_schema_migrations WHERE id = ?`
+      ).run("20260715_remove_orphan_conflict_cases");
+
+      await initializeDatabase(env);
+
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count FROM sb_conflict_cases WHERE id = ?`
+      ).get("orphan-conflict")).toEqual({ count: 0 });
+    } finally {
+      db.close();
+    }
+  });
+
   it("migrates existing parent version CHECK constraints to allow active_degraded", async () => {
     const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
     try {

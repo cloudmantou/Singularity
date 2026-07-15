@@ -3,8 +3,38 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 const html = readFileSync(path.join(process.cwd(), "public/index.html"), "utf8");
+const observatoryHtml = readFileSync(
+  path.join(process.cwd(), "public/observatory.html"),
+  "utf8"
+);
 
 describe("web memory mutation API contract", () => {
+  it("scopes cached connection credentials to the page origin", () => {
+    expect(html).toContain("resolveStoredConnection(localStorage, origin)");
+    expect(html).toContain(
+      "storeScopedConnection(localStorage, window.location.origin, url, tok)"
+    );
+    expect(html).toContain("clearScopedConnection(localStorage, window.location.origin)");
+    expect(html).not.toContain("const tok = localStorage.getItem('sb_token')");
+
+    expect(observatoryHtml).toContain('<script src="utils.js"></script>');
+    expect(observatoryHtml).toContain(
+      "resolveStoredConnection(localStorage, window.location.origin)"
+    );
+    expect(observatoryHtml).toContain(
+      "storeScopedConnection(localStorage, window.location.origin, BASE, TOKEN)"
+    );
+    expect(observatoryHtml).not.toContain('localStorage.getItem("sb_token")');
+  });
+
+  it("surfaces an orphaned vector rebuild as a recoverable maintenance error", () => {
+    expect(html).toContain("data.error === 'vector_rebuild_state_missing'");
+    expect(html).toContain("t('models.rebuildStateMissing')");
+    expect(html).toMatch(
+      /async function runVectorize\(btn\)[\s\S]*?catch \(error\)[\s\S]*?btn\.textContent = message/
+    );
+  });
+
   it("uses REST for append, update, and forget instead of routing the UI through MCP", () => {
     expect(html).not.toContain("async function apiMcp");
     expect(html).toMatch(/async function apiAppend[\s\S]*?\/append/);

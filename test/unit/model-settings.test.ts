@@ -69,6 +69,37 @@ describe("model-settings helpers", () => {
     expect(merged.embedding.provider).toBe("none");
   });
 
+  it("normalizes an env-only local hash profile to its canonical preset", () => {
+    const merged = mergeModelSettings(null, {
+      SELFHOST: "1",
+      EMBEDDING_PROVIDER: "local-hash-dev",
+      ALLOW_DEV_EMBEDDING: "true",
+    });
+
+    expect(merged.embedding).toMatchObject({
+      provider: "local-hash-dev",
+      model: "local-hash",
+      dimensions: 384,
+      supportsDimensionsParameter: false,
+    });
+  });
+
+  it("uses the provider preset when a stored embedding profile omits its shape", () => {
+    const stored = emptyModelSettings();
+    stored.embedding.provider = "minimax";
+    stored.embedding.model = "";
+    stored.embedding.dimensions = 0;
+    stored.embedding.supportsDimensionsParameter = undefined as unknown as boolean;
+    const merged = mergeModelSettings(stored, {});
+
+    expect(merged.embedding).toMatchObject({
+      provider: "minimax",
+      model: "embo-01",
+      dimensions: 1536,
+      supportsDimensionsParameter: false,
+    });
+  });
+
   it("patch keeps previous apiKey when masked", () => {
     const prev = emptyModelSettings();
     prev.llm.apiKey = "sk-real-secret-key";

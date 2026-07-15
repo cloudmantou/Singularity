@@ -541,7 +541,7 @@ export function mergeModelSettings(
 
   const preset = EMBEDDING_PRESETS.find((p) => p.id === embProvider);
   const supportsDim =
-    s.embedding.supportsDimensionsParameter ??
+    stored?.embedding.supportsDimensionsParameter ??
     preset?.supportsDimensionsParameter ??
     true;
 
@@ -556,10 +556,11 @@ export function mergeModelSettings(
       provider: embProvider,
       baseURL: s.embedding.baseURL || env.EMBEDDING_BASE_URL || "",
       apiKey: s.embedding.apiKey || env.EMBEDDING_API_KEY || "",
-      model: s.embedding.model || env.EMBEDDING_MODEL || "",
+      model: s.embedding.model || env.EMBEDDING_MODEL || preset?.model || "",
       dimensions:
         s.embedding.dimensions ||
-        parseInt(env.EMBEDDING_DIM || "384", 10) ||
+        parseInt(env.EMBEDDING_DIM || "", 10) ||
+        preset?.dimensions ||
         384,
       supportsDimensionsParameter: supportsDim,
     },

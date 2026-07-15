@@ -3860,13 +3860,14 @@
         applyTheme()
         // Auto-populate URL from the current page origin (UI is hosted on the same Worker)
         const origin = window.location.origin
-        document.getElementById('auth-url').value = origin
-
-        const url = localStorage.getItem('sb_url') || origin
-        const tok = localStorage.getItem('sb_token')
-        if (tok) {
-          WORKER_URL = url
-          AUTH_TOKEN = tok
+        const connection = resolveStoredConnection(localStorage, origin)
+        document.getElementById('auth-url').value = connection.url || origin
+        if (connection.source === 'legacy') {
+          storeScopedConnection(localStorage, origin, connection.url, connection.token)
+        }
+        if (connection.token) {
+          WORKER_URL = connection.url
+          AUTH_TOKEN = connection.token
           showApp()
         }
       }
@@ -3887,8 +3888,7 @@
           const res = await fetch(`${url}/list?n=1`, { headers: { Authorization: `Bearer ${tok}` } })
           if (res.status === 401) throw new Error(t('auth.invalidToken'))
           if (!res.ok) throw new Error(t('auth.serverError', { status: res.status }))
-          localStorage.setItem('sb_url', url)
-          localStorage.setItem('sb_token', tok)
+          storeScopedConnection(localStorage, window.location.origin, url, tok)
           WORKER_URL = url
           AUTH_TOKEN = tok
           showApp()
@@ -3983,8 +3983,7 @@
 
       function logout() {
         closeMenu()
-        localStorage.removeItem('sb_url')
-        localStorage.removeItem('sb_token')
+        clearScopedConnection(localStorage, window.location.origin)
         WORKER_URL = ''
         AUTH_TOKEN = ''
         document.getElementById('app').style.display = 'none'
@@ -5803,7 +5802,12 @@ ${metaLine}
             body: JSON.stringify({ limit, includeRecent }),
           })
           const data = await readJsonResponse(res)
-          if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+          if (!res.ok) {
+            if (data.error === 'vector_rebuild_state_missing') {
+              throw new Error(t('models.rebuildStateMissing'))
+            }
+            throw new Error(data.error || `HTTP ${res.status}`)
+          }
           const processed = data.processed ?? 0
           const failed = data.failed ?? 0
           remaining = data.remaining ?? 0
@@ -6002,13 +6006,16 @@ ${metaLine}
           btn.style.color = 'var(--good)'
           await loadMenuStats()
           loadRecent()
-        } catch {
+        } catch (error) {
+          const message = String(error?.message || error || t('vectorize.reqFail'))
           btn.classList.remove('digest-btn--loading')
-          btn.innerHTML = '<i class="ti ti-wifi-off"></i> ' + t('vectorize.reqFail')
+          btn.textContent = message
+          btn.title = message
           btn.style.color = 'var(--danger)'
           setTimeout(() => {
             btn.disabled = false
             btn.innerHTML = t('vectorize.btn')
+            btn.title = ''
             btn.style.color = ''
           }, 3000)
         }

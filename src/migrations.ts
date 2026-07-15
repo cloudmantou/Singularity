@@ -496,4 +496,20 @@ export const MIGRATIONS: Migration[] = [
     statements: [],
     execute: parentVersionClaimsExecute,
   },
+  {
+    id: "20260715_remove_orphan_conflict_cases",
+    name: "Remove conflict cases whose entries were already erased",
+    checksum: "remove-orphan-conflict-cases-v1",
+    statements: [
+      `DELETE FROM sb_conflict_cases
+       WHERE NOT EXISTS (
+               SELECT 1 FROM entries old_entry
+               WHERE old_entry.id = sb_conflict_cases.old_memory_id
+             )
+          OR NOT EXISTS (
+               SELECT 1 FROM entries new_entry
+               WHERE new_entry.id = sb_conflict_cases.new_memory_id
+             )`,
+    ],
+  },
 ];

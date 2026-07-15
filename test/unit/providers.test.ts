@@ -394,6 +394,33 @@ describe("OpenAICompatibleLLM", () => {
     await expect(new Response(stream).text()).rejects.toThrow("before DONE");
   });
 
+  it("accepts a terminal finish_reason when a provider omits the DONE sentinel", async () => {
+    const upstream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(
+          'data: {"choices":[{"delta":{"content":"complete"}}]}\n\n' +
+          'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        ));
+        controller.close();
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(upstream, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    })));
+    const llm = new OpenAICompatibleLLM({
+      baseURL: "https://gateway.example/v1",
+      apiKey: "test-key",
+      model: "custom-model",
+    });
+
+    const stream = await llm.chatAsCfSse([{ role: "user", content: "stream" }]);
+    const raw = await new Response(stream).text();
+
+    expect(raw).toContain('"response":"complete"');
+    expect(raw).toContain("data: [DONE]");
+  });
+
   it("rejects OpenAI-compatible events after DONE", async () => {
     const upstream = new ReadableStream({
       start(controller) {

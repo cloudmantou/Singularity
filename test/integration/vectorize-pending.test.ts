@@ -45,6 +45,45 @@ describe("POST /vectorize-pending", () => {
     expect(data.remaining).toBe(0);
   });
 
+  it("returns an actionable conflict when pending settings have no rebuild row", async () => {
+    const settings = emptyModelSettings();
+    settings.activeEmbedding = { ...settings.embedding };
+    settings.pendingEmbedding = { ...settings.embedding };
+    settings.embeddingFingerprint = embeddingFingerprintOf(settings.activeEmbedding);
+    settings.pendingEmbeddingFingerprint = "orphaned-pending-fingerprint";
+    db.appSettings.model_settings = {
+      value: JSON.stringify(settings),
+      updated_at: Date.now(),
+    };
+    setStoredModelSettingsCache(settings);
+
+    const res = await worker.fetch(req("POST", "/vectorize-pending"), env, ctx);
+    const data = await res.json() as any;
+
+    expect(res.status).toBe(409);
+    expect(data).toMatchObject({
+      ok: false,
+      error: "vector_rebuild_state_missing",
+      activationError: "vector_rebuild_state_missing",
+      pendingFingerprint: "orphaned-pending-fingerprint",
+      retryable: false,
+    });
+    expect(data.next).toContain('/settings/models/reindex');
+    expect(data.next).toContain('cancelExisting');
+
+    const repair = await worker.fetch(
+      req("POST", "/settings/models/reindex", { body: { cancelExisting: true } }),
+      env,
+      ctx
+    );
+    const repaired = await repair.json() as any;
+
+    expect(repair.status).toBe(200);
+    expect(repaired.ok).toBe(true);
+    expect(repaired.mode).toBe("blue_green");
+    expect(db.vectorRebuilds).toHaveLength(1);
+  });
+
   it("processes past-grace entries and returns correct counts", async () => {
     db.entries.push(pastGraceEntry("e1"), pastGraceEntry("e2"));
     const res = await worker.fetch(req("POST", "/vectorize-pending"), env, ctx);

@@ -112,6 +112,7 @@ interface OpenAIChatPayload {
   choices?: Array<{
     delta?: { content?: string | null };
     message?: { content?: string | null };
+    finish_reason?: string | null;
   }>;
   usage?: {
     prompt_tokens?: number;
@@ -149,6 +150,7 @@ function openAiSseToCfSseStream(
   let output = "";
   let usage: OpenAIChatPayload["usage"];
   let providerDone = false;
+  let providerFinished = false;
 
   const emitDone = (controller: TransformStreamDefaultController<Uint8Array>) => {
     if (providerDone) return;
@@ -174,6 +176,9 @@ function openAiSseToCfSseStream(
     const streamError = providerStreamError(payload);
     if (streamError) throw streamError;
     if (payload.usage) usage = payload.usage;
+    if (payload.choices?.some((choice) => choice.finish_reason != null)) {
+      providerFinished = true;
+    }
     const content = extractChatContent(payload);
     if (!content) return;
     output += content;
@@ -198,6 +203,7 @@ function openAiSseToCfSseStream(
       try {
         carry += decoder.decode();
         if (carry) processLine(carry, controller);
+        if (!providerDone && providerFinished) emitDone(controller);
         if (!providerDone) throw new Error("Provider stream ended before DONE");
         record("success", output, usage);
       } catch (error) {

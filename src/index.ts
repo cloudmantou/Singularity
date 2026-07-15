@@ -11093,6 +11093,14 @@ function shouldBuildReplacementParentVersion(
   );
 }
 
+function isObservationParentVersionConflict(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return (
+    message.includes("sb_parent_versions.parent_id, sb_parent_versions.version_number") ||
+    message.includes("UNIQUE constraint failed: sb_parent_versions")
+  );
+}
+
 async function prepareObservationParentVersionForProcessing(
   env: Env,
   row: ObservationExtractionRow,
@@ -11100,33 +11108,63 @@ async function prepareObservationParentVersionForProcessing(
 ): Promise<ObservationExtractionRow> {
   const parent = parentVersionFromObservationMetadata(row.metadata_json);
   if (!parent || !shouldBuildReplacementParentVersion(row, statusBeforeLease)) return row;
-  const nextParent: ObservationParentVersionRef = {
-    parentId: parent.parentId,
-    versionId: crypto.randomUUID(),
-    versionNumber: parent.versionNumber + 1,
-    evidenceRootId: parent.evidenceRootId,
-  };
-  const metadataJson = observationMetadataWithParentVersion(
-    row.metadata_json,
-    nextParent,
-    parent.versionId
-  );
-  await env.DB.batch([
-    ...prepareObservationParentVersionStatements(env.DB, {
-      ...nextParent,
-      observationId: row.id,
-      contentHash: row.content_hash,
-      metadata: metadataJson,
-      source: row.source,
-      createdAt: Date.now(),
-    }),
-    env.DB.prepare(
-      `UPDATE sb_observations
-       SET metadata_json = ?
-       WHERE id = ?`
-    ).bind(metadataJson, row.id),
-  ]);
-  return { ...row, metadata_json: metadataJson };
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const [latestVersion, parentUnit] = await Promise.all([
+      env.DB.prepare(
+        `SELECT COALESCE(MAX(version_number), 0) AS version_number
+         FROM sb_parent_versions
+         WHERE parent_id = ?`
+      ).bind(parent.parentId).first<{ version_number: number }>(),
+      env.DB.prepare(
+        `SELECT active_version_id
+         FROM sb_parent_units
+         WHERE parent_id = ?
+         LIMIT 1`
+      ).bind(parent.parentId).first<{ active_version_id: string | null }>(),
+    ]);
+    const nextParent: ObservationParentVersionRef = {
+      parentId: parent.parentId,
+      versionId: crypto.randomUUID(),
+      versionNumber: Math.max(
+        parent.versionNumber,
+        Number(latestVersion?.version_number ?? 0)
+      ) + 1,
+      evidenceRootId: parent.evidenceRootId,
+    };
+    const metadataJson = observationMetadataWithParentVersion(
+      row.metadata_json,
+      nextParent,
+      parentUnit?.active_version_id ?? parent.versionId
+    );
+
+    try {
+      await env.DB.batch([
+        ...prepareObservationParentVersionStatements(env.DB, {
+          ...nextParent,
+          observationId: row.id,
+          contentHash: row.content_hash,
+          metadata: metadataJson,
+          source: row.source,
+          createdAt: Date.now(),
+        }),
+        env.DB.prepare(
+          `UPDATE sb_observations
+           SET metadata_json = ?
+           WHERE id = ?`
+        ).bind(metadataJson, row.id),
+      ]);
+      return { ...row, metadata_json: metadataJson };
+    } catch (error) {
+      lastError = error;
+      if (!isObservationParentVersionConflict(error)) throw error;
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("parent_version_retry_failed");
 }
 
 async function assertParentVersionReadyForActivation(
@@ -15508,6 +15546,8 @@ const defaultHandler = {
         : null;
       if (pendingFingerprint && !activeRebuild) {
         return json({
+          ok: false,
+          error: "vector_rebuild_state_missing",
           processed: 0,
           failed: 0,
           skipped: 0,
@@ -15519,9 +15559,10 @@ const defaultHandler = {
           activationState: "failed",
           activationError: "vector_rebuild_state_missing",
           retryable: false,
+          next: 'POST /settings/models/reindex with {"cancelExisting":true} to discard the stale pending generation and start a new rebuild.',
         }, 409);
       }
-      const openRebuildContext: OpenVectorRebuildContext | null =
+      let openRebuildContext: OpenVectorRebuildContext | null =
         pendingFingerprint &&
         activeRebuild &&
         (activeRebuild.state === "queued" ||
@@ -15533,6 +15574,36 @@ const defaultHandler = {
               state: activeRebuild.state,
             }
           : null;
+      if (openRebuildContext?.state === "queued") {
+        const transitioned = await env.DB.prepare(
+          `UPDATE sb_vector_rebuilds
+           SET state = 'building', updated_at = ?
+           WHERE id = ? AND state = 'queued'`
+        ).bind(Date.now(), openRebuildContext.id).run();
+        if (Number(transitioned.meta?.changes ?? 0) === 1) {
+          openRebuildContext = { ...openRebuildContext, state: "building" };
+        } else {
+          const refreshed = await loadCurrentVectorRebuild(env, pendingFingerprint!);
+          if (
+            refreshed &&
+            (refreshed.state === "building" || refreshed.state === "ready")
+          ) {
+            openRebuildContext = {
+              id: refreshed.id,
+              pendingFingerprint: pendingFingerprint!,
+              state: refreshed.state,
+            };
+          } else {
+            return json({
+              ok: false,
+              error: "vector_rebuild_state_changed",
+              pendingFingerprint,
+              activationState: refreshed?.state ?? "missing",
+              retryable: true,
+            }, 409);
+          }
+        }
+      }
       const usePendingProfile = Boolean(openRebuildContext);
       let reconciledEntries = 0;
       let repairedPendingGenerations = 0;
@@ -15652,7 +15723,7 @@ const defaultHandler = {
         : 0;
       const remainingN = usePendingProfile
         ? pendingQueueRemaining + stalePendingRemaining + unjoinedRemaining + claimVectorsRemaining
-        : pendingQueueRemaining;
+        : pendingQueueRemaining + claimVectorsRemaining;
       let activated = 0;
       let activationBlocked = 0;
       let activationIntegrity: PendingActivationIntegrity | null = null;

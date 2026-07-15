@@ -11,7 +11,62 @@ const {
   consumeRecallSseResponse,
   parseApiJsonResponse,
   importEntriesInBatches,
+  resolveStoredConnection,
+  scopedConnectionStorageKeys,
 } = require("../../public/utils.js");
+
+function memoryStorage(entries: Record<string, string> = {}) {
+  const values = new Map(Object.entries(entries));
+  return {
+    getItem(key: string) {
+      return values.has(key) ? values.get(key)! : null;
+    },
+  };
+}
+
+describe("resolveStoredConnection", () => {
+  it("ignores legacy credentials that belong to a different page origin", () => {
+    const storage = memoryStorage({
+      sb_url: "https://agent.mtzs.cloud",
+      sb_token: "cloud-token",
+    });
+
+    expect(resolveStoredConnection(storage, "http://127.0.0.1:8788")).toEqual({
+      url: "http://127.0.0.1:8788",
+      token: "",
+      source: "none",
+    });
+  });
+
+  it("accepts same-origin legacy credentials for one-time migration", () => {
+    const storage = memoryStorage({
+      sb_url: "https://agent.mtzs.cloud/",
+      sb_token: "cloud-token",
+    });
+
+    expect(resolveStoredConnection(storage, "https://agent.mtzs.cloud")).toEqual({
+      url: "https://agent.mtzs.cloud",
+      token: "cloud-token",
+      source: "legacy",
+    });
+  });
+
+  it("prefers credentials scoped to the current page origin", () => {
+    const keys = scopedConnectionStorageKeys("http://127.0.0.1:8788/");
+    const storage = memoryStorage({
+      [keys.url]: "https://intentional.example",
+      [keys.token]: "local-page-token",
+      sb_url: "https://agent.mtzs.cloud",
+      sb_token: "cloud-token",
+    });
+
+    expect(resolveStoredConnection(storage, "http://127.0.0.1:8788")).toEqual({
+      url: "https://intentional.example",
+      token: "local-page-token",
+      source: "scoped",
+    });
+  });
+});
 
 describe("importEntriesInBatches", () => {
   it("sends five entries as sequential 4 + 1 batches and aggregates totals", async () => {

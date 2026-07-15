@@ -436,6 +436,7 @@
       <div id="drawer-body"></div>
     </aside>
 
+    <script src="utils.js"></script>
     <script>
       let BASE = "", TOKEN = "", timer = null, lastLogs = []
 
@@ -456,16 +457,25 @@
       }
 
       function init() {
+        const connection = resolveStoredConnection(localStorage, window.location.origin)
+        if (connection.source === "legacy") {
+          storeScopedConnection(
+            localStorage,
+            window.location.origin,
+            connection.url,
+            connection.token
+          )
+        }
         // Prefer in-app Observatory panel (left nav → right main)
         try {
-          if (localStorage.getItem("sb_token")) {
+          if (connection.token) {
             location.replace("/?tab=observatory")
             return
           }
         } catch (_) {}
         applyTheme()
-        BASE = localStorage.getItem("sb_url") || window.location.origin
-        TOKEN = localStorage.getItem("sb_token") || ""
+        BASE = connection.url || window.location.origin
+        TOKEN = connection.token
         document.getElementById("auth-url").value = BASE
         if (TOKEN) {
           showApp()
@@ -482,8 +492,7 @@
           document.getElementById("auth-err").textContent = "请填写 URL 与令牌"
           return
         }
-        localStorage.setItem("sb_url", BASE)
-        localStorage.setItem("sb_token", TOKEN)
+        storeScopedConnection(localStorage, window.location.origin, BASE, TOKEN)
         document.getElementById("auth-gate").style.display = "none"
         showApp()
         refresh()

@@ -475,6 +475,17 @@ export class D1Mock {
           }
           return { meta: { changes: row ? 1 : 0 } };
         }
+        if (s.startsWith("UPDATE sb_vector_rebuilds SET state = 'building'")) {
+          const [updated_at, id] = args;
+          const row = db.vectorRebuilds.find((item: any) =>
+            item.id === id && item.state === "queued"
+          );
+          if (row) {
+            row.state = "building";
+            row.updated_at = updated_at;
+          }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
         if (s.startsWith("UPDATE sb_vector_rebuilds SET state = ?,")) {
           const [state, rebuild_id, updated_at, id] = args;
           const row = db.vectorRebuilds.find((item: any) =>
@@ -2846,6 +2857,14 @@ export class D1Mock {
               .map((version: any) => Number(version.version_number ?? 0))
           );
           return { version_number: maxVersion };
+        }
+        if (
+          s.includes("SELECT active_version_id") &&
+          s.includes("FROM sb_parent_units")
+        ) {
+          const parentId = String(args[0]);
+          const row = db.parentUnits.find((unit: any) => String(unit.parent_id) === parentId);
+          return row ? { active_version_id: row.active_version_id ?? null } : null;
         }
         if (
           s.includes("SELECT pv.source_observation_id AS source_observation_id") &&

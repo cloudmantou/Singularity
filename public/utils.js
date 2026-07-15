@@ -33,6 +33,89 @@ function toDateStr(d) {
   return `${y}-${m}-${day}`;
 }
 
+function normalizeConnectionBase(value) {
+  const raw = String(value == null ? '' : value).trim().replace(/\/+$/, '');
+  if (!raw) return '';
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+    return parsed.href.replace(/\/+$/, '');
+  } catch (_) {
+    return '';
+  }
+}
+
+function scopedConnectionStorageKeys(pageOrigin) {
+  const scope = normalizeConnectionBase(pageOrigin);
+  return {
+    url: `sb_url:${scope}`,
+    token: `sb_token:${scope}`,
+  };
+}
+
+function connectionOrigin(value) {
+  const normalized = normalizeConnectionBase(value);
+  if (!normalized) return '';
+  try {
+    return new URL(normalized).origin;
+  } catch (_) {
+    return '';
+  }
+}
+
+/* Resolve saved credentials only within the page that created them. Legacy
+ * global credentials are accepted solely when their server origin equals the
+ * current page origin, preventing a local dashboard from silently calling a
+ * previously visited production deployment. */
+function resolveStoredConnection(storage, pageOrigin) {
+  const pageBase = normalizeConnectionBase(pageOrigin);
+  const keys = scopedConnectionStorageKeys(pageBase);
+  const scopedUrl = normalizeConnectionBase(storage.getItem(keys.url));
+  const scopedToken = String(storage.getItem(keys.token) || '').trim();
+  if (scopedUrl && scopedToken) {
+    return { url: scopedUrl, token: scopedToken, source: 'scoped' };
+  }
+
+  const legacyUrl = normalizeConnectionBase(storage.getItem('sb_url'));
+  const legacyToken = String(storage.getItem('sb_token') || '').trim();
+  if (
+    legacyUrl &&
+    legacyToken &&
+    connectionOrigin(legacyUrl) === connectionOrigin(pageBase)
+  ) {
+    return { url: legacyUrl, token: legacyToken, source: 'legacy' };
+  }
+
+  return { url: pageBase, token: '', source: 'none' };
+}
+
+function storeScopedConnection(storage, pageOrigin, serverUrl, token) {
+  const pageBase = normalizeConnectionBase(pageOrigin);
+  const url = normalizeConnectionBase(serverUrl);
+  const normalizedToken = String(token || '').trim();
+  if (!pageBase || !url || !normalizedToken) return false;
+  const keys = scopedConnectionStorageKeys(pageBase);
+  storage.setItem(keys.url, url);
+  storage.setItem(keys.token, normalizedToken);
+
+  if (connectionOrigin(storage.getItem('sb_url')) === connectionOrigin(pageBase)) {
+    storage.removeItem('sb_url');
+    storage.removeItem('sb_token');
+  }
+  return true;
+}
+
+function clearScopedConnection(storage, pageOrigin) {
+  const pageBase = normalizeConnectionBase(pageOrigin);
+  const keys = scopedConnectionStorageKeys(pageBase);
+  storage.removeItem(keys.url);
+  storage.removeItem(keys.token);
+  if (connectionOrigin(storage.getItem('sb_url')) === connectionOrigin(pageBase)) {
+    storage.removeItem('sb_url');
+    storage.removeItem('sb_token');
+  }
+}
+
 const D1_MAX_TAG_UTF8_BYTES = 46;
 
 /* Return the canonical stored tag, or null when its normalized UTF-8 payload
@@ -499,5 +582,9 @@ if (typeof module !== 'undefined' && module.exports) {
     parseApiJsonResponse,
     normalizeSafeTag,
     importEntriesInBatches,
+    resolveStoredConnection,
+    scopedConnectionStorageKeys,
+    storeScopedConnection,
+    clearScopedConnection,
   };
 }

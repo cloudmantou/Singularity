@@ -4,6 +4,7 @@ import { makeTestEnv, makeTestDb, makeVectorizeMock } from "../helpers/make-env"
 import { req } from "../helpers/make-request";
 import type { Env } from "../../src/index";
 import { D1Mock } from "../helpers/d1-mock";
+import { processExtractionQueue } from "../../src/index";
 
 function makeCtx() {
   const pending: Promise<any>[] = [];
@@ -121,6 +122,80 @@ describe("POST /capture", () => {
     expect(body.dryRun).toBe(true);
     expect(db.observations[0].extraction_status).toBe("pending");
     expect(run).not.toHaveBeenCalled();
+  });
+
+  it("allocates a replacement parent version after stale observation metadata", async () => {
+    const now = Date.now();
+    db.parentUnits.push({
+      parent_id: "parent-stale",
+      active_version_id: "parent-version-2",
+      scope_id: null,
+      created_at: now - 2_000,
+      updated_at: now - 1_000,
+    });
+    db.parentVersions.push(
+      {
+        version_id: "parent-version-1",
+        parent_id: "parent-stale",
+        version_number: 1,
+        source_observation_id: "observation-stale",
+        source_snapshot_hash: "hash-stale",
+        state: "superseded",
+        summary_vector_ids: "[]",
+        created_at: now - 2_000,
+        updated_at: now - 1_000,
+      },
+      {
+        version_id: "parent-version-2",
+        parent_id: "parent-stale",
+        version_number: 2,
+        source_observation_id: "observation-newer",
+        source_snapshot_hash: "hash-newer",
+        state: "active_degraded",
+        summary_vector_ids: "[]",
+        created_at: now - 1_000,
+        updated_at: now - 500,
+      }
+    );
+    db.observations.push({
+      id: "observation-stale",
+      content: "A fact that needs extraction",
+      source: "api",
+      metadata_json: JSON.stringify({
+        parent_id: "parent-stale",
+        parent_version_id: "parent-version-1",
+        parent_version_number: 1,
+        evidence_root_id: "parent-stale",
+      }),
+      content_hash: "hash-stale",
+      extraction_status: "fallback",
+      extraction_attempts: 0,
+      next_attempt_at: null,
+      processing_started_at: null,
+      extraction_version: 2,
+      needs_reprocess: 1,
+      created_at: now - 2_000,
+    });
+    env = makeTestEnv(db, {
+      AI: {
+        run: vi.fn().mockRejectedValue(new Error("provider unavailable")),
+      } as unknown as Ai,
+    });
+
+    const { ctx } = makeCtx();
+    await expect(processExtractionQueue(env, ctx, 1)).resolves.toMatchObject({
+      failed: 1,
+    });
+
+    expect(db.parentVersions).toContainEqual(expect.objectContaining({
+      parent_id: "parent-stale",
+      version_number: 3,
+      state: "building",
+    }));
+    expect(JSON.parse(db.observations[0].metadata_json)).toMatchObject({
+      parent_version_number: 3,
+      previous_parent_version_id: "parent-version-2",
+    });
   });
 
   it("stores valid entry and returns id", async () => {
