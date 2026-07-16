@@ -2,8 +2,10 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ensureEntityResolutionDataModel } from "../../src/memory/entities";
 import { ensureAIReviewDataModel } from "../../src/memory/ai-review";
+import { inspectMemoryBackupIntegrity } from "../../src/memory/backup";
 import { FACT_RESOLUTION_SCHEMA_STATEMENTS } from "../../src/memory/fact-resolution";
 import { forgetMemoryGraph } from "../../src/memory/forget";
+import { ensureKnowledgeEvolutionDataModel } from "../../src/memory/knowledge-evolution";
 import { MEMORY_QUALITY_SCHEMA_STATEMENTS } from "../../src/memory/quality";
 import { ensureMemoryDataModel } from "../../src/memory/schema";
 import { SqliteD1Database } from "../../src/selfhost/sqlite-d1";
@@ -32,6 +34,7 @@ describe("forgetMemoryGraph Fact evidence repair", () => {
       );
     `);
     await ensureAIReviewDataModel(db);
+    await ensureKnowledgeEvolutionDataModel(db);
   });
 
   afterEach(() => raw.close());
@@ -195,5 +198,126 @@ describe("forgetMemoryGraph Fact evidence repair", () => {
       .toEqual({ count: 0 });
     expect(raw.prepare(`SELECT COUNT(*) AS count FROM sb_ai_review_applications`).get())
       .toEqual({ count: 0 });
+  });
+
+  it("removes evolution lineage and copied provenance when forgetting a consolidated source", async () => {
+    raw.prepare(
+      `INSERT INTO entries (id, content, tags, source, created_at, vector_ids)
+       VALUES ('evolution-source', 'same fact', '[]', 'api', 1, '[]'),
+              ('evolution-target', 'same fact', '[]', 'api', 2, '[]')`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_observations (
+         id, content, source, root_evidence_id, revision, author_type, created_at
+       ) VALUES ('evolution-source-observation', 'same fact', 'api', 'root-source', 1, 'user', 1),
+                ('evolution-target-observation', 'same fact', 'api', 'root-target', 1, 'user', 2)`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_memories (
+         id, content, entry_id, claim_status, invalid_at, entities_json, created_at
+       ) VALUES ('evolution-source-claim', 'same fact', 'evolution-source', 'superseded', 10, '[]', 1),
+                ('evolution-target-claim', 'same fact', 'evolution-target', 'supported', NULL, '[]', 2)`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_memory_sources (
+         id, memory_id, observation_id, role, relation, extractor_model,
+         extractor_version, evidence_root_id, created_at
+       ) VALUES ('evolution-source-proof', 'evolution-source-claim',
+                 'evolution-source-observation', 'supports', 'supports', 'seed', '1', 'root-source', 1),
+                ('evolution-target-proof', 'evolution-target-claim',
+                 'evolution-target-observation', 'supports', 'supports', 'seed', '1', 'root-target', 2),
+                ('evolution-copied-proof', 'evolution-target-claim',
+                 'evolution-source-observation', 'derived_from', 'derived_from',
+                 'knowledge-evolution', 'review:evolution-run', 'root-source', 10)`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_memory_merge_candidates (
+         id, source_memory_id, target_memory_id, similarity,
+         suggested_action, state, reviewed_by, reviewed_at, created_at
+       ) VALUES ('evolution-candidate', 'evolution-source', 'evolution-target', 1,
+                 'duplicate', 'accepted', 'ai-review:system', 10, 1)`
+    ).run();
+    const manifest = JSON.stringify({
+      objectType: "memory_merge_candidate",
+      objectId: "evolution-candidate",
+      state: "pending",
+      evidence: [],
+      policyInput: {},
+    });
+    raw.prepare(
+      `INSERT INTO sb_ai_review_jobs (
+         id, object_type, object_id, mode, status, requested_by,
+         input_snapshot_hash, input_snapshot_json, run_id, created_at, completed_at
+       ) VALUES ('evolution-job', 'memory_merge_candidate', 'evolution-candidate',
+                 'auto_low_risk', 'applied', 'system', 'snapshot', ?, 'evolution-run', 1, 10)`
+    ).run(manifest);
+    raw.prepare(
+      `INSERT INTO sb_ai_review_runs (
+         id, job_id, object_type, object_id, mode, decision, reason,
+         evidence_refs_json, confidence_json, reviewer_provider, reviewer_model,
+         prompt_version, input_snapshot_hash, input_snapshot_json, created_at
+       ) VALUES ('evolution-run', 'evolution-job', 'memory_merge_candidate',
+                 'evolution-candidate', 'auto_low_risk', 'duplicate', 'same fact',
+                 '["SOURCE","TARGET"]', '{"decision":1,"evidence":1}',
+                 'rules', 'exact', 'v3', 'snapshot', ?, 10)`
+    ).run(manifest);
+    raw.prepare(
+      `INSERT INTO sb_ai_review_applications (
+         id, run_id, object_type, object_id, decision, applied_by,
+         application_mode, created_at
+       ) VALUES ('evolution-application', 'evolution-run', 'memory_merge_candidate',
+                 'evolution-candidate', 'duplicate', 'system', 'deterministic_auto', 10)`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_knowledge_evolutions (
+         id, ai_review_run_id, candidate_id, operation, state, generation,
+         output_entry_id, output_claim_id, output_generated,
+         decision_confidence, evidence_confidence, applied_by, applied_at,
+         created_at, updated_at
+       ) VALUES ('evolution-1', 'evolution-run', 'evolution-candidate', 'consolidate',
+                 'active', 1, 'evolution-target', 'evolution-target-claim', 0,
+                 1, 1, 'system', 10, 10, 10)`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_knowledge_evolution_sources (
+         evolution_id, claim_id, entry_id, disposition, previous_claim_status,
+         previous_invalid_at, source_order, created_at
+       ) VALUES ('evolution-1', 'evolution-source-claim', 'evolution-source',
+                 'absorbed', 'supported', NULL, 0, 10),
+                ('evolution-1', 'evolution-target-claim', 'evolution-target',
+                 'retained', 'supported', NULL, 1, 10)`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_knowledge_claim_ownership (claim_id, evolution_id, acquired_at)
+       VALUES ('evolution-source-claim', 'evolution-1', 10)`
+    ).run();
+    raw.prepare(
+      `INSERT INTO sb_knowledge_evolution_history (
+         id, evolution_id, action, actor_id, created_at
+       ) VALUES ('evolution-history', 'evolution-1', 'applied', 'system', 10)`
+    ).run();
+
+    await expect(forgetMemoryGraph(
+      "evolution-source",
+      db,
+      { deleteByIds: vi.fn().mockResolvedValue(undefined) } as unknown as VectorizeIndex
+    )).resolves.toMatchObject({ status: "deleted" });
+
+    expect(raw.prepare(
+      `SELECT COUNT(*) AS count FROM sb_memory_sources
+       WHERE id = 'evolution-copied-proof'`
+    ).get()).toEqual({ count: 0 });
+    expect(raw.prepare(`SELECT COUNT(*) AS count FROM sb_knowledge_evolutions`).get())
+      .toEqual({ count: 0 });
+    expect(raw.prepare(`SELECT COUNT(*) AS count FROM sb_knowledge_evolution_sources`).get())
+      .toEqual({ count: 0 });
+    expect(raw.prepare(`SELECT COUNT(*) AS count FROM sb_knowledge_claim_ownership`).get())
+      .toEqual({ count: 0 });
+    expect(raw.prepare(`SELECT COUNT(*) AS count FROM sb_knowledge_evolution_history`).get())
+      .toEqual({ count: 0 });
+    expect(raw.prepare(
+      `SELECT claim_status, invalid_at FROM sb_memories WHERE id = 'evolution-target-claim'`
+    ).get()).toEqual({ claim_status: "supported", invalid_at: null });
+    expect((await inspectMemoryBackupIntegrity(db)).ok).toBe(true);
   });
 });

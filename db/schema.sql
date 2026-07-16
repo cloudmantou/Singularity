@@ -686,6 +686,69 @@ CREATE INDEX IF NOT EXISTS idx_sb_memory_sources_observation ON sb_memory_source
 CREATE INDEX IF NOT EXISTS idx_memory_sources_relation
   ON sb_memory_sources(relation, evidence_score, created_at DESC);
 
+-- Reversible AI knowledge refinement. Raw observations remain immutable evidence;
+-- these rows describe how derived claims were consolidated or superseded.
+CREATE TABLE IF NOT EXISTS sb_knowledge_evolutions (
+  id TEXT PRIMARY KEY,
+  ai_review_run_id TEXT NOT NULL UNIQUE,
+  candidate_id TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'active',
+  generation INTEGER NOT NULL DEFAULT 1,
+  output_entry_id TEXT,
+  output_claim_id TEXT,
+  output_generated INTEGER NOT NULL DEFAULT 0,
+  decision_confidence REAL NOT NULL,
+  evidence_confidence REAL NOT NULL,
+  applied_by TEXT NOT NULL,
+  applied_at INTEGER NOT NULL,
+  rolled_back_by TEXT,
+  rolled_back_at INTEGER,
+  rollback_reason TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  CHECK (operation IN ('consolidate', 'merge', 'supersede', 'keep_separate')),
+  CHECK (state IN ('active', 'rolled_back')),
+  CHECK (output_generated IN (0, 1))
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_evolutions_state
+  ON sb_knowledge_evolutions(state, generation, applied_at DESC);
+CREATE INDEX IF NOT EXISTS idx_knowledge_evolutions_output
+  ON sb_knowledge_evolutions(output_claim_id, state);
+
+CREATE TABLE IF NOT EXISTS sb_knowledge_evolution_sources (
+  evolution_id TEXT NOT NULL,
+  claim_id TEXT NOT NULL,
+  entry_id TEXT,
+  disposition TEXT NOT NULL,
+  previous_claim_status TEXT NOT NULL,
+  previous_invalid_at INTEGER,
+  source_order INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (evolution_id, claim_id),
+  CHECK (disposition IN ('absorbed', 'superseded', 'retained'))
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_evolution_sources_claim
+  ON sb_knowledge_evolution_sources(claim_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS sb_knowledge_claim_ownership (
+  claim_id TEXT PRIMARY KEY,
+  evolution_id TEXT NOT NULL,
+  acquired_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sb_knowledge_evolution_history (
+  id TEXT PRIMARY KEY,
+  evolution_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  reason TEXT,
+  created_at INTEGER NOT NULL,
+  CHECK (action IN ('applied', 'rolled_back'))
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_evolution_history
+  ON sb_knowledge_evolution_history(evolution_id, created_at ASC);
+
 -- Entity + temporal fact graph
 CREATE TABLE IF NOT EXISTS sb_entities (
   id TEXT PRIMARY KEY,

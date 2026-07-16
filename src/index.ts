@@ -184,6 +184,7 @@ import {
   type AIReviewObjectType,
   type AIReviewRunRecord,
 } from "./memory/ai-review";
+import { prepareMemoryKnowledgeEvolution } from "./memory/knowledge-evolution";
 import {
   prepareMemoryRevision,
   type MemoryRevisionEvent,
@@ -357,6 +358,8 @@ export interface Env {
   VERIFIER_LLM_MODEL?: string;
   VERIFIER_LLM_EXTRA_BODY?: string;
   /** Knowledge Review model mode: shadow, suggest, or deterministic auto_low_risk. */
+  /** Automatic Knowledge Evolution: auto (default) or off. */
+  KNOWLEDGE_REVIEW_AUTOMATION?: string;
 }
 
 const entityEmbeddingIndexes = new WeakMap<object, EntityEmbeddingIndex>();
@@ -8061,6 +8064,14 @@ async function runScheduledMaintenance(env: Env, ctx: ExecutionContext): Promise
     console.error("Classification queue maintenance failed (non-fatal):", e);
   }
 
+  if ((env.KNOWLEDGE_REVIEW_AUTOMATION ?? "auto").trim().toLowerCase() !== "off") {
+    try {
+      await runAutomaticKnowledgeReview(env, env.SELFHOST === "1" ? 10 : 3);
+    } catch (e) {
+      console.error("Automatic Knowledge Evolution failed (non-fatal):", e);
+    }
+  }
+
   await flushTelemetry(env.DB);
   await aggregateTelemetryHour(env.DB);
 
@@ -10934,6 +10945,7 @@ async function resolveMemoryMergeCandidate(
     >;
     reviewedAt?: number;
     aiReview?: { runId: string; decision: string; applicationMode: "human" | "deterministic_auto" };
+    domainStatements?: D1PreparedStatement[];
     finalizationStatements?: D1PreparedStatement[];
   }
 ): Promise<boolean> {
@@ -10981,6 +10993,7 @@ async function resolveMemoryMergeCandidate(
        SET state = ?, reviewed_by = ?, reviewed_at = ?
        WHERE id = ? AND state = 'pending'`
     ).bind(input.state, input.reviewedBy, now, input.id),
+    ...(input.domainStatements ?? []),
     guardedAudit,
     ...(input.finalizationStatements ?? []),
   ]);
@@ -11108,14 +11121,20 @@ async function resolveConflictCase(
     state: ConflictCaseState;
     resolution: ConflictResolution;
     resolvedBy: string;
-    principal: AuthPrincipal;
+    principal?: AuthPrincipal;
+    auditActor?: Pick<
+      ComplianceAuditEventInput,
+      "actorType" | "actorId" | "tokenId" | "vaultId"
+    >;
     resolvedAt?: number;
     finalizationStatements?: D1PreparedStatement[];
     aiReview?: { runId: string; decision: string; applicationMode: "human" | "deterministic_auto" };
   }
 ): Promise<boolean> {
   const now = input.resolvedAt ?? Date.now();
-  const actor = auditActorFromPrincipal(input.principal);
+  const actor = input.auditActor ?? (input.principal
+    ? auditActorFromPrincipal(input.principal)
+    : { actorType: "system", actorId: "system", tokenId: null, vaultId: null });
   return await new D1ResolutionCoordinator(env.DB).applyConflictResolution({
     conflictId: input.id,
     state: input.state,
@@ -11146,6 +11165,10 @@ function publicAIReviewJob(job: AIReviewJobRecord): Record<string, unknown> {
       ...difference,
       evidenceRefs: [...difference.evidenceRefs],
     })),
+    refinement: {
+      ...job.run.refinement,
+      sourceRefs: [...job.run.refinement.sourceRefs],
+    },
     requiresHuman: job.run.requiresHuman,
     autoApplyEligible: job.run.autoApplyEligible,
     reviewerProvider: job.run.reviewerProvider,
@@ -11267,7 +11290,7 @@ async function applyAIReviewRecommendation(
     vaultId: null,
   };
   const appliedBy = input.deterministicAuto
-    ? "system:deterministic"
+    ? run.reviewerProvider === "rules" ? "system:deterministic" : "system:guarded-ai"
     : actor.actorId ?? "owner";
   const applicationMode = input.deterministicAuto ? "deterministic_auto" : "human";
   const reviewedAt = Date.now();
@@ -11297,7 +11320,8 @@ async function applyAIReviewRecommendation(
         state,
         resolution,
         resolvedBy,
-        principal: input.principal!,
+        principal: input.principal,
+        auditActor: actor,
         resolvedAt: reviewedAt,
         finalizationStatements,
         aiReview: { runId: run.id, decision: run.decision, applicationMode },
@@ -11352,6 +11376,18 @@ async function applyAIReviewRecommendation(
           reviewedAt,
         },
       });
+      const evolution = run.refinement.action === "none"
+        ? null
+        : await prepareMemoryKnowledgeEvolution(env.DB, {
+            candidateId: run.objectId,
+            aiReviewRunId: run.id,
+            decision: run.decision as "duplicate" | "merge" | "replace" | "keep_both",
+            refinementContent: run.refinement.content,
+            decisionConfidence: run.confidence.decision,
+            evidenceConfidence: run.confidence.evidence,
+            reviewedBy,
+            reviewedAt,
+          });
       applied = await resolveMemoryMergeCandidate(env, {
         id: run.objectId,
         state,
@@ -11360,8 +11396,24 @@ async function applyAIReviewRecommendation(
         principal: input.principal,
         auditActor: actor,
         aiReview: { runId: run.id, decision: run.decision, applicationMode },
+        domainStatements: evolution?.statements,
         finalizationStatements,
       });
+      if (applied && evolution?.outputClaimId && evolution.outputEntryId !== null) {
+        try {
+          const snapshot = await loadActiveEmbeddingSnapshot(env);
+          await enqueueClaimVectorJob(env.DB, {
+            claimId: evolution.outputClaimId,
+            targetFingerprint: snapshot.fingerprint,
+          });
+        } catch (error) {
+          console.error("Knowledge evolution Claim vector enqueue failed", {
+            evolutionId: evolution.evolutionId,
+            claimId: evolution.outputClaimId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
     }
     if (!applied) throw new AIReviewObjectUnavailableError(run.objectType, run.objectId);
     return {
@@ -11389,6 +11441,18 @@ async function processAIReviewInBackground(env: Env, jobId: string): Promise<voi
       jobId,
       error: error instanceof Error ? error.message : String(error),
     });
+  }
+}
+
+async function runAutomaticKnowledgeReview(env: Env, limit: number): Promise<void> {
+  const targets = await pendingAIReviewTargets(env.DB, null, limit);
+  for (const target of targets) {
+    const job = await enqueueAIReviewJob(env.DB, {
+      ...target,
+      mode: "auto_low_risk",
+      requestedBy: "system:knowledge-evolution",
+    });
+    if (job.status === "queued") await processAIReviewInBackground(env, job.id);
   }
 }
 

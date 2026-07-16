@@ -24,6 +24,12 @@
               : [],
           }))
           : [],
+        refinement: review.run.refinement ? {
+          ...review.run.refinement,
+          sourceRefs: Array.isArray(review.run.refinement.sourceRefs)
+            ? review.run.refinement.sourceRefs.map(String)
+            : [],
+        } : null,
       } : null,
       context: review.context && Array.isArray(review.context.evidence) ? {
         evidence: review.context.evidence.map((item) => ({
@@ -313,6 +319,19 @@
     }
     panel.appendChild(decision);
     panel.appendChild(el("p", "review-ai-reason", run.reason));
+    if (run.refinement && run.refinement.action !== "none") {
+      const refinement = el("section", "review-ai-refinement");
+      refinement.appendChild(el("h4", "", t("review.ai.refinement")));
+      refinement.appendChild(el(
+        "div",
+        "review-ai-refinement-action",
+        t(`review.ai.refinement.${run.refinement.action}`)
+      ));
+      if (run.refinement.content) {
+        refinement.appendChild(el("p", "review-ai-refinement-content", run.refinement.content));
+      }
+      panel.appendChild(refinement);
+    }
     if (Array.isArray(run.keyDifferences) && run.keyDifferences.length) {
       const differences = el("section", "review-ai-differences");
       differences.appendChild(el("h4", "", t("review.ai.keyDifferences")));
@@ -350,7 +369,7 @@
       panel.appendChild(el("div", "review-ai-applied", t("review.ai.applied")));
     } else if (
       run.mode !== "shadow" && run.reviewability === "sufficient" &&
-      !run.abstain && run.decision !== "uncertain"
+      run.mode !== "auto_low_risk" && !run.abstain && run.decision !== "uncertain"
     ) {
       const apply = createAction(t("review.ai.apply"), "ai:apply", true);
       apply.dataset.reviewRunId = run.id;
@@ -367,11 +386,11 @@
     const root = options.root;
     const api = options.api;
     const t = options.t || ((key) => key);
-    let state = { active: "conflicts", busyId: null, queues: normalizeReviewQueues({}) };
+    let state = { active: "memories", busyId: null, queues: normalizeReviewQueues({}) };
 
     function currentMode() {
-      const value = String(root.querySelector("[data-review-ai-mode]")?.value || "suggest");
-      return ["shadow", "suggest", "auto_low_risk"].includes(value) ? value : "suggest";
+      const value = String(root.querySelector("[data-review-ai-mode]")?.value || "auto_low_risk");
+      return ["shadow", "suggest", "auto_low_risk"].includes(value) ? value : "auto_low_risk";
     }
 
     function currentItems() {
@@ -409,14 +428,16 @@
       appendTextBlock(compare, t("review.incoming"), item.newClaim?.content || item.newMemory?.content);
       article.appendChild(compare);
       appendAIReview(article, item, "conflict_case", t);
-      const actions = el("div", "review-actions");
-      actions.append(
-        createAction(t("review.useNew"), "conflict:use_new", true),
-        createAction(t("review.keepOld"), "conflict:use_old"),
-        createAction(t("review.keepBoth"), "conflict:keep_both"),
-        createAction(t("review.dismiss"), "conflict:dismissed")
-      );
-      article.appendChild(actions);
+      if (currentMode() !== "auto_low_risk") {
+        const actions = el("div", "review-actions");
+        actions.append(
+          createAction(t("review.useNew"), "conflict:use_new", true),
+          createAction(t("review.keepOld"), "conflict:use_old"),
+          createAction(t("review.keepBoth"), "conflict:keep_both"),
+          createAction(t("review.dismiss"), "conflict:dismissed")
+        );
+        article.appendChild(actions);
+      }
       return article;
     }
 
@@ -432,12 +453,14 @@
       appendTextBlock(compare, t("review.targetEntity"), item.target?.name);
       article.appendChild(compare);
       appendAIReview(article, item, "entity_merge_candidate", t);
-      const actions = el("div", "review-actions");
-      actions.append(
-        createAction(t("review.merge"), "entity:accept", true),
-        createAction(t("review.reject"), "entity:reject")
-      );
-      article.appendChild(actions);
+      if (currentMode() !== "auto_low_risk") {
+        const actions = el("div", "review-actions");
+        actions.append(
+          createAction(t("review.merge"), "entity:accept", true),
+          createAction(t("review.reject"), "entity:reject")
+        );
+        article.appendChild(actions);
+      }
       return article;
     }
 
@@ -454,12 +477,14 @@
       appendTextBlock(compare, t("review.targetMemory"), item.target?.content);
       article.appendChild(compare);
       appendAIReview(article, item, "memory_merge_candidate", t);
-      const actions = el("div", "review-actions");
-      actions.append(
-        createAction(t("review.accept"), "memory:accepted", true),
-        createAction(t("review.keepSeparate"), "memory:rejected")
-      );
-      article.appendChild(actions);
+      if (currentMode() !== "auto_low_risk") {
+        const actions = el("div", "review-actions");
+        actions.append(
+          createAction(t("review.accept"), "memory:accepted", true),
+          createAction(t("review.keepSeparate"), "memory:rejected")
+        );
+        article.appendChild(actions);
+      }
       return article;
     }
 

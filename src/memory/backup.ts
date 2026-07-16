@@ -19,11 +19,12 @@ import {
   AI_REVIEWABILITY_LEVELS,
   ensureAIReviewDataModel,
 } from "./ai-review";
+import { ensureKnowledgeEvolutionDataModel } from "./knowledge-evolution";
 
-export const MEMORY_BACKUP_SCHEMA_VERSION = 17;
+export const MEMORY_BACKUP_SCHEMA_VERSION = 18;
 export const MEMORY_MUTATION_BACKUP_MODE = "audit_only" as const;
 const MEMORY_BACKUP_FORMAT = "singularity-memory-backup";
-const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
+const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
 const MEMORY_BACKUP_FEATURES = [
   "atomic-memory",
   "temporal-facts",
@@ -48,6 +49,7 @@ const MEMORY_BACKUP_FEATURES = [
   "entry-mutation-journal-audit-only",
   "ai-assisted-quality-review",
   "context-aware-ai-review",
+  "reversible-knowledge-evolution",
 ] as const;
 
 export const AUDIT_IMPORT_MODES = ["replace_empty", "append_verified"] as const;
@@ -87,6 +89,10 @@ const GRAPH_ARRAY_KEYS = [
   "aiReviewJobs",
   "aiReviewRuns",
   "aiReviewApplications",
+  "knowledgeEvolutions",
+  "knowledgeEvolutionSources",
+  "knowledgeClaimOwnership",
+  "knowledgeEvolutionHistory",
   "auditEvents",
 ] as const;
 
@@ -107,7 +113,7 @@ export interface BackupIntegrityReport {
 
 export interface MemoryBackup {
   backupFormat: typeof MEMORY_BACKUP_FORMAT;
-  schemaVersion: 17;
+  schemaVersion: 18;
   features: Array<(typeof MEMORY_BACKUP_FEATURES)[number]>;
   exportedAt: string;
   source: string;
@@ -144,11 +150,15 @@ export interface MemoryBackup {
   aiReviewJobs: BackupRow[];
   aiReviewRuns: BackupRow[];
   aiReviewApplications: BackupRow[];
+  knowledgeEvolutions: BackupRow[];
+  knowledgeEvolutionSources: BackupRow[];
+  knowledgeClaimOwnership: BackupRow[];
+  knowledgeEvolutionHistory: BackupRow[];
   auditEvents: BackupRow[];
 }
 
 export interface MemoryBackupImportResult extends ImportResult {
-  schemaVersion: 17;
+  schemaVersion: 18;
   memoryMutationBackupMode: typeof MEMORY_MUTATION_BACKUP_MODE;
   graph: Record<GraphArrayKey, TableImportStats>;
   integrity: BackupIntegrityReport;
@@ -368,7 +378,30 @@ export async function inspectMemoryBackupIntegrity(db: D1Database): Promise<Back
           AND NOT EXISTS (
             SELECT 1 FROM sb_ai_review_applications a
             WHERE a.run_id = j.run_id
-          )) as ai_review_applied_jobs_missing_receipt`
+          )) as ai_review_applied_jobs_missing_receipt,
+       (SELECT COUNT(*) FROM sb_knowledge_evolutions evolution
+        LEFT JOIN sb_ai_review_runs run ON run.id = evolution.ai_review_run_id
+        WHERE run.id IS NULL) as knowledge_evolutions_missing_run,
+       (SELECT COUNT(*) FROM sb_knowledge_evolutions evolution
+        LEFT JOIN sb_memories claim ON claim.id = evolution.output_claim_id
+        WHERE evolution.output_claim_id IS NOT NULL AND claim.id IS NULL)
+          as knowledge_evolutions_missing_output_claim,
+       (SELECT COUNT(*) FROM sb_knowledge_evolution_sources source
+        LEFT JOIN sb_knowledge_evolutions evolution ON evolution.id = source.evolution_id
+        WHERE evolution.id IS NULL) as knowledge_evolution_sources_missing_evolution,
+       (SELECT COUNT(*) FROM sb_knowledge_evolution_sources source
+        LEFT JOIN sb_memories claim ON claim.id = source.claim_id
+        WHERE claim.id IS NULL) as knowledge_evolution_sources_missing_claim,
+       (SELECT COUNT(*) FROM sb_knowledge_claim_ownership ownership
+        LEFT JOIN sb_knowledge_evolutions evolution ON evolution.id = ownership.evolution_id
+        WHERE evolution.id IS NULL OR evolution.state <> 'active')
+          as knowledge_claim_ownership_missing_active_evolution,
+       (SELECT COUNT(*) FROM sb_knowledge_claim_ownership ownership
+        LEFT JOIN sb_memories claim ON claim.id = ownership.claim_id
+        WHERE claim.id IS NULL) as knowledge_claim_ownership_missing_claim,
+       (SELECT COUNT(*) FROM sb_knowledge_evolution_history history
+        LEFT JOIN sb_knowledge_evolutions evolution ON evolution.id = history.evolution_id
+        WHERE evolution.id IS NULL) as knowledge_evolution_history_missing_evolution`
   );
   const issues: Record<string, number> = {};
   for (const [key, value] of Object.entries(row ?? {})) {
@@ -388,6 +421,7 @@ export async function exportMemoryBackup(
   await ensureConflictClaimSchema(db);
   await ensureAssociationDataModel(db);
   await ensureAIReviewDataModel(db);
+  await ensureKnowledgeEvolutionDataModel(db);
   for (const statement of MEMORY_MUTATION_SCHEMA_STATEMENTS) await db.exec(statement);
   const [
     scopes,
@@ -420,6 +454,10 @@ export async function exportMemoryBackup(
     aiReviewJobs,
     aiReviewRuns,
     aiReviewApplications,
+    knowledgeEvolutions,
+    knowledgeEvolutionSources,
+    knowledgeClaimOwnership,
+    knowledgeEvolutionHistory,
     auditEvents,
   ] = await Promise.all([
     allRows(db, `SELECT scope_id, parent_scope_id, canonical_name, aliases_json,
@@ -559,7 +597,8 @@ export async function exportMemoryBackup(
                 ORDER BY created_at DESC, id DESC`),
     allRows(db, `SELECT id, job_id, object_type, object_id, mode, decision, reason,
                        evidence_refs_json, confidence_json, reviewability,
-                       missing_context_json, key_differences_json, abstained, requires_human,
+                       missing_context_json, key_differences_json, refinement_json,
+                       abstained, requires_human,
                        auto_apply_eligible, reviewer_provider, reviewer_model,
                        prompt_version, input_snapshot_hash, input_snapshot_json, created_at
                 FROM sb_ai_review_runs
@@ -567,6 +606,22 @@ export async function exportMemoryBackup(
     allRows(db, `SELECT id, run_id, object_type, object_id, decision, applied_by,
                        application_mode, created_at
                 FROM sb_ai_review_applications
+                ORDER BY created_at DESC, id DESC`),
+    allRows(db, `SELECT id, ai_review_run_id, candidate_id, operation, state,
+                       generation, output_entry_id, output_claim_id, output_generated,
+                       decision_confidence, evidence_confidence, applied_by, applied_at,
+                       rolled_back_by, rolled_back_at, rollback_reason, created_at, updated_at
+                FROM sb_knowledge_evolutions
+                ORDER BY applied_at DESC, id DESC`),
+    allRows(db, `SELECT evolution_id, claim_id, entry_id, disposition,
+                       previous_claim_status, previous_invalid_at, source_order, created_at
+                FROM sb_knowledge_evolution_sources
+                ORDER BY created_at DESC, evolution_id DESC, source_order ASC`),
+    allRows(db, `SELECT claim_id, evolution_id, acquired_at
+                FROM sb_knowledge_claim_ownership
+                ORDER BY acquired_at DESC, claim_id DESC`),
+    allRows(db, `SELECT id, evolution_id, action, actor_id, reason, created_at
+                FROM sb_knowledge_evolution_history
                 ORDER BY created_at DESC, id DESC`),
     allRows(db, `SELECT id, occurred_at, trace_id, actor_type, actor_id,
                        token_id, action, object_type, object_id, vault_id,
@@ -614,6 +669,10 @@ export async function exportMemoryBackup(
       aiReviewJobs: countRows(aiReviewJobs),
       aiReviewRuns: countRows(aiReviewRuns),
       aiReviewApplications: countRows(aiReviewApplications),
+      knowledgeEvolutions: countRows(knowledgeEvolutions),
+      knowledgeEvolutionSources: countRows(knowledgeEvolutionSources),
+      knowledgeClaimOwnership: countRows(knowledgeClaimOwnership),
+      knowledgeEvolutionHistory: countRows(knowledgeEvolutionHistory),
       auditEvents: countRows(auditEvents),
     },
     integrity: await inspectMemoryBackupIntegrity(db),
@@ -647,6 +706,10 @@ export async function exportMemoryBackup(
     aiReviewJobs,
     aiReviewRuns,
     aiReviewApplications,
+    knowledgeEvolutions,
+    knowledgeEvolutionSources,
+    knowledgeClaimOwnership,
+    knowledgeEvolutionHistory,
     auditEvents,
   };
 }
@@ -973,6 +1036,26 @@ function verifyAIReviewBackupRows(body: Record<string, unknown>, schemaVersion: 
       const evidenceRefs = requiredArray(run, "evidence_refs_json");
       const missingContext = requiredArray(run, "missing_context_json");
       const keyDifferences = requiredArray(run, "key_differences_json");
+      if (schemaVersion >= 18) {
+        let refinement: unknown = { action: "none", content: null, sourceRefs: [] };
+        try {
+          if (run.refinement_json != null) {
+            refinement = typeof run.refinement_json === "string"
+              ? JSON.parse(run.refinement_json)
+              : run.refinement_json;
+          }
+        } catch {
+          refinement = null;
+        }
+        if (
+          !refinement || typeof refinement !== "object" || Array.isArray(refinement) ||
+          !["none", "consolidate", "merge", "supersede", "keep_separate"]
+            .includes(String((refinement as Record<string, unknown>).action ?? "")) ||
+          !Array.isArray((refinement as Record<string, unknown>).sourceRefs)
+        ) {
+          throw new Error("AI review run has an invalid refinement plan");
+        }
+      }
       if (evidenceRefs.some((value) => typeof value !== "string" || !value.trim())) {
         throw new Error("AI review run has an invalid evidence reference");
       }
@@ -1029,6 +1112,105 @@ function verifyAIReviewBackupRows(body: Record<string, unknown>, schemaVersion: 
   }
 }
 
+function verifyKnowledgeEvolutionBackupRows(
+  body: Record<string, unknown>,
+  schemaVersion: number
+): void {
+  if (schemaVersion < 18) return;
+  const keys = [
+    "knowledgeEvolutions",
+    "knowledgeEvolutionSources",
+    "knowledgeClaimOwnership",
+    "knowledgeEvolutionHistory",
+  ] as const;
+  for (const key of keys) {
+    if (!Array.isArray(body[key])) throw new Error(`${key} must be an array in schema v18 backups`);
+  }
+
+  const evolutions = rowsFor(body, "knowledgeEvolutions");
+  const sources = rowsFor(body, "knowledgeEvolutionSources");
+  const ownership = rowsFor(body, "knowledgeClaimOwnership");
+  const history = rowsFor(body, "knowledgeEvolutionHistory");
+  const runs = new Set(rowsFor(body, "aiReviewRuns").map((row) => requiredText(row, "id")));
+  const claims = new Set(rowsFor(body, "memories").map((row) => requiredText(row, "id")));
+  const entries = new Set(arrayFrom(body.entries).map((row) => requiredText(row, "id")));
+  const evolutionsById = new Map<string, BackupRow>();
+  const activeEvolutionIds = new Set<string>();
+  const sourceCounts = new Map<string, number>();
+
+  for (const evolution of evolutions) {
+    const id = requiredText(evolution, "id");
+    if (evolutionsById.has(id)) throw new Error("Knowledge evolution IDs must be unique");
+    evolutionsById.set(id, evolution);
+    if (!runs.has(requiredText(evolution, "ai_review_run_id"))) {
+      throw new Error("Knowledge evolution references a missing AI review run");
+    }
+    if (!["consolidate", "merge", "supersede", "keep_separate"]
+      .includes(requiredText(evolution, "operation"))) {
+      throw new Error("Knowledge evolution has an invalid operation");
+    }
+    const state = textOrDefault(evolution, "state", "active");
+    if (!["active", "rolled_back"].includes(state)) {
+      throw new Error("Knowledge evolution has an invalid state");
+    }
+    if (state === "active") activeEvolutionIds.add(id);
+    if (intOrDefault(evolution, "generation", 0) < 1) {
+      throw new Error("Knowledge evolution generation must be positive");
+    }
+    const outputClaimId = textOrNull(evolution, "output_claim_id");
+    const outputEntryId = textOrNull(evolution, "output_entry_id");
+    const outputGenerated = intOrDefault(evolution, "output_generated", 0);
+    if (outputClaimId && !claims.has(outputClaimId)) {
+      throw new Error("Knowledge evolution references a missing output Claim");
+    }
+    if (outputEntryId && !entries.has(outputEntryId)) {
+      throw new Error("Knowledge evolution references a missing output Entry");
+    }
+    if (outputGenerated === 1 && (!outputClaimId || !outputEntryId)) {
+      throw new Error("Generated knowledge evolution requires output Entry and Claim IDs");
+    }
+  }
+
+  for (const source of sources) {
+    const evolutionId = requiredText(source, "evolution_id");
+    if (!evolutionsById.has(evolutionId)) {
+      throw new Error("Knowledge evolution source references a missing evolution");
+    }
+    if (!claims.has(requiredText(source, "claim_id"))) {
+      throw new Error("Knowledge evolution source references a missing Claim");
+    }
+    if (!["absorbed", "superseded", "retained"]
+      .includes(requiredText(source, "disposition"))) {
+      throw new Error("Knowledge evolution source has an invalid disposition");
+    }
+    sourceCounts.set(evolutionId, (sourceCounts.get(evolutionId) ?? 0) + 1);
+  }
+  for (const evolutionId of evolutionsById.keys()) {
+    if ((sourceCounts.get(evolutionId) ?? 0) < 2) {
+      throw new Error("Knowledge evolution must preserve both source Claims");
+    }
+  }
+
+  const ownedClaims = new Set<string>();
+  for (const row of ownership) {
+    const claimId = requiredText(row, "claim_id");
+    if (ownedClaims.has(claimId)) throw new Error("Knowledge Claim ownership must be unique");
+    ownedClaims.add(claimId);
+    if (!claims.has(claimId)) throw new Error("Knowledge Claim ownership references a missing Claim");
+    if (!activeEvolutionIds.has(requiredText(row, "evolution_id"))) {
+      throw new Error("Knowledge Claim ownership requires an active evolution");
+    }
+  }
+  for (const row of history) {
+    if (!evolutionsById.has(requiredText(row, "evolution_id"))) {
+      throw new Error("Knowledge evolution history references a missing evolution");
+    }
+    if (!["applied", "rolled_back"].includes(requiredText(row, "action"))) {
+      throw new Error("Knowledge evolution history has an invalid action");
+    }
+  }
+}
+
 async function importMemoryBackupUnlocked(
   db: D1Database,
   body: Record<string, unknown>,
@@ -1045,6 +1227,7 @@ async function importMemoryBackupUnlocked(
   }
   const mode: ImportMode = options.mode === "overwrite" ? "overwrite" : "skip";
   verifyAIReviewBackupRows(body, rawSchemaVersion);
+  verifyKnowledgeEvolutionBackupRows(body, rawSchemaVersion);
   const auditImportPlan = await prepareAuditImport(
     db,
     rowsFor(body, "auditEvents"),
@@ -1671,10 +1854,11 @@ async function importMemoryBackupUnlocked(
       `INSERT OR IGNORE INTO sb_ai_review_runs (
          id, job_id, object_type, object_id, mode, decision, reason,
          evidence_refs_json, confidence_json, reviewability,
-         missing_context_json, key_differences_json, abstained, requires_human,
+         missing_context_json, key_differences_json, refinement_json,
+         abstained, requires_human,
          auto_apply_eligible, reviewer_provider, reviewer_model, prompt_version,
          input_snapshot_hash, input_snapshot_json, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       requiredText(row, "id"),
       requiredText(row, "job_id"),
@@ -1696,6 +1880,7 @@ async function importMemoryBackupUnlocked(
         intOrDefault(row, "abstained", 0) === 1 ? '["complete_statement"]' : "[]"
       ),
       jsonText(row, "key_differences_json", "[]"),
+      jsonText(row, "refinement_json", '{"action":"none","content":null,"sourceRefs":[]}'),
       intOrDefault(row, "abstained", 0),
       intOrDefault(row, "requires_human", 1),
       intOrDefault(row, "auto_apply_eligible", 0),
@@ -1722,6 +1907,87 @@ async function importMemoryBackupUnlocked(
       requiredText(row, "decision"),
       textOrDefault(row, "applied_by", "backup_restore"),
       textOrDefault(row, "application_mode", "human"),
+      intOrDefault(row, "created_at", Date.now())
+    )
+  );
+
+  graph.knowledgeEvolutions = await importTable(db, rowsFor(body, "knowledgeEvolutions"), (row) =>
+    db.prepare(
+      `${insertVerb(mode)} INTO sb_knowledge_evolutions (
+         id, ai_review_run_id, candidate_id, operation, state, generation,
+         output_entry_id, output_claim_id, output_generated,
+         decision_confidence, evidence_confidence, applied_by, applied_at,
+         rolled_back_by, rolled_back_at, rollback_reason, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "id"),
+      requiredText(row, "ai_review_run_id"),
+      requiredText(row, "candidate_id"),
+      requiredText(row, "operation"),
+      textOrDefault(row, "state", "active"),
+      intOrDefault(row, "generation", 1),
+      textOrNull(row, "output_entry_id"),
+      textOrNull(row, "output_claim_id"),
+      intOrDefault(row, "output_generated", 0),
+      numberOrDefault(row, "decision_confidence", 0),
+      numberOrDefault(row, "evidence_confidence", 0),
+      textOrDefault(row, "applied_by", "backup_restore"),
+      intOrDefault(row, "applied_at", Date.now()),
+      textOrNull(row, "rolled_back_by"),
+      numberOrNull(row, "rolled_back_at"),
+      textOrNull(row, "rollback_reason"),
+      intOrDefault(row, "created_at", Date.now()),
+      intOrDefault(row, "updated_at", Date.now())
+    )
+  );
+
+  graph.knowledgeEvolutionSources = await importTable(
+    db,
+    rowsFor(body, "knowledgeEvolutionSources"),
+    (row) => db.prepare(
+      `${insertVerb(mode)} INTO sb_knowledge_evolution_sources (
+         evolution_id, claim_id, entry_id, disposition, previous_claim_status,
+         previous_invalid_at, source_order, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "evolution_id"),
+      requiredText(row, "claim_id"),
+      textOrNull(row, "entry_id"),
+      requiredText(row, "disposition"),
+      requiredText(row, "previous_claim_status"),
+      numberOrNull(row, "previous_invalid_at"),
+      intOrDefault(row, "source_order", 0),
+      intOrDefault(row, "created_at", Date.now())
+    )
+  );
+
+  graph.knowledgeClaimOwnership = await importTable(
+    db,
+    rowsFor(body, "knowledgeClaimOwnership"),
+    (row) => db.prepare(
+      `${insertVerb(mode)} INTO sb_knowledge_claim_ownership (
+         claim_id, evolution_id, acquired_at
+       ) VALUES (?, ?, ?)`
+    ).bind(
+      requiredText(row, "claim_id"),
+      requiredText(row, "evolution_id"),
+      intOrDefault(row, "acquired_at", Date.now())
+    )
+  );
+
+  graph.knowledgeEvolutionHistory = await importTable(
+    db,
+    rowsFor(body, "knowledgeEvolutionHistory"),
+    (row) => db.prepare(
+      `${insertVerb(mode)} INTO sb_knowledge_evolution_history (
+         id, evolution_id, action, actor_id, reason, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "id"),
+      requiredText(row, "evolution_id"),
+      requiredText(row, "action"),
+      textOrDefault(row, "actor_id", "backup_restore"),
+      textOrNull(row, "reason"),
       intOrDefault(row, "created_at", Date.now())
     )
   );
@@ -1780,6 +2046,7 @@ export async function importMemoryBackup(
   await ensureConflictClaimSchema(db);
   await ensureAssociationDataModel(db);
   await ensureAIReviewDataModel(db);
+  await ensureKnowledgeEvolutionDataModel(db);
   for (const statement of MEMORY_MUTATION_SCHEMA_STATEMENTS) await db.exec(statement);
 
   const ownerId = crypto.randomUUID();

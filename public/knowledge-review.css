@@ -282,16 +282,38 @@
 .review-ai-pending { color: var(--text-secondary); }
 
 .review-ai-differences,
-.review-ai-missing {
+.review-ai-missing,
+.review-ai-refinement {
   margin-top: 11px;
 }
 
 .review-ai-differences h4,
-.review-ai-missing h4 {
+.review-ai-missing h4,
+.review-ai-refinement h4 {
   margin: 0 0 6px;
   color: var(--text-primary);
   font-size: 11px;
   font-weight: 650;
+}
+
+.review-ai-refinement {
+  padding: 10px 12px;
+  border-left: 3px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+
+.review-ai-refinement-action {
+  color: var(--accent-ink);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.review-ai-refinement-content {
+  margin: 7px 0 0;
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
 }
 
 .review-ai-differences ul {

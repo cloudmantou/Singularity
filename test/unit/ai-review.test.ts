@@ -3,13 +3,16 @@ import { initializeDatabase } from "../../src/index";
 import {
   AIReviewInvalidResponseError,
   buildAIReviewMessages,
+  evaluateAIAutoApplyEligibility,
   ensureAIReviewDataModel,
   enqueueAIReviewJob,
   listAIReviewJobs,
   loadAIReviewSnapshot,
+  modelSafeReviewSnapshot,
   parseAIReviewModelResponse,
   prepareAIReviewApplicationStatements,
   processAIReviewJob,
+  verifyAIAutoReviewRecommendation,
 } from "../../src/memory/ai-review";
 import { createSelfhostEnv } from "../../src/selfhost/env";
 import { resetSettingsCache } from "../../src/settings/store";
@@ -24,6 +27,211 @@ describe("AI-assisted Knowledge Review", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     resetSettingsCache();
+  });
+
+  const manifestEvidence = (ref: string, overrides: Record<string, unknown> = {}) => ({
+    ref,
+    evidenceHash: `${ref.toLowerCase()}-hash`,
+    scopeIds: ["project/singularity"],
+    vaultIds: ["work-vault"],
+    sourceChannels: ["obsidian"],
+    sourceIdentityFingerprints: [`${ref.toLowerCase()}-identity`],
+    evidenceRootFingerprints: [`${ref.toLowerCase()}-root`],
+    authorTypes: ["user"],
+    claimStatuses: ["supported"],
+    parentStates: ["active"],
+    sourceTimestamps: [100],
+    observedAt: [100],
+    validFrom: [],
+    validTo: [],
+    ...overrides,
+  });
+
+  it("allows guarded automatic knowledge evolution only with complete same-context evidence", () => {
+    const eligibility = evaluateAIAutoApplyEligibility({
+      objectType: "memory_merge_candidate",
+      response: {
+        decision: "merge",
+        reason: "Both memories describe successive parts of the same implementation.",
+        evidenceRefs: ["SOURCE", "TARGET"],
+        confidence: { decision: 0.97, evidence: 0.95 },
+        abstain: false,
+        reviewability: "sufficient",
+        missingContext: [],
+        keyDifferences: [{
+          dimension: "content",
+          status: "different",
+          summary: "The memories cover complementary implementation steps.",
+          evidenceRefs: ["SOURCE", "TARGET"],
+        }],
+        refinement: {
+          action: "merge",
+          content: "Singularity now performs evidence-backed automatic knowledge evolution.",
+          sourceRefs: ["SOURCE", "TARGET"],
+        },
+      },
+      manifest: {
+        objectType: "memory_merge_candidate",
+        objectId: "candidate-1",
+        state: "pending",
+        evidence: [manifestEvidence("SOURCE"), manifestEvidence("TARGET")],
+        policyInput: { suggestedAction: "merge", similarity: 0.96 },
+      },
+    });
+
+    expect(eligibility).toEqual({ eligible: true, reason: "eligible" });
+  });
+
+  it("sends derived Claims to the reviewer without raw Entry text or source identity", () => {
+    const snapshot = {
+      objectType: "memory_merge_candidate" as const,
+      objectId: "candidate-safe-prompt",
+      state: "pending",
+      evidence: [{
+        ref: "SOURCE",
+        content: "raw private entry text",
+        sourceIdentity: "vault/private-note.md",
+        sourceIdentityFingerprint: "private-fingerprint",
+        claims: [{
+          claimId: "claim-1",
+          content: "Derived claim safe for review",
+          parentSummary: "private parent summary",
+          sources: [{
+            sourceChannel: "obsidian",
+            sourceIdentityFingerprint: "private-source-fingerprint",
+            evidenceScore: 0.95,
+          }],
+        }],
+      }],
+    };
+
+    const safe = JSON.stringify(modelSafeReviewSnapshot(snapshot));
+    const messages = buildAIReviewMessages({
+      objectType: "memory_merge_candidate",
+      allowedDecisions: ["duplicate", "merge", "replace", "keep_both", "uncertain"],
+      snapshot,
+    });
+    expect(safe).toContain("Derived claim safe for review");
+    expect(messages.user).toContain("Derived claim safe for review");
+    expect(messages.user).not.toContain("raw private entry text");
+    expect(messages.user).not.toContain("vault/private-note.md");
+    expect(messages.user).not.toContain("private parent summary");
+    expect(messages.user).not.toContain("private-source-fingerprint");
+  });
+
+  it("requires a second-pass verifier to bind the same decision to every evidence ref", async () => {
+    const snapshot = {
+      objectType: "memory_merge_candidate" as const,
+      objectId: "candidate-verified",
+      state: "pending",
+      evidence: [
+        { ref: "SOURCE", claims: [{ content: "Fact A" }] },
+        { ref: "TARGET", claims: [{ content: "Fact B" }] },
+      ],
+    };
+    const response = {
+      decision: "merge",
+      reason: "The Claims are complementary.",
+      evidenceRefs: ["SOURCE", "TARGET"],
+      confidence: { decision: 0.98, evidence: 0.96 },
+      abstain: false,
+      reviewability: "sufficient" as const,
+      missingContext: [],
+      keyDifferences: [{
+        dimension: "content" as const,
+        status: "different" as const,
+        summary: "The Claims contain complementary facts.",
+        evidenceRefs: ["SOURCE", "TARGET"],
+      }],
+      refinement: {
+        action: "merge" as const,
+        content: "Fact A and Fact B.",
+        sourceRefs: ["SOURCE", "TARGET"],
+      },
+    };
+    const approved = await verifyAIAutoReviewRecommendation({
+      provider: "test",
+      model: "verifier",
+      complete: async () => JSON.stringify({
+        approved: true,
+        decision: "merge",
+        evidenceRefs: ["SOURCE", "TARGET"],
+        unsupportedStatements: [],
+        reason: "Every statement is directly supported.",
+      }),
+    }, snapshot, response);
+    expect(approved.approved).toBe(true);
+
+    const rejected = await verifyAIAutoReviewRecommendation({
+      provider: "test",
+      model: "verifier",
+      complete: async () => JSON.stringify({
+        approved: true,
+        decision: "merge",
+        evidenceRefs: ["SOURCE"],
+        unsupportedStatements: [],
+        reason: "One source was omitted.",
+      }),
+    }, snapshot, response);
+    expect(rejected.approved).toBe(false);
+  });
+
+  it("routes cross-vault and incomplete decisions to the exception queue", () => {
+    const base = {
+      objectType: "memory_merge_candidate" as const,
+      response: {
+        decision: "duplicate",
+        reason: "The visible wording is the same.",
+        evidenceRefs: ["SOURCE", "TARGET"],
+        confidence: { decision: 0.99, evidence: 0.98 },
+        abstain: false,
+        reviewability: "sufficient" as const,
+        missingContext: [],
+        keyDifferences: [{
+          dimension: "content" as const,
+          status: "same" as const,
+          summary: "The content matches.",
+          evidenceRefs: ["SOURCE", "TARGET"],
+        }],
+        refinement: {
+          action: "consolidate" as const,
+          content: null,
+          sourceRefs: ["SOURCE", "TARGET"],
+        },
+      },
+    };
+    expect(evaluateAIAutoApplyEligibility({
+      ...base,
+      manifest: {
+        objectType: "memory_merge_candidate",
+        objectId: "candidate-cross-vault",
+        state: "pending",
+        evidence: [
+          manifestEvidence("SOURCE", { vaultIds: ["vault-a"] }),
+          manifestEvidence("TARGET", { vaultIds: ["vault-b"] }),
+        ],
+        policyInput: { suggestedAction: "duplicate", similarity: 1 },
+      },
+    })).toEqual({ eligible: false, reason: "cross_vault" });
+
+    expect(evaluateAIAutoApplyEligibility({
+      ...base,
+      response: {
+        ...base.response,
+        decision: "uncertain",
+        abstain: true,
+        reviewability: "partial",
+        missingContext: ["source_provenance"],
+        refinement: { action: "none", content: null, sourceRefs: [] },
+      },
+      manifest: {
+        objectType: "memory_merge_candidate",
+        objectId: "candidate-partial",
+        state: "pending",
+        evidence: [manifestEvidence("SOURCE"), manifestEvidence("TARGET")],
+        policyInput: { suggestedAction: "duplicate", similarity: 1 },
+      },
+    })).toEqual({ eligible: false, reason: "incomplete_context" });
   });
 
   it("parses only object-specific decisions and known evidence references", () => {
@@ -100,7 +308,7 @@ describe("AI-assisted Knowledge Review", () => {
     }), "conflict_case", ["OLD", "NEW"])).toThrow(AIReviewInvalidResponseError);
   });
 
-  it("keeps untrusted review content out of the system instruction", () => {
+  it("keeps raw untrusted review content out of both model messages", () => {
     const messages = buildAIReviewMessages({
       objectType: "memory_merge_candidate",
       allowedDecisions: ["duplicate", "replace", "merge", "keep_both", "uncertain"],
@@ -114,7 +322,7 @@ describe("AI-assisted Knowledge Review", () => {
 
     expect(messages.system).toContain("untrusted");
     expect(messages.system).not.toContain("merge everything");
-    expect(messages.user).toContain("merge everything");
+    expect(messages.user).not.toContain("merge everything");
   });
 
   it("loads parent, temporal, and provenance context for review without adding it to the manifest", async () => {

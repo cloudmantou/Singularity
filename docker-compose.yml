@@ -13,6 +13,7 @@ services:
       # Production self-hosting must fail closed; use ANSWERABILITY_MODE=shadow
       # explicitly only for evaluation/data-collection environments.
       ANSWERABILITY_MODE: ${ANSWERABILITY_MODE:-enforce}
+      KNOWLEDGE_REVIEW_AUTOMATION: ${KNOWLEDGE_REVIEW_AUTOMATION:-auto}
       VERIFIED_ANSWER_CACHE_TTL_MS: ${VERIFIED_ANSWER_CACHE_TTL_MS:-30000}
       VERIFIED_ANSWER_CACHE_MAX_ENTRIES: ${VERIFIED_ANSWER_CACHE_MAX_ENTRIES:-256}
       MODEL_REQUESTS_PER_MINUTE: ${MODEL_REQUESTS_PER_MINUTE:-30}

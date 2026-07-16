@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import worker, { initializeDatabase } from "../../src/index";
 import { ensureAssociationDataModel } from "../../src/memory/associations";
 import { ensureAIReviewDataModel } from "../../src/memory/ai-review";
+import { ensureKnowledgeEvolutionDataModel } from "../../src/memory/knowledge-evolution";
 import { exportMemoryBackup, importMemoryBackup } from "../../src/memory/backup";
 import { ensureEntityResolutionDataModel } from "../../src/memory/entities";
 import {
@@ -232,6 +233,7 @@ describe("full memory backup import/export", () => {
       await initializeDatabase(source.env);
       await initializeDatabase(target.env);
       await ensureAIReviewDataModel(source.env.DB);
+      await ensureKnowledgeEvolutionDataModel(source.env.DB);
       const now = Date.now();
       const manifest = JSON.stringify({
         objectType: "memory_merge_candidate",
@@ -240,6 +242,17 @@ describe("full memory backup import/export", () => {
         evidence: [{ ref: "SOURCE", evidenceHash: "hash-1", scopeIds: ["scope-1"], vaultIds: ["vault-1"] }],
         policyInput: { suggestedAction: "duplicate" },
       });
+      source.db.prepare(
+        `INSERT INTO entries (id, content, tags, source, created_at, vector_ids)
+         VALUES ('evolution-entry-a', 'Fact A', '[]', 'test', ?, '[]'),
+                ('evolution-entry-b', 'Fact B', '[]', 'test', ?, '[]')`
+      ).run(now, now);
+      source.db.prepare(
+        `INSERT INTO sb_memories (
+           id, content, entry_id, claim_status, entities_json, created_at
+         ) VALUES ('evolution-claim-a', 'Fact A', 'evolution-entry-a', 'supported', '[]', ?),
+                  ('evolution-claim-b', 'Fact B', 'evolution-entry-b', 'supported', '[]', ?)`
+      ).run(now, now);
       source.db.prepare(
         `INSERT INTO sb_ai_review_jobs (
            id, object_type, object_id, mode, status, requested_by,
@@ -268,13 +281,39 @@ describe("full memory backup import/export", () => {
          ) VALUES ('application-1', 'run-1', 'memory_merge_candidate', 'candidate-1',
                    'duplicate', 'owner', 'human', ?)`
       ).run(now);
+      source.db.prepare(
+        `INSERT INTO sb_knowledge_evolutions (
+           id, ai_review_run_id, candidate_id, operation, state, generation,
+           output_generated, decision_confidence, evidence_confidence,
+           applied_by, applied_at, created_at, updated_at
+         ) VALUES ('evolution-1', 'run-1', 'candidate-1', 'keep_separate',
+                   'active', 1, 0, 1, 1, 'owner', ?, ?, ?)`
+      ).run(now, now, now);
+      source.db.prepare(
+        `INSERT INTO sb_knowledge_evolution_history (
+           id, evolution_id, action, actor_id, reason, created_at
+         ) VALUES ('evolution-history-1', 'evolution-1', 'applied',
+                   'owner', 'verified backup', ?)`
+      ).run(now);
+      source.db.prepare(
+        `INSERT INTO sb_knowledge_evolution_sources (
+           evolution_id, claim_id, entry_id, disposition, previous_claim_status,
+           previous_invalid_at, source_order, created_at
+         ) VALUES ('evolution-1', 'evolution-claim-a', 'evolution-entry-a',
+                   'retained', 'supported', NULL, 0, ?),
+                  ('evolution-1', 'evolution-claim-b', 'evolution-entry-b',
+                   'retained', 'supported', NULL, 1, ?)`
+      ).run(now, now);
 
       const backup = await exportMemoryBackup(source.env.DB, { source: "test" });
-      expect(backup.schemaVersion).toBe(17);
+      expect(backup.schemaVersion).toBe(18);
       expect(backup.totals).toMatchObject({
         aiReviewJobs: 1,
         aiReviewRuns: 1,
         aiReviewApplications: 1,
+        knowledgeEvolutions: 1,
+        knowledgeEvolutionSources: 2,
+        knowledgeEvolutionHistory: 1,
       });
       expect(JSON.stringify(backup.aiReviewRuns)).not.toContain("private source text");
       expect(backup.aiReviewRuns[0]).toMatchObject({
@@ -290,6 +329,9 @@ describe("full memory backup import/export", () => {
       expect(imported.graph.aiReviewJobs.imported).toBe(1);
       expect(imported.graph.aiReviewRuns.imported).toBe(1);
       expect(imported.graph.aiReviewApplications.imported).toBe(1);
+      expect(imported.graph.knowledgeEvolutions.imported).toBe(1);
+      expect(imported.graph.knowledgeEvolutionSources.imported).toBe(2);
+      expect(imported.graph.knowledgeEvolutionHistory.imported).toBe(1);
       expect(target.db.prepare(
         `SELECT status, lease_owner FROM sb_ai_review_jobs WHERE id = 'job-1'`
       ).get()).toEqual({ status: "applied", lease_owner: null });
@@ -299,6 +341,80 @@ describe("full memory backup import/export", () => {
       expect(target.db.prepare(
         `SELECT reviewability, missing_context_json FROM sb_ai_review_runs WHERE id = 'run-1'`
       ).get()).toEqual({ reviewability: "sufficient", missing_context_json: "[]" });
+      expect(target.db.prepare(
+        `SELECT operation, state FROM sb_knowledge_evolutions WHERE id = 'evolution-1'`
+      ).get()).toEqual({ operation: "keep_separate", state: "active" });
+    } finally {
+      source.db.close();
+      target.db.close();
+    }
+  });
+
+  it("rejects incomplete v18 evolution lineage before importing business rows", async () => {
+    const source = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    const target = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(source.env);
+      await initializeDatabase(target.env);
+      const backup = await exportMemoryBackup(source.env.DB, { source: "test" });
+      const invalid = {
+        ...backup,
+        entries: [{
+          id: "must-not-import-before-evolution-validation",
+          content: "invalid restore must not write this row",
+          tags: "[]",
+          source: "test",
+          created_at: Date.now(),
+          vector_ids: "[]",
+        }],
+        knowledgeEvolutions: [{
+          id: "broken-evolution",
+          ai_review_run_id: "missing-run",
+          candidate_id: "candidate-1",
+          operation: "merge",
+          state: "active",
+          generation: 1,
+          output_entry_id: "missing-entry",
+          output_claim_id: "missing-claim",
+          output_generated: 1,
+          decision_confidence: 1,
+          evidence_confidence: 1,
+          applied_by: "test",
+          applied_at: Date.now(),
+          created_at: Date.now(),
+          updated_at: Date.now(),
+        }],
+      };
+
+      await expect(importMemoryBackup(
+        target.env.DB,
+        invalid as unknown as Record<string, unknown>,
+        { atomic: false }
+      )).rejects.toThrow(/knowledge evolution references a missing AI review run/i);
+      expect(target.db.prepare(
+        `SELECT COUNT(*) AS count FROM entries
+         WHERE id = 'must-not-import-before-evolution-validation'`
+      ).get()).toEqual({ count: 0 });
+    } finally {
+      source.db.close();
+      target.db.close();
+    }
+  });
+
+  it("requires explicit knowledge evolution arrays in v18 backups", async () => {
+    const source = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    const target = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(source.env);
+      await initializeDatabase(target.env);
+      const backup = await exportMemoryBackup(source.env.DB, { source: "test" });
+      const { knowledgeEvolutionSources: _omitted, ...invalid } = backup;
+
+      await expect(importMemoryBackup(
+        target.env.DB,
+        invalid as unknown as Record<string, unknown>,
+        { atomic: false }
+      )).rejects.toThrow(/knowledgeEvolutionSources must be an array/i);
     } finally {
       source.db.close();
       target.db.close();
@@ -791,7 +907,7 @@ describe("full memory backup import/export", () => {
     const backup = await exportResponse.json() as any;
 
     expect(backup.backupFormat).toBe("singularity-memory-backup");
-    expect(backup.schemaVersion).toBe(17);
+    expect(backup.schemaVersion).toBe(18);
     expect(backup.features).toEqual(
       expect.arrayContaining([
         "atomic-memory",
@@ -934,7 +1050,7 @@ describe("full memory backup import/export", () => {
     );
     expect(importResponse.status).toBe(200);
     const imported = await importResponse.json() as any;
-    expect(imported.schemaVersion).toBe(17);
+    expect(imported.schemaVersion).toBe(18);
     expect(imported.inserted).toBe(2);
     expect(imported.graph.scopes.imported).toBe(1);
     expect(imported.graph.parentUnits.imported).toBe(2);
@@ -1049,7 +1165,7 @@ describe("full memory backup import/export", () => {
     );
     expect(legacyImportResponse.status).toBe(200);
     const legacyImported = await legacyImportResponse.json() as any;
-    expect(legacyImported.schemaVersion).toBe(17);
+    expect(legacyImported.schemaVersion).toBe(18);
     expect(legacyImported.graph.factSources.total).toBe(0);
     expect(legacyImported.graph.parentVersionClaims.total).toBe(1);
 
@@ -1068,14 +1184,14 @@ describe("full memory backup import/export", () => {
     const futureImportResponse = await worker.fetch(
       auth("/import", {
         method: "POST",
-        body: JSON.stringify({ ...backup, schemaVersion: 18 }),
+        body: JSON.stringify({ ...backup, schemaVersion: 19 }),
       }),
       legacyRestored.env,
       createExecutionContext()
     );
     expect(futureImportResponse.status).toBe(400);
     const futureImported = await futureImportResponse.json() as any;
-    expect(futureImported.error).toMatch(/schemaVersion 18/);
+    expect(futureImported.error).toMatch(/schemaVersion 19/);
 
     db.close();
     restored.db.close();

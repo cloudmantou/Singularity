@@ -35,6 +35,7 @@ describe("Knowledge Review UI module", () => {
       evidenceRefs: ["OLD", "NEW"],
     }];
     const sourceChannels = ["obsidian"];
+    const refinementRefs = ["OLD", "NEW"];
     const payload = normalizeReviewQueues({
       conflicts: { conflicts: [{ id: "conflict-1" }] },
       entities: { candidates: [{ id: "entity-1" }] },
@@ -52,6 +53,11 @@ describe("Knowledge Review UI module", () => {
           missingContext,
           keyDifferences,
           requiresHuman: true,
+          refinement: {
+            action: "keep_separate",
+            content: null,
+            sourceRefs: refinementRefs,
+          },
         },
       }] },
     });
@@ -69,6 +75,8 @@ describe("Knowledge Review UI module", () => {
     expect(payload.conflicts[0].aiReview.run.keyDifferences).not.toBe(keyDifferences);
     expect(payload.conflicts[0].aiReview.run.keyDifferences[0].evidenceRefs)
       .not.toBe(keyDifferences[0].evidenceRefs);
+    expect(payload.conflicts[0].aiReview.run.refinement.sourceRefs).toEqual(["OLD", "NEW"]);
+    expect(payload.conflicts[0].aiReview.run.refinement.sourceRefs).not.toBe(refinementRefs);
     expect(payload.conflicts[0].aiReview.context.evidence[0].sourceChannels)
       .not.toBe(sourceChannels);
     expect(payload.entities[0].aiReview).toBeNull();
@@ -178,6 +186,8 @@ describe("Knowledge Review UI module", () => {
     expect(reviewHtml).toContain('aria-selected="true"');
     expect(reviewHtml).toContain('role="tabpanel"');
     expect(reviewHtml).toContain('data-i18n-aria="review.refresh"');
+    expect(reviewHtml).toMatch(/value="auto_low_risk"[^>]*selected/);
+    expect(reviewHtml).toContain('id="review-tab-memories" class="review-tab active"');
   });
 
   it("moves review tab focus deterministically without escaping the queue", () => {

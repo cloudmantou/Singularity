@@ -5,6 +5,7 @@ import {
   ensureAIReviewDataModel,
   prepareOrphanAIReviewPurgeStatements,
 } from "./ai-review";
+import { ensureKnowledgeEvolutionDataModel } from "./knowledge-evolution";
 
 const DERIVED_RELATION_TYPES = ["digest_of", "derived_from"] as const;
 const QUERY_BATCH_SIZE = 100;
@@ -108,6 +109,24 @@ async function findDerivedClosure(db: D1Database, rootId: string): Promise<strin
         if (!row.from_memory_id || seen.has(row.from_memory_id)) continue;
         seen.add(row.from_memory_id);
         next.push(row.from_memory_id);
+        if (seen.size > MAX_DELETE_CLOSURE) return null;
+      }
+
+      const derived = await db.prepare(
+        `SELECT DISTINCT evolution.output_entry_id
+         FROM sb_knowledge_evolutions evolution
+         JOIN sb_knowledge_evolution_sources source
+           ON source.evolution_id = evolution.id
+         JOIN sb_memories claim ON claim.id = source.claim_id
+         WHERE evolution.state = 'active'
+           AND evolution.output_generated = 1
+           AND evolution.output_entry_id IS NOT NULL
+           AND claim.entry_id IN (${placeholders(batch.length)})`
+      ).bind(...batch).all<{ output_entry_id: string }>();
+      for (const row of derived.results ?? []) {
+        if (!row.output_entry_id || seen.has(row.output_entry_id)) continue;
+        seen.add(row.output_entry_id);
+        next.push(row.output_entry_id);
         if (seen.size > MAX_DELETE_CLOSURE) return null;
       }
     }
@@ -263,6 +282,101 @@ async function loadAtomicGraphRows(
   };
 }
 
+async function loadImpactedKnowledgeEvolutionIds(
+  db: D1Database,
+  claimIds: string[]
+): Promise<string[]> {
+  const evolutionIds = new Set<string>();
+  for (const batch of chunks(claimIds, QUERY_BATCH_SIZE)) {
+    const inList = placeholders(batch.length);
+    const rows = await db.prepare(
+      `SELECT DISTINCT evolution.id
+       FROM sb_knowledge_evolutions evolution
+       WHERE evolution.output_claim_id IN (${inList})
+          OR EXISTS (
+            SELECT 1 FROM sb_knowledge_evolution_sources source
+            WHERE source.evolution_id = evolution.id
+              AND source.claim_id IN (${inList})
+          )`
+    ).bind(...batch, ...batch).all<{ id: string }>();
+    for (const row of rows.results ?? []) if (row.id) evolutionIds.add(row.id);
+  }
+  return [...evolutionIds];
+}
+
+function prepareKnowledgeEvolutionErase(
+  db: D1Database,
+  evolutionIds: string[],
+  deletingClaimIds: string[]
+): D1PreparedStatement[] {
+  if (evolutionIds.length === 0) return [];
+  const deletingList = placeholders(deletingClaimIds.length);
+  return chunks(evolutionIds, DELETE_BATCH_SIZE).flatMap((batch) => {
+    const evolutionList = placeholders(batch.length);
+    return [
+      db.prepare(
+        `UPDATE sb_memories
+         SET claim_status = (
+               SELECT source.previous_claim_status
+               FROM sb_knowledge_evolution_sources source
+               JOIN sb_knowledge_evolutions evolution ON evolution.id = source.evolution_id
+               WHERE source.claim_id = sb_memories.id
+                 AND source.evolution_id IN (${evolutionList})
+                 AND evolution.state = 'active'
+                 AND source.disposition <> 'retained'
+               ORDER BY source.source_order ASC LIMIT 1
+             ),
+             invalid_at = (
+               SELECT source.previous_invalid_at
+               FROM sb_knowledge_evolution_sources source
+               JOIN sb_knowledge_evolutions evolution ON evolution.id = source.evolution_id
+               WHERE source.claim_id = sb_memories.id
+                 AND source.evolution_id IN (${evolutionList})
+                 AND evolution.state = 'active'
+                 AND source.disposition <> 'retained'
+               ORDER BY source.source_order ASC LIMIT 1
+             )
+         WHERE id NOT IN (${deletingList})
+           AND EXISTS (
+             SELECT 1
+             FROM sb_knowledge_evolution_sources source
+             JOIN sb_knowledge_evolutions evolution ON evolution.id = source.evolution_id
+             WHERE source.claim_id = sb_memories.id
+               AND source.evolution_id IN (${evolutionList})
+               AND evolution.state = 'active'
+               AND source.disposition <> 'retained'
+           )`
+      ).bind(...batch, ...batch, ...deletingClaimIds, ...batch),
+      db.prepare(
+        `DELETE FROM sb_memory_sources
+         WHERE EXISTS (
+           SELECT 1 FROM sb_knowledge_evolutions evolution
+           WHERE evolution.id IN (${evolutionList})
+             AND evolution.operation = 'consolidate'
+             AND evolution.output_claim_id = sb_memory_sources.memory_id
+             AND sb_memory_sources.extractor_model = 'knowledge-evolution'
+             AND sb_memory_sources.extractor_version = 'review:' || evolution.ai_review_run_id
+         )`
+      ).bind(...batch),
+      db.prepare(
+        `DELETE FROM sb_knowledge_evolution_history
+         WHERE evolution_id IN (${evolutionList})`
+      ).bind(...batch),
+      db.prepare(
+        `DELETE FROM sb_knowledge_claim_ownership
+         WHERE evolution_id IN (${evolutionList})`
+      ).bind(...batch),
+      db.prepare(
+        `DELETE FROM sb_knowledge_evolution_sources
+         WHERE evolution_id IN (${evolutionList})`
+      ).bind(...batch),
+      db.prepare(
+        `DELETE FROM sb_knowledge_evolutions WHERE id IN (${evolutionList})`
+      ).bind(...batch),
+    ];
+  });
+}
+
 async function loadClaimVectorIds(
   db: D1Database,
   memoryIds: string[]
@@ -288,6 +402,7 @@ function prepareDatabaseErase(
   ids: string[],
   survivingDigestSources: DigestSourceRow[],
   atomicGraph: AtomicGraphRows,
+  evolutionIds: string[],
   prepareVectorCleanup?: (vectorIds: string[], reason: string) => D1PreparedStatement[],
 ) {
   const unrollStatements = survivingDigestSources.flatMap(row => {
@@ -570,6 +685,7 @@ function prepareDatabaseErase(
   });
   return [
     ...unrollStatements,
+    ...prepareKnowledgeEvolutionErase(db, evolutionIds, atomicGraph.memoryIds),
     ...atomicMemoryStatements,
     ...observationStatements,
     ...eraseStatements,
@@ -586,6 +702,7 @@ export async function forgetMemoryGraph(
   const memoryId = id.trim();
   if (!memoryId) return { status: "not_found" };
   await ensureAIReviewDataModel(db);
+  await ensureKnowledgeEvolutionDataModel(db);
   const root = await loadTrackedEntry(db, memoryId);
   if (!root) return { status: "not_found" };
   try {
@@ -607,6 +724,7 @@ export async function forgetMemoryGraph(
   );
   if (!survivingDigestSources) return { status: "delete_failed" };
   const atomicGraph = await loadAtomicGraphRows(db, [...trackedIds]);
+  const evolutionIds = await loadImpactedKnowledgeEvolutionIds(db, atomicGraph.memoryIds);
   const claimVectorIds = await loadClaimVectorIds(db, atomicGraph.memoryIds);
   if (!claimVectorIds) return { status: "delete_failed" };
 
@@ -663,6 +781,7 @@ export async function forgetMemoryGraph(
         [...trackedIds],
         survivingDigestSources,
         atomicGraph,
+        evolutionIds,
         options.prepareVectorCleanup
       ),
     ]);
