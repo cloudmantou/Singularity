@@ -71,6 +71,7 @@ const MODEL_ROUTES = new Set([
   "GET /recall",
   "POST /quality/ai-review",
   "POST /quality/ai-review/batch",
+  "POST /quality/knowledge-evolution/run",
   "POST /settings/models/test",
 ]);
 const MAINTENANCE_ROUTES = new Set([

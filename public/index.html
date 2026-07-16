@@ -3498,10 +3498,19 @@
                       <option value="auto_low_risk" data-i18n="review.ai.mode.auto_low_risk" selected>自动整理</option>
                     </select>
                   </label>
-                  <button class="review-ai-batch" type="button" data-review-ai-batch><i class="ti ti-sparkles"></i><span data-i18n="review.ai.batch">立即整理 5 项</span></button>
+                  <button class="review-auto-start" type="button" data-review-auto-start><i class="ti ti-player-play"></i><span data-i18n="review.ai.startAutomation">开始自动整理</span></button>
                   <button class="review-refresh" type="button" data-review-refresh data-i18n-title="review.refresh" data-i18n-aria="review.refresh" title="刷新" aria-label="刷新"><i class="ti ti-refresh"></i></button>
                 </div>
               </header>
+              <section class="review-progress" data-review-progress hidden aria-live="polite">
+                <div class="review-progress-copy">
+                  <strong data-review-progress-label data-i18n="review.progress.idle">等待自动整理</strong>
+                  <span data-review-progress-detail></span>
+                </div>
+                <div class="review-progress-track" data-review-progressbar role="progressbar" aria-label="知识进化进度" data-i18n-aria="review.progress.aria" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                  <div class="review-progress-fill" data-review-progress-fill></div>
+                </div>
+              </section>
               <div class="review-tabs" role="tablist" data-i18n-aria="review.queues" aria-label="审核队列">
                 <button id="review-tab-conflicts" class="review-tab" type="button" role="tab" aria-selected="false" aria-controls="review-panel" tabindex="-1" data-review-tab="conflicts"><span data-i18n="review.conflicts">事实冲突</span><span data-review-count>0</span></button>
                 <button id="review-tab-entities" class="review-tab" type="button" role="tab" aria-selected="false" aria-controls="review-panel" tabindex="-1" data-review-tab="entities"><span data-i18n="review.entities">实体合并</span><span data-review-count>0</span></button>

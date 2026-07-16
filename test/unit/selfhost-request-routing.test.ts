@@ -14,6 +14,9 @@ describe("self-host request routing", () => {
     expect(isKnownWorkerRoute("GET", "/quality/ai-review")).toBe(true);
     expect(isKnownWorkerRoute("POST", "/quality/ai-review")).toBe(true);
     expect(isKnownWorkerRoute("POST", "/quality/ai-review/batch")).toBe(true);
+    expect(isKnownWorkerRoute("GET", "/quality/knowledge-evolution/status")).toBe(true);
+    expect(isKnownWorkerRoute("POST", "/quality/knowledge-evolution/status")).toBe(false);
+    expect(isKnownWorkerRoute("POST", "/quality/knowledge-evolution/run")).toBe(true);
     expect(isKnownWorkerRoute("POST", "/quality/ai-review/apply")).toBe(true);
     expect(isKnownWorkerRoute("GET", "/digest")).toBe(false);
     expect(isKnownWorkerRoute("GET", "/digest/preview")).toBe(true);

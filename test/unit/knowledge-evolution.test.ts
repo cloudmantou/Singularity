@@ -5,6 +5,7 @@ import {
   prepareMemoryKnowledgeEvolution,
   rollbackKnowledgeEvolution,
 } from "../../src/memory/knowledge-evolution";
+import { createAssociationEdge, deleteAssociationEdge } from "../../src/memory/associations";
 import { createSelfhostEnv } from "../../src/selfhost/env";
 import { resetSettingsCache } from "../../src/settings/store";
 
@@ -157,6 +158,265 @@ describe("knowledge evolution", () => {
         "evolve-merge-target-observation",
       ]);
       expect(await eligibleClaimIds(db)).toEqual([plan.outputClaimId]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("carries entity, fact, lineage, aggregate, and parent associations into a refined generation", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      await seedCandidate(db, {
+        id: "evolve-linked",
+        sourceContent: "Singularity links claims to durable evidence.",
+        targetContent: "Singularity refines related knowledge into a new generation.",
+      });
+      await seedCandidate(db, {
+        id: "evolve-neighbor",
+        sourceContent: "Obsidian is the human knowledge workspace.",
+        targetContent: "Obsidian projections remain traceable.",
+      });
+      const now = Date.now();
+      db.prepare(
+        `INSERT INTO sb_entities (
+           id, name, name_normalized, entity_type, mention_count,
+           lifecycle_state, created_at, updated_at
+         ) VALUES ('entity-singularity', 'Singularity', 'singularity', 'project', 2,
+                   'active', ?, ?)`
+      ).run(now, now);
+      for (const side of ["source", "target"] as const) {
+        db.prepare(
+          `INSERT INTO sb_memory_entities (id, memory_id, entity_id, role, score, created_at)
+           VALUES (?, ?, 'entity-singularity', 'mentions', 0.98, ?)`
+        ).run(`memory-entity-${side}`, `evolve-linked-${side}-claim`, now);
+      }
+      db.prepare(
+        `INSERT INTO sb_entity_relations (
+           id, from_entity_id, to_entity_id, relation_type, fact, evidence_count,
+           memory_id, score, scope_id, polarity, modality, resolution_type,
+           resolution_state, metadata_json, created_at
+         ) VALUES (
+           'fact-relation', 'entity-singularity', 'entity-singularity', 'preserves',
+           'Singularity preserves evidence lineage', 2,
+           'evolve-linked-source-claim', 0.98, 'project/singularity', 'positive',
+           'asserted', 'supports', 'active', '{}', ?
+         )`
+      ).run(now);
+      for (const side of ["source", "target"] as const) {
+        db.prepare(
+          `INSERT INTO sb_fact_sources (id, relation_id, memory_id, observation_id, created_at)
+           VALUES (?, 'fact-relation', ?, ?, ?)`
+        ).run(
+          `fact-source-${side}`,
+          `evolve-linked-${side}-claim`,
+          `evolve-linked-${side}-observation`,
+          now
+        );
+      }
+      db.prepare(
+        `INSERT INTO sb_knowledge_aggregates (
+           id, aggregate_type, title, source_memory_ids_json, content,
+           generated_at, created_at, updated_at
+         ) VALUES ('aggregate-linked', 'project', 'Singularity', ?, 'Current state', ?, ?, ?)`
+      ).run(JSON.stringify(["evolve-linked-source", "evolve-linked-target"]), now, now, now);
+      await createAssociationEdge(env.DB, {
+        source: "evolve-linked-source",
+        target: "evolve-neighbor-source",
+        edgeType: "part_of_project",
+        provenance: "manual",
+        weight: 0.9,
+        metadata: { origin: "source" },
+        createdAt: now,
+      });
+      await createAssociationEdge(env.DB, {
+        source: "evolve-linked-target",
+        target: "evolve-neighbor-source",
+        edgeType: "part_of_project",
+        provenance: "provider",
+        weight: 0.6,
+        metadata: { origin: "target" },
+        createdAt: now,
+      });
+
+      const reviewedAt = now + 10;
+      const plan = await prepareMemoryKnowledgeEvolution(env.DB, {
+        candidateId: "evolve-linked",
+        aiReviewRunId: "run-linked",
+        decision: "merge",
+        refinementContent: "Singularity refines related claims while preserving durable evidence lineage.",
+        decisionConfidence: 0.99,
+        evidenceConfidence: 0.98,
+        reviewedBy: "ai-review:system",
+        reviewedAt,
+      });
+      await env.DB.batch([
+        env.DB.prepare(
+          `UPDATE sb_memory_merge_candidates
+           SET state = 'accepted', reviewed_by = ?, reviewed_at = ?
+           WHERE id = ? AND state = 'pending'`
+        ).bind("ai-review:system", reviewedAt, "evolve-linked"),
+        ...plan.statements,
+      ]);
+
+      expect(db.prepare(
+        `SELECT entity_id FROM sb_memory_entities WHERE memory_id = ?`
+      ).all(plan.outputClaimId)).toEqual([{ entity_id: "entity-singularity" }]);
+      expect(db.prepare(
+        `SELECT relation_id FROM sb_fact_sources WHERE memory_id = ?`
+      ).all(plan.outputClaimId)).toEqual([{ relation_id: "fact-relation" }]);
+      expect(db.prepare(
+        `SELECT to_memory_id, relation_type
+         FROM sb_memory_relations WHERE from_memory_id = ? ORDER BY to_memory_id`
+      ).all(plan.outputEntryId)).toEqual([
+        { to_memory_id: "evolve-linked-source", relation_type: "derived_from" },
+        { to_memory_id: "evolve-linked-target", relation_type: "derived_from" },
+      ]);
+      expect(db.prepare(
+        `SELECT stale_at FROM sb_knowledge_aggregates WHERE id = 'aggregate-linked'`
+      ).get()).toEqual({ stale_at: reviewedAt });
+      const outputParent = db.prepare(
+        `SELECT pv.parent_id
+         FROM sb_memories memory
+         JOIN sb_parent_versions pv ON pv.version_id = memory.parent_version_id
+         WHERE memory.id = ?`
+      ).get(plan.outputClaimId) as { parent_id: string };
+      const neighborParent = db.prepare(
+        `SELECT pv.parent_id
+         FROM sb_memories memory
+         JOIN sb_parent_versions pv ON pv.version_id = memory.parent_version_id
+         WHERE memory.id = 'evolve-neighbor-source-claim'`
+      ).get() as { parent_id: string };
+      const projectedAssociation = db.prepare(
+        `SELECT edge_type, provenance, weight, metadata_json
+         FROM sb_association_edges
+         WHERE source_parent_id = ? AND target_parent_id = ?`
+      ).get(outputParent.parent_id, neighborParent.parent_id) as {
+        edge_type: string;
+        provenance: string;
+        weight: number;
+        metadata_json: string;
+      };
+      expect(projectedAssociation).toMatchObject({
+        edge_type: "part_of_project",
+        provenance: "system",
+        weight: 0.9,
+      });
+      const associationMetadata = JSON.parse(projectedAssociation.metadata_json) as {
+        sourceEdges: Array<{ provenance: string; weight: number; metadata: { origin: string } }>;
+      };
+      expect(associationMetadata.sourceEdges).toEqual(expect.arrayContaining([
+        expect.objectContaining({ provenance: "manual", weight: 0.9, metadata: { origin: "source" } }),
+        expect.objectContaining({ provenance: "provider", weight: 0.6, metadata: { origin: "target" } }),
+      ]));
+
+      await rollbackKnowledgeEvolution(env.DB, {
+        evolutionId: plan.evolutionId,
+        actorId: "owner",
+        reason: "verify reversible projections",
+        rolledBackAt: reviewedAt + 10,
+      });
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count FROM sb_memory_entities WHERE id LIKE ?`
+      ).get(`knowledge-evolution:${plan.evolutionId}:%`)).toEqual({ count: 0 });
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count FROM sb_fact_sources WHERE id LIKE ?`
+      ).get(`knowledge-evolution:${plan.evolutionId}:%`)).toEqual({ count: 0 });
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count FROM sb_memory_relations WHERE id LIKE ?`
+      ).get(`knowledge-evolution:${plan.evolutionId}:%`)).toEqual({ count: 0 });
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count FROM sb_association_edges WHERE id LIKE ?`
+      ).get(`knowledge-evolution:${plan.evolutionId}:%`)).toEqual({ count: 0 });
+      expect(db.prepare(
+        `SELECT stale_at FROM sb_knowledge_aggregates WHERE id = 'aggregate-linked'`
+      ).get()).toEqual({ stale_at: null });
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count
+         FROM sb_association_edges
+         WHERE deleted_at IS NULL AND edge_type = 'part_of_project'
+           AND (source_parent_id IN (?, ?) OR target_parent_id IN (?, ?))`
+      ).get(
+        "evolve-linked-source-parent",
+        "evolve-linked-target-parent",
+        "evolve-linked-source-parent",
+        "evolve-linked-target-parent"
+      )).toEqual({ count: 2 });
+      expect(await eligibleClaimIds(db)).toContain("evolve-linked-source-claim");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("reactivates a soft-deleted keep-separate association and restores it on rollback", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      await seedCandidate(db, {
+        id: "evolve-soft-edge",
+        sourceContent: "Source and target remain independently useful.",
+        targetContent: "Target and source remain independently useful.",
+      });
+      const now = Date.now();
+      const original = await createAssociationEdge(env.DB, {
+        source: "evolve-soft-edge-source",
+        target: "evolve-soft-edge-target",
+        edgeType: "related_to",
+        provenance: "manual",
+        weight: 0.7,
+        metadata: { origin: "manual" },
+        createdAt: now,
+      });
+      await deleteAssociationEdge(env.DB, {
+        source: "evolve-soft-edge-source",
+        target: "evolve-soft-edge-target",
+        edgeType: "related_to",
+        asOf: now + 1,
+      });
+
+      const reviewedAt = now + 2;
+      const plan = await prepareMemoryKnowledgeEvolution(env.DB, {
+        candidateId: "evolve-soft-edge",
+        aiReviewRunId: "run-soft-edge",
+        decision: "keep_both",
+        refinementContent: null,
+        decisionConfidence: 0.96,
+        evidenceConfidence: 0.95,
+        reviewedBy: "ai-review:system",
+        reviewedAt,
+      });
+      await env.DB.batch([
+        env.DB.prepare(
+          `UPDATE sb_memory_merge_candidates
+           SET state = 'rejected', reviewed_by = ?, reviewed_at = ?
+           WHERE id = ? AND state = 'pending'`
+        ).bind("ai-review:system", reviewedAt, "evolve-soft-edge"),
+        ...plan.statements,
+      ]);
+
+      expect(db.prepare(
+        `SELECT deleted_at, provenance FROM sb_association_edges
+         WHERE source_parent_id = ? AND target_parent_id = ? AND edge_type = 'related_to'`
+      ).get("evolve-soft-edge-source-parent", "evolve-soft-edge-target-parent")).toEqual({
+        deleted_at: null,
+        provenance: "system",
+      });
+
+      await rollbackKnowledgeEvolution(env.DB, {
+        evolutionId: plan.evolutionId,
+        actorId: "owner",
+        reason: "restore prior association state",
+        rolledBackAt: now + 3,
+      });
+      expect(db.prepare(
+        `SELECT id, deleted_at, provenance, metadata_json FROM sb_association_edges
+         WHERE source_parent_id = ? AND target_parent_id = ? AND edge_type = 'related_to'`
+      ).get("evolve-soft-edge-source-parent", "evolve-soft-edge-target-parent")).toEqual({
+        id: original.id,
+        deleted_at: now + 1,
+        provenance: "manual",
+        metadata_json: JSON.stringify({ origin: "manual" }),
+      });
     } finally {
       db.close();
     }

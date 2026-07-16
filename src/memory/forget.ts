@@ -363,6 +363,14 @@ function prepareKnowledgeEvolutionErase(
          WHERE evolution_id IN (${evolutionList})`
       ).bind(...batch),
       db.prepare(
+        `DELETE FROM sb_knowledge_evolution_association_snapshots
+         WHERE evolution_id IN (${evolutionList})`
+      ).bind(...batch),
+      db.prepare(
+        `DELETE FROM sb_knowledge_evolution_aggregate_snapshots
+         WHERE evolution_id IN (${evolutionList})`
+      ).bind(...batch),
+      db.prepare(
         `DELETE FROM sb_knowledge_claim_ownership
          WHERE evolution_id IN (${evolutionList})`
       ).bind(...batch),

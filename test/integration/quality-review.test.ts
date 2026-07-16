@@ -354,10 +354,14 @@ describe("memory quality review queues", () => {
       expect(response.status).toBe(202);
       expect(db.prepare(
         `SELECT state, reviewed_by FROM sb_memory_merge_candidates WHERE id = 'ai-auto'`
-      ).get()).toEqual({ state: "accepted", reviewed_by: "ai-review:system:deterministic" });
+      ).get()).toEqual({ state: "accepted", reviewed_by: "ai-review:owner" });
       expect(db.prepare(
-        `SELECT decision, application_mode FROM sb_ai_review_applications`
-      ).get()).toEqual({ decision: "duplicate", application_mode: "deterministic_auto" });
+        `SELECT decision, application_mode, applied_by FROM sb_ai_review_applications`
+      ).get()).toEqual({
+        decision: "duplicate",
+        application_mode: "deterministic_auto",
+        applied_by: "owner",
+      });
     } finally {
       db.close();
     }

@@ -13,6 +13,20 @@ function services() {
     listAIReviews: vi.fn(async () => []),
     requestAIReview: vi.fn(async () => ({ id: "ai-job-1", status: "queued" })),
     requestAIReviewBatch: vi.fn(async () => ({ jobs: [{ id: "ai-job-1" }] })),
+    getKnowledgeEvolutionStatus: vi.fn(async () => ({
+      runId: "evolution-run-1",
+      state: "running",
+      total: 8,
+      processed: 3,
+      percent: 38,
+    })),
+    startKnowledgeEvolution: vi.fn(async () => ({
+      runId: "evolution-run-1",
+      state: "running",
+      total: 8,
+      processed: 3,
+      percent: 38,
+    })),
     applyAIReview: vi.fn(async () => ({ runId: "ai-run-1", status: "applied" })),
     mapError: vi.fn(() => null),
   };
@@ -131,5 +145,37 @@ describe("quality route module", () => {
     );
     expect(invalid?.status).toBe(400);
     expect(deps.applyAIReview).not.toHaveBeenCalled();
+  });
+
+  it("reports and starts a persisted serial knowledge evolution run", async () => {
+    const deps = services();
+    const status = await handleQualityRoute(
+      new Request("https://memory.example/quality/knowledge-evolution/status"),
+      new URL("https://memory.example/quality/knowledge-evolution/status"),
+      deps
+    );
+    expect(status?.status).toBe(200);
+    expect(await status?.json()).toMatchObject({
+      ok: true,
+      state: "running",
+      total: 8,
+      processed: 3,
+    });
+
+    const started = await handleQualityRoute(
+      new Request("https://memory.example/quality/knowledge-evolution/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      }),
+      new URL("https://memory.example/quality/knowledge-evolution/run"),
+      deps
+    );
+    expect(started?.status).toBe(202);
+    expect(deps.startKnowledgeEvolution).toHaveBeenCalledWith({
+      objectType: null,
+      mode: "auto_low_risk",
+      principal: { id: "owner" },
+    });
   });
 });

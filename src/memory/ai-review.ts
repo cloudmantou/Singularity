@@ -1362,6 +1362,37 @@ function deterministicRecommendation(job: AIReviewJobRecord): AIReviewModelRespo
   };
 }
 
+function contextIsolationRecommendation(job: AIReviewJobRecord): AIReviewModelResponse | null {
+  const [left, right] = job.inputManifest.evidence;
+  if (!left || !right) return null;
+  const differs = (first: string[], second: string[]) =>
+    first.length > 0 && second.length > 0 && stableJson(first) !== stableJson(second);
+  const crossVault = differs(left.vaultIds, right.vaultIds);
+  const crossScope = differs(left.scopeIds, right.scopeIds);
+  if (!crossVault && !crossScope) return null;
+  const refs = [left.ref, right.ref];
+  return {
+    decision: "uncertain",
+    reason: crossVault
+      ? "The evidence belongs to different vaults, so no model review was performed."
+      : "The evidence belongs to different scopes, so no model review was performed.",
+    evidenceRefs: refs,
+    confidence: { decision: 0, evidence: 1 },
+    abstain: true,
+    reviewability: "insufficient",
+    missingContext: [crossVault ? "source_provenance" : "scope_context"],
+    keyDifferences: [{
+      dimension: crossVault ? "source" : "scope",
+      status: "different",
+      summary: crossVault
+        ? "Vault isolation prevents cross-vault automatic review."
+        : "Scope isolation prevents cross-scope automatic review.",
+      evidenceRefs: refs,
+    }],
+    refinement: { action: "none", content: null, sourceRefs: [] },
+  };
+}
+
 export function evaluateAIAutoApplyEligibility(input: {
   objectType: AIReviewObjectType;
   response: AIReviewModelResponse;
@@ -1474,7 +1505,7 @@ export async function processAIReviewJob(
     if (await hashAIReviewSnapshot(currentSnapshot) !== job.inputSnapshotHash) {
       throw new AIReviewObjectUnavailableError(job.objectType, job.objectId);
     }
-    const deterministic = deterministicRecommendation(job);
+    const deterministic = contextIsolationRecommendation(job) ?? deterministicRecommendation(job);
     const refs = currentSnapshot.evidence.map((item) => item.ref);
     const modelResponse = deterministic ?? parseAIReviewModelResponse(
       await reviewer.complete(buildAIReviewMessages({

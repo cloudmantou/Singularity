@@ -1,3 +1,6 @@
+import { ensureAssociationDataModel } from "./associations";
+import { distinctFactEvidenceCountSql } from "./fact-evidence";
+
 export const KNOWLEDGE_EVOLUTION_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS sb_knowledge_evolutions (
     id TEXT PRIMARY KEY,
@@ -56,6 +59,34 @@ export const KNOWLEDGE_EVOLUTION_SCHEMA_STATEMENTS = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_knowledge_evolution_history
    ON sb_knowledge_evolution_history(evolution_id, created_at ASC)`,
+  `CREATE TABLE IF NOT EXISTS sb_knowledge_evolution_association_snapshots (
+    evolution_id TEXT NOT NULL,
+    edge_id TEXT NOT NULL,
+    source_parent_id TEXT NOT NULL,
+    target_parent_id TEXT NOT NULL,
+    edge_type TEXT NOT NULL,
+    weight REAL NOT NULL,
+    provenance TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    directed INTEGER NOT NULL,
+    valid_from INTEGER,
+    valid_to INTEGER,
+    deleted_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (evolution_id, edge_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_knowledge_evolution_association_snapshots_edge
+   ON sb_knowledge_evolution_association_snapshots(edge_id, evolution_id)`,
+  `CREATE TABLE IF NOT EXISTS sb_knowledge_evolution_aggregate_snapshots (
+    evolution_id TEXT NOT NULL,
+    aggregate_id TEXT NOT NULL,
+    previous_stale_at INTEGER,
+    previous_updated_at INTEGER NOT NULL,
+    PRIMARY KEY (evolution_id, aggregate_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_knowledge_evolution_aggregate_snapshots_aggregate
+   ON sb_knowledge_evolution_aggregate_snapshots(aggregate_id, evolution_id)`,
 ] as const;
 
 type MemoryEvolutionDecision = "duplicate" | "merge" | "replace" | "keep_both";
@@ -86,6 +117,7 @@ interface ClaimRow {
   entities_json: string;
   tags: string;
   vault_snapshot: string | null;
+  parent_id: string | null;
 }
 
 interface ProvenanceRow {
@@ -96,6 +128,37 @@ interface ProvenanceRow {
   evidence_score: number | null;
   derivation_confidence: number | null;
   evidence_root_id: string | null;
+}
+
+interface MemoryEntityProjectionRow {
+  entity_id: string;
+  role: string;
+  score: number | null;
+}
+
+interface AssociationProjectionRow {
+  id: string;
+  source_parent_id: string;
+  target_parent_id: string;
+  edge_type: string;
+  weight: number;
+  provenance: string;
+  metadata_json: string;
+  directed: number;
+  valid_from: number | null;
+  valid_to: number | null;
+  created_at: number;
+}
+
+interface GroupedAssociationProjection {
+  sourceParentId: string;
+  targetParentId: string;
+  edgeType: string;
+  weight: number;
+  directed: number;
+  validFrom: number;
+  validTo: number | null;
+  metadata: Record<string, unknown>;
 }
 
 export interface MemoryKnowledgeEvolutionPlan {
@@ -130,6 +193,98 @@ function sameOrNull(first: string | null, second: string | null): string | null 
   return first === second ? first : null;
 }
 
+function projectionId(evolutionId: string, kind: string): string {
+  return `knowledge-evolution:${evolutionId}:${kind}:${crypto.randomUUID()}`;
+}
+
+function parseObject(value: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(value || "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function normalizedAssociationEndpoints(
+  sourceParentId: string,
+  targetParentId: string,
+  directed: number
+): [string, string] {
+  return directed || sourceParentId.localeCompare(targetParentId) <= 0
+    ? [sourceParentId, targetParentId]
+    : [targetParentId, sourceParentId];
+}
+
+function groupAssociationProjections(
+  edges: AssociationProjectionRow[],
+  replacedParents: Set<string>,
+  outputParentId: string,
+  evolutionId: string,
+  generation: number
+): GroupedAssociationProjection[] {
+  const groups = new Map<string, {
+    sourceParentId: string;
+    targetParentId: string;
+    edgeType: string;
+    directed: number;
+    edges: AssociationProjectionRow[];
+  }>();
+  for (const edge of edges) {
+    const sourceReplaced = replacedParents.has(edge.source_parent_id);
+    const targetReplaced = replacedParents.has(edge.target_parent_id);
+    if (!sourceReplaced && !targetReplaced) continue;
+    let nextSource = sourceReplaced ? outputParentId : edge.source_parent_id;
+    let nextTarget = targetReplaced ? outputParentId : edge.target_parent_id;
+    if (nextSource === nextTarget) continue;
+    [nextSource, nextTarget] = normalizedAssociationEndpoints(nextSource, nextTarget, edge.directed);
+    const key = `${nextSource}\u0000${nextTarget}\u0000${edge.edge_type}`;
+    const group = groups.get(key) ?? {
+      sourceParentId: nextSource,
+      targetParentId: nextTarget,
+      edgeType: edge.edge_type,
+      directed: edge.directed,
+      edges: [],
+    };
+    group.edges.push(edge);
+    groups.set(key, group);
+  }
+  return [...groups.values()].map((group) => {
+    const sourceEdges = [...group.edges]
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map((edge) => ({
+        id: edge.id,
+        sourceParentId: edge.source_parent_id,
+        targetParentId: edge.target_parent_id,
+        provenance: edge.provenance,
+        weight: Number(edge.weight),
+        metadata: parseObject(edge.metadata_json),
+        validFrom: Number(edge.valid_from ?? edge.created_at),
+        validTo: edge.valid_to == null ? null : Number(edge.valid_to),
+      }));
+    const validToValues = sourceEdges.map((edge) => edge.validTo);
+    return {
+      sourceParentId: group.sourceParentId,
+      targetParentId: group.targetParentId,
+      edgeType: group.edgeType,
+      weight: Math.max(...sourceEdges.map((edge) => edge.weight)),
+      directed: group.directed,
+      validFrom: Math.min(...sourceEdges.map((edge) => edge.validFrom)),
+      validTo: validToValues.some((value) => value == null)
+        ? null
+        : Math.max(...validToValues.map(Number)),
+      metadata: {
+        evolutionId,
+        generation,
+        evolvedFrom: sourceEdges.map((edge) => edge.id),
+        sourceEdges,
+      },
+    };
+  });
+}
+
 function candidateGuard(): string {
   return `EXISTS (
     SELECT 1 FROM sb_memory_merge_candidates candidate
@@ -151,7 +306,7 @@ function guardBindings(input: {
 
 async function loadClaim(db: D1Database, entryId: string): Promise<ClaimRow | null> {
   return db.prepare(
-    `SELECT m.*, e.tags, pv.vault_snapshot
+    `SELECT m.*, e.tags, pv.vault_snapshot, pv.parent_id
      FROM sb_memories m
      JOIN entries e ON e.id = m.entry_id AND e.content_hash = m.content_hash
      LEFT JOIN sb_parent_versions pv ON pv.version_id = m.parent_version_id
@@ -160,6 +315,49 @@ async function loadClaim(db: D1Database, entryId: string): Promise<ClaimRow | nu
        AND m.invalid_at IS NULL AND m.expired_at IS NULL
      ORDER BY m.created_at DESC, m.id DESC LIMIT 1`
   ).bind(entryId).first<ClaimRow>();
+}
+
+async function loadMemoryEntityProjections(
+  db: D1Database,
+  claimIds: string[]
+): Promise<MemoryEntityProjectionRow[]> {
+  const rows = await db.prepare(
+    `SELECT entity_id, role, MAX(score) AS score
+     FROM sb_memory_entities
+     WHERE memory_id IN (?, ?)
+     GROUP BY entity_id, role
+     ORDER BY entity_id, role`
+  ).bind(claimIds[0], claimIds[1]).all<MemoryEntityProjectionRow>();
+  return rows.results ?? [];
+}
+
+async function loadFactRelationIds(
+  db: D1Database,
+  claimIds: string[]
+): Promise<string[]> {
+  const rows = await db.prepare(
+    `SELECT DISTINCT relation_id FROM sb_fact_sources
+     WHERE memory_id IN (?, ?) ORDER BY relation_id`
+  ).bind(claimIds[0], claimIds[1]).all<{ relation_id: string }>();
+  return (rows.results ?? []).map((row) => row.relation_id);
+}
+
+async function loadAssociationProjections(
+  db: D1Database,
+  parentIds: string[]
+): Promise<AssociationProjectionRow[]> {
+  const usable = [...new Set(parentIds.filter(Boolean))];
+  if (usable.length === 0) return [];
+  const placeholders = usable.map(() => "?").join(", ");
+  const rows = await db.prepare(
+    `SELECT id, source_parent_id, target_parent_id, edge_type, weight, provenance,
+            metadata_json, directed, valid_from, valid_to, created_at
+     FROM sb_association_edges
+     WHERE deleted_at IS NULL
+       AND (source_parent_id IN (${placeholders}) OR target_parent_id IN (${placeholders}))
+     ORDER BY updated_at DESC, id DESC`
+  ).bind(...usable, ...usable).all<AssociationProjectionRow>();
+  return rows.results ?? [];
 }
 
 async function loadProvenance(db: D1Database, claimIds: string[]): Promise<ProvenanceRow[]> {
@@ -184,6 +382,7 @@ async function loadProvenance(db: D1Database, claimIds: string[]): Promise<Prove
 
 export async function ensureKnowledgeEvolutionDataModel(db: D1Database): Promise<void> {
   for (const statement of KNOWLEDGE_EVOLUTION_SCHEMA_STATEMENTS) await db.exec(statement);
+  await ensureAssociationDataModel(db);
 }
 
 export async function prepareMemoryKnowledgeEvolution(
@@ -201,9 +400,13 @@ export async function prepareMemoryKnowledgeEvolution(
 ): Promise<MemoryKnowledgeEvolutionPlan> {
   await ensureKnowledgeEvolutionDataModel(db);
   const candidate = await db.prepare(
-    `SELECT source_memory_id, target_memory_id
+    `SELECT source_memory_id, target_memory_id, similarity
      FROM sb_memory_merge_candidates WHERE id = ? AND state = 'pending'`
-  ).bind(input.candidateId).first<{ source_memory_id: string; target_memory_id: string }>();
+  ).bind(input.candidateId).first<{
+    source_memory_id: string;
+    target_memory_id: string;
+    similarity: number | null;
+  }>();
   if (!candidate) throw new Error("knowledge_evolution_candidate_unavailable");
   const [source, target] = await Promise.all([
     loadClaim(db, candidate.source_memory_id),
@@ -237,6 +440,7 @@ export async function prepareMemoryKnowledgeEvolution(
   const generation = Number(generationRow?.generation ?? 0) + 1;
   const evolutionId = crypto.randomUUID();
   const outputGenerated = input.decision === "merge";
+  const generatedParentId = outputGenerated ? crypto.randomUUID() : null;
   const outputEntryId = outputGenerated ? crypto.randomUUID() : input.decision === "duplicate"
     ? target.entry_id
     : input.decision === "replace"
@@ -286,7 +490,17 @@ export async function prepareMemoryKnowledgeEvolution(
       ? [[source, "absorbed"], [target, "retained"]] as const
       : input.decision === "replace"
         ? [[source, "retained"], [target, "superseded"]] as const
-        : [[source, "retained"], [target, "retained"]] as const;
+      : [[source, "retained"], [target, "retained"]] as const;
+  const sourceClaims = [source.id, target.id];
+  const sourceParents = [source.parent_id, target.parent_id].filter((value): value is string => Boolean(value));
+  const outputParentId = generatedParentId ?? (input.decision === "duplicate"
+    ? target.parent_id
+    : input.decision === "replace" ? source.parent_id : null);
+  const entityProjections = outputClaimId
+    ? await loadMemoryEntityProjections(db, sourceClaims)
+    : [];
+  const factRelationIds = await loadFactRelationIds(db, sourceClaims);
+  const associationProjections = await loadAssociationProjections(db, sourceParents);
   sourceDispositions.forEach(([claim, disposition], index) => {
     statements.push(db.prepare(
       `INSERT INTO sb_knowledge_evolution_sources (
@@ -334,7 +548,7 @@ export async function prepareMemoryKnowledgeEvolution(
                   'knowledge-evolution', ?, ?, ?
            WHERE ${candidateGuard()}`
       ).bind(
-        crypto.randomUUID(),
+        projectionId(evolutionId, "memory-relation"),
         target.id,
         proof.observation_id,
         proof.score,
@@ -353,7 +567,6 @@ export async function prepareMemoryKnowledgeEvolution(
     const content = input.refinementContent?.trim();
     if (!content) throw new Error("knowledge_evolution_refinement_required");
     const contentHash = await sha256(content);
-    const parentId = crypto.randomUUID();
     const parentVersionId = crypto.randomUUID();
     const tags = uniqueJsonValues(source.tags, target.tags);
     const entities = uniqueJsonValues(source.entities_json, target.entities_json);
@@ -377,7 +590,7 @@ export async function prepareMemoryKnowledgeEvolution(
     statements.push(db.prepare(
       `INSERT INTO sb_parent_units (parent_id, active_version_id, scope_id, created_at, updated_at)
        SELECT ?, ?, ?, ?, ? WHERE ${candidateGuard()}`
-    ).bind(parentId, parentVersionId, source.scope_id, input.reviewedAt, input.reviewedAt, ...guard));
+    ).bind(generatedParentId, parentVersionId, source.scope_id, input.reviewedAt, input.reviewedAt, ...guard));
     statements.push(db.prepare(
       `INSERT INTO sb_parent_versions (
          version_id, parent_id, version_number, source_snapshot_hash,
@@ -387,7 +600,7 @@ export async function prepareMemoryKnowledgeEvolution(
          WHERE ${candidateGuard()}`
     ).bind(
       parentVersionId,
-      parentId,
+      generatedParentId,
       contentHash,
       tags,
       source.vault_snapshot,
@@ -454,7 +667,7 @@ export async function prepareMemoryKnowledgeEvolution(
                   'knowledge-evolution', ?, ?, ?
            WHERE ${candidateGuard()}`
       ).bind(
-        crypto.randomUUID(),
+        projectionId(evolutionId, "memory-relation"),
         outputClaimId,
         proof.observation_id,
         proof.score,
@@ -467,6 +680,222 @@ export async function prepareMemoryKnowledgeEvolution(
         ...guard
       ));
     }
+  }
+
+  if (outputEntryId) {
+    const relatedSources = [source, target].filter((claim) => claim.entry_id !== outputEntryId);
+    for (const related of relatedSources) {
+      const relationType = input.decision === "replace" ? "supersedes" : "derived_from";
+      statements.push(db.prepare(
+        `INSERT OR IGNORE INTO sb_memory_relations (
+           id, from_memory_id, to_memory_id, relation_type, score, metadata_json, created_at
+         ) SELECT ?, ?, ?, ?, ?, ?, ? WHERE ${candidateGuard()}`
+      ).bind(
+        projectionId(evolutionId, "memory-relation"),
+        outputEntryId,
+        related.entry_id,
+        relationType,
+        input.decisionConfidence,
+        JSON.stringify({ evolutionId, generation, aiReviewRunId: input.aiReviewRunId }),
+        input.reviewedAt,
+        ...guard
+      ));
+    }
+  } else if (input.decision === "keep_both") {
+    statements.push(db.prepare(
+      `INSERT OR IGNORE INTO sb_memory_relations (
+         id, from_memory_id, to_memory_id, relation_type, score, metadata_json, created_at
+       ) SELECT ?, ?, ?, 'similar', ?, ?, ? WHERE ${candidateGuard()}`
+    ).bind(
+      projectionId(evolutionId, "memory-relation"),
+      source.entry_id,
+      target.entry_id,
+      candidate.similarity ?? input.decisionConfidence,
+      JSON.stringify({ evolutionId, generation, disposition: "keep_separate" }),
+      input.reviewedAt,
+      ...guard
+    ));
+  }
+
+  if (outputClaimId) {
+    for (const entity of entityProjections) {
+      statements.push(db.prepare(
+        `INSERT OR IGNORE INTO sb_memory_entities (
+           id, memory_id, entity_id, role, score, created_at
+         ) SELECT ?, ?, ?, ?, ?, ? WHERE ${candidateGuard()}`
+      ).bind(
+        projectionId(evolutionId, "memory-entity"),
+        outputClaimId,
+        entity.entity_id,
+        entity.role,
+        entity.score,
+        input.reviewedAt,
+        ...guard
+      ));
+    }
+  }
+
+  if (outputClaimId && ["merge", "duplicate"].includes(input.decision)) {
+    for (const relationId of factRelationIds) {
+      statements.push(db.prepare(
+        `INSERT OR IGNORE INTO sb_fact_sources (
+           id, relation_id, memory_id, observation_id, created_at
+         ) SELECT ?, ?, ?, NULL, ? WHERE ${candidateGuard()}`
+      ).bind(
+        projectionId(evolutionId, "fact-source"),
+        relationId,
+        outputClaimId,
+        input.reviewedAt,
+        ...guard
+      ));
+    }
+  }
+
+  const invalidatedClaims = sourceDispositions
+    .filter(([, disposition]) => disposition !== "retained")
+    .map(([claim]) => claim.id);
+  if (invalidatedClaims.length) {
+    const affectedRelations = await loadFactRelationIds(
+      db,
+      invalidatedClaims.length === 1
+        ? [invalidatedClaims[0], invalidatedClaims[0]]
+        : invalidatedClaims
+    );
+    for (const relationId of affectedRelations) {
+      const evidenceCountSql = distinctFactEvidenceCountSql({
+        relationIdSql: "?",
+        activeMemoriesOnly: true,
+        asOf: input.reviewedAt,
+      });
+      statements.push(db.prepare(
+        `UPDATE sb_entity_relations
+         SET evidence_count = MAX(1, ${evidenceCountSql}),
+             resolution_state = CASE WHEN ${evidenceCountSql} = 0
+               THEN 'superseded' ELSE resolution_state END,
+             invalid_at = CASE WHEN ${evidenceCountSql} = 0
+               THEN COALESCE(invalid_at, ?) ELSE invalid_at END
+         WHERE id = ? AND ${candidateGuard()}`
+      ).bind(
+        relationId,
+        relationId,
+        relationId,
+        input.reviewedAt,
+        relationId,
+        ...guard
+      ));
+    }
+  }
+
+  if (outputParentId) {
+    const replacedParents = new Set(sourceDispositions
+      .filter(([, disposition]) => disposition !== "retained")
+      .map(([claim]) => claim.parent_id)
+      .filter((value): value is string => Boolean(value)));
+    const projectedEdges = groupAssociationProjections(
+      associationProjections,
+      replacedParents,
+      outputParentId,
+      evolutionId,
+      generation
+    );
+    for (const edge of projectedEdges) {
+      statements.push(db.prepare(
+        `INSERT OR IGNORE INTO sb_knowledge_evolution_association_snapshots (
+           evolution_id, edge_id, source_parent_id, target_parent_id, edge_type,
+           weight, provenance, metadata_json, directed, valid_from, valid_to,
+           deleted_at, created_at, updated_at
+         ) SELECT ?, id, source_parent_id, target_parent_id, edge_type,
+                  weight, provenance, metadata_json, directed, valid_from, valid_to,
+                  deleted_at, created_at, updated_at
+           FROM sb_association_edges
+          WHERE source_parent_id = ? AND target_parent_id = ? AND edge_type = ?
+            AND ${candidateGuard()}`
+      ).bind(
+        evolutionId,
+        edge.sourceParentId,
+        edge.targetParentId,
+        edge.edgeType,
+        ...guard
+      ));
+      statements.push(db.prepare(
+        `DELETE FROM sb_association_edges
+          WHERE source_parent_id = ? AND target_parent_id = ? AND edge_type = ?
+            AND ${candidateGuard()}`
+      ).bind(edge.sourceParentId, edge.targetParentId, edge.edgeType, ...guard));
+      statements.push(db.prepare(
+        `INSERT INTO sb_association_edges (
+           id, source_parent_id, target_parent_id, edge_type, weight,
+           provenance, metadata_json, directed, valid_from, valid_to,
+           deleted_at, created_at, updated_at
+         ) SELECT ?, ?, ?, ?, ?, 'system', ?, ?, ?, ?, NULL, ?, ?
+           WHERE ${candidateGuard()}`
+      ).bind(
+        projectionId(evolutionId, "association"),
+        edge.sourceParentId,
+        edge.targetParentId,
+        edge.edgeType,
+        edge.weight,
+        JSON.stringify(edge.metadata),
+        edge.directed,
+        edge.validFrom,
+        edge.validTo,
+        input.reviewedAt,
+        input.reviewedAt,
+        ...guard
+      ));
+    }
+  } else if (input.decision === "keep_both" && source.parent_id && target.parent_id) {
+    const [left, right] = normalizedAssociationEndpoints(source.parent_id, target.parent_id, 0);
+    statements.push(db.prepare(
+      `INSERT OR IGNORE INTO sb_knowledge_evolution_association_snapshots (
+         evolution_id, edge_id, source_parent_id, target_parent_id, edge_type,
+         weight, provenance, metadata_json, directed, valid_from, valid_to,
+         deleted_at, created_at, updated_at
+       ) SELECT ?, id, source_parent_id, target_parent_id, edge_type,
+                weight, provenance, metadata_json, directed, valid_from, valid_to,
+                deleted_at, created_at, updated_at
+         FROM sb_association_edges
+        WHERE source_parent_id = ? AND target_parent_id = ? AND edge_type = 'related_to'
+          AND ${candidateGuard()}`
+    ).bind(evolutionId, left, right, ...guard));
+    statements.push(db.prepare(
+      `DELETE FROM sb_association_edges
+        WHERE source_parent_id = ? AND target_parent_id = ? AND edge_type = 'related_to'
+          AND ${candidateGuard()}`
+    ).bind(left, right, ...guard));
+    statements.push(db.prepare(
+      `INSERT INTO sb_association_edges (
+         id, source_parent_id, target_parent_id, edge_type, weight,
+         provenance, metadata_json, directed, valid_from, valid_to,
+         deleted_at, created_at, updated_at
+       ) SELECT ?, ?, ?, 'related_to', ?, 'system', ?, 0, ?, NULL, NULL, ?, ?
+         WHERE ${candidateGuard()}`
+    ).bind(
+      projectionId(evolutionId, "association"),
+      left,
+      right,
+      candidate.similarity ?? input.decisionConfidence,
+      JSON.stringify({ evolutionId, generation, disposition: "keep_separate" }),
+      input.reviewedAt,
+      input.reviewedAt,
+      input.reviewedAt,
+      ...guard
+    ));
+  }
+
+  for (const entryId of [source.entry_id, target.entry_id]) {
+    statements.push(db.prepare(
+      `INSERT OR IGNORE INTO sb_knowledge_evolution_aggregate_snapshots (
+         evolution_id, aggregate_id, previous_stale_at, previous_updated_at
+       ) SELECT ?, id, stale_at, updated_at
+           FROM sb_knowledge_aggregates
+          WHERE source_memory_ids_json LIKE ? AND ${candidateGuard()}`
+    ).bind(evolutionId, `%"${entryId}"%`, ...guard));
+    statements.push(db.prepare(
+      `UPDATE sb_knowledge_aggregates
+       SET stale_at = COALESCE(stale_at, ?), updated_at = ?
+       WHERE source_memory_ids_json LIKE ? AND ${candidateGuard()}`
+    ).bind(input.reviewedAt, input.reviewedAt, `%"${entryId}"%`, ...guard));
   }
   statements.push(db.prepare(
     `INSERT INTO sb_knowledge_evolution_history (
@@ -523,6 +952,13 @@ export async function rollbackKnowledgeEvolution(
     previous_invalid_at: number | null;
   }>();
   const rolledBackAt = input.rolledBackAt ?? Date.now();
+  const projectedFactRelations = await db.prepare(
+    `SELECT DISTINCT fact.relation_id
+     FROM sb_knowledge_evolution_sources source
+     JOIN sb_fact_sources fact ON fact.memory_id = source.claim_id
+     WHERE source.evolution_id = ?
+     ORDER BY fact.relation_id`
+  ).bind(evolution.id).all<{ relation_id: string }>();
   const statements: D1PreparedStatement[] = [
     db.prepare(
       `UPDATE sb_knowledge_evolutions
@@ -582,6 +1018,111 @@ export async function rollbackKnowledgeEvolution(
     ).bind(
       evolution.output_claim_id,
       `review:${evolution.ai_review_run_id}`,
+      evolution.id,
+      rolledBackAt
+    ));
+  }
+  statements.push(
+    db.prepare(
+      `DELETE FROM sb_memory_entities
+       WHERE id LIKE ?
+         AND EXISTS (
+           SELECT 1 FROM sb_knowledge_evolutions
+           WHERE id = ? AND state = 'rolled_back' AND rolled_back_at = ?
+         )`
+    ).bind(`knowledge-evolution:${evolution.id}:memory-entity:%`, evolution.id, rolledBackAt),
+    db.prepare(
+      `DELETE FROM sb_fact_sources
+       WHERE id LIKE ?
+         AND EXISTS (
+           SELECT 1 FROM sb_knowledge_evolutions
+           WHERE id = ? AND state = 'rolled_back' AND rolled_back_at = ?
+         )`
+    ).bind(`knowledge-evolution:${evolution.id}:fact-source:%`, evolution.id, rolledBackAt),
+    db.prepare(
+      `DELETE FROM sb_memory_relations
+       WHERE id LIKE ?
+         AND EXISTS (
+           SELECT 1 FROM sb_knowledge_evolutions
+           WHERE id = ? AND state = 'rolled_back' AND rolled_back_at = ?
+         )`
+    ).bind(`knowledge-evolution:${evolution.id}:memory-relation:%`, evolution.id, rolledBackAt),
+    db.prepare(
+      `DELETE FROM sb_association_edges
+       WHERE id LIKE ?
+         AND EXISTS (
+           SELECT 1 FROM sb_knowledge_evolutions
+           WHERE id = ? AND state = 'rolled_back' AND rolled_back_at = ?
+         )`
+    ).bind(`knowledge-evolution:${evolution.id}:association:%`, evolution.id, rolledBackAt)
+  );
+  statements.push(db.prepare(
+    `INSERT INTO sb_association_edges (
+       id, source_parent_id, target_parent_id, edge_type, weight,
+       provenance, metadata_json, directed, valid_from, valid_to,
+       deleted_at, created_at, updated_at
+     )
+     SELECT snapshot.edge_id, snapshot.source_parent_id, snapshot.target_parent_id,
+            snapshot.edge_type, snapshot.weight, snapshot.provenance,
+            snapshot.metadata_json, snapshot.directed, snapshot.valid_from,
+            snapshot.valid_to, snapshot.deleted_at, snapshot.created_at,
+            snapshot.updated_at
+       FROM sb_knowledge_evolution_association_snapshots snapshot
+      WHERE snapshot.evolution_id = ?
+        AND EXISTS (
+          SELECT 1 FROM sb_knowledge_evolutions
+          WHERE id = ? AND state = 'rolled_back' AND rolled_back_at = ?
+        )`
+  ).bind(evolution.id, evolution.id, rolledBackAt));
+  statements.push(db.prepare(
+    `UPDATE sb_knowledge_aggregates
+        SET stale_at = (
+              SELECT snapshot.previous_stale_at
+                FROM sb_knowledge_evolution_aggregate_snapshots snapshot
+               WHERE snapshot.evolution_id = ? AND snapshot.aggregate_id = sb_knowledge_aggregates.id
+            ),
+            updated_at = (
+              SELECT snapshot.previous_updated_at
+                FROM sb_knowledge_evolution_aggregate_snapshots snapshot
+               WHERE snapshot.evolution_id = ? AND snapshot.aggregate_id = sb_knowledge_aggregates.id
+            )
+      WHERE id IN (
+              SELECT aggregate_id FROM sb_knowledge_evolution_aggregate_snapshots
+               WHERE evolution_id = ?
+            )
+        AND EXISTS (
+          SELECT 1 FROM sb_knowledge_evolutions
+          WHERE id = ? AND state = 'rolled_back' AND rolled_back_at = ?
+        )`
+  ).bind(evolution.id, evolution.id, evolution.id, evolution.id, rolledBackAt));
+  for (const relation of projectedFactRelations.results ?? []) {
+    const evidenceCountSql = distinctFactEvidenceCountSql({
+      relationIdSql: "?",
+      activeMemoriesOnly: true,
+      asOf: rolledBackAt,
+      floorAtOne: true,
+    });
+    statements.push(db.prepare(
+      `UPDATE sb_entity_relations
+       SET evidence_count = ${evidenceCountSql},
+           resolution_state = CASE
+             WHEN resolution_state = 'superseded' AND invalid_at = ? THEN 'active'
+             ELSE resolution_state
+           END,
+           invalid_at = CASE
+             WHEN resolution_state = 'superseded' AND invalid_at = ? THEN NULL
+             ELSE invalid_at
+           END
+       WHERE id = ?
+         AND EXISTS (
+           SELECT 1 FROM sb_knowledge_evolutions
+           WHERE id = ? AND state = 'rolled_back' AND rolled_back_at = ?
+         )`
+    ).bind(
+      relation.relation_id,
+      evolution.applied_at,
+      evolution.applied_at,
+      relation.relation_id,
       evolution.id,
       rolledBackAt
     ));

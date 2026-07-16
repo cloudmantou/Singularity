@@ -749,6 +749,80 @@ CREATE TABLE IF NOT EXISTS sb_knowledge_evolution_history (
 CREATE INDEX IF NOT EXISTS idx_knowledge_evolution_history
   ON sb_knowledge_evolution_history(evolution_id, created_at ASC);
 
+CREATE TABLE IF NOT EXISTS sb_knowledge_evolution_association_snapshots (
+  evolution_id TEXT NOT NULL,
+  edge_id TEXT NOT NULL,
+  source_parent_id TEXT NOT NULL,
+  target_parent_id TEXT NOT NULL,
+  edge_type TEXT NOT NULL,
+  weight REAL NOT NULL,
+  provenance TEXT NOT NULL,
+  metadata_json TEXT NOT NULL,
+  directed INTEGER NOT NULL,
+  valid_from INTEGER,
+  valid_to INTEGER,
+  deleted_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (evolution_id, edge_id)
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_evolution_association_snapshots_edge
+  ON sb_knowledge_evolution_association_snapshots(edge_id, evolution_id);
+
+CREATE TABLE IF NOT EXISTS sb_knowledge_evolution_aggregate_snapshots (
+  evolution_id TEXT NOT NULL,
+  aggregate_id TEXT NOT NULL,
+  previous_stale_at INTEGER,
+  previous_updated_at INTEGER NOT NULL,
+  PRIMARY KEY (evolution_id, aggregate_id)
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_evolution_aggregate_snapshots_aggregate
+  ON sb_knowledge_evolution_aggregate_snapshots(aggregate_id, evolution_id);
+
+CREATE TABLE IF NOT EXISTS sb_knowledge_evolution_runs (
+  id TEXT PRIMARY KEY,
+  state TEXT NOT NULL,
+  object_type TEXT,
+  mode TEXT NOT NULL DEFAULT 'auto_low_risk',
+  requested_by TEXT NOT NULL,
+  total_items INTEGER NOT NULL DEFAULT 0,
+  processed_items INTEGER NOT NULL DEFAULT 0,
+  applied_items INTEGER NOT NULL DEFAULT 0,
+  skipped_items INTEGER NOT NULL DEFAULT 0,
+  failed_items INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  started_at INTEGER NOT NULL,
+  completed_at INTEGER,
+  updated_at INTEGER NOT NULL,
+  CHECK (state IN ('running', 'completed')),
+  CHECK (object_type IS NULL OR object_type IN (
+    'conflict_case', 'entity_merge_candidate', 'memory_merge_candidate'
+  ))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_evolution_single_running
+  ON sb_knowledge_evolution_runs(state) WHERE state = 'running';
+CREATE INDEX IF NOT EXISTS idx_knowledge_evolution_runs_recent
+  ON sb_knowledge_evolution_runs(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS sb_knowledge_evolution_run_items (
+  run_id TEXT NOT NULL,
+  object_type TEXT NOT NULL,
+  object_id TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'queued',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  worker_id TEXT,
+  lease_expires_at INTEGER,
+  error_code TEXT,
+  source_created_at INTEGER NOT NULL,
+  started_at INTEGER,
+  completed_at INTEGER,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (run_id, object_type, object_id),
+  CHECK (state IN ('queued', 'processing', 'applied', 'skipped', 'failed'))
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_evolution_run_items_queue
+  ON sb_knowledge_evolution_run_items(run_id, state, source_created_at, object_id);
+
 -- Entity + temporal fact graph
 CREATE TABLE IF NOT EXISTS sb_entities (
   id TEXT PRIMARY KEY,

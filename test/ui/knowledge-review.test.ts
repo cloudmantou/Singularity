@@ -156,7 +156,7 @@ describe("Knowledge Review UI module", () => {
     expect(JSON.parse(String(fetchImpl.mock.calls[1][1].body))).toEqual({ runId: "ai-run-1" });
   });
 
-  it("preserves shadow and low-risk modes for single and batch review requests", async () => {
+  it("starts and polls automatic evolution without a fixed batch size", async () => {
     const fetchImpl = vi.fn(async (_url: string, _init: RequestInit) => ({
       ok: true,
       status: 202,
@@ -169,14 +169,13 @@ describe("Knowledge Review UI module", () => {
     });
 
     await api.requestAIReview("entity_merge_candidate", "entity-1", "shadow");
-    await api.requestAIReviewBatch("memory_merge_candidate", "auto_low_risk", 5);
+    await api.startKnowledgeEvolution();
+    await api.getKnowledgeEvolutionStatus();
 
     expect(JSON.parse(String(fetchImpl.mock.calls[0][1].body))).toMatchObject({ mode: "shadow" });
-    expect(JSON.parse(String(fetchImpl.mock.calls[1][1].body))).toMatchObject({
-      objectType: "memory_merge_candidate",
-      mode: "auto_low_risk",
-      limit: 5,
-    });
+    expect(fetchImpl.mock.calls[1][0]).toContain("/quality/knowledge-evolution/run");
+    expect(JSON.parse(String(fetchImpl.mock.calls[1][1].body))).toEqual({ mode: "auto_low_risk" });
+    expect(fetchImpl.mock.calls[2][0]).toContain("/quality/knowledge-evolution/status");
   });
 
   it("keeps the review queue keyboard navigable and browser zoom available", () => {
@@ -188,6 +187,9 @@ describe("Knowledge Review UI module", () => {
     expect(reviewHtml).toContain('data-i18n-aria="review.refresh"');
     expect(reviewHtml).toMatch(/value="auto_low_risk"[^>]*selected/);
     expect(reviewHtml).toContain('id="review-tab-memories" class="review-tab active"');
+    expect(reviewHtml).toContain('role="progressbar"');
+    expect(reviewHtml).toContain("data-review-progress-fill");
+    expect(reviewHtml).not.toContain("立即整理 5 项");
   });
 
   it("moves review tab focus deterministically without escaping the queue", () => {

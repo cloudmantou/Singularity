@@ -501,6 +501,59 @@ describe("AI-assisted Knowledge Review", () => {
     }
   });
 
+  it("blocks cross-vault evidence before any model content is sent", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      const now = Date.now();
+      db.prepare(
+        `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, content_hash)
+         VALUES ('vault-a-entry', 'Vault A fact', '[]', 'obsidian', ?, '[]', 'vault-a-hash'),
+                ('vault-b-entry', 'Vault B fact', '[]', 'obsidian', ?, '[]', 'vault-b-hash')`
+      ).run(now, now);
+      db.prepare(
+        `INSERT INTO sb_external_links (
+           id, provider, vault_id, external_path, object_type, object_id,
+           entry_id, sync_status, created_at, updated_at
+         ) VALUES
+           ('vault-a-link', 'obsidian', 'vault-a', 'a.md', 'memory', 'vault-a-entry',
+            'vault-a-entry', 'synced', ?, ?),
+           ('vault-b-link', 'obsidian', 'vault-b', 'b.md', 'memory', 'vault-b-entry',
+            'vault-b-entry', 'synced', ?, ?)`
+      ).run(now, now, now, now);
+      db.prepare(
+        `INSERT INTO sb_memory_merge_candidates (
+           id, source_memory_id, target_memory_id, similarity,
+           suggested_action, state, created_at
+         ) VALUES ('cross-vault-review', 'vault-a-entry', 'vault-b-entry', 0.9,
+                   'merge', 'pending', ?)`
+      ).run(now);
+      const job = await enqueueAIReviewJob(env.DB, {
+        objectType: "memory_merge_candidate",
+        objectId: "cross-vault-review",
+        mode: "auto_low_risk",
+        requestedBy: "owner",
+      });
+      const complete = vi.fn(async () => "model must not receive cross-vault content");
+      const result = await processAIReviewJob(env.DB, job.id, {
+        provider: "test",
+        model: "reviewer-v1",
+        complete,
+      });
+
+      expect(complete).not.toHaveBeenCalled();
+      expect(result.run).toMatchObject({
+        decision: "uncertain",
+        abstain: true,
+        requiresHuman: true,
+        autoApplyEligible: false,
+        reviewerProvider: "rules",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
   it("uses deterministic exact-hash review for auto_low_risk without calling the model", async () => {
     const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
     try {

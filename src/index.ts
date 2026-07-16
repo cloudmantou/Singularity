@@ -186,6 +186,12 @@ import {
 } from "./memory/ai-review";
 import { prepareMemoryKnowledgeEvolution } from "./memory/knowledge-evolution";
 import {
+  claimNextKnowledgeEvolutionItem,
+  completeKnowledgeEvolutionItem,
+  getKnowledgeEvolutionAutomationStatus,
+  startKnowledgeEvolutionAutomation,
+} from "./memory/knowledge-evolution-automation";
+import {
   prepareMemoryRevision,
   type MemoryRevisionEvent,
 } from "./memory/revisions";
@@ -8066,7 +8072,7 @@ async function runScheduledMaintenance(env: Env, ctx: ExecutionContext): Promise
 
   if ((env.KNOWLEDGE_REVIEW_AUTOMATION ?? "auto").trim().toLowerCase() !== "off") {
     try {
-      await runAutomaticKnowledgeReview(env, env.SELFHOST === "1" ? 10 : 3);
+      await runAutomaticKnowledgeReview(env);
     } catch (e) {
       console.error("Automatic Knowledge Evolution failed (non-fatal):", e);
     }
@@ -11268,6 +11274,7 @@ async function applyAIReviewRecommendation(
   input: {
     principal?: AuthPrincipal;
     deterministicAuto?: boolean;
+    automationActorId?: string;
   }
 ): Promise<Record<string, unknown>> {
   const run = await getAIReviewRun(env.DB, runId);
@@ -11285,12 +11292,14 @@ async function applyAIReviewRecommendation(
   const claimed = await claimAIReviewApplication(env.DB, runId);
   const actor = input.principal ? auditActorFromPrincipal(input.principal) : {
     actorType: "system",
-    actorId: "ai-review-rules",
+    actorId: input.automationActorId ?? "system:knowledge-evolution",
     tokenId: null,
     vaultId: null,
   };
   const appliedBy = input.deterministicAuto
-    ? run.reviewerProvider === "rules" ? "system:deterministic" : "system:guarded-ai"
+    ? input.automationActorId ?? (
+        run.reviewerProvider === "rules" ? "system:deterministic" : "system:guarded-ai"
+      )
     : actor.actorId ?? "owner";
   const applicationMode = input.deterministicAuto ? "deterministic_auto" : "human";
   const reviewedAt = Date.now();
@@ -11430,12 +11439,22 @@ async function applyAIReviewRecommendation(
   }
 }
 
+async function processAIReviewForAutomation(env: Env, jobId: string): Promise<boolean> {
+  const result = await processAIReviewJob(env.DB, jobId, await createAIReviewModel(env));
+  if (result.job.status === "applied") return true;
+  if (result.run.autoApplyEligible && result.run.mode === "auto_low_risk") {
+    await applyAIReviewRecommendation(env, result.run.id, {
+      deterministicAuto: true,
+      automationActorId: result.job.requestedBy,
+    });
+    return true;
+  }
+  return false;
+}
+
 async function processAIReviewInBackground(env: Env, jobId: string): Promise<void> {
   try {
-    const result = await processAIReviewJob(env.DB, jobId, await createAIReviewModel(env));
-    if (result.run.autoApplyEligible && result.run.mode === "auto_low_risk") {
-      await applyAIReviewRecommendation(env, result.run.id, { deterministicAuto: true });
-    }
+    await processAIReviewForAutomation(env, jobId);
   } catch (error) {
     console.error("AI Knowledge Review job failed", {
       jobId,
@@ -11444,15 +11463,59 @@ async function processAIReviewInBackground(env: Env, jobId: string): Promise<voi
   }
 }
 
-async function runAutomaticKnowledgeReview(env: Env, limit: number): Promise<void> {
-  const targets = await pendingAIReviewTargets(env.DB, null, limit);
-  for (const target of targets) {
-    const job = await enqueueAIReviewJob(env.DB, {
-      ...target,
-      mode: "auto_low_risk",
-      requestedBy: "system:knowledge-evolution",
+async function runKnowledgeEvolutionAutomation(env: Env, runId: string): Promise<void> {
+  const workerId = crypto.randomUUID();
+  const run = await getKnowledgeEvolutionAutomationStatus(env.DB);
+  if (run.runId !== runId || run.state !== "running") return;
+  const deadline = Date.now() + (env.SELFHOST === "1" ? 5 * 60_000 : 20_000);
+  while (Date.now() < deadline) {
+    const target = await claimNextKnowledgeEvolutionItem(env.DB, {
+      runId,
+      workerId,
+      leaseMs: 5 * 60_000,
     });
-    if (job.status === "queued") await processAIReviewInBackground(env, job.id);
+    if (!target) return;
+    let outcome: "applied" | "skipped" | "failed" = "skipped";
+    let errorCode: string | null = null;
+    try {
+      const job = await enqueueAIReviewJob(env.DB, {
+        ...target,
+        mode: run.mode,
+        requestedBy: run.requestedBy ?? "system:knowledge-evolution",
+      });
+      outcome = await processAIReviewForAutomation(env, job.id) ? "applied" : "skipped";
+    } catch (error) {
+      if (error instanceof AIReviewObjectUnavailableError) {
+        outcome = "skipped";
+      } else {
+        outcome = "failed";
+        errorCode = (error instanceof Error ? error.message : String(error)).slice(0, 256);
+        console.error("Automatic Knowledge Evolution item failed", {
+          runId,
+          objectType: target.objectType,
+          objectId: target.objectId,
+          error: errorCode,
+        });
+      }
+    }
+    await completeKnowledgeEvolutionItem(env.DB, {
+      runId,
+      objectType: target.objectType,
+      objectId: target.objectId,
+      workerId,
+      outcome,
+      error: errorCode,
+    });
+  }
+}
+
+async function runAutomaticKnowledgeReview(env: Env): Promise<void> {
+  const status = await startKnowledgeEvolutionAutomation(env.DB, {
+    requestedBy: "system:knowledge-evolution",
+    mode: "auto_low_risk",
+  });
+  if (status.state === "running" && status.runId) {
+    await runKnowledgeEvolutionAutomation(env, status.runId);
   }
 }
 
@@ -11516,6 +11579,21 @@ function createQualityRouteServices(
         if (job.status === "queued") ctx.waitUntil(processAIReviewInBackground(env, job.id));
       }
       return { count: jobs.length, jobs };
+    },
+    getKnowledgeEvolutionStatus: async () => (
+      await getKnowledgeEvolutionAutomationStatus(env.DB)
+    ) as unknown as Record<string, unknown>,
+    startKnowledgeEvolution: async (input) => {
+      const actor = auditActorFromPrincipal(input.principal);
+      const status = await startKnowledgeEvolutionAutomation(env.DB, {
+        requestedBy: actor.actorId ?? "owner",
+        objectType: input.objectType,
+        mode: input.mode,
+      });
+      if (status.state === "running" && status.runId) {
+        ctx.waitUntil(runKnowledgeEvolutionAutomation(env, status.runId));
+      }
+      return status as unknown as Record<string, unknown>;
     },
     applyAIReview: (input) => applyAIReviewRecommendation(env, input.runId, {
       principal: input.principal,

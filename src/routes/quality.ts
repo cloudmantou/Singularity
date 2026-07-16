@@ -61,6 +61,14 @@ export interface QualityRouteServices<Principal> {
     mode: AIReviewMode;
     principal: Principal;
   }): Promise<Record<string, unknown>>;
+  getKnowledgeEvolutionStatus(input: {
+    principal: Principal;
+  }): Promise<Record<string, unknown>>;
+  startKnowledgeEvolution(input: {
+    objectType: AIReviewObjectType | null;
+    mode: AIReviewMode;
+    principal: Principal;
+  }): Promise<Record<string, unknown>>;
   applyAIReview(input: {
     runId: string;
     principal: Principal;
@@ -102,6 +110,11 @@ const AIReviewBatchSchema = z.object({
 
 const AIReviewApplySchema = z.object({
   runId: z.string().trim().min(1).max(256),
+}).strict();
+
+const KnowledgeEvolutionRunSchema = z.object({
+  objectType: z.enum(AI_REVIEW_OBJECT_TYPES).optional(),
+  mode: z.enum(AI_REVIEW_MODES).default("auto_low_risk"),
 }).strict();
 
 function json(data: unknown, status = 200): Response {
@@ -273,6 +286,25 @@ async function aiReviewRoute<Principal>(
   }
 }
 
+async function knowledgeEvolutionRoute<Principal>(
+  request: Request,
+  url: URL,
+  principal: Principal,
+  services: QualityRouteServices<Principal>
+): Promise<Response> {
+  if (url.pathname === "/quality/knowledge-evolution/status") {
+    return json({ ok: true, ...await services.getKnowledgeEvolutionStatus({ principal }) });
+  }
+  const parsed = KnowledgeEvolutionRunSchema.safeParse(await readJson(request));
+  if (!parsed.success) return json({ ok: false, error: "invalid_knowledge_evolution_run" }, 400);
+  const result = await services.startKnowledgeEvolution({
+    objectType: parsed.data.objectType ?? null,
+    mode: parsed.data.mode,
+    principal,
+  });
+  return json({ ok: true, ...result }, 202);
+}
+
 export async function handleQualityRoute<Principal>(
   request: Request,
   url: URL,
@@ -288,10 +320,16 @@ export async function handleQualityRoute<Principal>(
     "/quality/ai-review",
     "/quality/ai-review/batch",
     "/quality/ai-review/apply",
+    "/quality/knowledge-evolution/status",
+    "/quality/knowledge-evolution/run",
   ]);
   if (!routes.has(url.pathname)) return null;
   const expectedMethod = url.pathname === "/quality/ai-review"
     ? null
+    : url.pathname === "/quality/knowledge-evolution/status"
+      ? "GET"
+      : url.pathname === "/quality/knowledge-evolution/run"
+        ? "POST"
     : url.pathname.endsWith("/resolve") || url.pathname.endsWith("/batch") || url.pathname.endsWith("/apply")
       ? "POST"
       : "GET";
@@ -303,6 +341,9 @@ export async function handleQualityRoute<Principal>(
   }
   const auth = services.authenticate(request);
   if (!auth.ok) return auth.response;
+  if (url.pathname.startsWith("/quality/knowledge-evolution/")) {
+    return knowledgeEvolutionRoute(request, url, auth.principal, services);
+  }
   if (url.pathname.startsWith("/quality/ai-review")) {
     return aiReviewRoute(request, url, auth.principal, services);
   }

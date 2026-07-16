@@ -151,13 +151,15 @@
           body: JSON.stringify({ objectType, objectId, mode: mode || "suggest" }),
         });
       },
-      requestAIReviewBatch(objectType, mode, limit) {
-        return request("/quality/ai-review/batch", {
+      getKnowledgeEvolutionStatus() {
+        return request("/quality/knowledge-evolution/status");
+      },
+      startKnowledgeEvolution(objectType, mode) {
+        return request("/quality/knowledge-evolution/run", {
           method: "POST",
           body: JSON.stringify({
             ...(objectType ? { objectType } : {}),
-            mode: mode || "suggest",
-            limit: limit || 5,
+            mode: mode || "auto_low_risk",
           }),
         });
       },
@@ -386,7 +388,13 @@
     const root = options.root;
     const api = options.api;
     const t = options.t || ((key) => key);
-    let state = { active: "memories", busyId: null, queues: normalizeReviewQueues({}) };
+    let state = {
+      active: "memories",
+      busyId: null,
+      queues: normalizeReviewQueues({}),
+      automation: { state: "idle", total: 0, processed: 0, applied: 0, skipped: 0, failed: 0, percent: 0 },
+    };
+    let automationPollScheduled = false;
 
     function currentMode() {
       const value = String(root.querySelector("[data-review-ai-mode]")?.value || "auto_low_risk");
@@ -506,6 +514,40 @@
       }
     }
 
+    function renderAutomationProgress() {
+      const progress = root.querySelector("[data-review-progress]");
+      const bar = root.querySelector("[data-review-progressbar]");
+      const fill = root.querySelector("[data-review-progress-fill]");
+      const label = root.querySelector("[data-review-progress-label]");
+      const detail = root.querySelector("[data-review-progress-detail]");
+      const start = root.querySelector("[data-review-auto-start]");
+      if (!progress || !bar || !fill || !label || !detail) return;
+      const automation = state.automation || {};
+      const value = Math.max(0, Math.min(100, Number(automation.percent) || 0));
+      progress.hidden = automation.state === "idle" && Number(automation.total || 0) === 0;
+      bar.setAttribute("aria-valuenow", String(value));
+      bar.setAttribute("aria-valuetext", `${Number(automation.processed || 0)} / ${Number(automation.total || 0)}`);
+      fill.style.width = `${value}%`;
+      label.textContent = automation.state === "running"
+        ? t("review.progress.running", { done: automation.processed || 0, total: automation.total || 0 })
+        : t("review.progress.completed", { total: automation.total || 0 });
+      const currentType = automation.current && automation.current.objectType;
+      detail.textContent = automation.state === "running" && currentType
+        ? t("review.progress.current", { type: t(`review.progress.type.${currentType}`) })
+        : t("review.progress.summary", {
+          applied: automation.applied || 0,
+          skipped: automation.skipped || 0,
+          failed: automation.failed || 0,
+        });
+      if (start) {
+        start.disabled = automation.state === "running" || Boolean(state.busyId);
+        const text = start.querySelector("span");
+        if (text) text.textContent = automation.state === "running"
+          ? t("review.ai.running")
+          : t("review.ai.startAutomation");
+      }
+    }
+
     function setStatus(message, kind) {
       const target = root.querySelector("[data-review-status]");
       if (!target) return;
@@ -515,18 +557,21 @@
 
     function render() {
       renderTabs();
+      renderAutomationProgress();
       renderList();
     }
 
     async function load() {
       setStatus(t("review.loading"), "loading");
       try {
-        const [queues, aiReviews] = await Promise.all([
+        const [queues, aiReviews, automation] = await Promise.all([
           api.loadQueues(),
           api.loadAIReviews(),
+          api.getKnowledgeEvolutionStatus(),
         ]);
         state = {
           ...state,
+          automation,
           queues: normalizeReviewQueues({
             conflicts: { conflicts: queues.conflicts },
             entities: { candidates: queues.entities },
@@ -536,9 +581,32 @@
         };
         render();
         setStatus(t("review.ready", { n: state.queues.counts.total }), "ready");
+        if (automation.state === "running") scheduleAutomationRefresh();
       } catch (_) {
         setStatus(t("review.error"), "error");
       }
+    }
+
+    function scheduleAutomationRefresh() {
+      if (automationPollScheduled) return;
+      const schedule = options.schedule || global.setTimeout;
+      if (typeof schedule !== "function") return;
+      automationPollScheduled = true;
+      schedule(async () => {
+        automationPollScheduled = false;
+        try {
+          const automation = await api.getKnowledgeEvolutionStatus();
+          state = { ...state, automation };
+          renderAutomationProgress();
+          if (automation.state === "running") {
+            scheduleAutomationRefresh();
+          } else {
+            await load();
+          }
+        } catch (_) {
+          setStatus(t("review.progress.error"), "error");
+        }
+      }, 1_000);
     }
 
     async function resolveAction(itemId, action, objectType, runId) {
@@ -581,24 +649,21 @@
       }, 1_200);
     }
 
-    async function reviewBatch() {
-      state = { ...state, busyId: "batch" };
+    async function startAutomation() {
+      state = { ...state, busyId: "automation" };
       renderList();
-      setStatus(t("review.ai.batchPending"), "loading");
-      const objectTypes = {
-        conflicts: "conflict_case",
-        entities: "entity_merge_candidate",
-        memories: "memory_merge_candidate",
-      };
+      renderAutomationProgress();
+      setStatus(t("review.ai.automationPending"), "loading");
       try {
-        await api.requestAIReviewBatch(objectTypes[state.active], currentMode(), 5);
-        await load();
-        scheduleAIRefresh();
+        const automation = await api.startKnowledgeEvolution(null, currentMode());
+        state = { ...state, automation };
+        renderAutomationProgress();
+        scheduleAutomationRefresh();
       } catch (_) {
-        setStatus(t("review.ai.batchError"), "error");
+        setStatus(t("review.ai.automationError"), "error");
       } finally {
         state = { ...state, busyId: null };
-        renderList();
+        render();
       }
     }
 
@@ -615,8 +680,8 @@
       }
       const refresh = target.closest("[data-review-refresh]");
       if (refresh) { load(); return; }
-      const aiBatch = target.closest("[data-review-ai-batch]");
-      if (aiBatch && !state.busyId) { reviewBatch(); return; }
+      const autoStart = target.closest("[data-review-auto-start]");
+      if (autoStart && !state.busyId) { startAutomation(); return; }
       const action = target.closest("[data-review-action]");
       const item = action && action.closest("[data-review-id]");
       if (action && item && !state.busyId) {

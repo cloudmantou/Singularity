@@ -21,10 +21,10 @@ import {
 } from "./ai-review";
 import { ensureKnowledgeEvolutionDataModel } from "./knowledge-evolution";
 
-export const MEMORY_BACKUP_SCHEMA_VERSION = 18;
+export const MEMORY_BACKUP_SCHEMA_VERSION = 19;
 export const MEMORY_MUTATION_BACKUP_MODE = "audit_only" as const;
 const MEMORY_BACKUP_FORMAT = "singularity-memory-backup";
-const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
+const SUPPORTED_MEMORY_BACKUP_SCHEMA_VERSIONS = new Set([4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
 const MEMORY_BACKUP_FEATURES = [
   "atomic-memory",
   "temporal-facts",
@@ -50,6 +50,7 @@ const MEMORY_BACKUP_FEATURES = [
   "ai-assisted-quality-review",
   "context-aware-ai-review",
   "reversible-knowledge-evolution",
+  "knowledge-evolution-association-snapshots",
 ] as const;
 
 export const AUDIT_IMPORT_MODES = ["replace_empty", "append_verified"] as const;
@@ -60,6 +61,7 @@ const AUDIT_IMPORT_BATCH_SIZE = 80;
 const auditLockHeartbeats = new WeakMap<object, () => Promise<void>>();
 
 const GRAPH_ARRAY_KEYS = [
+  // Runtime automation leases are intentionally excluded; restore rebuilds work from pending domain rows.
   "scopes",
   "parentUnits",
   "parentVersions",
@@ -91,6 +93,7 @@ const GRAPH_ARRAY_KEYS = [
   "aiReviewApplications",
   "knowledgeEvolutions",
   "knowledgeEvolutionSources",
+  "knowledgeEvolutionAssociationSnapshots",
   "knowledgeClaimOwnership",
   "knowledgeEvolutionHistory",
   "auditEvents",
@@ -113,7 +116,7 @@ export interface BackupIntegrityReport {
 
 export interface MemoryBackup {
   backupFormat: typeof MEMORY_BACKUP_FORMAT;
-  schemaVersion: 18;
+  schemaVersion: 19;
   features: Array<(typeof MEMORY_BACKUP_FEATURES)[number]>;
   exportedAt: string;
   source: string;
@@ -152,13 +155,14 @@ export interface MemoryBackup {
   aiReviewApplications: BackupRow[];
   knowledgeEvolutions: BackupRow[];
   knowledgeEvolutionSources: BackupRow[];
+  knowledgeEvolutionAssociationSnapshots: BackupRow[];
   knowledgeClaimOwnership: BackupRow[];
   knowledgeEvolutionHistory: BackupRow[];
   auditEvents: BackupRow[];
 }
 
 export interface MemoryBackupImportResult extends ImportResult {
-  schemaVersion: 18;
+  schemaVersion: 19;
   memoryMutationBackupMode: typeof MEMORY_MUTATION_BACKUP_MODE;
   graph: Record<GraphArrayKey, TableImportStats>;
   integrity: BackupIntegrityReport;
@@ -392,6 +396,18 @@ export async function inspectMemoryBackupIntegrity(db: D1Database): Promise<Back
        (SELECT COUNT(*) FROM sb_knowledge_evolution_sources source
         LEFT JOIN sb_memories claim ON claim.id = source.claim_id
         WHERE claim.id IS NULL) as knowledge_evolution_sources_missing_claim,
+       (SELECT COUNT(*) FROM sb_knowledge_evolution_association_snapshots snapshot
+        LEFT JOIN sb_knowledge_evolutions evolution ON evolution.id = snapshot.evolution_id
+        WHERE evolution.id IS NULL) as knowledge_evolution_association_snapshots_missing_evolution,
+       (SELECT COUNT(*) FROM sb_knowledge_evolution_association_snapshots snapshot
+        LEFT JOIN sb_parent_units parent ON parent.parent_id = snapshot.source_parent_id
+        WHERE parent.parent_id IS NULL) as knowledge_evolution_association_snapshots_missing_source_parent,
+       (SELECT COUNT(*) FROM sb_knowledge_evolution_association_snapshots snapshot
+        LEFT JOIN sb_parent_units parent ON parent.parent_id = snapshot.target_parent_id
+        WHERE parent.parent_id IS NULL) as knowledge_evolution_association_snapshots_missing_target_parent,
+       (SELECT COUNT(*) FROM sb_knowledge_evolution_aggregate_snapshots snapshot
+        LEFT JOIN sb_knowledge_evolutions evolution ON evolution.id = snapshot.evolution_id
+        WHERE evolution.id IS NULL) as knowledge_evolution_aggregate_snapshots_missing_evolution,
        (SELECT COUNT(*) FROM sb_knowledge_claim_ownership ownership
         LEFT JOIN sb_knowledge_evolutions evolution ON evolution.id = ownership.evolution_id
         WHERE evolution.id IS NULL OR evolution.state <> 'active')
@@ -456,6 +472,7 @@ export async function exportMemoryBackup(
     aiReviewApplications,
     knowledgeEvolutions,
     knowledgeEvolutionSources,
+    knowledgeEvolutionAssociationSnapshots,
     knowledgeClaimOwnership,
     knowledgeEvolutionHistory,
     auditEvents,
@@ -617,6 +634,11 @@ export async function exportMemoryBackup(
                        previous_claim_status, previous_invalid_at, source_order, created_at
                 FROM sb_knowledge_evolution_sources
                 ORDER BY created_at DESC, evolution_id DESC, source_order ASC`),
+    allRows(db, `SELECT evolution_id, edge_id, source_parent_id, target_parent_id,
+                       edge_type, weight, provenance, metadata_json, directed,
+                       valid_from, valid_to, deleted_at, created_at, updated_at
+                FROM sb_knowledge_evolution_association_snapshots
+                ORDER BY updated_at DESC, evolution_id DESC, edge_id DESC`),
     allRows(db, `SELECT claim_id, evolution_id, acquired_at
                 FROM sb_knowledge_claim_ownership
                 ORDER BY acquired_at DESC, claim_id DESC`),
@@ -671,6 +693,7 @@ export async function exportMemoryBackup(
       aiReviewApplications: countRows(aiReviewApplications),
       knowledgeEvolutions: countRows(knowledgeEvolutions),
       knowledgeEvolutionSources: countRows(knowledgeEvolutionSources),
+      knowledgeEvolutionAssociationSnapshots: countRows(knowledgeEvolutionAssociationSnapshots),
       knowledgeClaimOwnership: countRows(knowledgeClaimOwnership),
       knowledgeEvolutionHistory: countRows(knowledgeEvolutionHistory),
       auditEvents: countRows(auditEvents),
@@ -708,6 +731,7 @@ export async function exportMemoryBackup(
     aiReviewApplications,
     knowledgeEvolutions,
     knowledgeEvolutionSources,
+    knowledgeEvolutionAssociationSnapshots,
     knowledgeClaimOwnership,
     knowledgeEvolutionHistory,
     auditEvents,
@@ -1126,14 +1150,19 @@ function verifyKnowledgeEvolutionBackupRows(
   for (const key of keys) {
     if (!Array.isArray(body[key])) throw new Error(`${key} must be an array in schema v18 backups`);
   }
+  if (schemaVersion >= 19 && !Array.isArray(body.knowledgeEvolutionAssociationSnapshots)) {
+    throw new Error("knowledgeEvolutionAssociationSnapshots must be an array in schema v19 backups");
+  }
 
   const evolutions = rowsFor(body, "knowledgeEvolutions");
   const sources = rowsFor(body, "knowledgeEvolutionSources");
   const ownership = rowsFor(body, "knowledgeClaimOwnership");
   const history = rowsFor(body, "knowledgeEvolutionHistory");
+  const associationSnapshots = rowsFor(body, "knowledgeEvolutionAssociationSnapshots");
   const runs = new Set(rowsFor(body, "aiReviewRuns").map((row) => requiredText(row, "id")));
   const claims = new Set(rowsFor(body, "memories").map((row) => requiredText(row, "id")));
   const entries = new Set(arrayFrom(body.entries).map((row) => requiredText(row, "id")));
+  const parents = new Set(rowsFor(body, "parentUnits").map((row) => requiredText(row, "parent_id")));
   const evolutionsById = new Map<string, BackupRow>();
   const activeEvolutionIds = new Set<string>();
   const sourceCounts = new Map<string, number>();
@@ -1207,6 +1236,15 @@ function verifyKnowledgeEvolutionBackupRows(
     }
     if (!["applied", "rolled_back"].includes(requiredText(row, "action"))) {
       throw new Error("Knowledge evolution history has an invalid action");
+    }
+  }
+  for (const snapshot of associationSnapshots) {
+    if (!evolutionsById.has(requiredText(snapshot, "evolution_id"))) {
+      throw new Error("Knowledge evolution association snapshot references a missing evolution");
+    }
+    if (!parents.has(requiredText(snapshot, "source_parent_id")) ||
+        !parents.has(requiredText(snapshot, "target_parent_id"))) {
+      throw new Error("Knowledge evolution association snapshot references a missing Parent");
     }
   }
 }
@@ -1958,6 +1996,33 @@ async function importMemoryBackupUnlocked(
       numberOrNull(row, "previous_invalid_at"),
       intOrDefault(row, "source_order", 0),
       intOrDefault(row, "created_at", Date.now())
+    )
+  );
+
+  graph.knowledgeEvolutionAssociationSnapshots = await importTable(
+    db,
+    rowsFor(body, "knowledgeEvolutionAssociationSnapshots"),
+    (row) => db.prepare(
+      `${insertVerb(mode)} INTO sb_knowledge_evolution_association_snapshots (
+         evolution_id, edge_id, source_parent_id, target_parent_id, edge_type,
+         weight, provenance, metadata_json, directed, valid_from, valid_to,
+         deleted_at, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      requiredText(row, "evolution_id"),
+      requiredText(row, "edge_id"),
+      requiredText(row, "source_parent_id"),
+      requiredText(row, "target_parent_id"),
+      requiredText(row, "edge_type"),
+      numberOrDefault(row, "weight", 0.5),
+      textOrDefault(row, "provenance", "system"),
+      jsonText(row, "metadata_json", "{}"),
+      intOrDefault(row, "directed", 0),
+      numberOrNull(row, "valid_from"),
+      numberOrNull(row, "valid_to"),
+      numberOrNull(row, "deleted_at"),
+      intOrDefault(row, "created_at", Date.now()),
+      intOrDefault(row, "updated_at", Date.now())
     )
   );
 
