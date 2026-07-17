@@ -35,6 +35,16 @@ describe("knowledge evolution automation", () => {
     resetSettingsCache();
   });
 
+  it("passes the self-host automation switch into the Worker environment", () => {
+    vi.stubEnv("KNOWLEDGE_REVIEW_AUTOMATION", "off");
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      expect(env.KNOWLEDGE_REVIEW_AUTOMATION).toBe("off");
+    } finally {
+      db.close();
+    }
+  });
+
   it("processes a persisted snapshot one item at a time and reports progress", async () => {
     const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
     try {

@@ -621,7 +621,7 @@ export async function exportMemoryBackup(
                 FROM sb_ai_review_runs
                 ORDER BY created_at DESC, id DESC`),
     allRows(db, `SELECT id, run_id, object_type, object_id, decision, applied_by,
-                       application_mode, created_at
+                       application_mode, decision_source, created_at
                 FROM sb_ai_review_applications
                 ORDER BY created_at DESC, id DESC`),
     allRows(db, `SELECT id, ai_review_run_id, candidate_id, operation, state,
@@ -1935,8 +1935,8 @@ async function importMemoryBackupUnlocked(
     db.prepare(
       `INSERT OR IGNORE INTO sb_ai_review_applications (
          id, run_id, object_type, object_id, decision, applied_by,
-         application_mode, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+         application_mode, decision_source, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       requiredText(row, "id"),
       requiredText(row, "run_id"),
@@ -1945,6 +1945,11 @@ async function importMemoryBackupUnlocked(
       requiredText(row, "decision"),
       textOrDefault(row, "applied_by", "backup_restore"),
       textOrDefault(row, "application_mode", "human"),
+      textOrDefault(
+        row,
+        "decision_source",
+        textOrDefault(row, "application_mode", "human") === "human" ? "human" : "deterministic"
+      ),
       intOrDefault(row, "created_at", Date.now())
     )
   );

@@ -34,6 +34,7 @@ describe("AI-assisted Knowledge Review", () => {
     evidenceHash: `${ref.toLowerCase()}-hash`,
     scopeIds: ["project/singularity"],
     vaultIds: ["work-vault"],
+    projectIds: ["singularity"],
     sourceChannels: ["obsidian"],
     sourceIdentityFingerprints: [`${ref.toLowerCase()}-identity`],
     evidenceRootFingerprints: [`${ref.toLowerCase()}-root`],
@@ -80,6 +81,45 @@ describe("AI-assisted Knowledge Review", () => {
     });
 
     expect(eligibility).toEqual({ eligible: true, reason: "eligible" });
+  });
+
+  it("requires an exact stable project set before a mutating auto decision", () => {
+    const response = {
+      decision: "merge",
+      reason: "The memories appear complementary.",
+      evidenceRefs: ["SOURCE", "TARGET"],
+      confidence: { decision: 0.97, evidence: 0.95 },
+      abstain: false,
+      reviewability: "sufficient" as const,
+      missingContext: [],
+      keyDifferences: [{
+        dimension: "content" as const,
+        status: "different" as const,
+        summary: "The implementation details are complementary.",
+        evidenceRefs: ["SOURCE", "TARGET"],
+      }],
+      refinement: {
+        action: "merge" as const,
+        content: "The two implementation details form one verified workflow.",
+        sourceRefs: ["SOURCE", "TARGET"],
+      },
+    };
+    const eligibility = evaluateAIAutoApplyEligibility({
+      objectType: "memory_merge_candidate",
+      response,
+      manifest: {
+        objectType: "memory_merge_candidate",
+        objectId: "partial-project-overlap",
+        state: "pending",
+        evidence: [
+          manifestEvidence("SOURCE", { projectIds: ["project-common", "project-source"] }),
+          manifestEvidence("TARGET", { projectIds: ["project-common"] }),
+        ],
+        policyInput: { suggestedAction: "merge", similarity: 0.95 },
+      },
+    });
+
+    expect(eligibility).toEqual({ eligible: false, reason: "cross_project" });
   });
 
   it("sends derived Claims to the reviewer without raw Entry text or source identity", () => {
@@ -174,6 +214,22 @@ describe("AI-assisted Knowledge Review", () => {
       }),
     }, snapshot, response);
     expect(rejected.approved).toBe(false);
+
+    const verboseRejected = await verifyAIAutoReviewRecommendation({
+      provider: "test",
+      model: "verifier",
+      complete: async () => JSON.stringify({
+        approved: false,
+        decision: "merge",
+        evidenceRefs: ["SOURCE", "TARGET"],
+        unsupportedStatements: ["x".repeat(600)],
+        reason: "y".repeat(1_200),
+        providerTrace: "must be ignored",
+      }),
+    }, snapshot, response);
+    expect(verboseRejected).toMatchObject({ approved: false, decision: "merge" });
+    expect(verboseRejected.unsupportedStatements[0]).toHaveLength(400);
+    expect(verboseRejected.reason).toHaveLength(1_000);
   });
 
   it("routes cross-vault and incomplete decisions to the exception queue", () => {
@@ -234,6 +290,47 @@ describe("AI-assisted Knowledge Review", () => {
     })).toEqual({ eligible: false, reason: "incomplete_context" });
   });
 
+  it("allows missing-context keep-separate only for trusted isolation rules", () => {
+    const input: Parameters<typeof evaluateAIAutoApplyEligibility>[0] = {
+      objectType: "memory_merge_candidate",
+      response: {
+        decision: "keep_both",
+        reason: "The memories describe unrelated projects.",
+        evidenceRefs: ["SOURCE", "TARGET"],
+        confidence: { decision: 0.9, evidence: 0.95 },
+        abstain: false,
+        reviewability: "sufficient",
+        missingContext: [],
+        keyDifferences: [{
+          dimension: "meaning",
+          status: "different",
+          summary: "The subjects and work products are different.",
+          evidenceRefs: ["SOURCE", "TARGET"],
+        }],
+        refinement: {
+          action: "keep_separate",
+          content: null,
+          sourceRefs: ["SOURCE", "TARGET"],
+        },
+      },
+      manifest: {
+        objectType: "memory_merge_candidate",
+        objectId: "candidate-cross-project",
+        state: "pending",
+        evidence: [
+          manifestEvidence("SOURCE", { scopeIds: [], vaultIds: [] }),
+          manifestEvidence("TARGET", { scopeIds: ["AppFlex"], vaultIds: [] }),
+        ],
+        policyInput: { suggestedAction: "keep_both", similarity: 0.86 },
+      },
+    };
+
+    expect(evaluateAIAutoApplyEligibility(input))
+      .toEqual({ eligible: false, reason: "cross_vault" });
+    expect(evaluateAIAutoApplyEligibility({ ...input, trustedContextIsolation: true }))
+      .toEqual({ eligible: true, reason: "eligible_context_isolation" });
+  });
+
   it("parses only object-specific decisions and known evidence references", () => {
     const parsed = parseAIReviewModelResponse(
       '<think>checked evidence only</think>\n```json\n' + JSON.stringify({
@@ -271,6 +368,56 @@ describe("AI-assisted Knowledge Review", () => {
       confidence: { decision: 0.8, evidence: 0.8 },
       abstain: false,
     }), "conflict_case", ["OLD", "NEW"])).toThrow(AIReviewInvalidResponseError);
+  });
+
+  it("strips provider-specific refinement fields without inventing decision semantics", () => {
+    const parsed = parseAIReviewModelResponse(JSON.stringify({
+      decision: "keep_both",
+      reason: "The memories describe different projects and should remain independent.",
+      evidenceRefs: ["SOURCE", "TARGET"],
+      confidence: { decision: 0.9, evidence: 0.95 },
+      abstain: false,
+      reviewability: "sufficient",
+      missingContext: [],
+      keyDifferences: [{
+        dimension: "meaning",
+        status: "different",
+        summary: "The memories cover unrelated work.",
+        evidenceRefs: ["SOURCE", "TARGET"],
+      }],
+      refinement: {
+        action: "keep_separate",
+        targetMemoryId: null,
+        instructions: null,
+        content: null,
+        sourceRefs: ["SOURCE", "TARGET"],
+        mergeOf: [],
+      },
+    }), "memory_merge_candidate", ["SOURCE", "TARGET"]);
+
+    expect(parsed.refinement).toEqual({
+      action: "keep_separate",
+      content: null,
+      sourceRefs: ["SOURCE", "TARGET"],
+    });
+
+    expect(() => parseAIReviewModelResponse(JSON.stringify({
+      decision: "keep_both",
+      reason: "The memories should remain independent.",
+      evidenceRefs: ["SOURCE", "TARGET"],
+      confidence: { decision: 0.9, evidence: 0.95 },
+      abstain: false,
+      reviewability: "sufficient",
+      missingContext: [],
+      keyDifferences: [{
+        dimension: "meaning",
+        status: "different",
+        summary: "The memories cover unrelated work.",
+        evidenceRefs: ["SOURCE", "TARGET"],
+      }],
+      refinement: { action: "none", content: null, sourceRefs: [] },
+    }), "memory_merge_candidate", ["SOURCE", "TARGET"]))
+      .toThrow("ai_review_refinement_action_mismatch");
   });
 
   it("treats incomplete context as a first-class abstention instead of forcing a decision", () => {
@@ -443,6 +590,20 @@ describe("AI-assisted Knowledge Review", () => {
          ) VALUES ('conflict-ai-1', 'old-entry', 'new-entry', 'contradiction',
                    'same scope, different object', 0.9, 'pending', ?)`
       ).run(now);
+      db.prepare(
+        `INSERT INTO sb_memories (id, content, entry_id, scope_id, content_hash, created_at)
+         VALUES ('old-context-claim', 'Project uses SQLite', 'old-entry', 'production', 'old-hash', ?),
+                ('new-context-claim', 'Project uses Postgres', 'new-entry', 'production', 'new-hash', ?)`
+      ).run(now - 1, now);
+      db.prepare(
+        `INSERT INTO sb_external_links (
+           id, provider, vault_id, external_path, object_type, object_id,
+           entry_id, sync_status, created_at, updated_at
+         ) VALUES ('old-context-link', 'api', 'work-vault', 'old', 'memory', 'old-entry',
+                   'old-entry', 'synced', ?, ?),
+                  ('new-context-link', 'api', 'work-vault', 'new', 'memory', 'new-entry',
+                   'new-entry', 'synced', ?, ?)`
+      ).run(now, now, now, now);
 
       const job = await enqueueAIReviewJob(env.DB, {
         objectType: "conflict_case",
@@ -501,7 +662,7 @@ describe("AI-assisted Knowledge Review", () => {
     }
   });
 
-  it("blocks cross-vault evidence before any model content is sent", async () => {
+  it("losslessly rejects cross-vault merge candidates before any model content is sent", async () => {
     const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
     try {
       await initializeDatabase(env);
@@ -543,10 +704,129 @@ describe("AI-assisted Knowledge Review", () => {
 
       expect(complete).not.toHaveBeenCalled();
       expect(result.run).toMatchObject({
-        decision: "uncertain",
-        abstain: true,
-        requiresHuman: true,
-        autoApplyEligible: false,
+        decision: "keep_both",
+        abstain: false,
+        refinement: {
+          action: "keep_separate",
+          sourceRefs: ["SOURCE", "TARGET"],
+        },
+        requiresHuman: false,
+        autoApplyEligible: true,
+        reviewerProvider: "rules",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("isolates candidates when their vault sets are not identical", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      const now = Date.now();
+      db.prepare(
+        `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, content_hash)
+         VALUES ('shared-vault-source', 'Source fact', '[]', 'obsidian', ?, '[]', 'source-hash'),
+                ('shared-vault-target', 'Target fact', '[]', 'obsidian', ?, '[]', 'target-hash')`
+      ).run(now, now);
+      db.prepare(
+        `INSERT INTO sb_external_links (
+           id, provider, vault_id, external_path, object_type, object_id,
+           entry_id, sync_status, created_at, updated_at
+         ) VALUES
+           ('shared-source-a', 'obsidian', 'vault-a', 'source-a.md', 'memory',
+            'shared-vault-source', 'shared-vault-source', 'synced', ?, ?),
+           ('shared-source-b', 'obsidian', 'vault-b', 'source-b.md', 'memory',
+            'shared-vault-source', 'shared-vault-source', 'synced', ?, ?),
+           ('shared-target-a', 'obsidian', 'vault-a', 'target-a.md', 'memory',
+            'shared-vault-target', 'shared-vault-target', 'synced', ?, ?)`
+      ).run(now, now, now, now, now, now);
+      db.prepare(
+        `INSERT INTO sb_memory_merge_candidates (
+           id, source_memory_id, target_memory_id, similarity,
+           suggested_action, state, created_at
+         ) VALUES ('shared-vault-review', 'shared-vault-source', 'shared-vault-target', 0.9,
+                   'keep_both', 'pending', ?)`
+      ).run(now);
+      const job = await enqueueAIReviewJob(env.DB, {
+        objectType: "memory_merge_candidate",
+        objectId: "shared-vault-review",
+        mode: "auto_low_risk",
+        requestedBy: "owner",
+      });
+      const complete = vi.fn(async () => "model must not receive mixed-vault content");
+      const result = await processAIReviewJob(env.DB, job.id, {
+        provider: "test",
+        model: "reviewer-v1",
+        complete,
+      });
+
+      expect(complete).not.toHaveBeenCalled();
+      expect(result.run).toMatchObject({
+        decision: "keep_both",
+        reviewerProvider: "rules",
+        requiresHuman: false,
+        autoApplyEligible: true,
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("losslessly rejects candidates assigned to different project entities", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      const now = Date.now();
+      db.prepare(
+        `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, content_hash)
+         VALUES ('project-source', 'Runtime smoke verification', '["project/mtzs"]', 'mcp', ?, '[]', 'source-hash'),
+                ('project-target', 'Hardening patch summary', '["project/AppFlex"]', 'mcp', ?, '[]', 'target-hash')`
+      ).run(now, now);
+      db.prepare(
+        `INSERT INTO sb_entities (
+           id, name, name_normalized, entity_type, created_at, updated_at
+         ) VALUES ('project-mtzs', 'mtzs', 'mtzs', 'project', ?, ?),
+                  ('project-appflex', 'AppFlex', 'appflex', 'project', ?, ?)`
+      ).run(now, now, now, now);
+      db.prepare(
+        `INSERT INTO sb_memories (id, content, entry_id, content_hash, created_at)
+         VALUES ('project-source-claim', 'Runtime smoke verification',
+                 'project-source', 'source-hash', ?)`
+      ).run(now);
+      db.prepare(
+        `INSERT INTO sb_memory_entities (id, memory_id, entity_id, role, created_at)
+         VALUES ('project-source-link', 'project-source-claim', 'project-mtzs', 'subject', ?)`
+      ).run(now);
+      db.prepare(
+        `INSERT INTO sb_memory_merge_candidates (
+           id, source_memory_id, target_memory_id, similarity,
+           suggested_action, state, created_at
+         ) VALUES ('cross-project-review', 'project-source', 'project-target', 0.91,
+                   'merge', 'pending', ?)`
+      ).run(now);
+      const job = await enqueueAIReviewJob(env.DB, {
+        objectType: "memory_merge_candidate",
+        objectId: "cross-project-review",
+        mode: "auto_low_risk",
+        requestedBy: "owner",
+      });
+      const complete = vi.fn(async () => "model must not receive cross-project content");
+      const result = await processAIReviewJob(env.DB, job.id, {
+        provider: "test",
+        model: "reviewer-v1",
+        complete,
+      });
+
+      expect(job.inputManifest.evidence.map((item) => item.projectIds)).toEqual([
+        ["project-mtzs"],
+        ["project-appflex"],
+      ]);
+      expect(complete).not.toHaveBeenCalled();
+      expect(result.run).toMatchObject({
+        decision: "keep_both",
+        requiresHuman: false,
+        autoApplyEligible: true,
         reviewerProvider: "rules",
       });
     } finally {
@@ -561,8 +841,13 @@ describe("AI-assisted Knowledge Review", () => {
       const now = Date.now();
       db.prepare(
         `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, content_hash)
-         VALUES ('source-entry', 'Exact duplicate', '[]', 'api', ?, '[]', 'same-hash'),
-                ('target-entry', 'Exact duplicate', '[]', 'api', ?, '[]', 'same-hash')`
+         VALUES ('source-entry', 'Exact duplicate', '["project/singularity"]', 'api', ?, '[]', 'same-hash'),
+                ('target-entry', 'Exact duplicate', '["project/singularity"]', 'api', ?, '[]', 'same-hash')`
+      ).run(now, now);
+      db.prepare(
+        `INSERT INTO sb_entities (
+           id, name, name_normalized, entity_type, created_at, updated_at
+         ) VALUES ('project-singularity', 'Singularity', 'singularity', 'project', ?, ?)`
       ).run(now, now);
       db.prepare(
         `INSERT INTO sb_memory_merge_candidates (
@@ -716,7 +1001,7 @@ describe("AI-assisted Knowledge Review", () => {
     }
   });
 
-  it("requires the model and human approval when exact hashes lack scope and vault context", async () => {
+  it("abstains before model review when scope and vault context are missing", async () => {
     const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
     try {
       await initializeDatabase(env);
@@ -760,13 +1045,110 @@ describe("AI-assisted Knowledge Review", () => {
         complete,
       });
 
-      expect(complete).toHaveBeenCalledOnce();
+      expect(complete).not.toHaveBeenCalled();
       expect(result.run).toMatchObject({
         decision: "uncertain",
-        reviewability: "partial",
-        missingContext: ["scope_context", "parent_context"],
+        reviewability: "insufficient",
+        missingContext: ["source_provenance", "scope_context"],
         requiresHuman: true,
         autoApplyEligible: false,
+        reviewerProvider: "rules",
+        reviewerModel: "context-isolation-v3",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("independently verifies a model keep-separate decision", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      const now = Date.now();
+      db.prepare(
+        `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, content_hash)
+         VALUES ('separate-source', 'Singularity recall implementation', '["project/singularity"]', 'mcp', ?, '[]', 'source-hash'),
+                ('separate-target', 'Singularity review dashboard', '["project/singularity"]', 'mcp', ?, '[]', 'target-hash')`
+      ).run(now, now);
+      db.prepare(
+        `INSERT INTO sb_entities (
+           id, name, name_normalized, entity_type, created_at, updated_at
+         ) VALUES ('separate-project', 'Singularity', 'singularity', 'project', ?, ?)`
+      ).run(now, now);
+      db.prepare(
+        `INSERT INTO sb_parent_versions (
+           version_id, parent_id, version_number, vault_snapshot, state, created_at, updated_at
+         ) VALUES ('separate-source-v1', 'separate-source-parent', 1, 'work-vault', 'active', ?, ?),
+                  ('separate-target-v1', 'separate-target-parent', 1, 'work-vault', 'active', ?, ?)`
+      ).run(now, now, now, now);
+      db.prepare(
+        `INSERT INTO sb_memories (
+           id, content, entry_id, parent_version_id, scope_id, content_hash, created_at
+         ) VALUES ('separate-source-claim', 'Singularity recall implementation', 'separate-source',
+                   'separate-source-v1', 'project/singularity', 'source-hash', ?),
+                  ('separate-target-claim', 'Singularity review dashboard', 'separate-target',
+                   'separate-target-v1', 'project/singularity', 'target-hash', ?)`
+      ).run(now, now);
+      db.prepare(
+        `INSERT INTO sb_memory_merge_candidates (
+           id, source_memory_id, target_memory_id, similarity,
+           suggested_action, state, created_at
+         ) VALUES ('keep-separate-review', 'separate-source', 'separate-target', 0.9,
+                   'keep_both', 'pending', ?)`
+      ).run(now);
+      const job = await enqueueAIReviewJob(env.DB, {
+        objectType: "memory_merge_candidate",
+        objectId: "keep-separate-review",
+        mode: "auto_low_risk",
+        requestedBy: "owner",
+      });
+      const recommendation = JSON.stringify({
+        decision: "keep_both",
+        reason: "The memories describe separate capabilities in the same project.",
+        evidenceRefs: ["SOURCE", "TARGET"],
+        confidence: { decision: 0.9, evidence: 0.92 },
+        abstain: false,
+        reviewability: "sufficient",
+        missingContext: [],
+        keyDifferences: [{
+          dimension: "meaning",
+          status: "different",
+          summary: "The capabilities differ while the project context matches.",
+          evidenceRefs: ["SOURCE", "TARGET"],
+        }],
+        refinement: {
+          action: "keep_separate",
+          content: null,
+          sourceRefs: ["SOURCE", "TARGET"],
+          mergeOf: [],
+        },
+      });
+      const verification = JSON.stringify({
+        approved: true,
+        decision: "keep_both",
+        evidenceRefs: ["SOURCE", "TARGET"],
+        unsupportedStatements: [],
+        reason: "Both evidence records support keeping the capabilities separate.",
+      });
+      const complete = vi.fn()
+        .mockResolvedValueOnce(recommendation)
+        .mockResolvedValueOnce(verification);
+      const result = await processAIReviewJob(env.DB, job.id, {
+        provider: "test",
+        model: "reviewer-v1",
+        complete,
+      });
+
+      expect(complete).toHaveBeenCalledTimes(2);
+      expect(result.run).toMatchObject({
+        decision: "keep_both",
+        refinement: {
+          action: "keep_separate",
+          sourceRefs: ["SOURCE", "TARGET"],
+        },
+        requiresHuman: false,
+        autoApplyEligible: true,
+        reviewerModel: "reviewer-v1+second-pass-verifier",
       });
     } finally {
       db.close();
@@ -817,7 +1199,7 @@ describe("AI-assisted Knowledge Review", () => {
       ).run(left.id);
       const upgraded = await create();
       expect(upgraded.id).not.toBe(left.id);
-      expect(upgraded.reviewPolicyVersion).toBe("knowledge-review-v3");
+      expect(upgraded.reviewPolicyVersion).toBe("knowledge-review-v6");
       expect(db.prepare(`SELECT COUNT(*) AS count FROM sb_ai_review_jobs`).get()).toEqual({ count: 2 });
     } finally {
       db.close();
@@ -918,6 +1300,11 @@ describe("AI-assisted Knowledge Review", () => {
             summary: "No material content difference was found.",
             evidenceRefs: ["SOURCE", "TARGET"],
           }],
+          refinement: {
+            action: "consolidate",
+            content: null,
+            sourceRefs: ["SOURCE", "TARGET"],
+          },
         }),
       });
       db.prepare(
@@ -931,6 +1318,7 @@ describe("AI-assisted Knowledge Review", () => {
         run,
         appliedBy: "owner",
         applicationMode: "human",
+        decisionSource: "human",
         leaseOwner: "stale-owner",
         guard: {
           objectType: "memory_merge_candidate",

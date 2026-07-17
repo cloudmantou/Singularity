@@ -73,6 +73,14 @@ function insertMemoryReviewCandidate(
     const observationId = `${input.id}-observation`;
     const evidenceRootId = `${input.id}-evidence-root`;
     db.prepare(
+      `UPDATE entries SET tags = '["project/singularity"]' WHERE id IN (?, ?)`
+    ).run(sourceId, targetId);
+    db.prepare(
+      `INSERT OR IGNORE INTO sb_entities (
+         id, name, name_normalized, entity_type, created_at, updated_at
+       ) VALUES ('project-singularity', 'Singularity', 'singularity', 'project', ?, ?)`
+    ).run(now, now);
+    db.prepare(
       `INSERT INTO sb_observations (
          id, content, source, source_channel, source_identity, author_type,
          source_timestamp, revision, root_evidence_id, created_at
@@ -80,9 +88,11 @@ function insertMemoryReviewCandidate(
     ).run(observationId, `${input.id}/exact-repeat`, now, evidenceRootId, now);
     db.prepare(
       `INSERT INTO sb_parent_versions (
-         version_id, parent_id, version_number, vault_snapshot, state, created_at, updated_at
-       ) VALUES (?, ?, 1, 'work-vault', 'active', ?, ?),
-                (?, ?, 1, 'work-vault', 'active', ?, ?)`
+         version_id, parent_id, version_number, vault_snapshot,
+         metadata_snapshot_hash, metadata_snapshot_source,
+         state, created_at, updated_at
+       ) VALUES (?, ?, 1, 'work-vault', 'source-metadata', 'recorded', 'active', ?, ?),
+                (?, ?, 1, 'work-vault', 'target-metadata', 'recorded', 'active', ?, ?)`
     ).run(
       `${input.id}-source-v1`, `${input.id}-source-parent`, now, now,
       `${input.id}-target-v1`, `${input.id}-target-parent`, now, now
@@ -153,7 +163,7 @@ describe("memory quality review queues", () => {
     const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
     try {
       await initializeDatabase(env);
-      insertMemoryReviewCandidate(db, { id: "ai-suggest" });
+      insertMemoryReviewCandidate(db, { id: "ai-suggest", exactContext: true });
       const job = await enqueueAIReviewJob(env.DB, {
         objectType: "memory_merge_candidate",
         objectId: "ai-suggest",
@@ -177,24 +187,32 @@ describe("memory quality review queues", () => {
             summary: "No material content difference was found.",
             evidenceRefs: ["SOURCE", "TARGET"],
           }],
+          refinement: {
+            action: "consolidate",
+            content: null,
+            sourceRefs: ["SOURCE", "TARGET"],
+          },
         }),
       });
       expect(db.prepare(
         `SELECT state FROM sb_memory_merge_candidates WHERE id = 'ai-suggest'`
       ).get()).toEqual({ state: "pending" });
-
       const response = await worker.fetch(auth("/quality/ai-review/apply", {
         method: "POST",
         body: JSON.stringify({ runId: run.id }),
       }), env, testCtx());
-
-      expect(response.status).toBe(200);
+      expect(response.status, await response.clone().text()).toBe(200);
       expect(db.prepare(
         `SELECT state, reviewed_by FROM sb_memory_merge_candidates WHERE id = 'ai-suggest'`
       ).get()).toEqual({ state: "accepted", reviewed_by: "ai-review:owner" });
       expect(db.prepare(
-        `SELECT decision, application_mode FROM sb_ai_review_applications WHERE run_id = ?`
-      ).get(run.id)).toEqual({ decision: "duplicate", application_mode: "human" });
+        `SELECT decision, application_mode, decision_source
+         FROM sb_ai_review_applications WHERE run_id = ?`
+      ).get(run.id)).toEqual({
+        decision: "duplicate",
+        application_mode: "human",
+        decision_source: "human",
+      });
       const audit = db.prepare(
         `SELECT metadata_json FROM sb_audit_events
          WHERE action = 'quality.merge_candidate.resolve' AND object_id = 'ai-suggest'`
@@ -261,6 +279,11 @@ describe("memory quality review queues", () => {
             summary: "No material content difference was found.",
             evidenceRefs: ["SOURCE", "TARGET"],
           }],
+          refinement: {
+            action: "consolidate",
+            content: null,
+            sourceRefs: ["SOURCE", "TARGET"],
+          },
         }),
       });
 
@@ -284,7 +307,7 @@ describe("memory quality review queues", () => {
     const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
     try {
       await initializeDatabase(env);
-      insertMemoryReviewCandidate(db, { id: "ai-atomic" });
+      insertMemoryReviewCandidate(db, { id: "ai-atomic", exactContext: true });
       const job = await enqueueAIReviewJob(env.DB, {
         objectType: "memory_merge_candidate",
         objectId: "ai-atomic",
@@ -308,6 +331,11 @@ describe("memory quality review queues", () => {
             summary: "No material content difference was found.",
             evidenceRefs: ["SOURCE", "TARGET"],
           }],
+          refinement: {
+            action: "consolidate",
+            content: null,
+            sourceRefs: ["SOURCE", "TARGET"],
+          },
         }),
       });
       db.exec(
@@ -354,14 +382,157 @@ describe("memory quality review queues", () => {
       expect(response.status).toBe(202);
       expect(db.prepare(
         `SELECT state, reviewed_by FROM sb_memory_merge_candidates WHERE id = 'ai-auto'`
-      ).get()).toEqual({ state: "accepted", reviewed_by: "ai-review:owner" });
+      ).get()).toEqual({
+        state: "accepted",
+        reviewed_by: "ai-review:system:deterministic",
+      });
       expect(db.prepare(
-        `SELECT decision, application_mode, applied_by FROM sb_ai_review_applications`
+        `SELECT decision, application_mode, decision_source, applied_by
+         FROM sb_ai_review_applications`
       ).get()).toEqual({
         decision: "duplicate",
         application_mode: "deterministic_auto",
-        applied_by: "owner",
+        decision_source: "deterministic",
+        applied_by: "system:deterministic",
       });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("auto-applies keep-separate without creating a cross-vault knowledge projection", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      insertMemoryReviewCandidate(db, { id: "ai-cross-vault" });
+      const now = Date.now();
+      db.prepare(
+        `INSERT INTO sb_external_links (
+           id, provider, vault_id, external_path, object_type, object_id,
+           entry_id, sync_status, created_at, updated_at
+         ) VALUES
+           ('ai-cross-vault-a', 'obsidian', 'vault-a', 'a.md', 'memory',
+            'ai-cross-vault-source', 'ai-cross-vault-source', 'synced', ?, ?),
+           ('ai-cross-vault-b', 'obsidian', 'vault-b', 'b.md', 'memory',
+            'ai-cross-vault-target', 'ai-cross-vault-target', 'synced', ?, ?)`
+      ).run(now, now, now, now);
+      const background = collectingCtx();
+
+      const response = await worker.fetch(auth("/quality/ai-review", {
+        method: "POST",
+        body: JSON.stringify({
+          objectType: "memory_merge_candidate",
+          objectId: "ai-cross-vault",
+          mode: "auto_low_risk",
+        }),
+      }), env, background.ctx);
+      await background.drain();
+
+      expect(response.status).toBe(202);
+      expect(db.prepare(
+        `SELECT state, reviewed_by FROM sb_memory_merge_candidates WHERE id = 'ai-cross-vault'`
+      ).get()).toEqual({
+        state: "rejected",
+        reviewed_by: "ai-review:system:deterministic",
+      });
+      expect(db.prepare(
+        `SELECT decision, application_mode, decision_source
+         FROM sb_ai_review_applications`
+      ).get()).toEqual({
+        decision: "keep_both",
+        application_mode: "deterministic_auto",
+        decision_source: "deterministic",
+      });
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count FROM sqlite_master
+         WHERE type = 'table' AND name = 'sb_knowledge_evolutions'`
+      ).get()).toEqual({ count: 0 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("records a reversible relation for a verified same-context keep-separate decision", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      insertMemoryReviewCandidate(db, { id: "ai-related-separate", exactContext: true });
+      db.prepare(
+        `UPDATE entries SET content = 'Recall pipeline capability', content_hash = 'source-related-hash'
+         WHERE id = 'ai-related-separate-source'`
+      ).run();
+      db.prepare(
+        `UPDATE entries SET content = 'Review dashboard capability', content_hash = 'target-related-hash'
+         WHERE id = 'ai-related-separate-target'`
+      ).run();
+      db.prepare(
+        `UPDATE sb_memories SET content = 'Recall pipeline capability', content_hash = 'source-related-hash'
+         WHERE entry_id = 'ai-related-separate-source'`
+      ).run();
+      db.prepare(
+        `UPDATE sb_memories SET content = 'Review dashboard capability', content_hash = 'target-related-hash'
+         WHERE entry_id = 'ai-related-separate-target'`
+      ).run();
+      db.prepare(
+        `UPDATE sb_memory_merge_candidates
+         SET suggested_action = 'keep_both', similarity = 0.88
+         WHERE id = 'ai-related-separate'`
+      ).run();
+      const job = await enqueueAIReviewJob(env.DB, {
+        objectType: "memory_merge_candidate",
+        objectId: "ai-related-separate",
+        mode: "auto_low_risk",
+        requestedBy: "owner",
+      });
+      const complete = vi.fn()
+        .mockResolvedValueOnce(JSON.stringify({
+          decision: "keep_both",
+          reason: "The capabilities are related but represent independent knowledge.",
+          evidenceRefs: ["SOURCE", "TARGET"],
+          confidence: { decision: 0.93, evidence: 0.94 },
+          abstain: false,
+          reviewability: "sufficient",
+          missingContext: [],
+          keyDifferences: [{
+            dimension: "content",
+            status: "different",
+            summary: "Recall and review are separate capabilities in one project.",
+            evidenceRefs: ["SOURCE", "TARGET"],
+          }],
+          refinement: {
+            action: "keep_separate",
+            content: null,
+            sourceRefs: ["SOURCE", "TARGET"],
+          },
+        }))
+        .mockResolvedValueOnce(JSON.stringify({
+          approved: true,
+          decision: "keep_both",
+          evidenceRefs: ["SOURCE", "TARGET"],
+          unsupportedStatements: [],
+          reason: "Both evidence records support the independent capabilities.",
+        }));
+      const { run } = await processAIReviewJob(env.DB, job.id, {
+        provider: "test",
+        model: "reviewer-v1",
+        complete,
+      });
+
+      expect(run.autoApplyEligible).toBe(true);
+      const response = await worker.fetch(auth("/quality/ai-review/apply", {
+        method: "POST",
+        body: JSON.stringify({ runId: run.id }),
+      }), env, testCtx());
+
+      expect(response.status).toBe(200);
+      expect(db.prepare(
+        `SELECT operation, state FROM sb_knowledge_evolutions WHERE ai_review_run_id = ?`
+      ).get(run.id)).toEqual({ operation: "keep_separate", state: "active" });
+      expect(db.prepare(
+        `SELECT relation_type FROM sb_memory_relations
+         WHERE from_memory_id = 'ai-related-separate-source'
+           AND to_memory_id = 'ai-related-separate-target'`
+      ).get()).toEqual({ relation_type: "similar" });
     } finally {
       db.close();
     }
@@ -390,6 +561,34 @@ describe("memory quality review queues", () => {
            reason_json, state, created_at, updated_at
          ) VALUES ('ai-entity', 'entity-source', 'entity-target', 'semantic', 0.84,
                    '["review_required"]', 'pending', ?, ?)`
+      ).run(now, now);
+      db.prepare(
+        `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, content_hash)
+         VALUES ('entity-source-entry', 'Project Alpha identity', '[]', 'api', ?, '[]', 'entity-source-hash'),
+                ('entity-target-entry', 'Project Beta identity', '[]', 'api', ?, '[]', 'entity-target-hash')`
+      ).run(now, now);
+      db.prepare(
+        `INSERT INTO sb_parent_versions (
+           version_id, parent_id, version_number, vault_snapshot,
+           metadata_snapshot_hash, metadata_snapshot_source,
+           state, created_at, updated_at
+         ) VALUES ('entity-source-v1', 'entity-source-parent', 1, 'work-vault',
+                   'entity-source-metadata', 'recorded', 'active', ?, ?),
+                  ('entity-target-v1', 'entity-target-parent', 1, 'work-vault',
+                   'entity-target-metadata', 'recorded', 'active', ?, ?)`
+      ).run(now, now, now, now);
+      db.prepare(
+        `INSERT INTO sb_memories (
+           id, content, entry_id, parent_version_id, scope_id, content_hash, created_at
+         ) VALUES ('entity-source-claim', 'Project Alpha identity', 'entity-source-entry',
+                   'entity-source-v1', 'project-identity', 'entity-source-hash', ?),
+                  ('entity-target-claim', 'Project Beta identity', 'entity-target-entry',
+                   'entity-target-v1', 'project-identity', 'entity-target-hash', ?)`
+      ).run(now, now);
+      db.prepare(
+        `INSERT INTO sb_memory_entities (id, memory_id, entity_id, role, created_at)
+         VALUES ('entity-source-mention', 'entity-source-claim', 'entity-source', 'subject', ?),
+                ('entity-target-mention', 'entity-target-claim', 'entity-target', 'subject', ?)`
       ).run(now, now);
       const entityJob = await enqueueAIReviewJob(env.DB, {
         objectType: "entity_merge_candidate",
@@ -431,10 +630,19 @@ describe("memory quality review queues", () => {
       ).run(now - 1, now);
       db.prepare(
         `INSERT INTO sb_memories (
-           id, content, entry_id, content_hash, observed_at, entities_json, created_at
-         ) VALUES ('old-claim-ai', 'Service uses SQLite', 'old-entry-ai', 'old-hash', ?, '[]', ?),
-                  ('new-claim-ai', 'Service uses Postgres', 'new-entry-ai', 'new-hash', ?, '[]', ?)`
+           id, content, entry_id, scope_id, content_hash, observed_at, entities_json, created_at
+         ) VALUES ('old-claim-ai', 'Service uses SQLite', 'old-entry-ai', 'production', 'old-hash', ?, '[]', ?),
+                  ('new-claim-ai', 'Service uses Postgres', 'new-entry-ai', 'production', 'new-hash', ?, '[]', ?)`
       ).run(now - 1, now - 1, now, now);
+      db.prepare(
+        `INSERT INTO sb_external_links (
+           id, provider, vault_id, external_path, object_type, object_id,
+           entry_id, sync_status, created_at, updated_at
+         ) VALUES ('old-conflict-link', 'api', 'work-vault', 'old-conflict', 'memory',
+                   'old-entry-ai', 'old-entry-ai', 'synced', ?, ?),
+                  ('new-conflict-link', 'api', 'work-vault', 'new-conflict', 'memory',
+                   'new-entry-ai', 'new-entry-ai', 'synced', ?, ?)`
+      ).run(now, now, now, now);
       db.prepare(
         `INSERT INTO sb_conflict_cases (
            id, old_memory_id, new_memory_id, old_claim_id, new_claim_id,

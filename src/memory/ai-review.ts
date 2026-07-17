@@ -37,6 +37,7 @@ export const AI_REVIEW_DIFFERENCE_DIMENSIONS = [
 export const AI_REVIEW_DIFFERENCE_STATUSES = ["same", "different", "missing", "ambiguous"] as const;
 
 export type AIReviewMode = (typeof AI_REVIEW_MODES)[number];
+export type AIReviewDecisionSource = "human" | "deterministic" | "guarded_ai";
 export type AIReviewObjectType = (typeof AI_REVIEW_OBJECT_TYPES)[number];
 export type AIReviewJobStatus = (typeof AI_REVIEW_JOB_STATUSES)[number];
 export type AIReviewability = (typeof AI_REVIEWABILITY_LEVELS)[number];
@@ -50,7 +51,7 @@ export type AIReviewRefinementAction =
   | "supersede"
   | "keep_separate";
 
-export const AI_REVIEW_PROMPT_VERSION = "knowledge-review-v3";
+export const AI_REVIEW_PROMPT_VERSION = "knowledge-review-v6";
 
 const DECISIONS: Record<AIReviewObjectType, readonly string[]> = {
   conflict_case: ["use_old", "use_new", "keep_both", "dismissed", "uncertain"],
@@ -124,9 +125,11 @@ export const AI_REVIEW_SCHEMA_STATEMENTS = [
     decision TEXT NOT NULL,
     applied_by TEXT NOT NULL,
     application_mode TEXT NOT NULL,
+    decision_source TEXT NOT NULL DEFAULT 'human',
     lease_owner TEXT,
     created_at INTEGER NOT NULL,
-    CHECK (application_mode IN ('human', 'deterministic_auto'))
+    CHECK (application_mode IN ('human', 'deterministic_auto')),
+    CHECK (decision_source IN ('human', 'deterministic', 'guarded_ai'))
   )`,
   `CREATE INDEX IF NOT EXISTS idx_ai_review_applications_object
    ON sb_ai_review_applications(object_type, object_id, created_at DESC)`,
@@ -198,6 +201,7 @@ export interface AIReviewEvidenceManifest {
   contentHash?: string;
   scopeIds: string[];
   vaultIds: string[];
+  projectIds: string[];
   sourceChannels: string[];
   sourceIdentityFingerprints: string[];
   evidenceRootFingerprints: string[];
@@ -283,6 +287,7 @@ export interface AIReviewJobRecord {
     id: string;
     appliedBy: string;
     applicationMode: "human" | "deterministic_auto";
+    decisionSource: AIReviewDecisionSource;
     createdAt: number;
   } | null;
 }
@@ -377,6 +382,27 @@ const VerificationResponseSchema = z.object({
   unsupportedStatements: z.array(z.string().trim().min(1).max(400)).max(8),
   reason: z.string().trim().min(1).max(1_000),
 }).strict();
+
+function normalizedVerificationResponseShape(parsed: unknown): unknown {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return parsed;
+  const response = parsed as Record<string, unknown>;
+  const strings = (value: unknown, maxItems: number, maxLength: number) =>
+    Array.isArray(value)
+      ? value
+        .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+        .slice(0, maxItems)
+        .map((item) => item.trim().slice(0, maxLength))
+      : value;
+  return {
+    approved: response.approved,
+    decision: response.decision,
+    evidenceRefs: strings(response.evidenceRefs, 16, 64),
+    unsupportedStatements: strings(response.unsupportedStatements, 8, 400),
+    reason: typeof response.reason === "string"
+      ? response.reason.trim().slice(0, 1_000)
+      : response.reason,
+  };
+}
 
 function parseJsonArray(value: unknown): unknown[] {
   try {
@@ -485,6 +511,7 @@ export async function createAIReviewManifest(
         ...values("scopeId"),
       ]),
       vaultIds: normalizedContextValues(item.vaultIds),
+      projectIds: normalizedContextValues(item.projectIds),
       sourceChannels: normalizedContextValues([
         item.entrySource,
         ...values("sourceChannel"),
@@ -532,6 +559,24 @@ function unwrapModelResponse(raw: string): string {
   return (fenced?.[1] ?? withoutThinking).trim();
 }
 
+function normalizedModelResponseShape(
+  parsed: unknown
+): unknown {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return parsed;
+  const response = parsed as Record<string, unknown>;
+  if (!response.refinement || typeof response.refinement !== "object" ||
+      Array.isArray(response.refinement)) return response;
+  const refinement = response.refinement as Record<string, unknown>;
+  return {
+    ...response,
+    refinement: {
+      action: refinement.action,
+      content: typeof refinement.content === "string" ? refinement.content : null,
+      sourceRefs: refinement.sourceRefs,
+    },
+  };
+}
+
 export function parseAIReviewModelResponse(
   raw: string,
   objectType: AIReviewObjectType,
@@ -539,7 +584,7 @@ export function parseAIReviewModelResponse(
 ): AIReviewModelResponse {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(unwrapModelResponse(raw));
+    parsed = normalizedModelResponseShape(JSON.parse(unwrapModelResponse(raw)));
   } catch {
     throw new AIReviewInvalidResponseError();
   }
@@ -569,6 +614,19 @@ export function parseAIReviewModelResponse(
   };
   if (refinement.sourceRefs.some((ref) => !allowedRefs.has(ref))) {
     throw new AIReviewInvalidResponseError("ai_review_unknown_refinement_evidence_ref");
+  }
+  const expectedMemoryActions: Record<string, AIReviewRefinementAction> = {
+    duplicate: "consolidate",
+    merge: "merge",
+    replace: "supersede",
+    keep_both: "keep_separate",
+    uncertain: "none",
+  };
+  const expectedAction = objectType === "memory_merge_candidate"
+    ? expectedMemoryActions[result.data.decision]
+    : "none";
+  if (!expectedAction || refinement.action !== expectedAction) {
+    throw new AIReviewInvalidResponseError("ai_review_refinement_action_mismatch");
   }
   if (result.data.reviewability !== "sufficient" && (!result.data.abstain || result.data.decision !== "uncertain")) {
     throw new AIReviewInvalidResponseError("ai_review_incomplete_context_requires_abstention");
@@ -697,7 +755,7 @@ unsupportedStatements, reason. No markdown or extra text.`,
   });
   let parsed: unknown;
   try {
-    parsed = JSON.parse(unwrapModelResponse(raw));
+    parsed = normalizedVerificationResponseShape(JSON.parse(unwrapModelResponse(raw)));
   } catch {
     throw new AIReviewInvalidResponseError("ai_review_invalid_verification_response");
   }
@@ -750,6 +808,31 @@ export async function ensureAIReviewDataModel(db: D1Database): Promise<void> {
   );
   if (!applicationNames.has("lease_owner")) {
     await db.exec(`ALTER TABLE sb_ai_review_applications ADD COLUMN lease_owner TEXT`);
+  }
+  if (!applicationNames.has("decision_source")) {
+    await db.exec(`DROP TRIGGER IF EXISTS trg_ai_review_applications_immutable_update`);
+    await db.exec(
+      `ALTER TABLE sb_ai_review_applications
+       ADD COLUMN decision_source TEXT NOT NULL DEFAULT 'human'
+       CHECK (decision_source IN ('human', 'deterministic', 'guarded_ai'))`
+    );
+    await db.exec(
+      `UPDATE sb_ai_review_applications
+       SET decision_source = CASE
+         WHEN application_mode = 'human' THEN 'human'
+         WHEN EXISTS (
+           SELECT 1 FROM sb_ai_review_runs run
+           WHERE run.id = sb_ai_review_applications.run_id
+             AND run.reviewer_provider = 'rules'
+         ) THEN 'deterministic'
+         ELSE 'guarded_ai'
+       END`
+    );
+    await db.exec(
+      `CREATE TRIGGER IF NOT EXISTS trg_ai_review_applications_immutable_update
+       BEFORE UPDATE ON sb_ai_review_applications
+       BEGIN SELECT RAISE(ABORT, 'ai_review_applications_immutable'); END`
+    );
   }
   const runColumns = await db.prepare(`PRAGMA table_info(sb_ai_review_runs)`).all<{ name: string }>();
   const runNames = new Set((runColumns.results ?? []).map((column) => column.name));
@@ -879,7 +962,7 @@ async function loadEntityEvidence(db: D1Database, entityId: string): Promise<Rec
 async function loadEntryPolicyContext(
   db: D1Database,
   entryId: string
-): Promise<{ scopeIds: string[]; vaultIds: string[] }> {
+): Promise<{ scopeIds: string[]; vaultIds: string[]; projectIds: string[] }> {
   const scopes = await db.prepare(
     `SELECT DISTINCT scope_id AS value
      FROM sb_memories
@@ -900,9 +983,53 @@ async function loadEntryPolicyContext(
      WHERE value IS NOT NULL AND trim(value) <> ''
      ORDER BY value`
   ).bind(entryId, entryId).all<{ value: string }>();
+  const structuredProjects = await db.prepare(
+    `SELECT DISTINCT entity.id AS value
+     FROM sb_memories memory
+     JOIN sb_memory_entities link ON link.memory_id = memory.id
+     JOIN sb_entities entity ON entity.id = link.entity_id
+     WHERE memory.entry_id = ?
+       AND lower(COALESCE(entity.entity_type, '')) IN ('project', 'product')
+       AND entity.lifecycle_state = 'active'
+     ORDER BY value`
+  ).bind(entryId).all<{ value: string }>();
+  const taggedProjects = await db.prepare(
+    `WITH entry_tags AS (
+       SELECT lower(trim(CAST(tag.value AS TEXT))) AS raw_value
+       FROM entries entry
+       CROSS JOIN json_each(
+         CASE WHEN json_valid(entry.tags) THEN entry.tags ELSE '[]' END
+       ) tag
+       WHERE entry.id = ?
+     ), normalized_tags AS (
+       SELECT CASE
+                WHEN raw_value LIKE 'project/%' THEN substr(raw_value, 9)
+                WHEN raw_value LIKE 'product/%' THEN substr(raw_value, 9)
+                ELSE raw_value
+              END AS value,
+              CASE
+                WHEN raw_value LIKE 'project/%' OR raw_value LIKE 'product/%' THEN 1
+                ELSE 0
+              END AS explicitly_scoped
+       FROM entry_tags
+     )
+     SELECT DISTINCT COALESCE(entity.id, 'tag:' || tag.value) AS value
+     FROM normalized_tags tag
+     LEFT JOIN sb_entities entity
+       ON entity.name_normalized = tag.value
+      AND lower(COALESCE(entity.entity_type, '')) IN ('project', 'product')
+      AND entity.lifecycle_state = 'active'
+     WHERE tag.value <> ''
+       AND (tag.explicitly_scoped = 1 OR entity.id IS NOT NULL)
+     ORDER BY value`
+  ).bind(entryId).all<{ value: string }>();
   return {
     scopeIds: normalizedContextValues((scopes.results ?? []).map((row) => row.value)),
     vaultIds: normalizedContextValues((vaults.results ?? []).map((row) => row.value)),
+    projectIds: normalizedContextValues([
+      ...(structuredProjects.results ?? []).map((row) => row.value),
+      ...(taggedProjects.results ?? []).map((row) => row.value),
+    ]),
   };
 }
 
@@ -1365,28 +1492,83 @@ function deterministicRecommendation(job: AIReviewJobRecord): AIReviewModelRespo
 function contextIsolationRecommendation(job: AIReviewJobRecord): AIReviewModelResponse | null {
   const [left, right] = job.inputManifest.evidence;
   if (!left || !right) return null;
-  const differs = (first: string[], second: string[]) =>
+  const differs = (first: string[] = [], second: string[] = []) =>
     first.length > 0 && second.length > 0 && stableJson(first) !== stableJson(second);
   const crossVault = differs(left.vaultIds, right.vaultIds);
   const crossScope = differs(left.scopeIds, right.scopeIds);
-  if (!crossVault && !crossScope) return null;
+  const crossProject = differs(left.projectIds, right.projectIds);
+  const missingVault = left.vaultIds.length === 0 || right.vaultIds.length === 0;
+  const missingScope = left.scopeIds.length === 0 || right.scopeIds.length === 0;
+  if (!crossVault && !crossScope && !crossProject && !missingVault && !missingScope) return null;
   const refs = [left.ref, right.ref];
+  const dimension: AIReviewDifferenceDimension = crossVault
+    ? "source"
+    : crossScope ? "scope" : "identity";
+  const summary = crossVault
+    ? "Vault isolation requires the memories to remain separate."
+    : crossScope
+      ? "Scope isolation requires the memories to remain separate."
+      : "The memories are assigned to different project entities.";
+  if (job.objectType === "memory_merge_candidate" &&
+      (crossVault || crossScope || crossProject)) {
+    return {
+      decision: "keep_both",
+      reason: `${summary} No model review was needed for this lossless decision.`,
+      evidenceRefs: refs,
+      confidence: { decision: 1, evidence: 1 },
+      abstain: false,
+      reviewability: "sufficient",
+      missingContext: [],
+      keyDifferences: [{
+        dimension,
+        status: "different",
+        summary,
+        evidenceRefs: refs,
+      }],
+      refinement: { action: "keep_separate", content: null, sourceRefs: refs },
+    };
+  }
+  const missingContext = [
+    ...(missingVault ? ["source_provenance" as const] : []),
+    ...(missingScope ? ["scope_context" as const] : []),
+  ];
+  if (missingContext.length > 0 && !crossVault && !crossScope && !crossProject) {
+    const missingSummary = missingVault && missingScope
+      ? "Vault and scope context are required before model review."
+      : missingVault
+        ? "Vault context is required before model review."
+        : "Scope context is required before model review.";
+    return {
+      decision: "uncertain",
+      reason: `${missingSummary} No Claim content was sent to the model.`,
+      evidenceRefs: refs,
+      confidence: { decision: 0, evidence: 0 },
+      abstain: true,
+      reviewability: "insufficient",
+      missingContext,
+      keyDifferences: [{
+        dimension: missingVault ? "source" : "scope",
+        status: "missing",
+        summary: missingSummary,
+        evidenceRefs: refs,
+      }],
+      refinement: { action: "none", content: null, sourceRefs: [] },
+    };
+  }
   return {
     decision: "uncertain",
-    reason: crossVault
-      ? "The evidence belongs to different vaults, so no model review was performed."
-      : "The evidence belongs to different scopes, so no model review was performed.",
+    reason: `${summary} No model review was performed.`,
     evidenceRefs: refs,
     confidence: { decision: 0, evidence: 1 },
     abstain: true,
     reviewability: "insufficient",
-    missingContext: [crossVault ? "source_provenance" : "scope_context"],
+    missingContext: [crossVault
+      ? "source_provenance"
+      : crossScope ? "scope_context" : "identity_evidence"],
     keyDifferences: [{
-      dimension: crossVault ? "source" : "scope",
+      dimension,
       status: "different",
-      summary: crossVault
-        ? "Vault isolation prevents cross-vault automatic review."
-        : "Scope isolation prevents cross-scope automatic review.",
+      summary,
       evidenceRefs: refs,
     }],
     refinement: { action: "none", content: null, sourceRefs: [] },
@@ -1397,6 +1579,7 @@ export function evaluateAIAutoApplyEligibility(input: {
   objectType: AIReviewObjectType;
   response: AIReviewModelResponse;
   manifest: AIReviewSnapshotManifest;
+  trustedContextIsolation?: boolean;
 }): { eligible: boolean; reason: string } {
   const { response, manifest } = input;
   if (
@@ -1414,12 +1597,6 @@ export function evaluateAIAutoApplyEligibility(input: {
   const sameContext = (first: string[], second: string[]) =>
     (first?.length ?? 0) > 0 && (second?.length ?? 0) > 0 &&
     stableJson(first) === stableJson(second);
-  if (!sameContext(left.vaultIds, right.vaultIds)) {
-    return { eligible: false, reason: "cross_vault" };
-  }
-  if (!sameContext(left.scopeIds, right.scopeIds)) {
-    return { eligible: false, reason: "cross_scope" };
-  }
 
   const decisionConfidence = response.confidence.decision;
   const evidenceConfidence = response.confidence.evidence;
@@ -1449,6 +1626,30 @@ export function evaluateAIAutoApplyEligibility(input: {
     if (decisionConfidence < requirement.decision || evidenceConfidence < requirement.evidence) {
       return { eligible: false, reason: "confidence_below_threshold" };
     }
+    if (response.decision === "keep_both") {
+      if (input.trustedContextIsolation) {
+        return { eligible: true, reason: "eligible_context_isolation" };
+      }
+      if (!sameContext(left.vaultIds, right.vaultIds)) {
+        return { eligible: false, reason: "cross_vault" };
+      }
+      if (!sameContext(left.scopeIds, right.scopeIds)) {
+        return { eligible: false, reason: "cross_scope" };
+      }
+      if (!sameContext(left.projectIds, right.projectIds)) {
+        return { eligible: false, reason: "cross_project" };
+      }
+      return { eligible: true, reason: "eligible_keep_separate" };
+    }
+    if (!sameContext(left.vaultIds, right.vaultIds)) {
+      return { eligible: false, reason: "cross_vault" };
+    }
+    if (!sameContext(left.scopeIds, right.scopeIds)) {
+      return { eligible: false, reason: "cross_scope" };
+    }
+    if (!sameContext(left.projectIds, right.projectIds)) {
+      return { eligible: false, reason: "cross_project" };
+    }
     if (response.decision === "replace") {
       const hasTemporalBasis = response.keyDifferences.some((difference) =>
         difference.dimension === "time" && difference.status === "different");
@@ -1458,6 +1659,13 @@ export function evaluateAIAutoApplyEligibility(input: {
       }
     }
     return { eligible: true, reason: "eligible" };
+  }
+
+  if (!sameContext(left.vaultIds, right.vaultIds)) {
+    return { eligible: false, reason: "cross_vault" };
+  }
+  if (!sameContext(left.scopeIds, right.scopeIds)) {
+    return { eligible: false, reason: "cross_scope" };
   }
 
   if (input.objectType === "entity_merge_candidate") {
@@ -1505,7 +1713,8 @@ export async function processAIReviewJob(
     if (await hashAIReviewSnapshot(currentSnapshot) !== job.inputSnapshotHash) {
       throw new AIReviewObjectUnavailableError(job.objectType, job.objectId);
     }
-    const deterministic = contextIsolationRecommendation(job) ?? deterministicRecommendation(job);
+    const contextIsolation = contextIsolationRecommendation(job);
+    const deterministic = contextIsolation ?? deterministicRecommendation(job);
     const refs = currentSnapshot.evidence.map((item) => item.ref);
     const modelResponse = deterministic ?? parseAIReviewModelResponse(
       await reviewer.complete(buildAIReviewMessages({
@@ -1521,6 +1730,7 @@ export async function processAIReviewJob(
           objectType: job.objectType,
           response: modelResponse,
           manifest: job.inputManifest,
+          trustedContextIsolation: Boolean(contextIsolation),
         })
       : { eligible: false, reason: "mode_not_automatic" };
     let verification: AIReviewVerificationResult | null = null;
@@ -1555,7 +1765,9 @@ export async function processAIReviewJob(
       autoApplyEligible: eligibility.eligible,
       reviewerProvider: deterministic ? "rules" : reviewer.provider,
       reviewerModel: deterministic
-        ? "exact-content-hash-v1"
+        ? contextIsolation
+          ? "context-isolation-v3"
+          : "exact-content-hash-v1"
         : verification ? `${reviewer.model}+second-pass-verifier` : reviewer.model,
       promptVersion: AI_REVIEW_PROMPT_VERSION,
       inputSnapshotHash: job.inputSnapshotHash,
@@ -1658,6 +1870,7 @@ export async function listAIReviewJobs(
             r.input_snapshot_json AS review_input_snapshot_json,
             r.created_at AS review_created_at,
             a.id AS application_id, a.applied_by, a.application_mode,
+            a.decision_source,
             a.created_at AS application_created_at
      FROM sb_ai_review_jobs j
      LEFT JOIN sb_ai_review_runs r ON r.id = j.run_id
@@ -1695,6 +1908,7 @@ export async function listAIReviewJobs(
       id: String(row.application_id),
       appliedBy: String(row.applied_by),
       applicationMode: row.application_mode as "human" | "deterministic_auto",
+      decisionSource: row.decision_source as AIReviewDecisionSource,
       createdAt: Number(row.application_created_at),
     } : null;
     return { ...job, run, application };
@@ -1752,6 +1966,7 @@ export function prepareAIReviewApplicationStatements(
     run: AIReviewRunRecord;
     appliedBy: string;
     applicationMode: "human" | "deterministic_auto";
+    decisionSource: AIReviewDecisionSource;
     leaseOwner: string;
     guard: AIReviewApplicationGuard;
   }
@@ -1793,8 +2008,8 @@ export function prepareAIReviewApplicationStatements(
     db.prepare(
       `INSERT INTO sb_ai_review_applications (
          id, run_id, object_type, object_id, decision, applied_by,
-         application_mode, lease_owner, created_at
-       ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+         application_mode, decision_source, lease_owner, created_at
+       ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          WHERE EXISTS (${guardSql})`
     ).bind(
       applicationId,
@@ -1804,6 +2019,7 @@ export function prepareAIReviewApplicationStatements(
       input.run.decision,
       input.appliedBy,
       input.applicationMode,
+      input.decisionSource,
       input.leaseOwner,
       now,
       ...guardBindings

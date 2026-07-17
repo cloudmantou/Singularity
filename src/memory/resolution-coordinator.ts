@@ -26,7 +26,12 @@ export interface ConflictResolutionInput {
   actorType: string;
   actorId?: string | null;
   finalizationStatements?: D1PreparedStatement[];
-  aiReview?: { runId: string; decision: string; applicationMode: "human" | "deterministic_auto" };
+  aiReview?: {
+    runId: string;
+    decision: string;
+    applicationMode: "human" | "deterministic_auto";
+    decisionSource: "human" | "deterministic" | "guarded_ai";
+  };
 }
 
 interface ConflictRow {
@@ -403,6 +408,7 @@ export class D1ResolutionCoordinator implements ResolutionCoordinator {
           ai_review_run_id: input.aiReview.runId,
           ai_review_decision: input.aiReview.decision,
           ai_review_application_mode: input.aiReview.applicationMode,
+          ai_review_decision_source: input.aiReview.decisionSource,
         } : {}),
       },
     });

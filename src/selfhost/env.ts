@@ -97,6 +97,7 @@ export function createSelfhostEnv(options: SelfhostOptions = {}): {
     VERIFIER_LLM_API_KEY: process.env.VERIFIER_LLM_API_KEY,
     VERIFIER_LLM_MODEL: process.env.VERIFIER_LLM_MODEL,
     VERIFIER_LLM_EXTRA_BODY: process.env.VERIFIER_LLM_EXTRA_BODY,
+    KNOWLEDGE_REVIEW_AUTOMATION: process.env.KNOWLEDGE_REVIEW_AUTOMATION,
   };
 
   return { env, db: raw, databasePath };

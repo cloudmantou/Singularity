@@ -36,6 +36,7 @@
           ...item,
           scopeIds: Array.isArray(item.scopeIds) ? item.scopeIds.map(String) : [],
           vaultIds: Array.isArray(item.vaultIds) ? item.vaultIds.map(String) : [],
+          projectIds: Array.isArray(item.projectIds) ? item.projectIds.map(String) : [],
           sourceChannels: Array.isArray(item.sourceChannels) ? item.sourceChannels.map(String) : [],
           authorTypes: Array.isArray(item.authorTypes) ? item.authorTypes.map(String) : [],
           claimStatuses: Array.isArray(item.claimStatuses) ? item.claimStatuses.map(String) : [],
@@ -262,6 +263,7 @@
         };
         addValues("review.ai.context.scope", contextItem.scopeIds);
         addValues("review.ai.context.vault", contextItem.vaultIds);
+        addValues("review.ai.context.project", contextItem.projectIds);
         addValues("review.ai.context.source", contextItem.sourceChannels);
         addValues("review.ai.context.author", contextItem.authorTypes);
         addValues("review.ai.context.claimStatus", contextItem.claimStatuses);

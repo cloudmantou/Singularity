@@ -75,8 +75,8 @@ describe("Knowledge Evolution automation API", () => {
         state: "completed",
         total: 1,
         processed: 1,
-        skipped: 0,
-        failed: 1,
+        skipped: 1,
+        failed: 0,
         percent: 100,
         current: null,
       });

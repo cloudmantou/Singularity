@@ -35,6 +35,7 @@ describe("Knowledge Review UI module", () => {
       evidenceRefs: ["OLD", "NEW"],
     }];
     const sourceChannels = ["obsidian"];
+    const projectIds = ["singularity"];
     const refinementRefs = ["OLD", "NEW"];
     const payload = normalizeReviewQueues({
       conflicts: { conflicts: [{ id: "conflict-1" }] },
@@ -45,7 +46,14 @@ describe("Knowledge Review UI module", () => {
         objectType: "conflict_case",
         objectId: "conflict-1",
         status: "completed",
-        context: { evidence: [{ ref: "OLD", sourceChannels, scopeIds: ["production"] }] },
+        context: {
+          evidence: [{
+            ref: "OLD",
+            sourceChannels,
+            projectIds,
+            scopeIds: ["production"],
+          }],
+        },
         run: {
           id: "run-1",
           decision: "uncertain",
@@ -79,6 +87,10 @@ describe("Knowledge Review UI module", () => {
     expect(payload.conflicts[0].aiReview.run.refinement.sourceRefs).not.toBe(refinementRefs);
     expect(payload.conflicts[0].aiReview.context.evidence[0].sourceChannels)
       .not.toBe(sourceChannels);
+    expect(payload.conflicts[0].aiReview.context.evidence[0].projectIds)
+      .toEqual(["singularity"]);
+    expect(payload.conflicts[0].aiReview.context.evidence[0].projectIds)
+      .not.toBe(projectIds);
     expect(payload.entities[0].aiReview).toBeNull();
   });
 

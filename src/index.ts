@@ -180,6 +180,7 @@ import {
   prepareAIReviewApplicationStatements,
   releaseAIReviewApplication,
   type AIReviewJobRecord,
+  type AIReviewDecisionSource,
   type AIReviewMode,
   type AIReviewObjectType,
   type AIReviewRunRecord,
@@ -10950,7 +10951,12 @@ async function resolveMemoryMergeCandidate(
       "actorType" | "actorId" | "tokenId" | "vaultId"
     >;
     reviewedAt?: number;
-    aiReview?: { runId: string; decision: string; applicationMode: "human" | "deterministic_auto" };
+    aiReview?: {
+      runId: string;
+      decision: string;
+      applicationMode: "human" | "deterministic_auto";
+      decisionSource: AIReviewDecisionSource;
+    };
     domainStatements?: D1PreparedStatement[];
     finalizationStatements?: D1PreparedStatement[];
   }
@@ -10971,6 +10977,7 @@ async function resolveMemoryMergeCandidate(
         ai_review_run_id: input.aiReview.runId,
         ai_review_decision: input.aiReview.decision,
         ai_review_application_mode: input.aiReview.applicationMode,
+        ai_review_decision_source: input.aiReview.decisionSource,
       } : {}),
     },
   });
@@ -11134,7 +11141,12 @@ async function resolveConflictCase(
     >;
     resolvedAt?: number;
     finalizationStatements?: D1PreparedStatement[];
-    aiReview?: { runId: string; decision: string; applicationMode: "human" | "deterministic_auto" };
+    aiReview?: {
+      runId: string;
+      decision: string;
+      applicationMode: "human" | "deterministic_auto";
+      decisionSource: AIReviewDecisionSource;
+    };
   }
 ): Promise<boolean> {
   const now = input.resolvedAt ?? Date.now();
@@ -11199,6 +11211,7 @@ function publicAIReviewJob(job: AIReviewJobRecord): Record<string, unknown> {
         ref: item.ref,
         scopeIds: [...(item.scopeIds ?? [])],
         vaultIds: [...(item.vaultIds ?? [])],
+        projectIds: [...(item.projectIds ?? [])],
         sourceChannels: [...(item.sourceChannels ?? [])],
         authorTypes: [...(item.authorTypes ?? [])],
         claimStatuses: [...(item.claimStatuses ?? [])],
@@ -11274,7 +11287,6 @@ async function applyAIReviewRecommendation(
   input: {
     principal?: AuthPrincipal;
     deterministicAuto?: boolean;
-    automationActorId?: string;
   }
 ): Promise<Record<string, unknown>> {
   const run = await getAIReviewRun(env.DB, runId);
@@ -11290,18 +11302,22 @@ async function applyAIReviewRecommendation(
     throw new AIReviewObjectUnavailableError(run.objectType, run.objectId);
   }
   const claimed = await claimAIReviewApplication(env.DB, runId);
+  const automaticActorId = run.reviewerProvider === "rules"
+    ? "system:deterministic"
+    : "system:guarded-ai";
   const actor = input.principal ? auditActorFromPrincipal(input.principal) : {
     actorType: "system",
-    actorId: input.automationActorId ?? "system:knowledge-evolution",
+    actorId: automaticActorId,
     tokenId: null,
     vaultId: null,
   };
   const appliedBy = input.deterministicAuto
-    ? input.automationActorId ?? (
-        run.reviewerProvider === "rules" ? "system:deterministic" : "system:guarded-ai"
-      )
+    ? automaticActorId
     : actor.actorId ?? "owner";
   const applicationMode = input.deterministicAuto ? "deterministic_auto" : "human";
+  const decisionSource: AIReviewDecisionSource = input.deterministicAuto
+    ? run.reviewerProvider === "rules" ? "deterministic" : "guarded_ai"
+    : "human";
   const reviewedAt = Date.now();
   try {
     let applied = false;
@@ -11314,6 +11330,7 @@ async function applyAIReviewRecommendation(
         run,
         appliedBy,
         applicationMode,
+        decisionSource,
         leaseOwner: claimed.job.leaseOwner!,
         guard: {
           objectType: "conflict_case",
@@ -11333,7 +11350,7 @@ async function applyAIReviewRecommendation(
         auditActor: actor,
         resolvedAt: reviewedAt,
         finalizationStatements,
-        aiReview: { runId: run.id, decision: run.decision, applicationMode },
+        aiReview: { runId: run.id, decision: run.decision, applicationMode, decisionSource },
       });
     } else if (run.objectType === "entity_merge_candidate") {
       const reviewedBy = `ai-review:${appliedBy}`;
@@ -11343,6 +11360,7 @@ async function applyAIReviewRecommendation(
         run,
         appliedBy,
         applicationMode,
+        decisionSource,
         leaseOwner: claimed.job.leaseOwner!,
         guard: {
           objectType: "entity_merge_candidate",
@@ -11376,6 +11394,7 @@ async function applyAIReviewRecommendation(
         run,
         appliedBy,
         applicationMode,
+        decisionSource,
         leaseOwner: claimed.job.leaseOwner!,
         guard: {
           objectType: "memory_merge_candidate",
@@ -11385,7 +11404,20 @@ async function applyAIReviewRecommendation(
           reviewedAt,
         },
       });
-      const evolution = run.refinement.action === "none"
+      const [leftContext, rightContext] = run.inputManifest.evidence;
+      const sameContextValues = (left: string[] = [], right: string[] = []) =>
+        left.length > 0 && right.length > 0 &&
+        JSON.stringify([...left].sort()) === JSON.stringify([...right].sort());
+      const projectContextCompatible = (leftContext?.projectIds.length ?? 0) === 0 &&
+          (rightContext?.projectIds.length ?? 0) === 0 ||
+        sameContextValues(leftContext?.projectIds, rightContext?.projectIds);
+      const relatedKeepSeparate = run.decision === "keep_both" &&
+        sameContextValues(leftContext?.vaultIds, rightContext?.vaultIds) &&
+        sameContextValues(leftContext?.scopeIds, rightContext?.scopeIds) &&
+        projectContextCompatible;
+      const skipEvolution = run.refinement.action === "none" ||
+        (run.decision === "keep_both" && !relatedKeepSeparate);
+      const evolution = skipEvolution
         ? null
         : await prepareMemoryKnowledgeEvolution(env.DB, {
             candidateId: run.objectId,
@@ -11404,7 +11436,7 @@ async function applyAIReviewRecommendation(
         reviewedAt,
         principal: input.principal,
         auditActor: actor,
-        aiReview: { runId: run.id, decision: run.decision, applicationMode },
+        aiReview: { runId: run.id, decision: run.decision, applicationMode, decisionSource },
         domainStatements: evolution?.statements,
         finalizationStatements,
       });
@@ -11445,7 +11477,6 @@ async function processAIReviewForAutomation(env: Env, jobId: string): Promise<bo
   if (result.run.autoApplyEligible && result.run.mode === "auto_low_risk") {
     await applyAIReviewRecommendation(env, result.run.id, {
       deterministicAuto: true,
-      automationActorId: result.job.requestedBy,
     });
     return true;
   }
