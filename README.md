@@ -173,9 +173,21 @@ The MCP surface includes:
 ```text
 remember · append · update · set_status · recall · list_recent
 relations · link · unlink · connections · forget
+evolution_next · evolution_submit (when EXTERNAL_EVOLUTION_MCP=1)
 ```
 
 OAuth discovery and PKCE allow supported remote clients to register without placing the owner token in a connector URL.
+
+`evolution_next` and `evolution_submit` let an authenticated external agent review one
+pending memory-merge candidate at a time. The lease contains a bounded, redacted Claim
+snapshot rather than raw Evidence. A submission is applied only after Singularity
+rechecks the lease, snapshot hash, references, Scope/Vault/Project isolation and
+confidence, then obtains an independent server-side model verification and application
+receipt through the existing reversible evolution rules. The external agent cannot
+self-verify, delete, or rewrite source Observations through this path. Set
+`EXTERNAL_EVOLUTION_MCP=1` to expose these tools to personal MCP clients that the
+owner approved through the existing AUTH_TOKEN-backed OAuth flow. The server prefers
+`VERIFIER_LLM_*` when configured and otherwise uses its own configured LLM.
 
 ## OpenAI support
 

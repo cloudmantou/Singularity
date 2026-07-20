@@ -187,6 +187,11 @@ import {
 } from "./memory/ai-review";
 import { prepareMemoryKnowledgeEvolution } from "./memory/knowledge-evolution";
 import {
+  isExternalEvolutionError,
+  leaseNextExternalEvolutionReview,
+  submitExternalEvolutionReview,
+} from "./memory/external-evolution";
+import {
   claimNextKnowledgeEvolutionItem,
   completeKnowledgeEvolutionItem,
   getKnowledgeEvolutionAutomationStatus,
@@ -367,6 +372,8 @@ export interface Env {
   /** Knowledge Review model mode: shadow, suggest, or deterministic auto_low_risk. */
   /** Automatic Knowledge Evolution: auto (default) or off. */
   KNOWLEDGE_REVIEW_AUTOMATION?: string;
+  /** Explicitly enables external evolution for owner-approved personal MCP clients. */
+  EXTERNAL_EVOLUTION_MCP?: string;
 }
 
 const entityEmbeddingIndexes = new WeakMap<object, EntityEmbeddingIndex>();
@@ -11227,22 +11234,29 @@ function publicAIReviewJob(job: AIReviewJobRecord): Record<string, unknown> {
   };
 }
 
-async function createAIReviewModel(env: Env) {
-  let provider = env.LLM_BASE_URL ? "openai-compatible" : "workers-ai";
-  let model = env.LLM_MODEL ?? "default";
-  try {
-    const { effective } = await getEffectiveModelSettings(env);
-    provider = effective.llm.provider;
-    model = effective.llm.model;
-  } catch {
-    // createLLM reports the actionable provider error when processing starts.
+async function createAIReviewModel(env: Env, options: { preferVerifier?: boolean } = {}) {
+  const verifierEnv = options.preferVerifier
+    ? (await resolveSynthesisRuntimeConfig(env)).verifierEnv
+    : null;
+  let provider = verifierEnv?.LLM_BASE_URL
+    ? "openai-compatible"
+    : env.LLM_BASE_URL ? "openai-compatible" : "workers-ai";
+  let model = verifierEnv?.LLM_MODEL ?? env.LLM_MODEL ?? "default";
+  if (!verifierEnv) {
+    try {
+      const { effective } = await getEffectiveModelSettings(env);
+      provider = effective.llm.provider;
+      model = effective.llm.model;
+    } catch {
+      // createLLM reports the actionable provider error when processing starts.
+    }
   }
   let llm: LLMProvider | null = null;
   return {
     provider,
     model,
     complete: async (messages: { system: string; user: string }) => {
-      llm ??= await createLLM(env);
+      llm ??= await createLLM(verifierEnv ?? env);
       return llm.chat([
         { role: "system", content: messages.system },
         { role: "user", content: messages.user },
@@ -13521,6 +13535,41 @@ export async function applyStatus(id: string, status: MemoryStatus, env: Env): P
 
 // ─── MCP Server ───────────────────────────────────────────────────────────────
 
+const ExternalEvolutionDifferenceSchema = z.object({
+  dimension: z.enum(["meaning", "identity", "scope", "time", "source", "status", "content"]),
+  status: z.enum(["same", "different", "missing", "ambiguous"]),
+  summary: z.string().trim().min(1).max(400),
+  evidenceRefs: z.array(z.enum(["SOURCE", "TARGET"])).min(1).max(2),
+}).strict();
+
+const ExternalEvolutionProposalSchema = z.object({
+  decision: z.enum(["duplicate", "replace", "merge", "keep_both", "uncertain"]),
+  reason: z.string().trim().min(1).max(2_000),
+  evidenceRefs: z.array(z.enum(["SOURCE", "TARGET"])).max(2),
+  confidence: z.object({
+    decision: z.number().min(0).max(1),
+    evidence: z.number().min(0).max(1),
+  }).strict(),
+  abstain: z.boolean(),
+  reviewability: z.enum(["sufficient", "partial", "insufficient"]),
+  missingContext: z.array(z.enum([
+    "complete_statement",
+    "source_provenance",
+    "source_authority",
+    "scope_context",
+    "temporal_context",
+    "parent_context",
+    "identity_evidence",
+    "conflict_basis",
+  ])).max(8),
+  keyDifferences: z.array(ExternalEvolutionDifferenceSchema).max(8),
+  refinement: z.object({
+    action: z.enum(["none", "consolidate", "merge", "supersede", "keep_separate"]),
+    content: z.string().trim().min(1).max(6_000).nullable(),
+    sourceRefs: z.array(z.enum(["SOURCE", "TARGET"])).max(2),
+  }).strict(),
+}).strict();
+
 function buildMcpServer(
   env: Env,
   ctx: ExecutionContext,
@@ -13846,6 +13895,93 @@ function buildMcpServer(
       return { content: [{ type: "text", text }] };
     }
   );
+
+  if (["1", "on", "true"].includes((env.EXTERNAL_EVOLUTION_MCP ?? "").trim().toLowerCase())) {
+    server.registerTool(
+      "evolution_next",
+      {
+        description: "Lease the next same-context memory merge candidate for evidence-grounded external review. Returns a bounded Claim-only snapshot; raw Evidence remains private and immutable.",
+        inputSchema: {
+          reviewer_id: z.string().regex(/^[A-Za-z0-9._-]{1,80}$/)
+            .describe("Stable external reviewer identifier, for example codex-local"),
+          lease_seconds: z.number().int().min(1).max(600).default(300),
+        },
+      },
+      async ({ reviewer_id, lease_seconds }) => {
+        try {
+          const lease = await leaseNextExternalEvolutionReview(env.DB, {
+            reviewerId: reviewer_id,
+            leaseMs: lease_seconds * 1_000,
+          }, {
+            reconcileApplication: (runId) => applyAIReviewRecommendation(env, runId, {
+              deterministicAuto: true,
+            }),
+          });
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify(lease ?? { status: "empty", message: "No reviewable candidate is available." }),
+            }],
+          };
+        } catch (error) {
+          const message = isExternalEvolutionError(error) && error instanceof Error
+            ? error.message
+            : "external_evolution_next_failed";
+          return { content: [{ type: "text", text: JSON.stringify({ error: message }) }], isError: true };
+        }
+      }
+    );
+
+    server.registerTool(
+      "evolution_submit",
+      {
+        description: "Submit a structured review for a leased memory merge candidate. Singularity revalidates the lease, snapshot, references, context, confidence, and second-pass verification before any reversible Knowledge Evolution is applied.",
+        inputSchema: {
+          job_id: z.string().uuid(),
+          lease_token: z.string().uuid(),
+          snapshot_hash: z.string().regex(/^[a-f0-9]{64}$/i),
+          reviewer_id: z.string().regex(/^[A-Za-z0-9._-]{1,80}$/),
+          reviewer_model: z.string().trim().min(1).max(160),
+          proposal: ExternalEvolutionProposalSchema,
+        },
+      },
+      async ({
+        job_id,
+        lease_token,
+        snapshot_hash,
+        reviewer_id,
+        reviewer_model,
+        proposal,
+      }) => {
+        try {
+          const verifier = await createAIReviewModel(env, { preferVerifier: true });
+          const result = await submitExternalEvolutionReview(env.DB, {
+            jobId: job_id,
+            leaseToken: lease_token,
+            snapshotHash: snapshot_hash,
+            reviewerId: reviewer_id,
+            reviewerModel: reviewer_model,
+            proposal,
+          }, {
+            verifier,
+            applyRecommendation: (runId) => applyAIReviewRecommendation(env, runId, {
+              deterministicAuto: true,
+            }),
+          });
+          return { content: [{ type: "text", text: JSON.stringify(result) }] };
+        } catch (error) {
+          console.error("MCP external evolution submit failed", {
+            jobId: job_id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          const message = isExternalEvolutionError(error) && error instanceof Error
+            ? error.message
+            : "external_evolution_submit_failed";
+          return { content: [{ type: "text", text: JSON.stringify({ error: message }) }], isError: true };
+        }
+      }
+    );
+  }
 
   // ── forget ───────────────────────────────────────────────────────────────
   server.registerTool(

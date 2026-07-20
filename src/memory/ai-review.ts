@@ -1678,7 +1678,13 @@ export function evaluateAIAutoApplyEligibility(input: {
 export async function processAIReviewJob(
   db: D1Database,
   jobId: string,
-  reviewer: AIReviewModel
+  reviewer: AIReviewModel,
+  options: {
+    existingLeaseOwner?: string;
+    preserveLeaseOnCompletion?: boolean;
+    now?: number;
+    clock?: () => number;
+  } = {}
 ): Promise<{ job: AIReviewJobRecord; run: AIReviewRunRecord }> {
   await ensureAIReviewDataModel(db);
   const existingRow = await db.prepare(`SELECT * FROM sb_ai_review_jobs WHERE id = ?`).bind(jobId)
@@ -1690,17 +1696,30 @@ export async function processAIReviewJob(
       .first<Record<string, unknown>>();
     if (runRow) return { job: existing, run: rowToRun(runRow) };
   }
-  const startedAt = Date.now();
-  const leaseOwner = crypto.randomUUID();
-  const leaseExpiresAt = startedAt + 60_000;
-  const claimed = await db.prepare(
-    `UPDATE sb_ai_review_jobs
-     SET status = 'processing', started_at = ?, error_code = NULL,
-         lease_owner = ?, lease_expires_at = ?
-     WHERE id = ?
-       AND (status = 'queued' OR (status = 'processing' AND COALESCE(lease_expires_at, 0) <= ?))`
-  ).bind(startedAt, leaseOwner, leaseExpiresAt, jobId, startedAt).run();
-  if (Number(claimed.meta?.changes ?? 0) !== 1) throw new AIReviewJobUnavailableError(jobId);
+  const clock = options.clock ?? (options.now == null ? Date.now : () => options.now!);
+  const startedAt = clock();
+  const leaseOwner = options.existingLeaseOwner ?? crypto.randomUUID();
+  const leaseExpiresAt = options.existingLeaseOwner
+    ? existing.leaseExpiresAt ?? 0
+    : startedAt + 60_000;
+  if (options.existingLeaseOwner) {
+    if (
+      existing.status !== "processing" ||
+      existing.leaseOwner !== options.existingLeaseOwner ||
+      leaseExpiresAt <= startedAt
+    ) {
+      throw new AIReviewJobUnavailableError(jobId);
+    }
+  } else {
+    const claimed = await db.prepare(
+      `UPDATE sb_ai_review_jobs
+       SET status = 'processing', started_at = ?, error_code = NULL,
+           lease_owner = ?, lease_expires_at = ?
+       WHERE id = ?
+         AND (status = 'queued' OR (status = 'processing' AND COALESCE(lease_expires_at, 0) <= ?))`
+    ).bind(startedAt, leaseOwner, leaseExpiresAt, jobId, startedAt).run();
+    if (Number(claimed.meta?.changes ?? 0) !== 1) throw new AIReviewJobUnavailableError(jobId);
+  }
   const job = {
     ...existing,
     status: "processing" as const,
@@ -1749,7 +1768,7 @@ export async function processAIReviewJob(
       }
     }
     const runId = crypto.randomUUID();
-    const completedAt = Date.now();
+    const completedAt = clock();
     const verificationSuffix = verification
       ? ` Second-pass verification: ${verification.reason}`
       : "";
@@ -1787,6 +1806,7 @@ export async function processAIReviewJob(
            WHERE EXISTS (
              SELECT 1 FROM sb_ai_review_jobs
              WHERE id = ? AND status = 'processing' AND lease_owner = ?
+               AND COALESCE(lease_expires_at, 0) > ?
            )`
       ).bind(
         run.id, run.jobId, run.objectType, run.objectId, run.mode, run.decision, run.reason,
@@ -1795,14 +1815,23 @@ export async function processAIReviewJob(
         JSON.stringify(run.refinement), Number(run.abstain),
         Number(run.requiresHuman), Number(run.autoApplyEligible), run.reviewerProvider,
         run.reviewerModel, run.promptVersion, run.inputSnapshotHash,
-        stableJson(run.inputManifest), run.createdAt, jobId, leaseOwner
+        stableJson(run.inputManifest), run.createdAt, jobId, leaseOwner, completedAt
       ),
       db.prepare(
         `UPDATE sb_ai_review_jobs
          SET status = 'completed', run_id = ?, completed_at = ?,
-             lease_owner = NULL, lease_expires_at = NULL
-         WHERE id = ? AND status = 'processing' AND lease_owner = ?`
-      ).bind(run.id, completedAt, jobId, leaseOwner),
+             lease_owner = ?, lease_expires_at = ?
+         WHERE id = ? AND status = 'processing' AND lease_owner = ?
+           AND COALESCE(lease_expires_at, 0) > ?`
+      ).bind(
+        run.id,
+        completedAt,
+        options.preserveLeaseOnCompletion ? leaseOwner : null,
+        options.preserveLeaseOnCompletion ? leaseExpiresAt : null,
+        jobId,
+        leaseOwner,
+        completedAt
+      ),
     ]);
     if (Number(results[0]?.meta?.changes ?? 0) !== 1 || Number(results[1]?.meta?.changes ?? 0) !== 1) {
       throw new AIReviewJobUnavailableError(jobId);
@@ -1813,8 +1842,8 @@ export async function processAIReviewJob(
         status: "completed",
         runId,
         completedAt,
-        leaseOwner: null,
-        leaseExpiresAt: null,
+        leaseOwner: options.preserveLeaseOnCompletion ? leaseOwner : null,
+        leaseExpiresAt: options.preserveLeaseOnCompletion ? leaseExpiresAt : null,
       },
       run,
     };

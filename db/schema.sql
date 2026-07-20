@@ -326,6 +326,13 @@ CREATE INDEX IF NOT EXISTS idx_ai_review_jobs_status
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_review_jobs_active_identity
   ON sb_ai_review_jobs(object_type, object_id, mode, input_snapshot_hash, review_policy_version)
   WHERE status IN ('queued', 'processing', 'completed', 'applying', 'applied');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_review_jobs_single_external_lease
+  ON sb_ai_review_jobs(review_policy_version)
+  WHERE review_policy_version = 'external-evolution-v1'
+    AND (
+      status IN ('processing', 'applying') OR
+      (status = 'completed' AND lease_owner IS NOT NULL)
+    );
 
 CREATE TABLE IF NOT EXISTS sb_ai_review_runs (
   id TEXT PRIMARY KEY,

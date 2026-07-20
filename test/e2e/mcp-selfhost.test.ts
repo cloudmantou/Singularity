@@ -109,6 +109,7 @@ beforeAll(async () => {
         DATABASE_PATH: databasePath,
         ALLOW_DEV_EMBEDDING: "true",
         EMBEDDING_PROVIDER: "local-hash-dev",
+        EXTERNAL_EVOLUTION_MCP: "1",
         OAUTH_ALLOWED_REDIRECT_ORIGINS: "https://chatgpt.com,http://127.0.0.1,http://localhost",
         PUBLIC_URL: baseUrl,
         HOST: "127.0.0.1",
@@ -215,9 +216,239 @@ describe("self-host MCP and personal OAuth", () => {
         "set_status",
         "recall",
         "list_recent",
+        "evolution_next",
+        "evolution_submit",
         "forget",
       ])
     );
+  });
+
+  it("leases and applies a traceable exact duplicate through the external evolution tools", async () => {
+    const now = Date.now();
+    const contents = {
+      source: "Singularity preserves immutable source observations.",
+      target: "Singularity preserves immutable source observations.",
+    } as const;
+    const contentHashes = {
+      source: createHash("sha256").update(contents.source).digest("hex"),
+      target: createHash("sha256").update(contents.target).digest("hex"),
+    } as const;
+    const db = new Database(databasePath);
+    try {
+      db.prepare(
+        `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, content_hash)
+         VALUES ('evolution-source', ?, '["project/singularity"]', 'mcp', ?, '[]', ?),
+                ('evolution-target', ?, '["project/singularity"]', 'mcp', ?, '[]', ?)`
+      ).run(contents.source, now, contentHashes.source, contents.target, now, contentHashes.target);
+      db.prepare(
+        `INSERT INTO sb_observations (
+           id, content, source, content_hash, source_channel, source_identity,
+           author_type, source_timestamp, revision, root_evidence_id,
+           extraction_status, created_at
+         ) VALUES ('evolution-source-observation', ?, 'mcp', ?, 'mcp', 'e2e/shared',
+                   'user', ?, 1, 'evolution-shared-root', 'completed', ?),
+                  ('evolution-target-observation', ?, 'mcp', ?, 'mcp', 'e2e/shared',
+                   'user', ?, 1, 'evolution-shared-root', 'completed', ?)`
+      ).run(
+        contents.source,
+        contentHashes.source,
+        now,
+        now,
+        contents.target,
+        contentHashes.target,
+        now,
+        now
+      );
+      db.prepare(
+        `INSERT INTO sb_external_links (
+           id, provider, vault_id, external_path, object_type, object_id,
+           entry_id, sync_status, created_at, updated_at
+         ) VALUES ('evolution-source-link', 'mcp', 'work-vault', 'source', 'memory',
+                   'evolution-source', 'evolution-source', 'synced', ?, ?),
+                  ('evolution-target-link', 'mcp', 'work-vault', 'target', 'memory',
+                   'evolution-target', 'evolution-target', 'synced', ?, ?)`
+      ).run(now, now, now, now);
+      for (const side of ["source", "target"] as const) {
+        const parentId = `evolution-${side}-parent`;
+        const versionId = `${parentId}-v1`;
+        const entryId = `evolution-${side}`;
+        const claimId = `${entryId}-claim`;
+        const observationId = `${entryId}-observation`;
+        const evidenceRootId = "evolution-shared-root";
+        const content = contents[side];
+        const contentHash = contentHashes[side];
+        db.prepare(
+          `INSERT INTO sb_parent_units (
+             parent_id, active_version_id, scope_id, created_at, updated_at
+           ) VALUES (?, ?, 'project/singularity', ?, ?)`
+        ).run(parentId, versionId, now, now);
+        db.prepare(
+          `INSERT INTO sb_parent_versions (
+             version_id, parent_id, version_number, source_observation_id,
+             source_snapshot_hash, tags_snapshot_json, source_snapshot, vault_snapshot,
+             metadata_snapshot_hash, metadata_snapshot_source,
+             state, activated_at, activation_time_source, created_at, updated_at
+           ) VALUES (?, ?, 1, ?, ?, '["project/singularity"]',
+                     'mcp', 'work-vault', ?, 'recorded', 'active', ?, 'recorded', ?, ?)`
+        ).run(
+          versionId,
+          parentId,
+          observationId,
+          contentHash,
+          `e2e:${versionId}`,
+          now,
+          now,
+          now
+        );
+        db.prepare(
+          `INSERT INTO sb_memories (
+             id, content, kind, memory_class, confidence, entry_id, parent_version_id,
+             scope_id, claim_status, scores_json, content_hash, observed_at,
+             entities_json, created_at
+           ) VALUES (?, ?, 'semantic', 'fact', 1, ?, ?, 'project/singularity',
+                     'supported', '{}', ?, ?, '[]', ?)`
+        ).run(claimId, content, entryId, versionId, contentHash, now, now);
+        db.prepare(
+          `INSERT INTO sb_memory_sources (
+             id, memory_id, observation_id, role, score, relation, evidence_score,
+             derivation_confidence, extractor_model, extractor_version,
+             evidence_root_id, created_at
+           ) VALUES (?, ?, ?, 'supports', 1, 'supports', 1, 1,
+                     'e2e', '1', ?, ?)`
+        ).run(`${claimId}-source`, claimId, observationId, evidenceRootId, now);
+        db.prepare(
+          `INSERT INTO sb_parent_version_claims (
+             parent_version_id, memory_id, relation, created_at
+           ) VALUES (?, ?, 'supports', ?)`
+        ).run(versionId, claimId, now);
+      }
+      db.prepare(
+        `INSERT INTO sb_memory_merge_candidates (
+           id, source_memory_id, target_memory_id, similarity,
+           suggested_action, state, created_at
+         ) VALUES ('evolution-e2e', 'evolution-source', 'evolution-target', 0.94,
+                   'duplicate', 'pending', ?)`
+      ).run(now);
+    } finally {
+      db.close();
+    }
+
+    const transport = new StreamableHTTPClientTransport(
+      new URL(`${baseUrl}/mcp`),
+      { requestInit: { headers: { Authorization: `Bearer ${AUTH_TOKEN}` } } }
+    );
+    const client = new Client({ name: "external-evolution-e2e", version: "1.0.0" });
+    await client.connect(transport);
+    try {
+      const next = (await client.callTool({
+        name: "evolution_next",
+        arguments: { reviewer_id: "codex-e2e", lease_seconds: 60 },
+      })) as any;
+      expect(next.isError).not.toBe(true);
+      const lease = JSON.parse(next.content?.find((part: any) => part.type === "text")?.text ?? "{}");
+      expect(lease).toMatchObject({ objectId: "evolution-e2e", objectType: "memory_merge_candidate" });
+      expect(lease.manifest.evidence.map((item: any) => item.vaultIds)).toEqual([
+        ["work-vault"],
+        ["work-vault"],
+      ]);
+      const leaseDb = new Database(databasePath, { readonly: true });
+      try {
+        expect(leaseDb.prepare(
+          `SELECT m.entry_id, m.parent_version_id, pv.vault_snapshot
+           FROM sb_memories m
+           LEFT JOIN sb_parent_versions pv ON pv.version_id = m.parent_version_id
+           WHERE m.entry_id IN ('evolution-source', 'evolution-target')
+           ORDER BY m.entry_id`
+        ).all()).toEqual([
+          {
+            entry_id: "evolution-source",
+            parent_version_id: "evolution-source-parent-v1",
+            vault_snapshot: "work-vault",
+          },
+          {
+            entry_id: "evolution-target",
+            parent_version_id: "evolution-target-parent-v1",
+            vault_snapshot: "work-vault",
+          },
+        ]);
+      } finally {
+        leaseDb.close();
+      }
+
+      const submitted = (await client.callTool({
+        name: "evolution_submit",
+        arguments: {
+          job_id: lease.jobId,
+          lease_token: lease.leaseToken,
+          snapshot_hash: lease.snapshotHash,
+          reviewer_id: "codex-e2e",
+          reviewer_model: "codex-e2e-model",
+          proposal: {
+            decision: "duplicate",
+            reason: "Both claims are the same fact from the same evidence lineage.",
+            evidenceRefs: ["SOURCE", "TARGET"],
+            confidence: { decision: 1, evidence: 1 },
+            abstain: false,
+            reviewability: "sufficient",
+            missingContext: [],
+            keyDifferences: [{
+              dimension: "content",
+              status: "same",
+              summary: "The normalized Claim content and evidence lineage are identical.",
+              evidenceRefs: ["SOURCE", "TARGET"],
+            }],
+            refinement: {
+              action: "consolidate",
+              content: null,
+              sourceRefs: ["SOURCE", "TARGET"],
+            },
+          },
+        },
+      })) as any;
+      expect(submitted.isError, `${JSON.stringify(submitted)}\n${serverOutput}`).not.toBe(true);
+      const result = JSON.parse(
+        submitted.content?.find((part: any) => part.type === "text")?.text ?? "{}"
+      );
+      expect(result).toMatchObject({
+        objectId: "evolution-e2e",
+        decision: "duplicate",
+        status: "applied",
+      });
+    } finally {
+      await client.close();
+    }
+
+    const verified = new Database(databasePath, { readonly: true });
+    try {
+      expect(verified.prepare(
+        `SELECT state, reviewed_by FROM sb_memory_merge_candidates WHERE id = 'evolution-e2e'`
+      ).get()).toMatchObject({ state: "accepted" });
+      expect(verified.prepare(
+        `SELECT decision_source FROM sb_ai_review_applications
+         WHERE object_id = 'evolution-e2e'`
+      ).get()).toEqual({ decision_source: "deterministic" });
+      const evolution = verified.prepare(
+        `SELECT output_claim_id, output_generated
+         FROM sb_knowledge_evolutions WHERE candidate_id = 'evolution-e2e'`
+      ).get() as { output_claim_id: string; output_generated: number };
+      expect(evolution.output_generated).toBe(0);
+      expect(verified.prepare(
+        `SELECT evidence_root_id FROM sb_memory_sources
+         WHERE memory_id = ? ORDER BY evidence_root_id`
+      ).all(evolution.output_claim_id)).toEqual([
+        { evidence_root_id: "evolution-shared-root" },
+        { evidence_root_id: "evolution-shared-root" },
+      ]);
+      expect(verified.prepare(
+        `SELECT id, content FROM sb_observations
+         WHERE id LIKE 'evolution-%-observation' ORDER BY id`
+      ).all()).toEqual([
+        { id: "evolution-source-observation", content: contents.source },
+        { id: "evolution-target-observation", content: contents.target },
+      ]);
+    } finally {
+      verified.close();
+    }
   });
 
   it("updates a remembered fact through MCP and exposes the committed version", async () => {
