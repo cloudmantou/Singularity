@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { initializeDatabase } from "../../src/index";
 import { AIReviewJobUnavailableError } from "../../src/memory/ai-review";
 import {
+  EXTERNAL_EVOLUTION_POLICY_VERSION,
   ExternalEvolutionLeaseUnavailableError,
   ExternalEvolutionSubmissionConflictError,
   leaseNextExternalEvolutionReview,
@@ -306,8 +307,15 @@ describe("external knowledge evolution review", () => {
       expect(leases.filter(Boolean)).toHaveLength(1);
       expect(db.prepare(
         `SELECT COUNT(*) AS count FROM sb_ai_review_jobs
-         WHERE review_policy_version = 'external-evolution-v1' AND status = 'processing'`
-      ).get()).toEqual({ count: 1 });
+         WHERE review_policy_version = ? AND status = 'processing'`
+      ).get(EXTERNAL_EVOLUTION_POLICY_VERSION)).toEqual({ count: 1 });
+      expect(EXTERNAL_EVOLUTION_POLICY_VERSION).toBe("external-evolution-v2");
+      expect(db.prepare(
+        `SELECT sql FROM sqlite_master
+         WHERE type = 'index' AND name = 'idx_ai_review_jobs_single_external_lease'`
+      ).get()).toEqual(expect.objectContaining({
+        sql: expect.stringContaining("external-evolution-v[0-9]*"),
+      }));
     } finally {
       db.close();
     }

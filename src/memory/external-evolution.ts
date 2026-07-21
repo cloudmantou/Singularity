@@ -17,7 +17,7 @@ import {
   processAIReviewJob,
 } from "./ai-review";
 
-export const EXTERNAL_EVOLUTION_POLICY_VERSION = "external-evolution-v1";
+export const EXTERNAL_EVOLUTION_POLICY_VERSION = "external-evolution-v2";
 export const EXTERNAL_EVOLUTION_ALLOWED_DECISIONS = [
   "duplicate",
   "replace",
@@ -40,10 +40,17 @@ const EXTERNAL_PRIVATE_SOURCE_CHANNELS = new Set([
 
 async function ensureExternalEvolutionDataModel(db: D1Database): Promise<void> {
   await ensureAIReviewDataModel(db);
+  const leaseIndex = await db.prepare(
+    `SELECT sql FROM sqlite_master
+     WHERE type = 'index' AND name = 'idx_ai_review_jobs_single_external_lease'`
+  ).first<{ sql: string | null }>();
+  if (leaseIndex?.sql && !leaseIndex.sql.includes("external-evolution-v[0-9]*")) {
+    await db.exec(`DROP INDEX IF EXISTS idx_ai_review_jobs_single_external_lease`);
+  }
   await db.exec(
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_review_jobs_single_external_lease
      ON sb_ai_review_jobs(review_policy_version)
-     WHERE review_policy_version = 'external-evolution-v1'
+     WHERE review_policy_version GLOB 'external-evolution-v[0-9]*'
        AND (
          status IN ('processing', 'applying') OR
          (status = 'completed' AND lease_owner IS NOT NULL)

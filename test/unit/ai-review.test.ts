@@ -192,13 +192,18 @@ describe("AI-assisted Knowledge Review", () => {
     const approved = await verifyAIAutoReviewRecommendation({
       provider: "test",
       model: "verifier",
-      complete: async () => JSON.stringify({
-        approved: true,
-        decision: "merge",
-        evidenceRefs: ["SOURCE", "TARGET"],
-        unsupportedStatements: [],
-        reason: "Every statement is directly supported.",
-      }),
+      complete: async (messages) => {
+        expect(messages.system).toContain("keep_both -> keep_separate");
+        expect(messages.system).toContain("any cited Claim or supplied metadata");
+        expect(messages.system).toContain("refinement.content is null");
+        return JSON.stringify({
+          approved: true,
+          decision: "merge",
+          evidenceRefs: ["SOURCE", "TARGET"],
+          unsupportedStatements: [],
+          reason: "Every statement is directly supported.",
+        });
+      },
     }, snapshot, response);
     expect(approved.approved).toBe(true);
 
