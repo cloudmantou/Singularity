@@ -52,6 +52,7 @@ export type AIReviewRefinementAction =
   | "keep_separate";
 
 export const AI_REVIEW_PROMPT_VERSION = "knowledge-review-v6";
+const MAX_REVIEW_CLAIM_CONTENT_LENGTH = 6_000;
 
 const DECISIONS: Record<AIReviewObjectType, readonly string[]> = {
   conflict_case: ["use_old", "use_new", "keep_both", "dismissed", "uncertain"],
@@ -426,6 +427,10 @@ function boundedReviewText(value: unknown, maxLength: number): string | null {
   const text = typeof value === "string" ? value.trim() : "";
   if (!text) return null;
   return text.length <= maxLength ? text : `${text.slice(0, maxLength).trimEnd()}...`;
+}
+
+function reviewTextWasTruncated(value: unknown, maxLength: number): boolean {
+  return typeof value === "string" && value.trim().length > maxLength;
 }
 
 function stableValue(value: unknown): unknown {
@@ -1083,7 +1088,11 @@ async function loadEntryReviewContext(
       if (claims.size >= 8) continue;
       claim = {
         claimId,
-        content: boundedReviewText(row.content, 1_200),
+        content: boundedReviewText(row.content, MAX_REVIEW_CLAIM_CONTENT_LENGTH),
+        contentTruncated: reviewTextWasTruncated(
+          row.content,
+          MAX_REVIEW_CLAIM_CONTENT_LENGTH
+        ),
         kind: row.kind ?? null,
         memoryClass: row.memory_class ?? null,
         importance: row.importance ?? null,

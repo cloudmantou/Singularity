@@ -217,6 +217,80 @@ describe("external knowledge evolution review", () => {
     }
   });
 
+  it("leases complete reviewable claims instead of silently truncating them", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      await seedCandidate(db, "external-complete-claim");
+      const content = `Complete implementation evidence: ${"verified diagnostic detail ".repeat(90)}`;
+      const contentHash = await hash(content);
+      db.prepare(
+        `UPDATE entries SET content = ?, content_hash = ? WHERE id = ?`
+      ).run(content, contentHash, "external-complete-claim-source");
+      db.prepare(
+        `UPDATE sb_memories SET content = ?, content_hash = ? WHERE entry_id = ?`
+      ).run(content, contentHash, "external-complete-claim-source");
+      db.prepare(
+        `UPDATE sb_observations SET content = ?, content_hash = ? WHERE id = ?`
+      ).run(content, contentHash, "external-complete-claim-source-observation");
+      db.prepare(
+        `UPDATE sb_parent_versions SET source_snapshot_hash = ? WHERE version_id = ?`
+      ).run(contentHash, "external-complete-claim-source-parent-v1");
+
+      const leased = await leaseNextExternalEvolutionReview(env.DB, {
+        reviewerId: "codex-complete",
+        now: 20_100,
+      });
+      const evidence = leased?.snapshot.evidence as Array<{
+        ref: string;
+        claims: Array<{ content: string; contentTruncated: boolean }>;
+      }>;
+      const source = evidence.find((item) => item.ref === "SOURCE");
+
+      expect(source?.claims[0]).toMatchObject({
+        content: content.trim(),
+        contentTruncated: false,
+      });
+      expect(source?.claims[0].content.endsWith("...")).toBe(false);
+      expect(new TextEncoder().encode(JSON.stringify(leased)).byteLength)
+        .toBeLessThanOrEqual(64 * 1_024);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("does not lease a claim whose complete text exceeds the review bound", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      await seedCandidate(db, "external-oversized-claim");
+      const content = `Oversized evidence: ${"x".repeat(6_100)}`;
+      const contentHash = await hash(content);
+      db.prepare(
+        `UPDATE entries SET content = ?, content_hash = ? WHERE id = ?`
+      ).run(content, contentHash, "external-oversized-claim-source");
+      db.prepare(
+        `UPDATE sb_memories SET content = ?, content_hash = ? WHERE entry_id = ?`
+      ).run(content, contentHash, "external-oversized-claim-source");
+      db.prepare(
+        `UPDATE sb_observations SET content = ?, content_hash = ? WHERE id = ?`
+      ).run(content, contentHash, "external-oversized-claim-source-observation");
+      db.prepare(
+        `UPDATE sb_parent_versions SET source_snapshot_hash = ? WHERE version_id = ?`
+      ).run(contentHash, "external-oversized-claim-source-parent-v1");
+
+      await expect(leaseNextExternalEvolutionReview(env.DB, {
+        reviewerId: "codex-oversized",
+        now: 20_200,
+      })).resolves.toBeNull();
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count FROM sb_ai_review_jobs WHERE object_id = ?`
+      ).get("external-oversized-claim")).toEqual({ count: 0 });
+    } finally {
+      db.close();
+    }
+  });
+
   it("allows only one global lease when two reviewers race across multiple candidates", async () => {
     const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
     try {

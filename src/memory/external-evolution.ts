@@ -223,7 +223,11 @@ function reviewableMergeSnapshot(snapshot: Record<string, unknown>): boolean {
     if (!item || typeof item !== "object" || Array.isArray(item)) return false;
     const record = item as Record<string, unknown>;
     return typeof record.content === "string" && record.content.trim().length > 0 &&
-      Array.isArray(record.claims) && record.claims.length > 0;
+      Array.isArray(record.claims) && record.claims.length > 0 &&
+      record.claims.every((claim) => {
+        if (!claim || typeof claim !== "object" || Array.isArray(claim)) return false;
+        return (claim as Record<string, unknown>).contentTruncated === false;
+      });
   });
 }
 
