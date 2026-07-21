@@ -17,7 +17,7 @@ import {
   processAIReviewJob,
 } from "./ai-review";
 
-export const EXTERNAL_EVOLUTION_POLICY_VERSION = "external-evolution-v2";
+export const EXTERNAL_EVOLUTION_POLICY_VERSION = "external-evolution-v3";
 export const EXTERNAL_EVOLUTION_ALLOWED_DECISIONS = [
   "duplicate",
   "replace",

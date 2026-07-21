@@ -164,6 +164,9 @@ describe("AI-assisted Knowledge Review", () => {
       objectType: "memory_merge_candidate" as const,
       objectId: "candidate-verified",
       state: "pending",
+      suggestedAction: "merge",
+      similarity: 0.91,
+      reason: "Untrusted candidate-generation hint.",
       evidence: [
         { ref: "SOURCE", claims: [{ content: "Fact A" }] },
         { ref: "TARGET", claims: [{ content: "Fact B" }] },
@@ -196,6 +199,9 @@ describe("AI-assisted Knowledge Review", () => {
         expect(messages.system).toContain("keep_both -> keep_separate");
         expect(messages.system).toContain("any cited Claim or supplied metadata");
         expect(messages.system).toContain("refinement.content is null");
+        expect(messages.user).not.toContain("suggestedAction");
+        expect(messages.user).not.toContain("similarity");
+        expect(messages.user).not.toContain("Untrusted candidate-generation hint");
         return JSON.stringify({
           approved: true,
           decision: "merge",

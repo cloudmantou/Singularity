@@ -309,7 +309,7 @@ describe("external knowledge evolution review", () => {
         `SELECT COUNT(*) AS count FROM sb_ai_review_jobs
          WHERE review_policy_version = ? AND status = 'processing'`
       ).get(EXTERNAL_EVOLUTION_POLICY_VERSION)).toEqual({ count: 1 });
-      expect(EXTERNAL_EVOLUTION_POLICY_VERSION).toBe("external-evolution-v2");
+      expect(EXTERNAL_EVOLUTION_POLICY_VERSION).toBe("external-evolution-v3");
       expect(db.prepare(
         `SELECT sql FROM sqlite_master
          WHERE type = 'index' AND name = 'idx_ai_review_jobs_single_external_lease'`
