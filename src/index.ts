@@ -11442,6 +11442,14 @@ async function applyAIReviewRecommendation(
             evidenceConfidence: run.confidence.evidence,
             reviewedBy,
             reviewedAt,
+            trustedReviewContext:
+              sameContextValues(leftContext?.scopeIds, rightContext?.scopeIds) &&
+              sameContextValues(leftContext?.vaultIds, rightContext?.vaultIds)
+                ? {
+                    scopeIds: [...leftContext.scopeIds],
+                    vaultIds: [...leftContext.vaultIds],
+                  }
+                : undefined,
           });
       applied = await resolveMemoryMergeCandidate(env, {
         id: run.objectId,

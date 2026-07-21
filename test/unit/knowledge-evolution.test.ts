@@ -102,6 +102,18 @@ async function eligibleClaimIds(
   ).all() as Array<{ id: string }>).map((row) => row.id);
 }
 
+function clearStoredContext(
+  db: ReturnType<typeof createSelfhostEnv>["db"],
+  candidateId: string
+): void {
+  db.prepare(
+    `UPDATE sb_memories SET scope_id = NULL WHERE entry_id IN (?, ?)`
+  ).run(`${candidateId}-source`, `${candidateId}-target`);
+  db.prepare(
+    `UPDATE sb_parent_versions SET vault_snapshot = NULL WHERE parent_id IN (?, ?)`
+  ).run(`${candidateId}-source-parent`, `${candidateId}-target-parent`);
+}
+
 describe("knowledge evolution", () => {
   beforeEach(() => {
     resetSettingsCache();
@@ -585,6 +597,106 @@ describe("knowledge evolution", () => {
         "evolve-duplicate-source-claim",
         "evolve-duplicate-target-claim",
       ]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("applies a legacy replacement using the immutable review manifest context", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      await seedCandidate(db, {
+        id: "evolve-legacy-replace",
+        sourceContent: "The newer diagnostic narrows the unresolved wrapper cause.",
+        targetContent: "The older diagnostic attributes the wrapper failure to one cause.",
+      });
+      clearStoredContext(db, "evolve-legacy-replace");
+      const observationsBefore = db.prepare(
+        `SELECT id, content, content_hash FROM sb_observations ORDER BY id`
+      ).all();
+      const reviewedAt = Date.now();
+
+      const plan = await prepareMemoryKnowledgeEvolution(env.DB, {
+        candidateId: "evolve-legacy-replace",
+        aiReviewRunId: "run-legacy-replace",
+        decision: "replace",
+        refinementContent: "The newer diagnostic narrows the unresolved wrapper cause.",
+        decisionConfidence: 0.98,
+        evidenceConfidence: 0.97,
+        reviewedBy: "ai-review:external",
+        reviewedAt,
+        trustedReviewContext: {
+          scopeIds: ["project-context:appflex", "project-context:itunes"],
+          vaultIds: ["external:owner-private"],
+        },
+      });
+      await env.DB.batch([
+        env.DB.prepare(
+          `UPDATE sb_memory_merge_candidates
+           SET state = 'accepted', reviewed_by = ?, reviewed_at = ?
+           WHERE id = ? AND state = 'pending'`
+        ).bind("ai-review:external", reviewedAt, "evolve-legacy-replace"),
+        ...plan.statements,
+      ]);
+
+      expect(plan.outputClaimId).toBe("evolve-legacy-replace-source-claim");
+      expect(db.prepare(
+        `SELECT id, claim_status, invalid_at FROM sb_memories
+         WHERE entry_id IN (?, ?) ORDER BY entry_id`
+      ).all("evolve-legacy-replace-source", "evolve-legacy-replace-target")).toEqual([
+        {
+          id: "evolve-legacy-replace-source-claim",
+          claim_status: "supported",
+          invalid_at: null,
+        },
+        {
+          id: "evolve-legacy-replace-target-claim",
+          claim_status: "superseded",
+          invalid_at: reviewedAt,
+        },
+      ]);
+      expect(db.prepare(
+        `SELECT operation, output_claim_id, output_generated
+         FROM sb_knowledge_evolutions WHERE id = ?`
+      ).get(plan.evolutionId)).toEqual({
+        operation: "supersede",
+        output_claim_id: "evolve-legacy-replace-source-claim",
+        output_generated: 0,
+      });
+      expect(db.prepare(
+        `SELECT id, content, content_hash FROM sb_observations ORDER BY id`
+      ).all()).toEqual(observationsBefore);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("rejects a legacy merge when the review context has multiple scopes", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      await seedCandidate(db, {
+        id: "evolve-legacy-ambiguous",
+        sourceContent: "One legacy claim has no stored scope.",
+        targetContent: "Another legacy claim has no stored scope.",
+      });
+      clearStoredContext(db, "evolve-legacy-ambiguous");
+
+      await expect(prepareMemoryKnowledgeEvolution(env.DB, {
+        candidateId: "evolve-legacy-ambiguous",
+        aiReviewRunId: "run-legacy-ambiguous",
+        decision: "merge",
+        refinementContent: "A generated claim must have one unambiguous scope.",
+        decisionConfidence: 0.98,
+        evidenceConfidence: 0.97,
+        reviewedBy: "ai-review:external",
+        reviewedAt: Date.now(),
+        trustedReviewContext: {
+          scopeIds: ["project-context:appflex", "project-context:itunes"],
+          vaultIds: ["external:owner-private"],
+        },
+      })).rejects.toThrow("knowledge_evolution_scope_context_ambiguous");
     } finally {
       db.close();
     }

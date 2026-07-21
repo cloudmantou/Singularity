@@ -396,6 +396,11 @@ export async function prepareMemoryKnowledgeEvolution(
     evidenceConfidence: number;
     reviewedBy: string;
     reviewedAt: number;
+    /** Server-derived context from the immutable AI review manifest. */
+    trustedReviewContext?: {
+      scopeIds: string[];
+      vaultIds: string[];
+    };
   }
 ): Promise<MemoryKnowledgeEvolutionPlan> {
   await ensureKnowledgeEvolutionDataModel(db);
@@ -413,12 +418,40 @@ export async function prepareMemoryKnowledgeEvolution(
     loadClaim(db, candidate.target_memory_id),
   ]);
   if (!source || !target) throw new Error("knowledge_evolution_claim_unavailable");
-  if (!source.scope_id || source.scope_id !== target.scope_id) {
-    throw new Error("knowledge_evolution_scope_mismatch");
-  }
-  if (!source.vault_snapshot || source.vault_snapshot !== target.vault_snapshot) {
-    throw new Error("knowledge_evolution_vault_mismatch");
-  }
+  const normalizedContext = (values: string[] | undefined) =>
+    [...new Set((values ?? []).map((value) => value.trim()).filter(Boolean))].sort();
+  const resolveContext = (
+    sourceValue: string | null,
+    targetValue: string | null,
+    reviewedValues: string[] | undefined,
+    mismatchError: string,
+    ambiguousError: string
+  ): string | null => {
+    const sourceContext = sourceValue?.trim() || null;
+    const targetContext = targetValue?.trim() || null;
+    if (sourceContext || targetContext) {
+      if (!sourceContext || sourceContext !== targetContext) throw new Error(mismatchError);
+      return sourceContext;
+    }
+    const derived = normalizedContext(reviewedValues);
+    if (derived.length === 0) throw new Error(mismatchError);
+    if (input.decision === "merge" && derived.length !== 1) throw new Error(ambiguousError);
+    return derived.length === 1 ? derived[0] : null;
+  };
+  const effectiveScopeId = resolveContext(
+    source.scope_id,
+    target.scope_id,
+    input.trustedReviewContext?.scopeIds,
+    "knowledge_evolution_scope_mismatch",
+    "knowledge_evolution_scope_context_ambiguous"
+  );
+  const effectiveVaultId = resolveContext(
+    source.vault_snapshot,
+    target.vault_snapshot,
+    input.trustedReviewContext?.vaultIds,
+    "knowledge_evolution_vault_mismatch",
+    "knowledge_evolution_vault_context_ambiguous"
+  );
   const ownership = await db.prepare(
     `SELECT claim_id FROM sb_knowledge_claim_ownership WHERE claim_id IN (?, ?) LIMIT 1`
   ).bind(source.id, target.id).first<{ claim_id: string }>();
@@ -590,7 +623,7 @@ export async function prepareMemoryKnowledgeEvolution(
     statements.push(db.prepare(
       `INSERT INTO sb_parent_units (parent_id, active_version_id, scope_id, created_at, updated_at)
        SELECT ?, ?, ?, ?, ? WHERE ${candidateGuard()}`
-    ).bind(generatedParentId, parentVersionId, source.scope_id, input.reviewedAt, input.reviewedAt, ...guard));
+    ).bind(generatedParentId, parentVersionId, effectiveScopeId, input.reviewedAt, input.reviewedAt, ...guard));
     statements.push(db.prepare(
       `INSERT INTO sb_parent_versions (
          version_id, parent_id, version_number, source_snapshot_hash,
@@ -603,7 +636,7 @@ export async function prepareMemoryKnowledgeEvolution(
       generatedParentId,
       contentHash,
       tags,
-      source.vault_snapshot,
+      effectiveVaultId,
       content,
       input.reviewedAt,
       input.reviewedAt,
@@ -630,7 +663,7 @@ export async function prepareMemoryKnowledgeEvolution(
       sameOrNull(source.claim_subject, target.claim_subject),
       sameOrNull(source.claim_predicate, target.claim_predicate),
       sameOrNull(source.claim_object, target.claim_object),
-      source.scope_id,
+      effectiveScopeId,
       sameOrNull(source.polarity, target.polarity) ?? "positive",
       sameOrNull(source.modality, target.modality) ?? "asserted",
       JSON.stringify({
