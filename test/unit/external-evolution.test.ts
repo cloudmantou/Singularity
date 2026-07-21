@@ -96,6 +96,41 @@ async function seedCandidate(
   ).run(id, `${id}-source`, `${id}-target`, now);
 }
 
+async function seedLegacyPrivateCandidate(
+  db: ReturnType<typeof createSelfhostEnv>["db"],
+  id: string,
+  targetProject = "singularity"
+): Promise<void> {
+  await seedCandidate(db, id);
+  db.prepare(
+    `UPDATE entries
+     SET source = 'mcp',
+         tags = CASE id
+           WHEN ? THEN '["project/singularity"]'
+           ELSE ?
+         END
+     WHERE id IN (?, ?)`
+  ).run(
+    `${id}-source`,
+    JSON.stringify([`project/${targetProject}`]),
+    `${id}-source`,
+    `${id}-target`
+  );
+  db.prepare(
+    `UPDATE sb_observations
+     SET source = 'mcp', source_channel = 'mcp', author_type = 'tool'
+     WHERE id IN (?, ?)`
+  ).run(`${id}-source-observation`, `${id}-target-observation`);
+  db.prepare(
+    `UPDATE sb_parent_versions
+     SET source_snapshot = 'mcp', vault_snapshot = NULL
+     WHERE version_id IN (?, ?)`
+  ).run(`${id}-source-parent-v1`, `${id}-target-parent-v1`);
+  db.prepare(
+    `UPDATE sb_memories SET scope_id = NULL WHERE entry_id IN (?, ?)`
+  ).run(`${id}-source`, `${id}-target`);
+}
+
 function mergeProposal() {
   return {
     decision: "merge",
@@ -663,6 +698,52 @@ describe("external knowledge evolution review", () => {
       expect(db.prepare(
         `SELECT COUNT(*) AS count FROM sb_ai_review_jobs
          WHERE object_id = 'external-cross-context'`
+      ).get()).toEqual({ count: 0 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("derives an owner-private review context for legacy MCP claims in the same project", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      await seedLegacyPrivateCandidate(db, "external-legacy-private");
+
+      const leased = await leaseNextExternalEvolutionReview(env.DB, {
+        reviewerId: "codex-a",
+        now: 120_000,
+      });
+
+      expect(leased?.objectId).toBe("external-legacy-private");
+      expect(leased?.manifest.evidence).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          vaultIds: ["external:owner-private"],
+          scopeIds: ["project-context:tag:singularity"],
+          projectIds: ["tag:singularity"],
+        }),
+      ]));
+      expect(JSON.stringify(leased?.snapshot)).not.toContain("private-vault");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("does not derive review context across different legacy MCP projects", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      await seedLegacyPrivateCandidate(db, "external-legacy-cross-project", "mtzs");
+
+      const leased = await leaseNextExternalEvolutionReview(env.DB, {
+        reviewerId: "codex-a",
+        now: 130_000,
+      });
+
+      expect(leased).toBeNull();
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count FROM sb_ai_review_jobs
+         WHERE object_id = 'external-legacy-cross-project'`
       ).get()).toEqual({ count: 0 });
     } finally {
       db.close();

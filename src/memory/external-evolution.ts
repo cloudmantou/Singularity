@@ -2,9 +2,11 @@ import {
   AIReviewInvalidResponseError,
   AIReviewJobUnavailableError,
   AIReviewObjectUnavailableError,
+  type AIReviewEvidenceManifest,
   type AIReviewModelResponse,
   type AIReviewModel,
   type AIReviewRunRecord,
+  type AIReviewSnapshotManifest,
   createAIReviewManifest,
   ensureAIReviewDataModel,
   getAIReviewRun,
@@ -28,6 +30,13 @@ const MAX_REVIEW_CANDIDATES = 500;
 const DEFAULT_LEASE_MS = 5 * 60_000;
 const MAX_LEASE_MS = 10 * 60_000;
 const MAX_LEASE_PAYLOAD_BYTES = 64 * 1_024;
+const EXTERNAL_OWNER_PRIVATE_VAULT_ID = "external:owner-private";
+const EXTERNAL_PRIVATE_SOURCE_CHANNELS = new Set([
+  "api",
+  "claude-code",
+  "codex",
+  "mcp",
+]);
 
 async function ensureExternalEvolutionDataModel(db: D1Database): Promise<void> {
   await ensureAIReviewDataModel(db);
@@ -218,25 +227,61 @@ function reviewableMergeSnapshot(snapshot: Record<string, unknown>): boolean {
   });
 }
 
-function externallyReviewableContext(manifest: Record<string, unknown>): boolean {
-  const evidence = Array.isArray(manifest.evidence)
-    ? manifest.evidence.filter((item): item is Record<string, unknown> =>
-        Boolean(item) && typeof item === "object" && !Array.isArray(item))
-    : [];
-  if (evidence.length !== 2) return false;
-  const values = (item: Record<string, unknown>, field: string) =>
-    Array.isArray(item[field]) ? [...new Set((item[field] as unknown[]).map(String))].sort() : [];
-  const [left, right] = evidence;
-  const sameNonEmpty = (field: string, required: boolean) => {
-    const leftValues = values(left, field);
-    const rightValues = values(right, field);
-    if (required && (leftValues.length === 0 || rightValues.length === 0)) return false;
-    if (leftValues.length === 0 || rightValues.length === 0) return true;
-    return stableJson(leftValues) === stableJson(rightValues);
+function sameOptionalContext(left: string[], right: string[]): boolean {
+  if (left.length === 0 && right.length === 0) return true;
+  if (left.length === 0 || right.length === 0) return false;
+  return stableJson(left) === stableJson(right);
+}
+
+function normalizedManifestValues(values: readonly string[]): string[] {
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))].sort();
+}
+
+function trustedPrivateEvidence(item: AIReviewEvidenceManifest): boolean {
+  const channels = normalizedManifestValues(item.sourceChannels);
+  return channels.length > 0 && channels.every((channel) =>
+    EXTERNAL_PRIVATE_SOURCE_CHANNELS.has(channel.toLowerCase())
+  );
+}
+
+function externallyReviewableManifest(
+  manifest: AIReviewSnapshotManifest
+): AIReviewSnapshotManifest | null {
+  if (manifest.evidence.length !== 2) return null;
+  const [left, right] = manifest.evidence;
+  const leftProjects = normalizedManifestValues(left.projectIds);
+  const rightProjects = normalizedManifestValues(right.projectIds);
+  if (!sameOptionalContext(leftProjects, rightProjects)) return null;
+
+  const leftVaults = normalizedManifestValues(left.vaultIds);
+  const rightVaults = normalizedManifestValues(right.vaultIds);
+  const leftScopes = normalizedManifestValues(left.scopeIds);
+  const rightScopes = normalizedManifestValues(right.scopeIds);
+  if (!sameOptionalContext(leftVaults, rightVaults) ||
+      !sameOptionalContext(leftScopes, rightScopes)) return null;
+
+  const needsDerivedVault = leftVaults.length === 0;
+  const needsDerivedScope = leftScopes.length === 0;
+  if (needsDerivedVault || needsDerivedScope) {
+    if (leftProjects.length === 0 ||
+        !trustedPrivateEvidence(left) || !trustedPrivateEvidence(right)) return null;
+  }
+
+  const vaultIds = needsDerivedVault
+    ? [EXTERNAL_OWNER_PRIVATE_VAULT_ID]
+    : leftVaults;
+  const scopeIds = needsDerivedScope
+    ? leftProjects.map((projectId) => `project-context:${projectId}`)
+    : leftScopes;
+  return {
+    ...manifest,
+    evidence: manifest.evidence.map((item) => ({
+      ...item,
+      projectIds: normalizedManifestValues(item.projectIds),
+      vaultIds: [...vaultIds],
+      scopeIds: [...scopeIds],
+    })),
   };
-  return sameNonEmpty("vaultIds", true) &&
-    sameNonEmpty("scopeIds", true) &&
-    sameNonEmpty("projectIds", false);
 }
 
 async function appliedJobExists(db: D1Database, run: AIReviewRunRecord): Promise<boolean> {
@@ -349,8 +394,8 @@ export async function leaseNextExternalEvolutionReview(
       ).bind(row.id, EXTERNAL_EVOLUTION_POLICY_VERSION, snapshotHash)
         .first<{ skipped: number }>();
       if (oversized) continue;
-      const manifest = await createAIReviewManifest(snapshot);
-      if (!externallyReviewableContext(manifest as unknown as Record<string, unknown>)) continue;
+      const manifest = externallyReviewableManifest(await createAIReviewManifest(snapshot));
+      if (!manifest) continue;
       const leaseToken = crypto.randomUUID();
       const leaseHash = await sha256(leaseToken);
       const leaseExpiresAt = now + leaseMs;
