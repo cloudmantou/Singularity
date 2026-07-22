@@ -218,6 +218,33 @@ describe("external knowledge evolution review", () => {
     }
   });
 
+  it("skips stale candidates whose source or target no longer has an active claim", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      await seedCandidate(db, "a-stale-candidate");
+      await seedCandidate(db, "b-active-candidate");
+      db.prepare(
+        `UPDATE sb_memories
+         SET claim_status = 'superseded', invalid_at = 19_000
+         WHERE entry_id = 'a-stale-candidate-target'`
+      ).run();
+
+      const leased = await leaseNextExternalEvolutionReview(env.DB, {
+        reviewerId: "codex-stale-skip",
+        now: 20_000,
+      });
+
+      expect(leased?.objectId).toBe("b-active-candidate");
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count FROM sb_ai_review_jobs
+         WHERE object_id = 'a-stale-candidate'`
+      ).get()).toEqual({ count: 0 });
+    } finally {
+      db.close();
+    }
+  });
+
   it("leases complete reviewable claims instead of silently truncating them", async () => {
     const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
     try {

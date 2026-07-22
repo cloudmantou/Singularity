@@ -1616,6 +1616,10 @@ export function evaluateAIAutoApplyEligibility(input: {
   }
   const [left, right] = manifest.evidence;
   if (!left || !right) return { eligible: false, reason: "insufficient_evidence" };
+  const activeClaimStatuses = new Set(["supported", "confirmed", "contested"]);
+  const bothHaveActiveClaims = [left, right].every((item) =>
+    (item.claimStatuses ?? []).some((status) => activeClaimStatuses.has(status))
+  );
   const sameContext = (first: string[], second: string[]) =>
     (first?.length ?? 0) > 0 && (second?.length ?? 0) > 0 &&
     stableJson(first) === stableJson(second);
@@ -1652,6 +1656,7 @@ export function evaluateAIAutoApplyEligibility(input: {
       if (input.trustedContextIsolation) {
         return { eligible: true, reason: "eligible_context_isolation" };
       }
+      if (!bothHaveActiveClaims) return { eligible: false, reason: "inactive_claim" };
       if (!sameContext(left.vaultIds, right.vaultIds)) {
         return { eligible: false, reason: "cross_vault" };
       }
@@ -1663,6 +1668,7 @@ export function evaluateAIAutoApplyEligibility(input: {
       }
       return { eligible: true, reason: "eligible_keep_separate" };
     }
+    if (!bothHaveActiveClaims) return { eligible: false, reason: "inactive_claim" };
     if (!sameContext(left.vaultIds, right.vaultIds)) {
       return { eligible: false, reason: "cross_vault" };
     }

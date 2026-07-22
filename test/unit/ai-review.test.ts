@@ -121,6 +121,42 @@ describe("AI-assisted Knowledge Review", () => {
     })).toEqual({ eligible: false, reason: "ambiguous_merge_scope" });
   });
 
+  it("does not auto-apply a review when either side has no active claim", () => {
+    expect(evaluateAIAutoApplyEligibility({
+      objectType: "memory_merge_candidate",
+      response: {
+        decision: "keep_both",
+        reason: "The records represent separate milestones.",
+        evidenceRefs: ["SOURCE", "TARGET"],
+        confidence: { decision: 0.99, evidence: 0.99 },
+        abstain: false,
+        reviewability: "sufficient",
+        missingContext: [],
+        keyDifferences: [{
+          dimension: "time",
+          status: "different",
+          summary: "The source is newer than the target.",
+          evidenceRefs: ["SOURCE", "TARGET"],
+        }],
+        refinement: {
+          action: "keep_separate",
+          content: null,
+          sourceRefs: ["SOURCE", "TARGET"],
+        },
+      },
+      manifest: {
+        objectType: "memory_merge_candidate",
+        objectId: "inactive-target",
+        state: "pending",
+        evidence: [
+          manifestEvidence("SOURCE"),
+          manifestEvidence("TARGET", { claimStatuses: ["superseded"] }),
+        ],
+        policyInput: { suggestedAction: "merge", similarity: 0.98 },
+      },
+    })).toEqual({ eligible: false, reason: "inactive_claim" });
+  });
+
   it("requires an exact stable project set before a mutating auto decision", () => {
     const response = {
       decision: "merge",

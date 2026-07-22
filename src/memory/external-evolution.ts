@@ -478,9 +478,31 @@ export async function leaseNextExternalEvolutionReview(
   if (live) return null;
 
   const rows = await db.prepare(
-    `SELECT id FROM sb_memory_merge_candidates
-     WHERE state = 'pending'
-     ORDER BY created_at ASC, id ASC LIMIT ?`
+    `SELECT candidate.id FROM sb_memory_merge_candidates candidate
+     WHERE candidate.state = 'pending'
+       AND EXISTS (
+         SELECT 1
+         FROM sb_memories source_claim
+         JOIN entries source_entry
+           ON source_entry.id = source_claim.entry_id
+          AND source_entry.content_hash = source_claim.content_hash
+         WHERE source_claim.entry_id = candidate.source_memory_id
+           AND source_claim.claim_status IN ('supported', 'confirmed', 'contested')
+           AND source_claim.invalid_at IS NULL
+           AND source_claim.expired_at IS NULL
+       )
+       AND EXISTS (
+         SELECT 1
+         FROM sb_memories target_claim
+         JOIN entries target_entry
+           ON target_entry.id = target_claim.entry_id
+          AND target_entry.content_hash = target_claim.content_hash
+         WHERE target_claim.entry_id = candidate.target_memory_id
+           AND target_claim.claim_status IN ('supported', 'confirmed', 'contested')
+           AND target_claim.invalid_at IS NULL
+           AND target_claim.expired_at IS NULL
+       )
+     ORDER BY candidate.created_at ASC, candidate.id ASC LIMIT ?`
   ).bind(MAX_REVIEW_CANDIDATES).all<{ id: string }>();
   for (const row of rows.results ?? []) {
     let snapshotHash: string | null = null;
