@@ -937,6 +937,77 @@ describe("external knowledge evolution review", () => {
     }
   });
 
+  it("revalidates a completed run and re-leases it when current policy rejects auto-apply", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      await seedCandidate(db, "external-stale-eligibility");
+      const leased = (await leaseNextExternalEvolutionReview(env.DB, {
+        reviewerId: "codex-old-policy",
+        now: 90_500,
+      }))!;
+      const evidence = (leased.manifest.evidence as Array<Record<string, unknown>>).map((item) => ({
+        ...item,
+        scopeIds: ["project/appflex", "project/itunes"],
+      }));
+      const staleManifest = { ...leased.manifest, evidence };
+      db.prepare(
+        `INSERT INTO sb_ai_review_runs (
+           id, job_id, object_type, object_id, mode, decision, reason,
+           evidence_refs_json, confidence_json, reviewability,
+           missing_context_json, key_differences_json, refinement_json,
+           abstained, requires_human, auto_apply_eligible,
+           reviewer_provider, reviewer_model, prompt_version,
+           input_snapshot_hash, input_snapshot_json, created_at
+         ) VALUES (
+           'stale-auto-run', ?, 'memory_merge_candidate', ?, 'auto_low_risk', 'merge',
+           'Previously eligible under an older policy.', '["SOURCE","TARGET"]',
+           '{"decision":0.99,"evidence":0.99}', 'sufficient', '[]',
+           '[{"dimension":"content","status":"different","summary":"Complementary wording.","evidenceRefs":["SOURCE","TARGET"]}]',
+           '{"action":"merge","content":"One merged Claim.","sourceRefs":["SOURCE","TARGET"]}',
+           0, 0, 1, 'mcp-external-agent', 'legacy-reviewer', 'knowledge-review-v5',
+           ?, ?, 90501
+         )`
+      ).bind(
+        leased.jobId,
+        leased.objectId,
+        leased.snapshotHash,
+        JSON.stringify(staleManifest)
+      ).run();
+      db.prepare(
+        `UPDATE sb_ai_review_jobs
+         SET status = 'completed', run_id = 'stale-auto-run', completed_at = 90501,
+             lease_owner = NULL, lease_expires_at = NULL
+         WHERE id = ?`
+      ).run(leased.jobId);
+      const reconcileApplication = vi.fn(async () => undefined);
+
+      const next = await leaseNextExternalEvolutionReview(env.DB, {
+        reviewerId: "codex-current-policy",
+        now: 90_502,
+      }, { reconcileApplication });
+
+      expect(reconcileApplication).not.toHaveBeenCalled();
+      expect(next).toMatchObject({
+        objectId: "external-stale-eligibility",
+        reviewPolicyVersion: EXTERNAL_EVOLUTION_POLICY_VERSION,
+      });
+      expect(next?.jobId).not.toBe(leased.jobId);
+      expect(db.prepare(
+        `SELECT status, error_code FROM sb_ai_review_jobs WHERE id = ?`
+      ).get(leased.jobId)).toEqual({
+        status: "failed",
+        error_code: "external_auto_apply_revalidation_failed",
+      });
+      expect(db.prepare(
+        `SELECT requires_human, auto_apply_eligible
+         FROM sb_ai_review_runs WHERE id = 'stale-auto-run'`
+      ).get()).toEqual({ requires_human: 0, auto_apply_eligible: 1 });
+    } finally {
+      db.close();
+    }
+  });
+
   it("re-reviews an expired applying run from an older policy instead of auto-applying it", async () => {
     const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
     try {

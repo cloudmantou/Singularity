@@ -178,6 +178,7 @@ import {
   loadAIReviewSnapshot,
   processAIReviewJob,
   prepareAIReviewApplicationStatements,
+  revalidateAIAutoApplyRun,
   releaseAIReviewApplication,
   type AIReviewJobRecord,
   type AIReviewDecisionSource,
@@ -11316,6 +11317,9 @@ async function applyAIReviewRecommendation(
   const run = await getAIReviewRun(env.DB, runId);
   if (!run) throw new AIReviewJobUnavailableError(runId);
   if (input.deterministicAuto && (!run.autoApplyEligible || run.requiresHuman)) {
+    throw new AIReviewJobUnavailableError(runId);
+  }
+  if (input.deterministicAuto && !revalidateAIAutoApplyRun(run).eligible) {
     throw new AIReviewJobUnavailableError(runId);
   }
   if (!input.deterministicAuto && !input.principal) {

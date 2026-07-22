@@ -1672,6 +1672,12 @@ export function evaluateAIAutoApplyEligibility(input: {
     if (!sameContext(left.projectIds, right.projectIds)) {
       return { eligible: false, reason: "cross_project" };
     }
+    if (response.decision === "merge" && left.scopeIds.length !== 1) {
+      return { eligible: false, reason: "ambiguous_merge_scope" };
+    }
+    if (response.decision === "merge" && left.vaultIds.length !== 1) {
+      return { eligible: false, reason: "ambiguous_merge_vault" };
+    }
     if (response.decision === "replace") {
       const hasTemporalBasis = response.keyDifferences.some((difference) =>
         difference.dimension === "time" && difference.status === "different");
@@ -1695,6 +1701,21 @@ export function evaluateAIAutoApplyEligibility(input: {
   }
 
   return { eligible: false, reason: "conflict_resolution_requires_reversible_evolution" };
+}
+
+export function revalidateAIAutoApplyRun(
+  run: AIReviewRunRecord
+): { eligible: boolean; reason: string } {
+  if (!run.autoApplyEligible || run.requiresHuman) {
+    return { eligible: false, reason: "stored_run_not_eligible" };
+  }
+  return evaluateAIAutoApplyEligibility({
+    objectType: run.objectType,
+    response: run,
+    manifest: run.inputManifest,
+    trustedContextIsolation:
+      run.reviewerProvider === "rules" && run.reviewerModel.startsWith("context-isolation-"),
+  });
 }
 
 export async function processAIReviewJob(

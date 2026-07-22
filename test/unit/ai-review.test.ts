@@ -83,6 +83,44 @@ describe("AI-assisted Knowledge Review", () => {
     expect(eligibility).toEqual({ eligible: true, reason: "eligible" });
   });
 
+  it("does not auto-apply a merge that cannot produce one unambiguous scope", () => {
+    const response = {
+      decision: "merge",
+      reason: "The two preferences can be consolidated.",
+      evidenceRefs: ["SOURCE", "TARGET"],
+      confidence: { decision: 0.99, evidence: 0.99 },
+      abstain: false,
+      reviewability: "sufficient" as const,
+      missingContext: [],
+      keyDifferences: [{
+        dimension: "content" as const,
+        status: "different" as const,
+        summary: "One Claim includes the preferred alternative.",
+        evidenceRefs: ["SOURCE", "TARGET"],
+      }],
+      refinement: {
+        action: "merge" as const,
+        content: "Use metadata-only records instead of VM snapshots.",
+        sourceRefs: ["SOURCE", "TARGET"],
+      },
+    };
+
+    expect(evaluateAIAutoApplyEligibility({
+      objectType: "memory_merge_candidate",
+      response,
+      manifest: {
+        objectType: "memory_merge_candidate",
+        objectId: "ambiguous-merge-scope",
+        state: "pending",
+        evidence: [
+          manifestEvidence("SOURCE", { scopeIds: ["project/appflex", "project/itunes"] }),
+          manifestEvidence("TARGET", { scopeIds: ["project/appflex", "project/itunes"] }),
+        ],
+        policyInput: { suggestedAction: "merge", similarity: 0.95 },
+      },
+    })).toEqual({ eligible: false, reason: "ambiguous_merge_scope" });
+  });
+
   it("requires an exact stable project set before a mutating auto decision", () => {
     const response = {
       decision: "merge",

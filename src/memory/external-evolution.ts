@@ -15,6 +15,7 @@ import {
   modelSafeReviewSnapshot,
   parseAIReviewModelResponse,
   processAIReviewJob,
+  revalidateAIAutoApplyRun,
 } from "./ai-review";
 
 export const EXTERNAL_EVOLUTION_POLICY_VERSION = "external-evolution-v3";
@@ -420,7 +421,7 @@ async function reconcileExternalApplication(
   ).bind(EXTERNAL_EVOLUTION_POLICY_GLOB, now).first<{ live: number }>();
   if (live) return true;
   const pending = await db.prepare(
-    `SELECT job.run_id
+    `SELECT job.id AS job_id, job.run_id
      FROM sb_ai_review_jobs job
      JOIN sb_ai_review_runs run ON run.id = job.run_id
      LEFT JOIN sb_ai_review_applications application ON application.run_id = run.id
@@ -428,12 +429,26 @@ async function reconcileExternalApplication(
        AND job.run_id IS NOT NULL AND run.auto_apply_eligible = 1
        AND application.id IS NULL
      ORDER BY job.completed_at ASC, job.id ASC LIMIT 1`
-  ).bind(EXTERNAL_EVOLUTION_POLICY_VERSION).first<{ run_id: string }>();
+  ).bind(EXTERNAL_EVOLUTION_POLICY_VERSION).first<{ job_id: string; run_id: string }>();
   if (!pending) return false;
+  const run = await getAIReviewRun(db, pending.run_id);
+  if (!run) throw new AIReviewJobUnavailableError(pending.run_id);
+  if (!revalidateAIAutoApplyRun(run).eligible) {
+    const released = await db.prepare(
+      `UPDATE sb_ai_review_jobs
+       SET status = 'failed', error_code = 'external_auto_apply_revalidation_failed',
+           completed_at = COALESCE(completed_at, ?),
+           lease_owner = NULL, lease_expires_at = NULL
+       WHERE id = ? AND run_id = ? AND status = 'completed'`
+    ).bind(now, pending.job_id, pending.run_id).run();
+    if (Number(released.meta?.changes ?? 0) !== 1) {
+      throw new AIReviewJobUnavailableError(pending.run_id);
+    }
+    return false;
+  }
   if (!services.reconcileApplication) return true;
   await services.reconcileApplication(pending.run_id);
-  const run = await getAIReviewRun(db, pending.run_id);
-  if (!run || !await appliedJobExists(db, run)) {
+  if (!await appliedJobExists(db, run)) {
     throw new AIReviewJobUnavailableError(pending.run_id);
   }
   return false;
