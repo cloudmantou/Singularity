@@ -31,6 +31,7 @@ const DEFAULT_LEASE_MS = 5 * 60_000;
 const MAX_LEASE_MS = 10 * 60_000;
 const MAX_LEASE_PAYLOAD_BYTES = 64 * 1_024;
 const EXTERNAL_OWNER_PRIVATE_VAULT_ID = "external:owner-private";
+const EXTERNAL_EVOLUTION_POLICY_GLOB = "external-evolution-v[0-9]*";
 const EXTERNAL_PRIVATE_SOURCE_CHANNELS = new Set([
   "api",
   "claude-code",
@@ -38,24 +39,112 @@ const EXTERNAL_PRIVATE_SOURCE_CHANNELS = new Set([
   "mcp",
 ]);
 
-async function ensureExternalEvolutionDataModel(db: D1Database): Promise<void> {
+function isGlobalExternalLeaseIndex(sql: string | null | undefined): boolean {
+  return Boolean(
+    sql &&
+    /CREATE\s+UNIQUE\s+INDEX/i.test(sql) &&
+    /ON\s+sb_ai_review_jobs\s*\(\s*\(?1\)?\s*\)/i.test(sql) &&
+    /review_policy_version\s+GLOB\s+'external-evolution-v\[0-9\]\*'/i.test(sql) &&
+    /status\s+IN\s*\(\s*'processing'\s*,\s*'applying'\s*\)/i.test(sql) &&
+    /status\s*=\s*'completed'[\s\S]*lease_owner\s+IS\s+NOT\s+NULL/i.test(sql)
+  );
+}
+
+async function expireExternalEvolutionLeases(
+  db: D1Database,
+  now: number
+): Promise<void> {
+  await db.prepare(
+    `UPDATE sb_ai_review_jobs
+     SET status = 'failed', error_code = 'external_lease_expired',
+         completed_at = ?, lease_owner = NULL, lease_expires_at = NULL
+     WHERE review_policy_version GLOB ? AND status = 'processing'
+       AND COALESCE(lease_expires_at, 0) <= ?`
+  ).bind(now, EXTERNAL_EVOLUTION_POLICY_GLOB, now).run();
+  await db.prepare(
+    `UPDATE sb_ai_review_jobs
+     SET status = 'completed', error_code = 'external_application_lease_expired',
+         lease_owner = NULL, lease_expires_at = NULL
+     WHERE review_policy_version GLOB ? AND status = 'applying'
+       AND COALESCE(lease_expires_at, 0) <= ?`
+  ).bind(EXTERNAL_EVOLUTION_POLICY_GLOB, now).run();
+  await db.prepare(
+    `UPDATE sb_ai_review_jobs
+     SET lease_owner = NULL, lease_expires_at = NULL,
+         error_code = 'external_completion_lease_expired'
+     WHERE review_policy_version GLOB ? AND status = 'completed'
+       AND lease_owner IS NOT NULL AND COALESCE(lease_expires_at, 0) <= ?`
+  ).bind(EXTERNAL_EVOLUTION_POLICY_GLOB, now).run();
+}
+
+async function migrateExternalLeaseIndex(
+  db: D1Database,
+  now: number
+): Promise<void> {
+  const rows = await db.prepare(
+    `SELECT id
+     FROM sb_ai_review_jobs
+     WHERE review_policy_version GLOB ?
+       AND (status IN ('processing', 'applying') OR
+            (status = 'completed' AND lease_owner IS NOT NULL))
+     ORDER BY CASE status WHEN 'applying' THEN 0 WHEN 'completed' THEN 1 ELSE 2 END,
+              CASE WHEN review_policy_version = ? THEN 0 ELSE 1 END,
+              COALESCE(started_at, created_at) ASC, id ASC`
+  ).bind(EXTERNAL_EVOLUTION_POLICY_GLOB, EXTERNAL_EVOLUTION_POLICY_VERSION)
+    .all<{ id: string }>();
+  const statements = (rows.results ?? []).slice(1).map((row) =>
+    db.prepare(
+      `UPDATE sb_ai_review_jobs
+       SET status = CASE
+             WHEN run_id IS NOT NULL AND EXISTS (
+               SELECT 1 FROM sb_ai_review_applications application
+               WHERE application.run_id = sb_ai_review_jobs.run_id
+             ) THEN 'applied'
+             WHEN status = 'processing' THEN 'failed'
+             ELSE 'completed'
+           END,
+           error_code = CASE
+             WHEN run_id IS NOT NULL AND EXISTS (
+               SELECT 1 FROM sb_ai_review_applications application
+               WHERE application.run_id = sb_ai_review_jobs.run_id
+             ) THEN NULL
+             ELSE 'external_parallel_lease_reconciled'
+           END,
+           completed_at = COALESCE(completed_at, ?),
+           lease_owner = NULL, lease_expires_at = NULL
+       WHERE id = ?
+         AND (status IN ('processing', 'applying') OR
+              (status = 'completed' AND lease_owner IS NOT NULL))`
+    ).bind(now, row.id)
+  );
+  statements.push(
+    db.prepare(`DROP INDEX IF EXISTS idx_ai_review_jobs_single_external_lease`),
+    db.prepare(
+      `CREATE UNIQUE INDEX idx_ai_review_jobs_single_external_lease
+       ON sb_ai_review_jobs((1))
+       WHERE review_policy_version GLOB 'external-evolution-v[0-9]*'
+         AND (
+           status IN ('processing', 'applying') OR
+           (status = 'completed' AND lease_owner IS NOT NULL)
+         )`
+    )
+  );
+  await db.batch(statements);
+}
+
+async function ensureExternalEvolutionDataModel(
+  db: D1Database,
+  now = Date.now()
+): Promise<void> {
   await ensureAIReviewDataModel(db);
+  await expireExternalEvolutionLeases(db, now);
   const leaseIndex = await db.prepare(
     `SELECT sql FROM sqlite_master
      WHERE type = 'index' AND name = 'idx_ai_review_jobs_single_external_lease'`
   ).first<{ sql: string | null }>();
-  if (leaseIndex?.sql && !leaseIndex.sql.includes("external-evolution-v[0-9]*")) {
-    await db.exec(`DROP INDEX IF EXISTS idx_ai_review_jobs_single_external_lease`);
+  if (!isGlobalExternalLeaseIndex(leaseIndex?.sql)) {
+    await migrateExternalLeaseIndex(db, now);
   }
-  await db.exec(
-    `CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_review_jobs_single_external_lease
-     ON sb_ai_review_jobs(review_policy_version)
-     WHERE review_policy_version GLOB 'external-evolution-v[0-9]*'
-       AND (
-         status IN ('processing', 'applying') OR
-         (status = 'completed' AND lease_owner IS NOT NULL)
-       )`
-  );
 }
 
 export class ExternalEvolutionLeaseUnavailableError extends Error {
@@ -308,19 +397,28 @@ async function appliedJobExists(db: D1Database, run: AIReviewRunRecord): Promise
 
 async function reconcileExternalApplication(
   db: D1Database,
-  services: ExternalEvolutionLeaseServices
+  services: ExternalEvolutionLeaseServices,
+  now: number
 ): Promise<boolean> {
   await db.prepare(
     `UPDATE sb_ai_review_jobs
      SET status = 'applied', lease_owner = NULL, lease_expires_at = NULL,
          error_code = NULL
-     WHERE review_policy_version = ? AND status IN ('completed', 'applying')
+     WHERE review_policy_version GLOB ? AND status IN ('completed', 'applying')
        AND run_id IS NOT NULL
        AND EXISTS (
          SELECT 1 FROM sb_ai_review_applications application
          WHERE application.run_id = sb_ai_review_jobs.run_id
        )`
-  ).bind(EXTERNAL_EVOLUTION_POLICY_VERSION).run();
+  ).bind(EXTERNAL_EVOLUTION_POLICY_GLOB).run();
+  const live = await db.prepare(
+    `SELECT 1 AS live FROM sb_ai_review_jobs
+     WHERE review_policy_version GLOB ?
+       AND (status IN ('processing', 'applying') OR
+            (status = 'completed' AND lease_owner IS NOT NULL))
+       AND COALESCE(lease_expires_at, 0) > ? LIMIT 1`
+  ).bind(EXTERNAL_EVOLUTION_POLICY_GLOB, now).first<{ live: number }>();
+  if (live) return true;
   const pending = await db.prepare(
     `SELECT job.run_id
      FROM sb_ai_review_jobs job
@@ -350,39 +448,18 @@ export async function leaseNextExternalEvolutionReview(
   },
   services: ExternalEvolutionLeaseServices = {}
 ): Promise<ExternalEvolutionLease | null> {
-  await ensureExternalEvolutionDataModel(db);
-  const reviewerId = boundedIdentity(input.reviewerId, "reviewer_id");
   const now = input.now ?? Date.now();
+  await ensureExternalEvolutionDataModel(db, now);
+  const reviewerId = boundedIdentity(input.reviewerId, "reviewer_id");
   const leaseMs = Math.max(1, Math.min(input.leaseMs ?? DEFAULT_LEASE_MS, MAX_LEASE_MS));
-  await db.prepare(
-    `UPDATE sb_ai_review_jobs
-     SET status = 'failed', error_code = 'external_lease_expired',
-         completed_at = ?, lease_owner = NULL, lease_expires_at = NULL
-     WHERE review_policy_version = ? AND status = 'processing'
-       AND COALESCE(lease_expires_at, 0) <= ?`
-  ).bind(now, EXTERNAL_EVOLUTION_POLICY_VERSION, now).run();
-  await db.prepare(
-    `UPDATE sb_ai_review_jobs
-     SET status = 'completed', error_code = 'external_application_lease_expired',
-         lease_owner = NULL, lease_expires_at = NULL
-     WHERE review_policy_version = ? AND status = 'applying'
-       AND COALESCE(lease_expires_at, 0) <= ?`
-  ).bind(EXTERNAL_EVOLUTION_POLICY_VERSION, now).run();
-  await db.prepare(
-    `UPDATE sb_ai_review_jobs
-     SET lease_owner = NULL, lease_expires_at = NULL,
-         error_code = 'external_completion_lease_expired'
-     WHERE review_policy_version = ? AND status = 'completed'
-       AND lease_owner IS NOT NULL AND COALESCE(lease_expires_at, 0) <= ?`
-  ).bind(EXTERNAL_EVOLUTION_POLICY_VERSION, now).run();
-  if (await reconcileExternalApplication(db, services)) return null;
+  if (await reconcileExternalApplication(db, services, now)) return null;
   const live = await db.prepare(
     `SELECT 1 AS live FROM sb_ai_review_jobs
-     WHERE review_policy_version = ?
+     WHERE review_policy_version GLOB ?
        AND (status IN ('processing', 'applying') OR
             (status = 'completed' AND lease_owner IS NOT NULL))
        AND COALESCE(lease_expires_at, 0) > ? LIMIT 1`
-  ).bind(EXTERNAL_EVOLUTION_POLICY_VERSION, now).first<{ live: number }>();
+  ).bind(EXTERNAL_EVOLUTION_POLICY_GLOB, now).first<{ live: number }>();
   if (live) return null;
 
   const rows = await db.prepare(
@@ -457,11 +534,11 @@ export async function leaseNextExternalEvolutionReview(
       if (error instanceof AIReviewObjectUnavailableError) continue;
       const concurrentLease = await db.prepare(
         `SELECT 1 AS live FROM sb_ai_review_jobs
-         WHERE review_policy_version = ?
+         WHERE review_policy_version GLOB ?
            AND (status IN ('processing', 'applying') OR
                 (status = 'completed' AND lease_owner IS NOT NULL))
            AND COALESCE(lease_expires_at, 0) > ? LIMIT 1`
-      ).bind(EXTERNAL_EVOLUTION_POLICY_VERSION, now).first<{ live: number }>();
+      ).bind(EXTERNAL_EVOLUTION_POLICY_GLOB, now).first<{ live: number }>();
       if (concurrentLease) return null;
       if (!snapshotHash) throw error;
       const active = await db.prepare(
@@ -484,12 +561,12 @@ export async function submitExternalEvolutionReview(
   input: ExternalEvolutionSubmission,
   services: ExternalEvolutionServices = {}
 ): Promise<ExternalEvolutionSubmissionResult> {
-  await ensureExternalEvolutionDataModel(db);
+  const now = input.now ?? Date.now();
+  await ensureExternalEvolutionDataModel(db, now);
   const reviewerId = boundedIdentity(input.reviewerId, "reviewer_id");
   const reviewerModel = boundedModel(input.reviewerModel);
   const leaseHash = await sha256(input.leaseToken);
   const expectedLeaseIdentity = leaseIdentity(reviewerId, leaseHash);
-  const now = input.now ?? Date.now();
   const response = parseAIReviewModelResponse(
     stableJson(input.proposal),
     "memory_merge_candidate",

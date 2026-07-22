@@ -2077,7 +2077,8 @@ export function prepareAIReviewApplicationStatements(
     ),
     db.prepare(
       `UPDATE sb_ai_review_jobs
-       SET status = 'applied', completed_at = ?, lease_owner = NULL, lease_expires_at = NULL
+       SET status = 'applied', completed_at = ?, error_code = NULL,
+           lease_owner = NULL, lease_expires_at = NULL
        WHERE id = ? AND run_id = ? AND status = 'applying' AND lease_owner = ?`
     ).bind(now, input.jobId, input.run.id, input.leaseOwner),
   ];

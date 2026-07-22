@@ -314,7 +314,209 @@ describe("external knowledge evolution review", () => {
         `SELECT sql FROM sqlite_master
          WHERE type = 'index' AND name = 'idx_ai_review_jobs_single_external_lease'`
       ).get()).toEqual(expect.objectContaining({
-        sql: expect.stringContaining("external-evolution-v[0-9]*"),
+        sql: expect.stringMatching(/ON sb_ai_review_jobs\s*\(\s*\(?1\)?\s*\)/),
+      }));
+    } finally {
+      db.close();
+    }
+  });
+
+  it("replaces a non-unique lookalike lease index during runtime migration", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      await leaseNextExternalEvolutionReview(env.DB, {
+        reviewerId: "schema-bootstrap",
+        now: 25_050,
+      });
+      db.exec(`DROP INDEX IF EXISTS idx_ai_review_jobs_single_external_lease`);
+      db.exec(
+        `CREATE INDEX idx_ai_review_jobs_single_external_lease
+         ON sb_ai_review_jobs((1))
+         WHERE review_policy_version GLOB 'external-evolution-v[0-9]*'
+           AND (
+             status IN ('processing', 'applying') OR
+             (status = 'completed' AND lease_owner IS NOT NULL)
+           )`
+      );
+
+      await leaseNextExternalEvolutionReview(env.DB, {
+        reviewerId: "schema-migrator",
+        now: 25_100,
+      });
+
+      expect(db.prepare(
+        `SELECT sql FROM sqlite_master
+         WHERE type = 'index' AND name = 'idx_ai_review_jobs_single_external_lease'`
+      ).get()).toEqual(expect.objectContaining({
+        sql: expect.stringMatching(/^CREATE UNIQUE INDEX/i),
+      }));
+
+      db.exec(`DROP INDEX idx_ai_review_jobs_single_external_lease`);
+      db.exec(
+        `CREATE UNIQUE INDEX idx_ai_review_jobs_single_external_lease
+         ON sb_ai_review_jobs((1))
+         WHERE review_policy_version GLOB 'external-evolution-v[0-9]*'
+           AND status IN ('processing', 'applying')`
+      );
+      await leaseNextExternalEvolutionReview(env.DB, {
+        reviewerId: "predicate-migrator",
+        now: 25_200,
+      });
+
+      expect(db.prepare(
+        `SELECT sql FROM sqlite_master
+         WHERE type = 'index' AND name = 'idx_ai_review_jobs_single_external_lease'`
+      ).get()).toEqual(expect.objectContaining({
+        sql: expect.stringMatching(/status\s*=\s*'completed'[\s\S]*lease_owner\s+IS\s+NOT\s+NULL/i),
+      }));
+    } finally {
+      db.close();
+    }
+  });
+
+  it("treats a live lease from an older policy generation as globally exclusive", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      await leaseNextExternalEvolutionReview(env.DB, {
+        reviewerId: "schema-bootstrap",
+        now: 10_000,
+      });
+      await seedCandidate(db, "external-cross-policy");
+      db.prepare(
+        `INSERT INTO sb_ai_review_jobs (
+           id, object_type, object_id, mode, status, requested_by,
+           review_policy_version, input_snapshot_hash, input_snapshot_json,
+           created_at, started_at, lease_owner, lease_expires_at
+         ) VALUES (
+           'external-v2-live', 'memory_merge_candidate', 'legacy-candidate',
+           'auto_low_risk', 'processing', 'external:legacy:lease',
+           'external-evolution-v2', 'legacy-snapshot', '{}',
+           19000, 19000, 'legacy-lease-hash', 25000
+         )`
+      ).run();
+
+      await expect(leaseNextExternalEvolutionReview(env.DB, {
+        reviewerId: "codex-v3",
+        now: 20_000,
+      })).resolves.toBeNull();
+      expect(db.prepare(
+        `SELECT COUNT(*) AS count FROM sb_ai_review_jobs
+         WHERE review_policy_version = ? AND status = 'processing'`
+      ).get(EXTERNAL_EVOLUTION_POLICY_VERSION)).toEqual({ count: 0 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("reclaims expired leases from older policy generations before leasing current work", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      await leaseNextExternalEvolutionReview(env.DB, {
+        reviewerId: "schema-bootstrap",
+        now: 10_000,
+      });
+      await seedCandidate(db, "external-after-expired-policy");
+      db.prepare(
+        `INSERT INTO sb_ai_review_jobs (
+           id, object_type, object_id, mode, status, requested_by,
+           review_policy_version, input_snapshot_hash, input_snapshot_json,
+           created_at, started_at, lease_owner, lease_expires_at
+         ) VALUES (
+           'external-v2-expired', 'memory_merge_candidate', 'legacy-candidate',
+           'auto_low_risk', 'processing', 'external:legacy:lease',
+           'external-evolution-v2', 'legacy-snapshot', '{}',
+           18000, 18000, 'legacy-lease-hash', 19999
+         )`
+      ).run();
+
+      const leased = await leaseNextExternalEvolutionReview(env.DB, {
+        reviewerId: "codex-v3",
+        now: 20_000,
+      });
+
+      expect(leased?.objectId).toBe("external-after-expired-policy");
+      expect(db.prepare(
+        `SELECT status, error_code, lease_owner, lease_expires_at
+         FROM sb_ai_review_jobs WHERE id = 'external-v2-expired'`
+      ).get()).toEqual({
+        status: "failed",
+        error_code: "external_lease_expired",
+        lease_owner: null,
+        lease_expires_at: null,
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("reconciles parallel legacy leases while migrating to the global lease index", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      await leaseNextExternalEvolutionReview(env.DB, {
+        reviewerId: "schema-bootstrap",
+        now: 10_000,
+      });
+      db.exec(`DROP INDEX idx_ai_review_jobs_single_external_lease`);
+      db.exec(
+        `CREATE UNIQUE INDEX idx_ai_review_jobs_single_external_lease
+         ON sb_ai_review_jobs(review_policy_version)
+         WHERE review_policy_version GLOB 'external-evolution-v[0-9]*'
+           AND status = 'processing'`
+      );
+      const insertLease = db.prepare(
+        `INSERT INTO sb_ai_review_jobs (
+           id, object_type, object_id, mode, status, requested_by,
+           review_policy_version, input_snapshot_hash, input_snapshot_json,
+           created_at, started_at, lease_owner, lease_expires_at
+         ) VALUES (?, 'memory_merge_candidate', ?, 'auto_low_risk', 'processing', ?,
+                   ?, ?, '{}', ?, ?, ?, 25000)`
+      );
+      insertLease.run(
+        "external-v2-parallel",
+        "legacy-candidate",
+        "external:legacy:lease",
+        "external-evolution-v2",
+        "legacy-snapshot",
+        18_000,
+        18_000,
+        "legacy-lease-hash"
+      );
+      insertLease.run(
+        "external-v3-parallel",
+        "current-candidate",
+        "external:current:lease",
+        EXTERNAL_EVOLUTION_POLICY_VERSION,
+        "current-snapshot",
+        19_000,
+        19_000,
+        "current-lease-hash"
+      );
+
+      await expect(leaseNextExternalEvolutionReview(env.DB, {
+        reviewerId: "codex-v3",
+        now: 20_000,
+      })).resolves.toBeNull();
+
+      expect(db.prepare(
+        `SELECT id, status, error_code FROM sb_ai_review_jobs
+         WHERE id IN ('external-v2-parallel', 'external-v3-parallel') ORDER BY id`
+      ).all()).toEqual([
+        {
+          id: "external-v2-parallel",
+          status: "failed",
+          error_code: "external_parallel_lease_reconciled",
+        },
+        { id: "external-v3-parallel", status: "processing", error_code: null },
+      ]);
+      expect(db.prepare(
+        `SELECT sql FROM sqlite_master
+         WHERE type = 'index' AND name = 'idx_ai_review_jobs_single_external_lease'`
+      ).get()).toEqual(expect.objectContaining({
+        sql: expect.stringMatching(/ON sb_ai_review_jobs\s*\(\s*\(?1\)?\s*\)/),
       }));
     } finally {
       db.close();
@@ -730,6 +932,91 @@ describe("external knowledge evolution review", () => {
       expect(db.prepare(
         `SELECT COUNT(*) AS count FROM sb_ai_review_runs WHERE object_id = 'external-reconcile-a'`
       ).get()).toEqual({ count: 1 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("re-reviews an expired applying run from an older policy instead of auto-applying it", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      await seedCandidate(db, "external-legacy-apply-a");
+      await seedCandidate(db, "external-legacy-apply-b");
+      const leased = (await leaseNextExternalEvolutionReview(env.DB, {
+        reviewerId: "codex-a",
+        now: 91_000,
+      }))!;
+      const recorded = await submitExternalEvolutionReview(env.DB, {
+        jobId: leased.jobId,
+        leaseToken: leased.leaseToken,
+        snapshotHash: leased.snapshotHash,
+        reviewerId: "codex-a",
+        reviewerModel: "gpt-test",
+        proposal: mergeProposal(),
+        now: 91_001,
+      }, { verifier: approvedVerifier() });
+      expect(recorded).toMatchObject({ status: "recorded", autoApplyEligible: true });
+      db.prepare(
+        `UPDATE sb_ai_review_jobs
+         SET review_policy_version = 'external-evolution-v2', status = 'applying',
+             lease_owner = 'legacy-application', lease_expires_at = 91002
+         WHERE id = ?`
+      ).run(leased.jobId);
+
+      const reconcileApplication = vi.fn(async (runId: string) => {
+        const run = db.prepare(
+          `SELECT job_id, object_type, object_id, decision FROM sb_ai_review_runs WHERE id = ?`
+        ).get(runId) as {
+          job_id: string;
+          object_type: string;
+          object_id: string;
+          decision: string;
+        };
+        db.prepare(
+          `INSERT INTO sb_ai_review_applications (
+             id, run_id, object_type, object_id, decision, applied_by,
+             application_mode, decision_source, created_at
+           ) VALUES (?, ?, ?, ?, ?, 'legacy-reconciler', 'deterministic_auto',
+                     'guarded_ai', ?)`
+        ).run(
+          crypto.randomUUID(),
+          runId,
+          run.object_type,
+          run.object_id,
+          run.decision,
+          91_004
+        );
+        db.prepare(
+          `UPDATE sb_ai_review_jobs
+           SET status = 'applied', lease_owner = NULL, lease_expires_at = NULL
+           WHERE id = ? AND run_id = ?`
+        ).run(run.job_id, runId);
+        db.prepare(
+          `UPDATE sb_memory_merge_candidates SET state = 'accepted' WHERE id = ?`
+        ).run(run.object_id);
+      });
+
+      const next = await leaseNextExternalEvolutionReview(env.DB, {
+        reviewerId: "codex-b",
+        now: 91_005,
+      }, { reconcileApplication });
+
+      expect(reconcileApplication).not.toHaveBeenCalled();
+      expect(next).toMatchObject({
+        objectId: "external-legacy-apply-a",
+        reviewPolicyVersion: EXTERNAL_EVOLUTION_POLICY_VERSION,
+      });
+      expect(next?.jobId).not.toBe(leased.jobId);
+      expect(db.prepare(
+        `SELECT status, error_code, lease_owner, lease_expires_at
+         FROM sb_ai_review_jobs WHERE id = ?`
+      ).get(leased.jobId)).toEqual({
+        status: "completed",
+        error_code: "external_application_lease_expired",
+        lease_owner: null,
+        lease_expires_at: null,
+      });
     } finally {
       db.close();
     }

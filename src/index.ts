@@ -7069,6 +7069,16 @@ function normalizeEntailmentText(value: string): string {
   return value.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
+function normalizeDeterministicInsightText(value: string): string {
+  return value.trim().replace(/\s+/g, " ")
+    .replace(
+      /^(?:based on (?:the )?verified (?:memory|evidence)|according to (?:the )?verified (?:memory|evidence)|根据(?:已验证的?|核实的?)(?:记忆|证据))[,，:：\s]+/i,
+      ""
+    )
+    .replace(/[.!?。！？]+$/g, "")
+    .trim();
+}
+
 function answerMatchesQueryLanguage(query: string, answer: string): boolean {
   const queryCjkCount = (query.match(/[\u3400-\u9fff]/g) ?? []).length;
   return queryCjkCount < 2 || /[\u3400-\u9fff]/.test(answer);
@@ -7108,12 +7118,12 @@ async function verifySynthesizedInsightEntailment(
   const claimsByRef = new Map(claims.map((claim) => [claim.ref.toUpperCase(), claim]));
   const deterministicIds = new Set<string>();
   const unresolved = paragraphs.filter((paragraph) => {
-    const normalizedAnswer = normalizeEntailmentText(paragraph.text);
     const referenced = paragraph.refs.map((ref) => claimsByRef.get(ref));
     if (referenced.some((claim) => !claim)) return true;
-    const supported = (referenced as CitableInsightClaim[]).every((claim) =>
-      normalizedAnswer.includes(normalizeEntailmentText(claim.statement))
-    );
+    const citedClaims = referenced as CitableInsightClaim[];
+    const supported = citedClaims.length === 1 &&
+      normalizeDeterministicInsightText(paragraph.text) ===
+        normalizeDeterministicInsightText(citedClaims[0].statement);
     if (supported) deterministicIds.add(paragraph.id);
     return !supported;
   });

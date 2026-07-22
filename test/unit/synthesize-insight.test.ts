@@ -482,6 +482,64 @@ describe("synthesizeInsight()", () => {
     expect(env.AI.run).toHaveBeenCalledTimes(2);
   });
 
+  it("does not bypass entailment when a paragraph copies a Claim before adding a new fact", async () => {
+    const generated = JSON.stringify({
+      answer: [{
+        text: "The project uses SQLite and stores passwords in plaintext.",
+        refs: ["C1"],
+        kind: "fact",
+      }],
+    });
+    const rejected = JSON.stringify({
+      paragraphs: [{ id: "P1", supported: false }],
+    });
+    const env = makeTestEnv(undefined, {
+      AI: aiSequenceMock(generated, rejected),
+    });
+
+    const result = await synthesizeVerifiedInsight(
+      "Which database is used?",
+      [verifiedEvidence("1", "The project uses SQLite")],
+      env
+    );
+
+    expect(result.answer).toBe("Retrieved direct evidence is insufficient for a verified answer.");
+    expect(result.verifiedClaims).toEqual([]);
+    expect(result.unverifiedClaims).toEqual([
+      expect.objectContaining({ reason: "claim_text_not_supported", refs: ["C1"] }),
+    ]);
+    expect(env.AI.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not treat case-sensitive identifiers as an exact deterministic copy", async () => {
+    const generated = JSON.stringify({
+      answer: [{
+        text: "database_url points to the production database.",
+        refs: ["C1"],
+        kind: "fact",
+      }],
+    });
+    const rejected = JSON.stringify({
+      paragraphs: [{ id: "P1", supported: false }],
+    });
+    const env = makeTestEnv(undefined, {
+      AI: aiSequenceMock(generated, rejected),
+    });
+
+    const result = await synthesizeVerifiedInsight(
+      "Which environment variable selects the production database?",
+      [verifiedEvidence("1", "DATABASE_URL points to the production database")],
+      env
+    );
+
+    expect(result.answer).toBe("Retrieved direct evidence is insufficient for a verified answer.");
+    expect(result.verifiedClaims).toEqual([]);
+    expect(result.unverifiedClaims).toEqual([
+      expect.objectContaining({ reason: "claim_text_not_supported", refs: ["C1"] }),
+    ]);
+    expect(env.AI.run).toHaveBeenCalledTimes(2);
+  });
+
   it("drops an unsupported paragraph while preserving supported cited paragraphs", async () => {
     const generated = JSON.stringify({
       answer: [{

@@ -1357,4 +1357,97 @@ describe("AI-assisted Knowledge Review", () => {
       db.close();
     }
   });
+
+  it("clears a recovered lease error when the review application succeeds", async () => {
+    const { env, db } = createSelfhostEnv({ databasePath: ":memory:", authToken: "test-token" });
+    try {
+      await initializeDatabase(env);
+      const now = Date.now();
+      db.prepare(
+        `INSERT INTO entries (id, content, tags, source, created_at, vector_ids, content_hash)
+         VALUES ('recovered-source', 'Same fact', '[]', 'api', ?, '[]', 'same-hash'),
+                ('recovered-target', 'Same fact', '[]', 'api', ?, '[]', 'same-hash')`
+      ).run(now, now);
+      db.prepare(
+        `INSERT INTO sb_memory_merge_candidates (
+           id, source_memory_id, target_memory_id, similarity,
+           suggested_action, state, created_at
+         ) VALUES ('recovered-review', 'recovered-source', 'recovered-target', 1,
+                   'duplicate', 'pending', ?)`
+      ).run(now);
+      const job = await enqueueAIReviewJob(env.DB, {
+        objectType: "memory_merge_candidate",
+        objectId: "recovered-review",
+        mode: "suggest",
+        requestedBy: "owner",
+      });
+      const { run } = await processAIReviewJob(env.DB, job.id, {
+        provider: "test",
+        model: "reviewer-v1",
+        complete: async () => JSON.stringify({
+          decision: "duplicate",
+          reason: "The evidence is identical.",
+          evidenceRefs: ["SOURCE", "TARGET"],
+          confidence: { decision: 0.95, evidence: 0.95 },
+          abstain: false,
+          reviewability: "sufficient",
+          missingContext: [],
+          keyDifferences: [{
+            dimension: "content",
+            status: "same",
+            summary: "No material content difference was found.",
+            evidenceRefs: ["SOURCE", "TARGET"],
+          }],
+          refinement: {
+            action: "consolidate",
+            content: null,
+            sourceRefs: ["SOURCE", "TARGET"],
+          },
+        }),
+      });
+      db.prepare(
+        `UPDATE sb_ai_review_jobs
+         SET status = 'applying', lease_owner = 'recovered-owner', lease_expires_at = ?,
+             error_code = 'external_application_lease_expired'
+         WHERE id = ?`
+      ).run(now + 60_000, job.id);
+      const reviewedAt = now + 1;
+      const finalization = prepareAIReviewApplicationStatements(env.DB, {
+        jobId: job.id,
+        run,
+        appliedBy: "owner",
+        applicationMode: "human",
+        decisionSource: "human",
+        leaseOwner: "recovered-owner",
+        guard: {
+          objectType: "memory_merge_candidate",
+          objectId: "recovered-review",
+          state: "accepted",
+          reviewedBy: "ai-review:owner",
+          reviewedAt,
+        },
+      });
+
+      await env.DB.batch([
+        env.DB.prepare(
+          `UPDATE sb_memory_merge_candidates
+           SET state = 'accepted', reviewed_by = 'ai-review:owner', reviewed_at = ?
+           WHERE id = 'recovered-review' AND state = 'pending'`
+        ).bind(reviewedAt),
+        ...finalization,
+      ]);
+
+      expect(db.prepare(
+        `SELECT status, error_code, lease_owner, lease_expires_at
+         FROM sb_ai_review_jobs WHERE id = ?`
+      ).get(job.id)).toEqual({
+        status: "applied",
+        error_code: null,
+        lease_owner: null,
+        lease_expires_at: null,
+      });
+    } finally {
+      db.close();
+    }
+  });
 });
